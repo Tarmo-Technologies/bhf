@@ -161,7 +161,7 @@ first row that matches wins:
 | `capability` | classification `capability` |
 | `intended_rejection` | classification `intended_rejection` |
 | `crash_lead` | prosthetics/stubs were used, or a sanitizer/unhandled crash with low confidence |
-| `runtime_oracle` | classification `oracle_hit`, confirmation `runtime`, or a differential divergence |
+| `runtime_oracle` | classification `oracle_hit`, confirmation `runtime`, or a differential divergence (a `bhf fuzz --differential-harness` divergence is an `oracle_hit` whose finding.json has a `differential` block with `mode: in_loop` and the `timeout_ms` of the fresh-process runs that confirmed it; `bhf replay` runs both builds of it) |
 | `sanitizer_crash` | sanitizer or unhandled crash |
 | `static_confirmed` | static finding confirmed by a fuzz run (`fuzz_confirmed` / `fuzz_exercised`) |
 | `static` | static finding, otherwise |

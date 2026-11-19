@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::differential::in_loop;
 use crate::protocol_detect::HarnessProtocol;
 use crate::runner::{harness_runner_for, SandboxModeArg};
 use clap::ValueEnum;
@@ -402,6 +403,23 @@ pub struct FuzzArgs {
     /// (a stateful state machine), where the per-spawn dynamics are preferred.
     #[arg(long)]
     pub no_fork_server: bool,
+
+    /// Differential fuzzing in the builtin engine's own loop: a second build
+    /// of the harness (another compiler, flags or version of the target, also
+    /// linked with bhf's driver) that every input the loop runs also runs
+    /// through. The builds are compared on how each run ended (clean,
+    /// rejected, crashed, hung) and on what it observed: the bytes the target
+    /// hands `bhf_diff_observe(ptr, len)`, the target's return value in a
+    /// generated harness, and `bhf_run_one`'s. Its process runs every input
+    /// the fuzzed build's runs, and both start over when either dies, so a
+    /// target that keeps state holds the same state in both. An input they
+    /// disagree on, and still disagree on when each re-runs it in a fresh
+    /// process (with twice `--timeout`, and once more to check each repeats
+    /// itself), is a BHF-301 divergence finding, which `bhf replay` re-runs
+    /// through both builds; an input that grows either build's coverage is
+    /// kept. Builtin engine, one worker only.
+    #[arg(long = "differential-harness", value_name = "PATH")]
+    pub differential_harness: Option<PathBuf>,
 
     /// Literal seed input; its UTF-8 bytes become a seed. Use `--seed-file` for
     /// a binary seed (any byte value, including NUL).
@@ -1098,10 +1116,11 @@ pub(crate) struct FuzzRunSummary {
     pub(crate) coverage: CoverageRunSummary,
     pub(crate) findings: Vec<String>,
     /// Findings recorded for this harness before the run (sorted ids) that a
-    /// crash in this run matched, so the crash was not recorded again.
+    /// crash, an oracle hit or an in-loop divergence (#345) in this run
+    /// matched, so it was not recorded again.
     #[serde(default)]
     pub(crate) duplicates_of_existing: Vec<String>,
-    /// How many crashing executions matched one of `duplicates_of_existing`.
+    /// How many executions matched one of `duplicates_of_existing`.
     #[serde(default)]
     pub(crate) duplicate_crashes_of_existing: usize,
     /// #405: actual wall-clock seconds this run spent fuzzing — the engine's
@@ -1164,6 +1183,10 @@ pub(crate) struct FuzzRunSummary {
     /// and the inputs it gave the pass. Omitted when the pass had none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) symcc: Option<crate::symcc::SymccRunSummary>,
+    /// #345: what `--differential-harness`'s second build ran and how often
+    /// the two builds disagreed. Omitted without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) differential: Option<DifferentialRunSummary>,
     /// #332: the workers a `bhf auto --workers-per-target` pass ran on and
     /// the corpus they merged. Omitted for a pass on one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1475,6 +1498,9 @@ struct PreparedFuzzRun {
     /// of a plateau through `main_symcc` and runs the inputs it solves.
     /// `None` unless the run asked for SymCC and the harness has the lane.
     symcc: Option<crate::symcc::SymccConfig>,
+    /// #345: the second build `--differential-harness` runs every input
+    /// through, or `None`.
+    differential: Option<DifferentialPlan>,
 }
 
 #[derive(Clone)]
@@ -1642,6 +1668,10 @@ pub fn run(mut args: FuzzArgs) -> i32 {
         return 2;
     }
     if let Some(error) = frame_conflict(&args) {
+        bhfeprintln!("{error}");
+        return 2;
+    }
+    if let Some(error) = differential_conflict(&args) {
         bhfeprintln!("{error}");
         return 2;
     }
@@ -1819,8 +1849,8 @@ fn duplicates_of_existing_note(ids: &[String], crashes: usize, harness_id: &str)
         listed.push_str(&format!(" and {} more", ids.len() - SHOWN));
     }
     Some(format!(
-        "bhf fuzz: {crashes} crashing input(s) matched finding(s) already recorded for \
-         {harness_id} ({listed}); they were not recorded again (see \"duplicates_of_existing\")"
+        "bhf fuzz: {crashes} input(s) matched finding(s) already recorded for {harness_id} \
+         ({listed}); they were not recorded again (see \"duplicates_of_existing\")"
     ))
 }
 
@@ -2266,6 +2296,7 @@ pub(crate) fn run_one_target_programmatic_with_runner(
         rss_limit_mb,
         fork_server: false,
         no_fork_server: false,
+        differential_harness: None,
         seed_inputs: Vec::new(),
         seed_files: Vec::new(),
         campaign_seed_files: Vec::new(),
@@ -2596,6 +2627,7 @@ fn run_programmatic_campaign(mut args: FuzzArgs, workers: u32) -> Result<FuzzRun
                 symcc
             },
         ),
+        differential: None,
         workers: Some(CampaignRunSummary {
             workers: campaign.workers_started,
             completed: campaign.workers_completed,
@@ -2978,6 +3010,7 @@ fn afl_programmatic_args(
         rss_limit_mb,
         fork_server: false,
         no_fork_server: false,
+        differential_harness: None,
         seed_inputs: Vec::new(),
         seed_files: Vec::new(),
         campaign_seed_files: Vec::new(),
@@ -3038,6 +3071,10 @@ pub(crate) fn given_flags(args: &FuzzArgs) -> Vec<&'static str> {
         ("--rss-limit-mb", args.rss_limit_mb != 0),
         ("--fork-server", args.fork_server),
         ("--no-fork-server", args.no_fork_server),
+        (
+            "--differential-harness",
+            args.differential_harness.is_some(),
+        ),
         ("--qemu-user", args.qemu_user.is_some()),
         ("--qemu-arg", !args.qemu_args.is_empty()),
         ("--extension", args.extension.is_some()),
@@ -3137,6 +3174,30 @@ fn frame_conflict(args: &FuzzArgs) -> Option<String> {
         "bhf fuzz --frame: only the builtin engine's single-input loop repairs its inputs \
          against a frame, and {other} runs another one, which would ignore it; remove --frame \
          or {other}"
+    ))
+}
+
+/// Why `--differential-harness` cannot apply to this run: only the builtin
+/// engine's single-worker loop runs every input through the second build.
+fn differential_conflict(args: &FuzzArgs) -> Option<String> {
+    args.differential_harness.as_ref()?;
+    let other = if args.engine != FuzzEngine::Builtin {
+        format!("--engine {}", engine_arg_name(args.engine))
+    } else if args.sanitizers.len() > 1 {
+        "a sanitizer matrix (several --sanitizers)".to_owned()
+    } else if multicore_requested(args) {
+        "--workers".to_owned()
+    } else if crate::transport_fuzz::should_use_transport(args) {
+        "--target-transport".to_owned()
+    } else if crate::session_fuzz::should_use_session(args) {
+        "--protocol-profile".to_owned()
+    } else {
+        return None;
+    };
+    Some(format!(
+        "bhf fuzz --differential-harness: only the builtin engine's single-worker loop runs \
+         each input through the second build, and {other} runs another one, which would \
+         ignore it; remove --differential-harness or {other}"
     ))
 }
 
@@ -4063,6 +4124,28 @@ fn prepare_with_runner(
         tool: args.sandbox_tool.clone(),
         strict: args.sandbox_strict,
     };
+    // `--differential-harness` (#345): the second build runs the way the
+    // first does.
+    let differential_runner = match &args.differential_harness {
+        Some(peer) => {
+            let peer = absolutize(peer)?;
+            if !peer.is_file() {
+                return Err(format!(
+                    "--differential-harness: {} is not a file",
+                    peer.display()
+                ));
+            }
+            Some(harness_runner_for(
+                peer,
+                args.qemu_user.clone(),
+                args.qemu_args.clone(),
+                args.sandbox,
+                args.sandbox_tool.clone(),
+                args.sandbox_strict,
+            )?)
+        }
+        None => None,
+    };
     let runner = match runner {
         Some(runner) => runner,
         None => harness_runner_for(
@@ -4284,6 +4367,24 @@ fn prepare_with_runner(
     #[cfg(not(any(unix, windows)))]
     let local_cmp_map: Option<shared_map::SharedMapFile> = None;
 
+    let differential = match differential_runner {
+        Some(peer) if builtin_framed => Some(DifferentialPlan::arm(
+            &work_dir,
+            harness_path.clone(),
+            peer,
+            &extra_env,
+        )?),
+        Some(_) => {
+            return Err(format!(
+                "--differential-harness: {} does not speak bhf's framed protocol: only a \
+                 harness built with bhf's driver (c_runtime/bhf_driver.c) records what each \
+                 run observed for the builtin engine to compare",
+                harness_path.display()
+            ))
+        }
+        None => None,
+    };
+
     let afl_workers = afl_worker_count(args.engine, args.workers);
     let symcc = if args.engine == FuzzEngine::Builtin {
         crate::symcc::SymccConfig::for_run(
@@ -4321,7 +4422,10 @@ fn prepare_with_runner(
         },
         winafl_timeout: args.timeout,
         mode: args.mode,
-        loop_env: in_loop_env(&extra_env, in_loop_symbolize()),
+        loop_env: match &differential {
+            Some(plan) => plan.primary_env(&in_loop_env(&extra_env, in_loop_symbolize())),
+            None => in_loop_env(&extra_env, in_loop_symbolize()),
+        },
         extra_env,
         _local_coverage_map: local_coverage_map,
         _local_cmp_map: local_cmp_map,
@@ -4346,6 +4450,7 @@ fn prepare_with_runner(
         afl_workers,
         extension_manifest: args.extension,
         symcc,
+        differential,
     })
 }
 
@@ -4900,6 +5005,19 @@ struct CoverageNovelty {
 }
 
 impl CoverageNovelty {
+    /// The novelty of one input over both builds of a differential run
+    /// (#345): what either build's coverage gained.
+    fn merged(self, other: Self) -> Self {
+        Self {
+            new_edges: self.new_edges.saturating_add(other.new_edges),
+            new_buckets: self.new_buckets.saturating_add(other.new_buckets),
+            comparison_advances: self
+                .comparison_advances
+                .saturating_add(other.comparison_advances),
+            deeper_stack: self.deeper_stack.saturating_add(other.deeper_stack),
+        }
+    }
+
     fn made_progress(self) -> bool {
         self.new_edges > 0
             || self.new_buckets > 0
@@ -5603,12 +5721,22 @@ fn run_builtin_with_progress(
         crate::protocol_detect::speaks_framed(prepared.runner.harness_path(), &detection);
     let handshake_timeout =
         fork_handshake_timeout(prepared.per_input_timeout, prepared.time, speaks_framed);
+    // #345: with `--differential-harness`, the second build's process runs
+    // every input the fuzzed build's persistent process runs.
+    let followed = prepared.differential.is_some();
     let mut fork_server = if prepared.fork_server && !c_libfuzzer_harness {
         start_fork_server(&prepared, handshake_timeout, speaks_framed)
+            .map(|server| server.followed(followed))
     } else {
         None
     };
     let mut forkserver_started = fork_server.is_some();
+    // #345: `--differential-harness`'s second build, which runs every input
+    // the loop runs.
+    let mut differential = prepared
+        .differential
+        .take()
+        .map(|plan| DifferentialPeer::start(plan, &prepared, &existing_findings));
 
     // Coverage-guided corpus (#398, #412): a SanitizerCoverage edge bitmap is
     // shared via BHF_COV_SHM by the C/C++ bhf driver (trace-pc-guard) AND,
@@ -6188,6 +6316,28 @@ fn run_builtin_with_progress(
             // #220: and the stack-depth word.
             cov.zero_stack();
         }
+        if let Some(peer) = differential.as_mut() {
+            peer.clear_primary();
+            // #345: the second build's process first runs what the fuzzed
+            // build's ran since the last input (colorization and CmpLog
+            // probes, calibration re-runs), so that both have run the same
+            // inputs when they are compared; when the second build's process
+            // died, the fuzzed build's starts over too.
+            if peer.follow(fork_server.as_mut(), None, &prepared, handshake_timeout) {
+                drop(fork_server.take());
+                fork_server = restart_fork_server(
+                    &prepared,
+                    pass_deadline,
+                    handshake_timeout,
+                    speaks_framed,
+                    followed,
+                );
+                forkserver_started |= fork_server.is_some();
+                peer.follow(fork_server.as_mut(), None, &prepared, handshake_timeout);
+            }
+        }
+        // The empty input's one run is reused: it ran nothing now.
+        let reused_empty_run = input.is_empty() && empty_input_run.is_some();
         // Whether this run came from the persistent fork-server (vs a fresh
         // per-spawn process). Fork-server findings are replay-validated below so
         // an artifact of accumulated global state never escapes as a finding.
@@ -6216,21 +6366,13 @@ fn run_builtin_with_progress(
                         protocol,
                         prepared.deadline,
                     )?;
-                    // Never wait past the end of the pass for the new server.
-                    let left = pass_deadline
-                        .map_or(handshake_timeout, |deadline| {
-                            deadline.saturating_duration_since(Instant::now())
-                        })
-                        .min(handshake_timeout);
-                    fork_server = if left.is_zero() {
-                        None
-                    } else {
-                        start_fork_server(
-                            &prepared,
-                            left,
-                            speaks_framed && left == handshake_timeout,
-                        )
-                    };
+                    fork_server = restart_fork_server(
+                        &prepared,
+                        pass_deadline,
+                        handshake_timeout,
+                        speaks_framed,
+                        followed,
+                    );
                     forkserver_started |= fork_server.is_some();
                     run
                 }
@@ -6298,6 +6440,24 @@ fn run_builtin_with_progress(
         if run.rejected {
             rejected_count += 1;
         }
+        // #345: the second build runs the input too. Its coverage joins this
+        // input's novelty, and a disagreement is checked in fresh processes
+        // once the coverage maps were read.
+        let mut peer_novelty = CoverageNovelty::default();
+        let mut diverged = None;
+        if let Some(peer) = differential.as_mut().filter(|_| !reused_empty_run) {
+            if let Some(primary) = peer.primary(&run) {
+                let (observed, novelty) = peer.run(
+                    &input,
+                    fork_server.as_mut(),
+                    from_fork_server,
+                    &prepared,
+                    handshake_timeout,
+                )?;
+                peer_novelty = novelty;
+                diverged = peer.worth_confirming(&primary, &observed);
+            }
+        }
         // Did this input grow edge coverage (#398 presence) OR push an edge into a
         // new AFL hit-count bucket (#420 loop/recursion depth) OR match more leading
         // bytes of some compare than any prior input (#421 laf-intel gradient)?
@@ -6321,7 +6481,8 @@ fn run_builtin_with_progress(
                     deeper_stack,
                 }
             })
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .merged(peer_novelty);
         let input_new_coverage = input_novelty.made_progress();
         // Fold newly-mined value-profile operands into the dictionary every 2048
         // execs so the mutator can splice magic bytes it just observed (#398).
@@ -6559,6 +6720,19 @@ fn run_builtin_with_progress(
             let descent = lineage.of(&input, parents);
             crate::fuzz_lineage::record(&prepared.work_dir, &id.0, &descent);
             finding_ids.push(id.0);
+        }
+        if let (Some(peer), Some(kind)) = (differential.as_mut(), diverged.as_deref()) {
+            match peer.confirm_and_record(&input, kind, &prepared, protocol, &emitter)? {
+                DivergenceRecord::Finding(id) => {
+                    let descent = lineage.of(&input, parents);
+                    crate::fuzz_lineage::record(&prepared.work_dir, &id, &descent);
+                    finding_ids.push(id);
+                }
+                DivergenceRecord::Duplicate(id) => {
+                    note_duplicate_of_existing(&mut duplicates_of_existing, Some(&id));
+                }
+                DivergenceRecord::None => {}
+            }
         }
 
         // Corpus retention (#398, #412). Keep only inputs that made progress —
@@ -6970,6 +7144,7 @@ fn run_builtin_with_progress(
         hangs: (hangs.observed > 0).then_some(hangs),
         stability: calibration.summary(),
         symcc: symcc_stage.as_ref().map(|stage| stage.summary().clone()),
+        differential: differential.map(DifferentialPeer::finish),
         workers: None,
     };
     if let Some(hint) = summary.stability.as_ref().and_then(StabilitySummary::hint) {
@@ -8499,6 +8674,7 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
         hangs: (hangs.observed > 0).then_some(hangs),
         stability: None,
         symcc: None,
+        differential: None,
         workers: None,
     };
     write_run_summary(&prepared.work_dir, &summary)?;
@@ -10816,6 +10992,9 @@ struct ExistingFindings {
     oracles: HashMap<String, String>,
     /// Event signature (hex) -> finding id, for the event-log lane.
     signatures: HashMap<String, String>,
+    /// In-loop divergence kind ([`in_loop::finding_key`]) -> finding id
+    /// (#345).
+    divergences: HashMap<String, String>,
 }
 
 impl ExistingFindings {
@@ -10858,6 +11037,12 @@ impl ExistingFindings {
                 .unwrap_or_else(|| entry.file_name().to_string_lossy().into_owned());
             if let Some(signature) = record.get("signature").and_then(|value| value.as_str()) {
                 keep_lowest_id(&mut existing.signatures, signature.to_owned(), &id);
+            }
+            if let Some(key) = record
+                .get("differential")
+                .and_then(in_loop::finding_key_of_block)
+            {
+                keep_lowest_id(&mut existing.divergences, key, &id);
             }
             // Oracle hits key on rule_id|oracle_name|api (oracle_hit_dedupe_key),
             // sanitizer crashes on the record's cluster_key_full: the root-cause
@@ -11983,7 +12168,18 @@ struct ForkServer {
     run_timeout_ms: i32,
     /// The harness asked for hex frames ([`TEXT_FRAMES_READY`]).
     text_frames: bool,
+    /// Which of the run's persistent processes this is: a new one has run
+    /// no input yet (#345).
+    serial: u64,
+    /// The inputs sent to it since [`Self::take_sent`] last took them, when a
+    /// second build's process follows this one
+    /// (`bhf fuzz --differential-harness`, [`Self::followed`]); `None`
+    /// otherwise.
+    sent: Option<Vec<Vec<u8>>>,
 }
+
+/// The serial of the next [`ForkServer`] a run starts.
+static NEXT_FORK_SERVER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 enum ForkOutcome {
     /// Boxed: a run result carries the parsed sanitizer report.
@@ -12956,6 +13152,28 @@ fn forget_queued_input(work_dir: &Path, harness_id: &str, input: &[u8]) {
     let _ = fs::remove_file(unchecked_input_path(&queue, input));
 }
 
+/// Start the run's fork-server again after it was stopped, `followed` by a
+/// second build's process when the run has one (#345), and never waiting past
+/// the end of the pass (`pass_deadline`) for it.
+fn restart_fork_server(
+    prepared: &PreparedFuzzRun,
+    pass_deadline: Option<Instant>,
+    handshake_timeout: Duration,
+    speaks_framed: bool,
+    followed: bool,
+) -> Option<ForkServer> {
+    let left = pass_deadline
+        .map_or(handshake_timeout, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        })
+        .min(handshake_timeout);
+    if left.is_zero() {
+        return None;
+    }
+    start_fork_server(prepared, left, speaks_framed && left == handshake_timeout)
+        .map(|server| server.followed(followed))
+}
+
 /// Start the run's fork-server, or `None` to run a fresh process per input. A
 /// harness known to speak the protocol that still misses the handshake says
 /// so, since every later input then pays a full process start.
@@ -13061,7 +13279,24 @@ impl ForkServer {
             rss_limit_mb,
             run_timeout_ms: fork_run_timeout_ms(run_timeout),
             text_frames: ready == TEXT_FRAMES_READY,
+            serial: NEXT_FORK_SERVER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            sent: None,
         })
+    }
+
+    /// This process, keeping the inputs it is sent for a second build's
+    /// process to run too (#345), when `followed`.
+    fn followed(mut self, followed: bool) -> Self {
+        if followed {
+            self.sent = Some(Vec::new());
+        }
+        self
+    }
+
+    /// The inputs sent to this process since the last call, in order, when
+    /// it is [`Self::followed`].
+    fn take_sent(&mut self) -> Vec<Vec<u8>> {
+        self.sent.as_mut().map(std::mem::take).unwrap_or_default()
     }
 
     /// Whether the persistent child's RSS now exceeds the configured ceiling.
@@ -13073,6 +13308,9 @@ impl ForkServer {
     }
 
     fn run_one(&mut self, input: &[u8]) -> ForkOutcome {
+        if let Some(sent) = self.sent.as_mut() {
+            sent.push(input.to_vec());
+        }
         // Write the framed input, then await the harness's sync byte (sent from
         // its next Load_From_Stdin once it has flushed this input's events). A
         // broken pipe / EOF means the process died; a timeout means this input
@@ -13181,6 +13419,692 @@ impl Drop for ForkServer {
         kill_process_group(&mut self.child);
         let _ = self.child.wait();
         let _ = fs::remove_file(&self.events_path);
+    }
+}
+
+/// The second build `bhf fuzz --differential-harness` runs every input
+/// through (#345), as `prepare` set it up: its runner and its environment,
+/// which is the run's with each channel a build writes for itself (the
+/// observation record, the edge and hit-count maps, stack depth, comparison
+/// progress, target entry and the runtrace log) on a file of its own, and
+/// without the channels only the fuzzed build feeds (CmpLog capture, value
+/// profile, comparison evidence).
+struct DifferentialPlan {
+    harness_a: PathBuf,
+    runner: replay_min::HarnessRunner,
+    extra_env: Vec<(String, String)>,
+    primary_record: PathBuf,
+    peer_record: PathBuf,
+    _maps: Vec<shared_map::SharedMapFile>,
+}
+
+/// The channels each build of a differential run writes on a file of its own.
+const DIFFERENTIAL_OWN_CHANNELS: &[&str] = &[
+    "BHF_DIFF_SHM",
+    "BHF_COV_SHM",
+    "BHF_COV_CNT_SHM",
+    "BHF_STACK_DEPTH_SHM",
+    "BHF_CMP_PROGRESS_SHM",
+    "BHF_TARGET_ENTRY_SHM",
+    "BHF_RUNTRACE_LOG",
+];
+
+/// The channels only the fuzzed build of a differential run feeds.
+const DIFFERENTIAL_PRIMARY_CHANNELS: &[&str] = &["BHF_CMP_SHM", "BHF_VP_SHM", "BHF_CMP_EVIDENCE"];
+
+/// The most BHF-301 findings one differential run records: one per kind of
+/// disagreement, which the run's summary counts.
+const MAX_DIVERGENCE_FINDINGS: usize = 16;
+
+impl DifferentialPlan {
+    /// Give the fuzzed build (`harness_a`, whose environment is `extra_env`)
+    /// an observation record, and `runner`'s build an environment of its own.
+    /// Only the loop's own runs of the fuzzed build, and the confirmation of a
+    /// divergence, write the record ([`Self::primary_env`]): the runs on other
+    /// threads (the fresh-process re-runs of new corpus entries) would
+    /// overwrite the loop's observation.
+    fn arm(
+        work_dir: &Path,
+        harness_a: PathBuf,
+        runner: replay_min::HarnessRunner,
+        extra_env: &[(String, String)],
+    ) -> Result<Self, String> {
+        let (primary_map, primary) =
+            arm_shared_map(work_dir, crate::differential::in_loop::RECORD_BYTES)?;
+        let primary_env = Self::with_record(extra_env, &primary);
+        let (peer_env, peer_maps) =
+            differential_peer_env(&primary_env, |bytes| arm_shared_map(work_dir, bytes))?;
+        let peer_record = peer_env
+            .iter()
+            .find(|(key, _)| key == "BHF_DIFF_SHM")
+            .map(|(_, path)| PathBuf::from(path))
+            .ok_or_else(|| "--differential-harness: no observation record".to_owned())?;
+        let mut maps = vec![primary_map];
+        maps.extend(peer_maps);
+        Ok(Self {
+            harness_a,
+            runner,
+            extra_env: peer_env,
+            primary_record: PathBuf::from(primary),
+            peer_record,
+            _maps: maps,
+        })
+    }
+
+    /// `env` with the observation record at `record`.
+    fn with_record(env: &[(String, String)], record: &str) -> Vec<(String, String)> {
+        let mut env = env.to_vec();
+        env.push(("BHF_DIFF_SHM".to_owned(), record.to_owned()));
+        env
+    }
+
+    /// `env`, an environment of the fuzzed build, with its observation record.
+    fn primary_env(&self, env: &[(String, String)]) -> Vec<(String, String)> {
+        Self::with_record(env, &self.primary_record.display().to_string())
+    }
+}
+
+/// A harness environment: its variables, in order.
+type HarnessEnv = Vec<(String, String)>;
+
+/// The second build's environment, from the fuzzed build's `env`: each of
+/// [`DIFFERENTIAL_OWN_CHANNELS`] on a new file `create` makes (as large as
+/// the fuzzed build's map; an empty log), none of
+/// [`DIFFERENTIAL_PRIMARY_CHANNELS`], and everything else as it is. Returns
+/// the files with it.
+fn differential_peer_env<M>(
+    env: &[(String, String)],
+    mut create: impl FnMut(usize) -> Result<(M, String), String>,
+) -> Result<(HarnessEnv, Vec<M>), String> {
+    let mut peer = Vec::with_capacity(env.len());
+    let mut files = Vec::new();
+    for (key, value) in env {
+        if DIFFERENTIAL_PRIMARY_CHANNELS.contains(&key.as_str()) {
+            continue;
+        }
+        if !DIFFERENTIAL_OWN_CHANNELS.contains(&key.as_str()) {
+            peer.push((key.clone(), value.clone()));
+            continue;
+        }
+        let bytes = if key == "BHF_RUNTRACE_LOG" {
+            0
+        } else {
+            fs::metadata(value)
+                .map_err(|error| format!("--differential-harness: read {key} {value}: {error}"))?
+                .len() as usize
+        };
+        let (file, path) = create(bytes)?;
+        files.push(file);
+        peer.push((key.clone(), path));
+    }
+    Ok((peer, files))
+}
+
+/// What `--differential-harness`'s second build did in a run (#345). Each of
+/// the loop's `divergences` is also one of `confirmed`, `unconfirmed`,
+/// `nondeterministic` or `not_rerun`.
+#[derive(Debug, Default, Serialize)]
+pub(crate) struct DifferentialRunSummary {
+    /// The second build.
+    pub(crate) harness: PathBuf,
+    /// The inputs it ran in the loop.
+    pub(crate) executions: usize,
+    /// Inputs the builds disagreed on in the loop.
+    pub(crate) divergences: usize,
+    /// Of those, the inputs re-run in fresh processes of each build, twice,
+    /// on which each build did what it did the first time and they disagreed
+    /// again.
+    pub(crate) confirmed: usize,
+    /// The inputs re-run in fresh processes that the builds agreed on: a
+    /// difference that came from what ran before in the loop's processes.
+    pub(crate) unconfirmed: usize,
+    /// The inputs re-run in fresh processes on which a build disagreed with
+    /// itself: what it observes changes from one process to the next (an
+    /// address, the time, a random value), so no divergence between the
+    /// builds is reported for it.
+    pub(crate) nondeterministic: usize,
+    /// The inputs not re-run: a finding (this run's or an earlier one's) was
+    /// recorded for their kind of disagreement already, the run has
+    /// [`MAX_DIVERGENCE_FINDINGS`], or [`MAX_FAILED_DIVERGENCE_CONFIRMATIONS`]
+    /// re-runs of that kind did not hold.
+    pub(crate) not_rerun: usize,
+    /// BHF-301 findings recorded, one per kind of disagreement.
+    pub(crate) findings: usize,
+}
+
+/// How many fresh-process re-runs of one kind of disagreement may fail to
+/// hold (the builds agreed, or a build disagreed with itself) before the
+/// loop's later disagreements of that kind are counted, not re-run. Each
+/// costs two to four process starts, and a target that keeps state or
+/// observes an address disagrees on most inputs.
+const MAX_FAILED_DIVERGENCE_CONFIRMATIONS: usize = 4;
+
+/// What [`DifferentialPeer::confirm_and_record`] made of a divergence.
+enum DivergenceRecord {
+    /// A new BHF-301 finding, by its id.
+    Finding(String),
+    /// The divergence of an existing finding of the work dir, by its id.
+    Duplicate(String),
+    /// Nothing: it did not hold, or this run recorded its kind already.
+    None,
+}
+
+/// The second build's side of a differential run's loop (#345).
+struct DifferentialPeer {
+    plan: DifferentialPlan,
+    /// `plan.extra_env` for the loop's own runs ([`in_loop_env`]).
+    loop_env: Vec<(String, String)>,
+    protocol: HarnessProtocol,
+    fork: Option<ForkServer>,
+    /// The [`ForkServer::serial`] of the fuzzed build's process that `fork`
+    /// follows: `fork` has run every input that one has, in order. `None`
+    /// while the fuzzed build runs a fresh process per input.
+    following: Option<u64>,
+    /// `fork` died on an input the fuzzed build's process ran, so the two
+    /// ran different inputs: the fuzzed build's process starts over too.
+    lost_step: bool,
+    /// The second build runs a fresh process per input: its fork-server would
+    /// not start, or the run has none.
+    per_spawn: bool,
+    coverage: Option<CoverageTracker>,
+    /// The kinds of disagreement ([`in_loop::finding_key`]) recorded, or
+    /// found to be an existing finding's, in this run.
+    reported: HashSet<String>,
+    /// The kinds of disagreement the work dir holds a finding for, with its
+    /// id.
+    existing: HashMap<String, String>,
+    /// The fresh-process re-runs that did not hold, by kind of disagreement.
+    failed: HashMap<String, usize>,
+    summary: DifferentialRunSummary,
+}
+
+impl DifferentialPeer {
+    fn start(
+        plan: DifferentialPlan,
+        prepared: &PreparedFuzzRun,
+        existing: &ExistingFindings,
+    ) -> Self {
+        let protocol = resolve_harness_protocol(&plan.runner, &prepared.work_dir);
+        Self {
+            loop_env: in_loop_env(&plan.extra_env, in_loop_symbolize()),
+            coverage: CoverageTracker::new(&plan.extra_env),
+            per_spawn: !prepared.fork_server || protocol != HarnessProtocol::BhfFramed,
+            summary: DifferentialRunSummary {
+                harness: plan.runner.harness_path().to_path_buf(),
+                ..DifferentialRunSummary::default()
+            },
+            protocol,
+            fork: None,
+            following: None,
+            lost_step: false,
+            reported: HashSet::new(),
+            existing: existing.divergences.clone(),
+            failed: HashMap::new(),
+            plan,
+        }
+    }
+
+    fn finish(self) -> DifferentialRunSummary {
+        self.summary
+    }
+
+    /// Clear the fuzzed build's observation record before it runs an input,
+    /// so a run that does not return leaves none behind.
+    fn clear_primary(&self) {
+        clear_observation(&self.plan.primary_record);
+    }
+
+    /// The fuzzed build's run of an input, as the builds are compared, or
+    /// `None` when it crashed or hung: that is a finding of its own.
+    fn primary(&self, run: &HarnessRun) -> Option<in_loop::ExecObserved> {
+        (run.sanitizer.is_none() && run.hung.is_none())
+            .then(|| exec_observed(run, &self.plan.primary_record))
+    }
+
+    /// The second build's fork-server, started when it has none, or `None`
+    /// when it runs a fresh process per input.
+    fn fork_server(
+        &mut self,
+        prepared: &PreparedFuzzRun,
+        handshake_timeout: Duration,
+    ) -> Option<&mut ForkServer> {
+        if self.per_spawn {
+            return None;
+        }
+        if self.fork.is_none() {
+            match ForkServer::spawn(
+                &self.plan.runner,
+                &prepared.work_dir,
+                &self.loop_env,
+                prepared.rss_limit_mb,
+                prepared.per_input_timeout,
+                handshake_timeout,
+            ) {
+                Ok(server) => self.fork = Some(server),
+                Err(error) => {
+                    bhfeprintln!(
+                        "bhf fuzz: --differential-harness: {error}; running a fresh process \
+                         per input for it"
+                    );
+                    self.per_spawn = true;
+                    return None;
+                }
+            }
+        }
+        self.fork.as_mut()
+    }
+
+    /// Keep the second build's process in step with the fuzzed build's,
+    /// `primary`: start over when `primary` is another process than the one
+    /// it followed (or there is none), and run every input `primary` was sent
+    /// since the last call (but `compared`, the last one, which the loop runs
+    /// itself to compare the builds on), so that a target that keeps state
+    /// from one input to the next holds the same state in both. The edges
+    /// these runs reach are no input's coverage. Returns `true` when the
+    /// second build's process died on one of them, or on an input the loop
+    /// compared them on: then the fuzzed build's process must start over too.
+    fn follow(
+        &mut self,
+        primary: Option<&mut ForkServer>,
+        compared: Option<&[u8]>,
+        prepared: &PreparedFuzzRun,
+        handshake_timeout: Duration,
+    ) -> bool {
+        let serial = primary.as_ref().map(|server| server.serial);
+        let mut sent = primary.map(ForkServer::take_sent).unwrap_or_default();
+        if serial != self.following {
+            self.fork = None;
+            self.following = serial;
+            self.lost_step = false;
+        }
+        if self.lost_step {
+            return true;
+        }
+        if compared.is_some() && sent.last().map(Vec::as_slice) == compared {
+            sent.pop();
+        }
+        sent.retain(|input| !input.is_empty());
+        if self.following.is_none() || self.per_spawn || sent.is_empty() {
+            return false;
+        }
+        let saved = self.coverage.as_ref().map(CoverageTracker::snapshot);
+        for input in &sent {
+            let Some(fork) = self.fork_server(prepared, handshake_timeout) else {
+                break;
+            };
+            if let ForkOutcome::Died = fork.run_one(input) {
+                self.fork = None;
+                self.lost_step = true;
+                break;
+            }
+        }
+        if let (Some(cov), Some(saved)) = (self.coverage.as_ref(), saved) {
+            cov.restore(&saved);
+        }
+        self.lost_step
+    }
+
+    /// Run `input` through the second build in the loop, as the fuzzed build
+    /// ran it: on its fork-server, in step with the fuzzed build's `primary`,
+    /// when that ran it `persistent`ly, else in a fresh process (and in one
+    /// when its fork-server dies on the input). How the run ended, what it
+    /// observed, and what it added to the second build's coverage.
+    fn run(
+        &mut self,
+        input: &[u8],
+        primary: Option<&mut ForkServer>,
+        persistent: bool,
+        prepared: &PreparedFuzzRun,
+        handshake_timeout: Duration,
+    ) -> Result<(in_loop::ExecObserved, CoverageNovelty), String> {
+        let persistent = persistent && !input.is_empty();
+        self.follow(
+            primary,
+            persistent.then_some(input),
+            prepared,
+            handshake_timeout,
+        );
+        if let Some(cov) = self.coverage.as_ref() {
+            cov.zero_counts();
+            cov.zero_progress();
+            cov.zero_stack();
+        }
+        clear_observation(&self.plan.peer_record);
+        self.summary.executions += 1;
+        let mut ran = None;
+        if persistent && !self.lost_step {
+            if let Some(server) = self.fork_server(prepared, handshake_timeout) {
+                match server.run_one(input) {
+                    ForkOutcome::Ran(run) => ran = Some(*run),
+                    ForkOutcome::Died => {
+                        self.fork = None;
+                        self.lost_step = true;
+                    }
+                }
+            }
+        }
+        let run = match ran {
+            Some(run) => run,
+            None => {
+                clear_observation(&self.plan.peer_record);
+                // No response deadline: a run's timing is not what the builds
+                // are compared on.
+                run_harness_with_protocol(
+                    &self.plan.runner,
+                    &prepared.work_dir,
+                    input,
+                    &self.loop_env,
+                    prepared.per_input_timeout,
+                    prepared.rss_limit_mb,
+                    self.protocol,
+                    None,
+                )?
+            }
+        };
+        let novelty = self
+            .coverage
+            .as_mut()
+            .map(|t| CoverageNovelty {
+                new_edges: t.input_increased_coverage(),
+                new_buckets: t.input_grew_buckets(),
+                comparison_advances: t.input_advanced_comparisons(),
+                deeper_stack: t.input_deepened_stack(),
+            })
+            .unwrap_or_default();
+        Ok((exec_observed(&run, &self.plan.peer_record), novelty))
+    }
+
+    /// The kind of disagreement ([`in_loop::finding_key`]) of the builds'
+    /// loop runs of one input (`primary`, `observed`) when the input is worth
+    /// re-running in fresh processes: no finding was recorded for that kind
+    /// yet, and not too many re-runs of it failed to hold. Counts every
+    /// disagreement.
+    fn worth_confirming(
+        &mut self,
+        primary: &in_loop::ExecObserved,
+        observed: &in_loop::ExecObserved,
+    ) -> Option<String> {
+        let kind = in_loop::divergence(primary, observed)?;
+        self.summary.divergences += 1;
+        let key = in_loop::finding_key(self.plan.runner.harness_path(), kind, primary, observed);
+        if self.reported.contains(&key)
+            || self.summary.findings >= MAX_DIVERGENCE_FINDINGS
+            || self.failed.get(&key).copied().unwrap_or(0) >= MAX_FAILED_DIVERGENCE_CONFIRMATIONS
+        {
+            self.summary.not_rerun += 1;
+            return None;
+        }
+        Some(key)
+    }
+
+    /// A fresh-process run of `input` by the fuzzed build (`fuzzed`, which
+    /// speaks `protocol`) or the second one, with `timeout`: the run, and as
+    /// the builds are compared.
+    fn fresh_run(
+        &self,
+        fuzzed: bool,
+        input: &[u8],
+        prepared: &PreparedFuzzRun,
+        protocol: HarnessProtocol,
+        timeout: Duration,
+    ) -> Result<(HarnessRun, in_loop::ExecObserved), String> {
+        let (runner, env, protocol, record) = if fuzzed {
+            (
+                &prepared.runner,
+                self.plan.primary_env(&prepared.extra_env),
+                protocol,
+                &self.plan.primary_record,
+            )
+        } else {
+            (
+                &self.plan.runner,
+                self.plan.extra_env.clone(),
+                self.protocol,
+                &self.plan.peer_record,
+            )
+        };
+        clear_observation(record);
+        let run = run_harness_with_protocol(
+            runner,
+            &prepared.work_dir,
+            input,
+            &env,
+            timeout,
+            prepared.rss_limit_mb,
+            protocol,
+            None,
+        )?;
+        let observed = exec_observed(&run, record);
+        Ok((run, observed))
+    }
+
+    /// Re-run `input`, which the builds disagreed on in the loop in the way
+    /// `loop_key` names, in a fresh process of each (the fuzzed one speaks
+    /// `protocol`) with twice the per-input timeout, so that a build's run
+    /// that only takes longer than the timeout is not a hang, as for the
+    /// fuzzed build's own hangs (#207). When they disagree, re-run each once
+    /// more: the divergence holds only when each build does what it did the
+    /// first time. A divergence that holds is a BHF-301 finding through
+    /// `emitter`, unless this run recorded its kind already or the work dir
+    /// holds a finding of it (a duplicate).
+    fn confirm_and_record(
+        &mut self,
+        input: &[u8],
+        loop_key: &str,
+        prepared: &PreparedFuzzRun,
+        protocol: HarnessProtocol,
+        emitter: &FindingEmitter,
+    ) -> Result<DivergenceRecord, String> {
+        let timeout = prepared.per_input_timeout.saturating_mul(2);
+        let (a_run, a) = self.fresh_run(true, input, prepared, protocol, timeout)?;
+        let (b_run, b) = self.fresh_run(false, input, prepared, protocol, timeout)?;
+        let verdict = if in_loop::divergence(&a, &b).is_none() {
+            in_loop::Confirmation::Agreed
+        } else {
+            let (_, a_again) = self.fresh_run(true, input, prepared, protocol, timeout)?;
+            let (_, b_again) = self.fresh_run(false, input, prepared, protocol, timeout)?;
+            in_loop::confirm((&a, &b), (&a_again, &b_again))
+        };
+        let kind = match verdict {
+            in_loop::Confirmation::Diverged(kind) => kind,
+            failed => {
+                match failed {
+                    in_loop::Confirmation::Nondeterministic => self.summary.nondeterministic += 1,
+                    _ => self.summary.unconfirmed += 1,
+                }
+                *self.failed.entry(loop_key.to_owned()).or_default() += 1;
+                return Ok(DivergenceRecord::None);
+            }
+        };
+        self.summary.confirmed += 1;
+        let harness_b = self.plan.runner.harness_path().to_path_buf();
+        let key = in_loop::finding_key(&harness_b, kind, &a, &b);
+        let recorded = self.reported.contains(&key);
+        // A later disagreement of either kind is not re-run.
+        self.reported.insert(loop_key.to_owned());
+        self.reported.insert(key.clone());
+        if recorded {
+            return Ok(DivergenceRecord::None);
+        }
+        if let Some(id) = self.existing.get(&key) {
+            return Ok(DivergenceRecord::Duplicate(id.clone()));
+        }
+        if self.summary.findings >= MAX_DIVERGENCE_FINDINGS {
+            return Ok(DivergenceRecord::None);
+        }
+        let hit = in_loop::oracle_hit(input, &harness_b, kind, &a, &b)
+            .ok_or_else(|| "the differential oracle did not take a divergence".to_owned())?;
+        let id = emitter
+            .emit_oracle_hit(input, &hit)
+            .map_err(|error| format!("emit divergence finding: {error}"))?;
+        let dir = corpus::layout::finding_dir(&prepared.work_dir, &id.0);
+        let path = dir.join("finding.json");
+        let mut record: serde_json::Value = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .ok_or_else(|| format!("read {}", path.display()))?;
+        record["differential"] =
+            in_loop::finding_block(&self.plan.harness_a, &harness_b, kind, &a, &b, timeout);
+        let bytes = serde_json::to_vec_pretty(&record)
+            .map_err(|error| format!("write {}: {error}", path.display()))?;
+        fs::write(&path, bytes).map_err(|error| format!("write {}: {error}", path.display()))?;
+        // The crashing build's sanitizer report is the finding's log.
+        if let Some(stderr) = [&b_run, &a_run]
+            .into_iter()
+            .find(|run| run.sanitizer.is_some())
+            .and_then(|run| run.stderr.as_deref())
+        {
+            let _ = fs::write(dir.join("sanitizer.log"), stderr);
+        }
+        self.summary.findings += 1;
+        Ok(DivergenceRecord::Finding(id.0))
+    }
+}
+
+/// `bhf replay` of an in-loop divergence finding (#345): run its input
+/// through each build in a fresh process, as the fuzz run confirmed it (with
+/// the timeout it recorded), and compare them on what the finding records:
+/// how they disagreed and how each run ended. `harness_a` is the fuzzed
+/// build, and `runner_for` runs a build as the replay was asked to (the
+/// emulator and sandbox). Without the second build the replay cannot tell,
+/// and is UNVERIFIED.
+pub(crate) fn replay_in_loop_divergence(
+    finding_dir: &Path,
+    harness_a: &Path,
+    runner_for: impl Fn(PathBuf) -> Result<replay_min::HarnessRunner, String>,
+) -> Result<crate::replay::LaneReplay, String> {
+    use crate::replay::{Detail, LaneReplay};
+    let path = finding_dir.join("finding.json");
+    let record: serde_json::Value = fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .ok_or_else(|| format!("read {}", path.display()))?;
+    let block = &record["differential"];
+    let recorded = |key: &str| {
+        block
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("none")
+            .to_owned()
+    };
+    let harness_b = block
+        .get("harness_b")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("{} names no second build", path.display()))?;
+    let mut lane = LaneReplay {
+        lane: "differential",
+        compared: format!(
+            "divergence {} (outcome_a {}, outcome_b {})",
+            recorded("divergence"),
+            recorded("outcome_a"),
+            recorded("outcome_b")
+        ),
+        details: vec![
+            Detail::new("harness_a", harness_a.display().to_string()),
+            Detail::new("harness_b", harness_b.display().to_string()),
+        ],
+        history: "replay",
+        ..LaneReplay::default()
+    };
+    if !harness_b.is_file() {
+        let reason = format!(
+            "the second build {} is not there: an in-loop divergence replays through both builds",
+            harness_b.display()
+        );
+        lane.unverified = true;
+        lane.status_line = format!("UNVERIFIED recorded=BHF-301 {reason}");
+        lane.differences.push(reason);
+        return Ok(lane);
+    }
+    let input = fs::read(finding_dir.join("testcase.bin")).map_err(|error| {
+        format!(
+            "read {}: {error}",
+            finding_dir.join("testcase.bin").display()
+        )
+    })?;
+    let work_dir = corpus::layout::work_dir_for_finding(finding_dir)
+        .unwrap_or_else(|| finding_dir.to_path_buf());
+    let timeout = block
+        .get("timeout_ms")
+        .and_then(serde_json::Value::as_u64)
+        .map_or(crate::replay::REPLAY_TIMEOUT, Duration::from_millis);
+    let mut runs = Vec::with_capacity(2);
+    for harness in [harness_a.to_path_buf(), harness_b] {
+        let runner = runner_for(harness)?;
+        let protocol = resolve_harness_protocol(&runner, &work_dir);
+        let (_map, record) = arm_shared_map(&work_dir, in_loop::RECORD_BYTES)?;
+        let env = [("BHF_DIFF_SHM".to_owned(), record.clone())];
+        let run = run_harness_with_protocol(
+            &runner, &work_dir, &input, &env, timeout, 0, protocol, None,
+        )?;
+        let observed = exec_observed(&run, Path::new(&record));
+        runs.push((run, observed));
+    }
+    let [(a_run, a), (b_run, b)] =
+        <[_; 2]>::try_from(runs).map_err(|_| "the replay did not run both builds".to_owned())?;
+    let differences = in_loop::replay_differences(block, &a, &b);
+    lane.matched = differences.is_empty();
+    lane.status_line = if lane.matched {
+        "MATCH".to_owned()
+    } else {
+        format!("MISMATCH recorded=BHF-301 {}", differences.join("; "))
+    };
+    lane.differences = differences;
+    for (label, exec) in [("a", &a), ("b", &b)] {
+        lane.details.push(Detail::new(
+            &format!("outcome_{label}"),
+            exec.outcome.as_str(),
+        ));
+        lane.details.push(Detail::new(
+            &format!("observation_{label}"),
+            in_loop::observation_text(exec),
+        ));
+    }
+    // The crashing build's stderr carries the report the summary shows.
+    let shown = [&b_run, &a_run]
+        .into_iter()
+        .find(|run| run.sanitizer.is_some())
+        .unwrap_or(&a_run);
+    lane.output = Some((
+        Vec::new(),
+        shown.stderr.clone().unwrap_or_default().into_bytes(),
+    ));
+    Ok(lane)
+}
+
+/// Mark the observation record at `path` as holding no observation. In
+/// place: a harness may have the file mapped, and one cut short under its
+/// mapping would die of SIGBUS on its next write.
+fn clear_observation(path: &Path) {
+    if let Ok(mut file) = fs::OpenOptions::new().write(true).open(path) {
+        let _ = file.write_all(&[0u8; in_loop::RECORD_BYTES]);
+    }
+}
+
+/// `run`, a run of one build, as the builds are compared: how it ended, and,
+/// for one that returned, what its record at `record` holds.
+fn exec_observed(run: &HarnessRun, record: &Path) -> in_loop::ExecObserved {
+    use in_loop::{ExecObserved, ExecOutcome, Observation};
+    let outcome = if run.hung.is_some() {
+        ExecOutcome::Hang
+    } else if let Some(report) = &run.sanitizer {
+        ExecOutcome::Crash {
+            kind: report.kind.clone(),
+            rule_id: report.rule_id.to_owned(),
+        }
+    } else if run.rejected {
+        ExecOutcome::Rejected
+    } else {
+        ExecOutcome::Clean
+    };
+    let observation = (outcome == ExecOutcome::Clean)
+        .then(|| fs::read(record).ok())
+        .flatten()
+        .and_then(|bytes| Observation::from_record(&bytes));
+    ExecObserved {
+        outcome,
+        observation,
     }
 }
 
@@ -13912,6 +14836,125 @@ mod signal_classification_tests {
             is_input_rejection(&ExitStatus::from_raw(2 << 8), ""),
             "an ordinary nonzero exit remains an input rejection",
         );
+    }
+}
+
+/// Only the loop's own runs of the fuzzed build write its observation record
+/// (#345): the fresh-process re-runs of new corpus entries run on another
+/// thread at the same time, and one writing the record (or holding it mapped
+/// while the loop clears it) would spoil the loop's observation.
+#[cfg(all(test, unix))]
+mod differential_record_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn script(path: &std::path::Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "#!/bin/sh\n# BHF_FRAMED\nexit 0\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn only_the_loops_runs_of_the_fuzzed_build_write_its_record() {
+        let work = tempfile::tempdir().unwrap();
+        script(&work.path().join("harnesses/H-REC/main"));
+        let peer = work.path().join("peer/main_b");
+        script(&peer);
+        let mut args = super::afl_programmatic_args(
+            work.path(),
+            "H-REC",
+            vec![b"seed".to_vec()],
+            None,
+            &[],
+            actionability::RunMode::Reporting,
+            0,
+            &[],
+            4096,
+        );
+        args.engine = super::FuzzEngine::Builtin;
+        args.differential_harness = Some(peer.clone());
+        let prepared = super::prepare(args).unwrap();
+        let record = |env: &[(String, String)]| {
+            env.iter()
+                .find(|(key, _)| key == "BHF_DIFF_SHM")
+                .map(|(_, value)| value.clone())
+        };
+        let plan = prepared.differential.as_ref().expect("a differential plan");
+        let primary = plan.primary_record.display().to_string();
+        assert_eq!(record(&prepared.loop_env), Some(primary.clone()));
+        assert_eq!(record(&prepared.extra_env), None);
+        let peer_record = record(&plan.extra_env).expect("the second build's record");
+        assert_ne!(peer_record, primary);
+        assert_eq!(plan.peer_record.display().to_string(), peer_record);
+        assert_eq!(plan.runner.harness_path(), peer.as_path());
+
+        // Clearing a record leaves it its size: a harness holding it mapped
+        // keeps a whole mapping.
+        std::fs::write(&plan.primary_record, [7u8; 16]).unwrap();
+        super::clear_observation(&plan.primary_record);
+        assert_eq!(std::fs::read(&plan.primary_record).unwrap(), [0u8; 16]);
+    }
+}
+
+/// The second build of a differential run (#345) writes its own observation
+/// record, coverage maps and runtrace log, never the fuzzed build's, feeds
+/// none of the fuzzed build's CmpLog, value-profile or comparison-evidence
+/// channels, and shares the rest of its environment.
+#[cfg(test)]
+mod differential_peer_env_tests {
+    #[test]
+    fn the_second_build_writes_channels_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let map = |name: &str, bytes: usize| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, vec![0u8; bytes]).unwrap();
+            path.display().to_string()
+        };
+        let env = vec![
+            ("BHF_DIFF_SHM".to_owned(), map("diff-a", 16)),
+            ("BHF_COV_SHM".to_owned(), map("cov-a", 64)),
+            ("BHF_CMP_SHM".to_owned(), map("cmp-a", 32)),
+            ("BHF_VP_SHM".to_owned(), map("vp-a", 8)),
+            ("BHF_RUNTRACE_LOG".to_owned(), map("runtrace-a", 5)),
+            ("ASAN_OPTIONS".to_owned(), "abort_on_error=1".to_owned()),
+        ];
+        let mut made = Vec::new();
+        let (peer, files) = super::differential_peer_env(&env, |bytes| {
+            let path = dir.path().join(format!("peer-{}", made.len()));
+            std::fs::write(&path, vec![0u8; bytes]).unwrap();
+            made.push(bytes);
+            Ok::<_, String>((made.len(), path.display().to_string()))
+        })
+        .unwrap();
+        let keys: Vec<&str> = peer.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "BHF_DIFF_SHM",
+                "BHF_COV_SHM",
+                "BHF_RUNTRACE_LOG",
+                "ASAN_OPTIONS"
+            ]
+        );
+        // Maps as large as the fuzzed build's; the log starts empty.
+        assert_eq!(made, [16, 64, 0]);
+        assert_eq!(files, [1, 2, 3]);
+        for ((key, value), (_, own)) in peer.iter().zip(&env) {
+            if key == "ASAN_OPTIONS" {
+                assert_eq!(value, "abort_on_error=1");
+            } else {
+                assert_ne!(value, own, "{key}");
+                assert!(value.contains("peer-"), "{key}: {value}");
+            }
+        }
+        // A channel the fuzzed build has no file for cannot be mirrored.
+        let missing = vec![(
+            "BHF_COV_CNT_SHM".to_owned(),
+            dir.path().join("absent").display().to_string(),
+        )];
+        let error =
+            super::differential_peer_env(&missing, |_| Ok::<_, String>(((), String::new())))
+                .unwrap_err();
+        assert!(error.contains("BHF_COV_CNT_SHM"), "{error}");
     }
 }
 
@@ -20096,6 +21139,7 @@ computed = "crc16(op, len, seq, body, opt)"
             rss_limit_mb: 0,
             fork_server: false,
             no_fork_server: false,
+            differential_harness: None,
             seed_inputs: Vec::new(),
             seed_files: Vec::new(),
             campaign_seed_files: Vec::new(),

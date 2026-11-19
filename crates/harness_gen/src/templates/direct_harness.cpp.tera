@@ -115,9 +115,22 @@
 // Keep a value-returning target call observable even when its result is not
 // otherwise consumed. Source-local/header-only targets are visible to the
 // optimizer; a plain `(void)R` lets it delete a pure parser call entirely.
+// Where bhf's driver is linked, the value also joins the exec's differential
+// observation (bhf_diff_result in c_runtime/bhf_driver.c), so `bhf fuzz
+// --differential-harness` compares two builds on what the target returned.
+#if defined(BHF_EXTERNAL_DRIVER) && (defined(__GNUC__) || defined(__clang__))
+extern "C" void bhf_diff_result(int type_class, const void *value, size_t size);
+#define BHF_DIFF_RESULT(value) \
+    bhf_diff_result(__builtin_classify_type(value), (const void *)std::addressof(value), \
+                    sizeof(value))
+#else
+#define BHF_DIFF_RESULT(value) ((void)0)
+#endif
 #if defined(__GNUC__) || defined(__clang__)
-#define BHF_KEEP_RESULT(value) \
-    __asm__ __volatile__("" : : "g"(std::addressof(value)) : "memory")
+#define BHF_KEEP_RESULT(value) do { \
+    __asm__ __volatile__("" : : "g"(std::addressof(value)) : "memory"); \
+    BHF_DIFF_RESULT(value); \
+} while (0)
 #else
 #define BHF_KEEP_RESULT(value) ((void)(value))
 #endif

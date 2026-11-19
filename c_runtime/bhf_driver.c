@@ -687,6 +687,97 @@ static void bhf_stack_open(void) {
         if (bhf_depth_ > *bhf_stack_map) *bhf_stack_map = bhf_depth_; \
     } \
 } while (0)
+/* Differential observation (#345): a 16-byte MAP_SHARED record named by
+ * BHF_DIFF_SHM, which `bhf fuzz --differential-harness` reads after every exec
+ * of each of the two builds it compares:
+ *   [u64 hash][u32 observations][u32 state]          (host byte order)
+ * `hash` is FNV-1a over what the exec observed: the length and bytes of each
+ * bhf_diff_observe() call, the target's return value where the generated
+ * harness hands it over (bhf_diff_result), and the return value of
+ * bhf_run_one itself. `observations` counts the bhf_diff_observe and
+ * bhf_diff_result calls. `state` is 0 while an exec runs and 1 once
+ * bhf_run_one returned, so an exec that crashed or exited part way, or a
+ * record no exec wrote, is never read as an observation. A no-op when unset.
+ * The layout MUST match the reader in crates/cli/src/differential.rs. */
+#define BHF_DIFF_BYTES 16u
+#define BHF_DIFF_FNV_BASIS 0xcbf29ce484222325ull
+#define BHF_DIFF_FNV_PRIME 0x100000001b3ull
+static unsigned char *bhf_diff_map = 0;
+static uint64_t bhf_diff_hash = BHF_DIFF_FNV_BASIS;
+static uint32_t bhf_diff_count = 0;
+BHF_NOCOV static void bhf_diff_open(void) {
+    if (bhf_diff_map) return;
+    const char *p = getenv("BHF_DIFF_SHM");
+    if (!p || !*p) return;
+    void *m = bhf_map_shared(p, BHF_DIFF_BYTES);
+    if (m) bhf_diff_map = (unsigned char *)m;
+}
+BHF_NOCOV static void bhf_diff_fold(const unsigned char *bytes, size_t len) {
+    uint64_t h = bhf_diff_hash;
+    for (size_t i = 0; i < len; i++) {
+        h ^= bytes[i];
+        h *= BHF_DIFF_FNV_PRIME;
+    }
+    bhf_diff_hash = h;
+}
+BHF_NOCOV static void bhf_diff_fold_u64(uint64_t value) {
+    unsigned char bytes[8];
+    for (unsigned i = 0; i < 8; i++) bytes[i] = (unsigned char)(value >> (8 * i));
+    bhf_diff_fold(bytes, sizeof bytes);
+}
+/* Fold `len` bytes at `data` into this exec's observation, so the two builds
+ * are compared on it. A target calls it on what it computed (a decoded value,
+ * a serialized output). Where the target is also built without bhf's driver,
+ * declare it weak:
+ *   extern void bhf_diff_observe(const void *, size_t) __attribute__((weak));
+ *   if (bhf_diff_observe) bhf_diff_observe(out, out_len); */
+BHF_NOCOV void bhf_diff_observe(const void *data, size_t len) {
+    if (!bhf_diff_map) return;
+    bhf_diff_fold_u64((uint64_t)len);
+    if (data && len) bhf_diff_fold((const unsigned char *)data, len);
+    bhf_diff_count++;
+}
+/* The generated harness's hook for the target's return value; `type_class` is
+ * __builtin_classify_type of it. An integer, character, enumeration, boolean
+ * or floating value of at most 8 bytes is observed whole, a pointer only as
+ * null or not (the two builds' addresses differ), and anything else (a
+ * struct, a long double with padding bytes) not at all. */
+BHF_NOCOV void bhf_diff_result(int type_class, const void *value, size_t size) {
+    unsigned char nonnull = 0;
+    if (!bhf_diff_map || !value) return;
+    switch (type_class) {
+    case 1: /* integer */
+    case 2: /* char */
+    case 3: /* enumeration */
+    case 4: /* boolean */
+        bhf_diff_observe(value, size);
+        break;
+    case 8: /* floating */
+        if (size <= 8) bhf_diff_observe(value, size);
+        break;
+    case 5: /* pointer */
+        for (size_t i = 0; i < size; i++) nonnull |= ((const unsigned char *)value)[i];
+        nonnull = (unsigned char)(nonnull != 0);
+        bhf_diff_observe(&nonnull, 1);
+        break;
+    default:
+        break;
+    }
+}
+BHF_NOCOV static void bhf_diff_begin(void) {
+    if (!bhf_diff_map) return;
+    bhf_diff_hash = BHF_DIFF_FNV_BASIS;
+    bhf_diff_count = 0;
+    memset(bhf_diff_map + 12, 0, 4);
+}
+BHF_NOCOV static void bhf_diff_end(int rc) {
+    uint32_t done = 1;
+    if (!bhf_diff_map) return;
+    bhf_diff_fold_u64((uint64_t)(uint32_t)rc);
+    memcpy(bhf_diff_map, &bhf_diff_hash, 8);
+    memcpy(bhf_diff_map + 8, &bhf_diff_count, 4);
+    memcpy(bhf_diff_map + 12, &done, 4);
+}
 /* laf-intel comparison-progress (#421): a THIRD map, BHF_CMP_PROGRESS_SHM,
  * one byte per hashed compare site recording the MAX leading-byte match this
  * exec, so the engine can reward an input one byte closer to a multi-byte gate.
@@ -1207,8 +1298,11 @@ BHF_NOCOV static void bhf_fatal_signal_install(void) {
 #endif
 
 BHF_NOCOV static void bhf_run_one_bytes(const uint8_t *data, size_t size) {
+    int rc;
     BHF_PUBLISH_INPUT(data, size);
-    bhf_run_one(data, size);
+    bhf_diff_begin();
+    rc = bhf_run_one(data, size);
+    bhf_diff_end(rc);
     bhf_c8_flush();
 }
 #ifndef _WIN32
@@ -1370,6 +1464,7 @@ int main(int argc, char **argv) {
     bhf_vp_open();
     bhf_ev_open();
     bhf_cmplog_open();
+    bhf_diff_open();
     /* Persistent fork-server framed protocol (BHF_FRAMED=1): write a ready
      * byte, then loop reading {u32 LE length, bytes} and replying one sync byte
      * per input. #427: redirect the target's stdout to /dev/null and write sync

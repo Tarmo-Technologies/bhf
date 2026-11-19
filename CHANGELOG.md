@@ -137,6 +137,21 @@
   none installed) records `fidelity.runtime_shim` (`not_exercised`, with the
   reason) on its run.json entry, the campaign rollup and its findings
   (additive).
+- `bhf fuzz --differential-harness PATH` (#345) runs every input of the
+  builtin engine's loop through a second build of the harness as well, and
+  compares the two on how each run ended and on a hash of what it observed:
+  the bytes the target hands the driver's new `bhf_diff_observe(ptr, len)`,
+  a generated harness's target return value, and `bhf_run_one`'s. The
+  second build's persistent process runs every input the fuzzed build's runs
+  (its CmpLog, colorization and calibration re-runs too) and both start over
+  when either dies, so a target that keeps state matches itself. A
+  disagreement that holds when both re-run the input in fresh processes, with
+  twice `--timeout`, and each build repeats its own run, is a BHF-301 finding
+  with a `differential` block (`mode: in_loop`); one a work dir already holds
+  is listed in `duplicates_of_existing` instead, and `bhf replay` of it runs
+  both builds (`UNVERIFIED` without the second). An input that grows either
+  build's coverage is kept. The run summary gains a `differential` block
+  (additive).
 
 ### Changed
 - The in-crate lane for private Rust targets (#83) is `bhf auto

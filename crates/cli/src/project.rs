@@ -688,6 +688,7 @@ fn plan_to_fuzz_args(
         rss_limit_mb: launch.rss_limit_mb.unwrap_or(0) as usize,
         fork_server: false,
         no_fork_server: false,
+        differential_harness: None,
         seed_inputs: Vec::new(),
         seed_files,
         campaign_seed_files: Vec::new(),

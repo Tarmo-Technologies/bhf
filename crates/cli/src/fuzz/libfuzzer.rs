@@ -422,6 +422,7 @@ pub(super) fn run(mut prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, Strin
         hangs: (hangs.observed > 0).then_some(hangs),
         stability: None,
         symcc: None,
+        differential: None,
         workers: None,
     };
     write_run_summary(&prepared.work_dir, &summary)?;

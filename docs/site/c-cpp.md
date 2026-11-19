@@ -1063,7 +1063,13 @@ they do not carry these oracles either.
 For cross-implementation checks, `bhf differential` replays the same input
 directory through two harness binaries and emits BHF-301 output-divergence
 findings stamped with the `differential-output-runtime` oracle when stdout,
-exit status, or timeout behavior differs.
+exit status, or timeout behavior differs. `bhf fuzz --differential-harness
+<PATH>` does it inside the builtin engine's loop instead: every mutant runs
+through both builds (a second build of the harness, for example `make diff
+DIFF_CC=gcc`'s `main_diff`), which are compared on how each run ended and on
+what it observed, the target's return value and anything it hands
+`bhf_diff_observe(ptr, len)`, so mutation searches for the inputs on which
+the builds disagree (see `docs/differential-fuzzing.md`).
 The same command supports single-harness metamorphic checks with `--harness`
 and `--metamorphic-transform`, one or several of `append-newline`,
 `trailing-whitespace`, `reorder-json-keys` and `utf8-bom`; BHF compares

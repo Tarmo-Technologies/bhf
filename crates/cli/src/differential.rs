@@ -926,6 +926,565 @@ fn oracle_hit_json(hit: &OracleHit) -> serde_json::Value {
     })
 }
 
+/// The builtin engine's in-loop differential oracle (#345, `bhf fuzz
+/// --differential-harness`): what one exec of each of the two builds is
+/// compared on, when they disagree, and the BHF-301 finding a disagreement
+/// becomes. The loop that runs both builds is in `crate::fuzz`.
+pub(crate) mod in_loop {
+    use finding_rules::oracle_registry::ORACLE_REGISTRY;
+    use finding_rules::oracle_sdk::{OracleHit, OracleRuntimeEvent};
+    use serde_json::{json, Value};
+    use sha2::{Digest, Sha256};
+    use std::path::Path;
+    use std::time::Duration;
+
+    /// The size of the observation record bhf's driver writes for each exec
+    /// (`BHF_DIFF_SHM`, `c_runtime/bhf_driver.c`): `[u64 hash][u32
+    /// observations][u32 state]` in host byte order.
+    pub(crate) const RECORD_BYTES: usize = 16;
+
+    /// What one exec observed: the FNV-1a hash the driver folded the target's
+    /// `bhf_diff_observe` bytes, its result and `bhf_run_one`'s return value
+    /// into, and how many observations went in.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct Observation {
+        pub(crate) hash: u64,
+        pub(crate) observations: u32,
+    }
+
+    impl Observation {
+        /// The observation in a record, or `None` when the record is short or
+        /// its exec has not returned (`state` is not 1): it crashed or exited
+        /// part way, or the record was cleared and nothing wrote it.
+        pub(crate) fn from_record(record: &[u8]) -> Option<Self> {
+            let record = record.get(..RECORD_BYTES)?;
+            let word = |at: usize| {
+                u32::from_ne_bytes([record[at], record[at + 1], record[at + 2], record[at + 3]])
+            };
+            if word(12) != 1 {
+                return None;
+            }
+            let mut hash = [0u8; 8];
+            hash.copy_from_slice(&record[..8]);
+            Some(Self {
+                hash: u64::from_ne_bytes(hash),
+                observations: word(8),
+            })
+        }
+
+        fn hash_hex(self) -> String {
+            format!("{:016x}", self.hash)
+        }
+    }
+
+    /// How one exec ended.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum ExecOutcome {
+        /// It returned from the input.
+        Clean,
+        /// It exited non-zero without a crash: the target rejected the input.
+        Rejected,
+        /// A sanitizer report or a fatal signal.
+        Crash { kind: String, rule_id: String },
+        /// It ran past the per-input timeout.
+        Hang,
+    }
+
+    impl ExecOutcome {
+        pub(crate) fn as_str(&self) -> &'static str {
+            match self {
+                Self::Clean => "clean",
+                Self::Rejected => "rejected",
+                Self::Crash { .. } => "crash",
+                Self::Hang => "hang",
+            }
+        }
+    }
+
+    /// One exec of a build, as the two builds are compared.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct ExecObserved {
+        pub(crate) outcome: ExecOutcome,
+        /// `None` when the exec did not return, or the build's driver makes no
+        /// observation record (one built before it existed).
+        pub(crate) observation: Option<Observation>,
+    }
+
+    /// How two builds' execs of one input disagree: `outcome` when they ended
+    /// differently (clean, rejected, crashed, hung), `observation` when both
+    /// returned but observed different things. Two crashes agree whatever
+    /// their kind (the primary build's crash is a finding of its own), and a
+    /// build that made no observation is compared on its outcome alone.
+    pub(crate) fn divergence(a: &ExecObserved, b: &ExecObserved) -> Option<&'static str> {
+        if a.outcome.as_str() != b.outcome.as_str() {
+            return Some("outcome");
+        }
+        match (a.observation, b.observation) {
+            (Some(left), Some(right)) if a.outcome == ExecOutcome::Clean && left != right => {
+                Some("observation")
+            }
+            _ => None,
+        }
+    }
+
+    /// What re-running an input the builds disagreed on in the loop, in
+    /// fresh processes, showed ([`confirm`]).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Confirmation {
+        /// Each build did what it did the first time, and they disagreed
+        /// again, in this way: a divergence between the builds.
+        Diverged(&'static str),
+        /// They agreed: the loop's disagreement came from what ran before in
+        /// the loop's processes.
+        Agreed,
+        /// A build disagreed with itself: what it observes changes from one
+        /// process to the next (an address, the time, a random value).
+        Nondeterministic,
+    }
+
+    /// Judge two fresh-process runs of each build of an input, `first` and
+    /// `second`, each `(a, b)`: a divergence only when each build reproduces
+    /// its own first run and the builds disagree.
+    pub(crate) fn confirm(
+        first: (&ExecObserved, &ExecObserved),
+        second: (&ExecObserved, &ExecObserved),
+    ) -> Confirmation {
+        if divergence(first.0, second.0).is_some() || divergence(first.1, second.1).is_some() {
+            return Confirmation::Nondeterministic;
+        }
+        match divergence(first.0, first.1) {
+            Some(kind) => Confirmation::Diverged(kind),
+            None => Confirmation::Agreed,
+        }
+    }
+
+    /// The kind of disagreement `divergence` between the fuzzed build's run
+    /// `a` and `harness_b`'s run `b` is, one finding per kind: the second
+    /// build, how they disagreed, how each run ended, and the kind of each
+    /// crash. [`finding_key_of_block`] gives it back from a finding.
+    pub(crate) fn finding_key(
+        harness_b: &Path,
+        divergence: &str,
+        a: &ExecObserved,
+        b: &ExecObserved,
+    ) -> String {
+        let crash_kind = |exec: &ExecObserved| match &exec.outcome {
+            ExecOutcome::Crash { kind, .. } => kind.clone(),
+            _ => String::new(),
+        };
+        key(
+            &harness_b.display().to_string(),
+            divergence,
+            a.outcome.as_str(),
+            b.outcome.as_str(),
+            &crash_kind(a),
+            &crash_kind(b),
+        )
+    }
+
+    /// The [`finding_key`] of the finding whose `differential` block is
+    /// `block`, or `None` when it records no in-loop divergence.
+    pub(crate) fn finding_key_of_block(block: &Value) -> Option<String> {
+        if block.get("mode").and_then(Value::as_str) != Some("in_loop") {
+            return None;
+        }
+        let text = |key: &str| block.get(key).and_then(Value::as_str);
+        let crash_kind = |key: &str| {
+            block
+                .get(key)
+                .and_then(|report| report.get("kind"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        };
+        Some(key(
+            text("harness_b")?,
+            text("divergence")?,
+            text("outcome_a")?,
+            text("outcome_b")?,
+            crash_kind("report_a"),
+            crash_kind("report_b"),
+        ))
+    }
+
+    fn key(
+        harness_b: &str,
+        divergence: &str,
+        outcome_a: &str,
+        outcome_b: &str,
+        crash_a: &str,
+        crash_b: &str,
+    ) -> String {
+        format!("{harness_b}\n{divergence}:{outcome_a}:{outcome_b}:{crash_a}:{crash_b}")
+    }
+
+    /// Whether the finding in `finding_dir` is an in-loop divergence, which
+    /// replays through both builds.
+    pub(crate) fn is_in_loop_finding(finding_dir: &Path) -> bool {
+        std::fs::read(finding_dir.join("finding.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|record| {
+                record.pointer("/differential/mode").and_then(Value::as_str) == Some("in_loop")
+            })
+    }
+
+    /// How a replay's runs of the two builds (`a`, `b`) differ from what the
+    /// finding's `differential` block recorded: how they disagreed and how
+    /// each run ended, one line each; none when the replay reproduced it.
+    pub(crate) fn replay_differences(
+        block: &Value,
+        a: &ExecObserved,
+        b: &ExecObserved,
+    ) -> Vec<String> {
+        let replayed = divergence(a, b).unwrap_or("none");
+        [
+            ("divergence", replayed),
+            ("outcome_a", a.outcome.as_str()),
+            ("outcome_b", b.outcome.as_str()),
+        ]
+        .into_iter()
+        .filter_map(|(key, replayed)| {
+            let recorded = block.get(key).and_then(Value::as_str).unwrap_or("none");
+            (recorded != replayed)
+                .then(|| format!("{key}: recorded {recorded}, replayed {replayed}"))
+        })
+        .collect()
+    }
+
+    /// An exec's observation hash, or `none`.
+    pub(crate) fn observation_text(exec: &ExecObserved) -> String {
+        exec.observation
+            .map(Observation::hash_hex)
+            .unwrap_or_else(|| "none".to_owned())
+    }
+
+    /// The BHF-301 hit for `divergence` between the fuzzed build (`a`) and
+    /// `harness_b` (`b`) on `input`.
+    pub(crate) fn oracle_hit(
+        input: &[u8],
+        harness_b: &Path,
+        divergence: &str,
+        a: &ExecObserved,
+        b: &ExecObserved,
+    ) -> Option<OracleHit> {
+        let event = OracleRuntimeEvent::Differential {
+            api: "bhf fuzz --differential-harness".to_owned(),
+            // The in-loop builds' "output" is what they observed.
+            stdout_equal: divergence != "observation",
+            exit_equal: a.outcome.as_str() == b.outcome.as_str(),
+            timed_out_a: a.outcome == ExecOutcome::Hang,
+            timed_out_b: b.outcome == ExecOutcome::Hang,
+            evidence: vec![
+                (
+                    "input_sha256".to_owned(),
+                    corpus::hex_lower(&Sha256::digest(input)),
+                ),
+                ("divergence".to_owned(), divergence.to_owned()),
+                ("harness_b".to_owned(), harness_b.display().to_string()),
+                ("outcome_a".to_owned(), a.outcome.as_str().to_owned()),
+                ("outcome_b".to_owned(), b.outcome.as_str().to_owned()),
+                ("observation_a".to_owned(), observation_text(a)),
+                ("observation_b".to_owned(), observation_text(b)),
+            ],
+        };
+        ORACLE_REGISTRY
+            .iter()
+            .find_map(|oracle| oracle.evaluate(&event))
+    }
+
+    /// The finding's `differential` block: both builds, how they disagreed,
+    /// and how each exec ended and what it observed, in the fresh processes
+    /// that confirmed the divergence, which ran with `timeout`.
+    pub(crate) fn finding_block(
+        harness_a: &Path,
+        harness_b: &Path,
+        divergence: &str,
+        a: &ExecObserved,
+        b: &ExecObserved,
+        timeout: Duration,
+    ) -> serde_json::Value {
+        let observation = |exec: &ExecObserved| {
+            exec.observation.map_or(
+                serde_json::Value::Null,
+                |seen| json!({"hash": seen.hash_hex(), "observations": seen.observations}),
+            )
+        };
+        let mut block = json!({
+            "mode": "in_loop",
+            "harness_a": harness_a.display().to_string(),
+            "harness_b": harness_b.display().to_string(),
+            "divergence": divergence,
+            "outcome_a": a.outcome.as_str(),
+            "outcome_b": b.outcome.as_str(),
+            "observation_a": observation(a),
+            "observation_b": observation(b),
+            "confirmed": "fresh_process",
+            "timeout_ms": u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+        });
+        for (key, exec) in [("report_a", a), ("report_b", b)] {
+            if let ExecOutcome::Crash { kind, rule_id } = &exec.outcome {
+                block[key] = json!({"kind": kind, "rule_id": rule_id});
+            }
+        }
+        block
+    }
+}
+
+/// The in-loop oracle's pieces that read and judge two builds' execs (#345).
+#[cfg(test)]
+mod in_loop_tests {
+    use super::in_loop::{
+        confirm, divergence, finding_block, finding_key, finding_key_of_block, oracle_hit,
+        replay_differences, Confirmation, ExecObserved, ExecOutcome, Observation, RECORD_BYTES,
+    };
+    use std::path::Path;
+    use std::time::Duration;
+
+    /// A record as the driver writes it once an exec returned (`state` 1), or
+    /// while one runs (`state` 0).
+    fn record(hash: u64, observations: u32, state: u32) -> Vec<u8> {
+        let mut bytes = hash.to_ne_bytes().to_vec();
+        bytes.extend_from_slice(&observations.to_ne_bytes());
+        bytes.extend_from_slice(&state.to_ne_bytes());
+        bytes
+    }
+
+    fn clean(hash: u64) -> ExecObserved {
+        ExecObserved {
+            outcome: ExecOutcome::Clean,
+            observation: Some(Observation {
+                hash,
+                observations: 1,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_record_is_an_observation_only_once_its_exec_returned() {
+        assert_eq!(RECORD_BYTES, 16);
+        assert_eq!(
+            Observation::from_record(&record(0xfeed, 2, 1)),
+            Some(Observation {
+                hash: 0xfeed,
+                observations: 2
+            })
+        );
+        // Still running (it crashed or exited part way), never written, or short.
+        assert_eq!(Observation::from_record(&record(0xfeed, 2, 0)), None);
+        assert_eq!(Observation::from_record(&[0; 16]), None);
+        assert_eq!(Observation::from_record(&record(1, 1, 1)[..12]), None);
+    }
+
+    #[test]
+    fn builds_diverge_on_their_outcome_or_what_they_observed() {
+        assert_eq!(divergence(&clean(1), &clean(1)), None);
+        assert_eq!(divergence(&clean(1), &clean(2)), Some("observation"));
+        let crash = |kind: &str| ExecObserved {
+            outcome: ExecOutcome::Crash {
+                kind: kind.to_owned(),
+                rule_id: "BHF-203".to_owned(),
+            },
+            observation: None,
+        };
+        assert_eq!(
+            divergence(&clean(1), &crash("stack-buffer-overflow")),
+            Some("outcome")
+        );
+        assert_eq!(
+            divergence(
+                &ExecObserved {
+                    outcome: ExecOutcome::Rejected,
+                    observation: None
+                },
+                &clean(1)
+            ),
+            Some("outcome")
+        );
+        assert_eq!(
+            divergence(
+                &clean(1),
+                &ExecObserved {
+                    outcome: ExecOutcome::Hang,
+                    observation: None
+                }
+            ),
+            Some("outcome")
+        );
+        // Two crashes agree whatever their kind; the primary's crash is a
+        // finding of its own.
+        assert_eq!(
+            divergence(&crash("heap-use-after-free"), &crash("SEGV")),
+            None
+        );
+        // A build that made no observation (one built before the record
+        // existed) is compared on its outcome alone.
+        let unobserved = ExecObserved {
+            outcome: ExecOutcome::Clean,
+            observation: None,
+        };
+        assert_eq!(divergence(&clean(1), &unobserved), None);
+    }
+
+    #[test]
+    fn a_divergence_is_a_bhf_301_hit_with_both_builds_in_its_block() {
+        let a = clean(0x1111);
+        let b = clean(0x2222);
+        let hit = oracle_hit(b"Zed", Path::new("/w/peer/main_b"), "observation", &a, &b)
+            .expect("an observation divergence is a hit");
+        assert_eq!(hit.rule_id, "BHF-301");
+        assert_eq!(hit.oracle_name, "differential-output-runtime");
+        assert_eq!(hit.evidence_value("divergence"), Some("observation"));
+        assert_eq!(hit.evidence_value("harness_b"), Some("/w/peer/main_b"));
+        assert_eq!(
+            hit.evidence_value("observation_a"),
+            Some("0000000000001111")
+        );
+        let block = finding_block(
+            Path::new("/w/harnesses/H/main"),
+            Path::new("/w/peer/main_b"),
+            "observation",
+            &a,
+            &b,
+            Duration::from_millis(2000),
+        );
+        assert_eq!(block["mode"], "in_loop");
+        assert_eq!(block["divergence"], "observation");
+        assert_eq!(block["outcome_a"], "clean");
+        assert_eq!(block["observation_a"]["hash"], "0000000000001111");
+        assert_eq!(block["observation_b"]["observations"], 1);
+        assert!(block.get("report_b").is_none(), "{block}");
+
+        let crashed = ExecObserved {
+            outcome: ExecOutcome::Crash {
+                kind: "stack-buffer-overflow".to_owned(),
+                rule_id: "BHF-203".to_owned(),
+            },
+            observation: None,
+        };
+        let block = finding_block(
+            Path::new("/w/harnesses/H/main"),
+            Path::new("/w/peer/main_b"),
+            "outcome",
+            &a,
+            &crashed,
+            Duration::from_millis(2000),
+        );
+        assert_eq!(block["outcome_b"], "crash");
+        assert_eq!(block["observation_b"], serde_json::Value::Null);
+        assert_eq!(block["report_b"]["kind"], "stack-buffer-overflow");
+        assert_eq!(block["report_b"]["rule_id"], "BHF-203");
+    }
+
+    fn crashed(kind: &str) -> ExecObserved {
+        ExecObserved {
+            outcome: ExecOutcome::Crash {
+                kind: kind.to_owned(),
+                rule_id: "BHF-203".to_owned(),
+            },
+            observation: None,
+        }
+    }
+
+    /// A divergence holds only when each build reproduces its own first run.
+    #[test]
+    fn a_divergence_holds_only_when_each_build_repeats_itself() {
+        // Each build repeats itself, and they disagree.
+        assert_eq!(
+            confirm((&clean(1), &clean(2)), (&clean(1), &clean(2))),
+            Confirmation::Diverged("observation")
+        );
+        assert_eq!(
+            confirm((&clean(1), &crashed("SEGV")), (&clean(1), &crashed("SEGV"))),
+            Confirmation::Diverged("outcome")
+        );
+        // A build whose observation changes from one process to the next.
+        assert_eq!(
+            confirm((&clean(1), &clean(2)), (&clean(3), &clean(4))),
+            Confirmation::Nondeterministic
+        );
+        assert_eq!(
+            confirm((&clean(1), &clean(2)), (&clean(1), &clean(5))),
+            Confirmation::Nondeterministic
+        );
+        assert_eq!(
+            confirm((&clean(1), &crashed("SEGV")), (&clean(1), &clean(7))),
+            Confirmation::Nondeterministic
+        );
+        // They agree.
+        assert_eq!(
+            confirm((&clean(1), &clean(1)), (&clean(1), &clean(1))),
+            Confirmation::Agreed
+        );
+    }
+
+    /// The kind of an in-loop divergence a finding records is the kind a
+    /// later run's divergence of the same sort has, so that it is a
+    /// duplicate; another sort, or another second build, is not.
+    #[test]
+    fn a_findings_divergence_kind_reads_back_from_its_block() {
+        let harness_b = Path::new("/w/peer/main_b");
+        let a = clean(1);
+        let b = crashed("stack-buffer-overflow");
+        let block = finding_block(
+            Path::new("/w/harnesses/H/main"),
+            harness_b,
+            "outcome",
+            &a,
+            &b,
+            Duration::from_secs(2),
+        );
+        assert_eq!(block["timeout_ms"], 2000);
+        let key = finding_key(harness_b, "outcome", &a, &b);
+        assert_eq!(finding_key_of_block(&block).as_deref(), Some(key.as_str()));
+        // The observed values are not part of the kind.
+        assert_eq!(key, finding_key(harness_b, "outcome", &clean(9), &b));
+        assert_ne!(
+            key,
+            finding_key(harness_b, "outcome", &a, &crashed("heap-use-after-free"))
+        );
+        assert_ne!(
+            key,
+            finding_key(Path::new("/w/other/main_c"), "outcome", &a, &b)
+        );
+        // A block of the post-run replay (or none) is no in-loop kind.
+        assert_eq!(
+            finding_key_of_block(&serde_json::json!({"mode": "replay"})),
+            None
+        );
+        assert_eq!(finding_key_of_block(&serde_json::Value::Null), None);
+    }
+
+    /// A replay reproduces an in-loop divergence when the builds disagree the
+    /// way the finding records and each run ends as recorded.
+    #[test]
+    fn a_replay_is_compared_on_the_divergence_and_each_outcome() {
+        let block = finding_block(
+            Path::new("/w/harnesses/H/main"),
+            Path::new("/w/peer/main_b"),
+            "observation",
+            &clean(1),
+            &clean(2),
+            Duration::from_secs(2),
+        );
+        // Other values observed, but still a divergence of the same kind.
+        assert_eq!(
+            replay_differences(&block, &clean(3), &clean(4)),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            replay_differences(&block, &clean(3), &clean(3)),
+            vec!["divergence: recorded observation, replayed none".to_owned()]
+        );
+        assert_eq!(
+            replay_differences(&block, &clean(3), &crashed("SEGV")),
+            vec![
+                "divergence: recorded observation, replayed outcome".to_owned(),
+                "outcome_b: recorded clean, replayed crash".to_owned()
+            ]
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

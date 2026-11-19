@@ -7340,6 +7340,95 @@ mod tests {
         }
     }
 
+    /// A generated harness built with bhf's driver hands the target's return
+    /// value to the driver's differential observation (#345): the run's
+    /// record holds one observation, and two builds whose targets return
+    /// different values observe different things on the same input.
+    #[cfg(unix)]
+    #[test]
+    fn a_generated_harness_observes_the_targets_return_value() {
+        let clang_ok = Command::new("clang")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !clang_ok {
+            eprintln!("skipping: clang unavailable");
+            return;
+        }
+        let (_root_guard, root) = temp_dir("diff result");
+        let runtime = root.join("c_runtime");
+        copy_c_runtime_to(&runtime);
+        let source = root.join("record.c");
+        fs::write(
+            &source,
+            "#include <stddef.h>\n\
+             int parse_record(const unsigned char *data, size_t len) {\n\
+             \x20   return len ? data[0] + OFFSET : -1;\n\
+             }\n",
+        )
+        .unwrap();
+        let out = root.join("harnesses/H-RESULT");
+        let mut args = direct_args("parse_record", out.clone());
+        args.source_path = source.clone();
+        args.params = vec![
+            CParameter {
+                name: "data".to_owned(),
+                c_type: "const unsigned char *".to_owned(),
+            },
+            CParameter {
+                name: "len".to_owned(),
+                c_type: "size_t".to_owned(),
+            },
+        ];
+        args.target_sources = vec![source.clone()];
+        args.c_runtime_include = runtime.clone();
+        generate_c_direct_harness(args).expect("harness generates");
+        let input = root.join("input.bin");
+        fs::write(&input, b"R").unwrap();
+        // The record a build with `OFFSET` writes for `input`.
+        let observe = |offset: u32| -> Vec<u8> {
+            let bin = root.join(format!("main-{offset}"));
+            let built = Command::new("clang")
+                .current_dir(&out)
+                .args(["-O1", "-DBHF_EXTERNAL_DRIVER", "-I"])
+                .arg(&runtime)
+                .arg(format!("-DOFFSET={offset}"))
+                .arg("-o")
+                .arg(&bin)
+                .arg("main.c")
+                .arg(&source)
+                .arg(runtime.join("bhf_driver.c"))
+                .output()
+                .unwrap();
+            assert!(
+                built.status.success(),
+                "{}",
+                String::from_utf8_lossy(&built.stderr)
+            );
+            let record = root.join(format!("record-{offset}"));
+            let ran = Command::new(&bin)
+                .arg(&input)
+                .env("BHF_DIFF_SHM", &record)
+                .output()
+                .unwrap();
+            assert!(ran.status.success(), "{ran:?}");
+            fs::read(&record).unwrap()
+        };
+        let word = |record: &[u8], at: usize| {
+            u32::from_ne_bytes([record[at], record[at + 1], record[at + 2], record[at + 3]])
+        };
+        let first = observe(0);
+        assert_eq!(first.len(), 16);
+        assert_eq!(word(&first, 12), 1, "the run returned");
+        assert_eq!(word(&first, 8), 1, "one observation: the target's result");
+        assert_eq!(
+            observe(0)[..8],
+            first[..8],
+            "the same build observes the same"
+        );
+        assert_ne!(observe(1)[..8], first[..8], "another result, another hash");
+    }
+
     /// The undefined weak symbols of `main.c` in `dir`, compiled with `flags`
     /// (with `runtime` on the include path).
     #[cfg(target_os = "linux")]

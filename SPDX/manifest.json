@@ -3163,6 +3163,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/fuzz_differential_in_loop.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/fuzz_extension_stages.rs",
       "license": "Apache-2.0"
     },
