@@ -5,6 +5,18 @@
 ## Unreleased
 
 ### Added
+- `bhf kernel syzlang SOURCE... --out DIR` writes the syzkaller description
+  of a Linux driver's ioctl interface (#348): the handlers a `struct
+  file_operations` registers, the `_IO`/`_IOR`/`_IOW`/`_IOWR` commands their
+  `switch (cmd)` dispatches on (through the calls that pass `cmd` on), the
+  argument structs and unions from the driver's own definitions (bit-fields,
+  packing, anonymous members, big-endian and always-aligned types), and the
+  device node, as `dev_<name>.txt`, with `dev_<name>.txt.const` holding each
+  command's number for the nine architectures syzkaller builds for Linux
+  (loong64 included), so no `syz-extract` run is needed. Each struct and
+  union is laid out as C does and as syzkaller will, per architecture; a
+  command whose argument type the source does not define, or whose layout
+  syzkaller cannot match, is left out with the reason.
 - `bhf auto --symcc` builds a SymCC variant of each native C/C++ harness
   (#324): the generated Makefiles gain a `symcc` goal (`main_symcc`, built by
   `SYMCC_CC`/`SYMCC_CXX`, default `symcc`/`sym++`), and run.json records it as

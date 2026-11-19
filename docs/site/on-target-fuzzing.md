@@ -60,6 +60,7 @@ binary release.
 | A proprietary RTOS image | **Actual RTOS execution** | VxWorks/INTEGRITY/QNX scheduler | ⛔ unproven (bring the image + toolchain) |
 | An on-device agent (TCP/serial) | **On-target agent** | Real device; coverage over the agent protocol | ⛔ unproven: the host side ships; no target-side agent does yet ([#289](https://github.com/Tarmo-Technologies/bhf/issues/289)), so you write one to the frame format in §3c |
 | A physical board | **HIL** (hardware-in-the-loop) | Silicon | ⛔ unproven (`BHF_HIL_GDB`) |
+| A Linux driver's source, and syzkaller | **syzkaller descriptions** (`bhf kernel syzlang`, §10) | syzkaller runs the kernel and its KCOV coverage; bhf describes the driver's ioctls | ✅ snapshot of the widget fixture's description; ⛔ syz-sysgen acceptance gated (needs a syzkaller checkout) |
 | Only a firmware image (ELF or flash dump), no source | **Rehosting** (`bhf binary rehost`, §9) | bhf's own Cortex-M interpreter: the real instructions, no peripherals or interrupts | ✅ fixture images in `crates/rehost/tests/fixtures/`: edge coverage that grows with the input, invalid-access, bad-PC and HardFault findings, `bhf replay` MATCH |
 
 ---
@@ -900,6 +901,84 @@ them.
 
 ---
 
+## 10. Linux kernel drivers: syzkaller descriptions
+
+A Linux driver's bugs are in the kernel, which a user-space harness never
+runs. bhf does not fuzz the kernel itself; it gives syzkaller what it needs
+to: `bhf kernel syzlang` reads the driver's C source and writes the syzkaller
+description (syzlang) of its ioctl interface.
+
+```sh
+# The driver's directory and the uapi header that defines its commands:
+bhf kernel syzlang drivers/misc/widget include/uapi/linux/widget.h \
+  --out ~/syzkaller/sys/linux
+cd ~/syzkaller && make descriptions   # runs syz-sysgen; then build and run syz-manager
+```
+
+- **The handler.** An ioctl handler is a function a `struct file_operations`
+  initializer registers as `.unlocked_ioctl`, `.compat_ioctl` or `.ioctl`;
+  without one, a function named `*ioctl*` that takes `(struct file *,
+  unsigned int, unsigned long)`.
+- **The commands.** The handler's `switch` on its command parameter names
+  them. A call that passes the command on (`return widget_do_xfer(state,
+  cmd, argp);`) is followed into the callee's `switch` on that parameter, up
+  to four calls deep. A command is a macro defined as `_IO`, `_IOR`, `_IOW`
+  or `_IOWR` (directly or through `#define A B`), or a plain number a `case`
+  names. When the handler's switch names none (a dispatch table indexed with
+  `_IOC_NR(cmd)`, say), every `_IO`-family macro of the source read is
+  described, and the header comment says so.
+- **The argument.** `_IOW` becomes `ptr[in, T]`, `_IOR` `ptr[out, T]`,
+  `_IOWR` `ptr[inout, T]`, and `_IO` an `intptr`. A plain-number command
+  takes `ptr[inout, array[int8]]`. Structs and unions are described from
+  their definitions in the source read: `__u8` to `__u64` and the other
+  fixed-width spellings as `int8` to `int64`, `__aligned_u64` and its kin as
+  `align64[int64]` (8-aligned on 386 too), `__be16`/`__be32`/`__be64` as
+  big-endian, `long`, `size_t` and their kin as `intptr`, arrays (lengths
+  from macros), bit-fields (`int8:4`; in a union, which syzlang gives no
+  bit-fields, the whole integer), the bits an unnamed bit-field or `: 0`
+  skips as zero padding, packing (`__packed`, `__attribute__((packed))`),
+  nested and anonymous structs and unions (a union C pads past its largest
+  member gets `[size[N]]`), and pointers (`ptr[inout, ...]`; a `void *` or
+  `char *` is a byte array). Typedefs are followed. Struct names take the
+  description's name as a prefix (`widget_config`), so they do not collide
+  with syzkaller's own; a member named after a syzlang keyword or reserved
+  name (`resource`, `include`, `parent`, ...) gets a `_` suffix.
+- **The layout check.** Each struct and union is laid out twice per
+  architecture: as C lays it out (GCC's and Clang's rules for that ABI) and
+  as syzkaller's compiler will lay out the description. A command whose
+  argument would differ, so the kernel would read a member where syzkaller
+  did not put it, is left out with the member and architecture (a 64-bit
+  bit-field that straddles a 4-byte boundary on 386, say); behind a pointer,
+  such a type becomes a byte array instead. Each command's comment names the
+  macro and where it is defined (`# WIDGET_IOC_RESET defined at
+  include/uapi/linux/widget.h:50: ...`), worded so syzkaller never takes it
+  for an `include` or `define` directive.
+- **The device node.** A `struct miscdevice`'s `.nodename` or `.name`, a
+  `device_create` or `register_chrdev` name, or `--device`. The fd resource
+  is opened with `openat$<name>`; a name with a `%d` becomes
+  `syz_open_dev$<name>` with `#` for the number.
+- **The numbers.** `dev_<name>.txt.const` gives each command's number for
+  each of the nine architectures syzkaller builds for Linux (386, amd64,
+  arm, arm64, loong64, mips64le, ppc64le, riscv64, s390x): the argument's
+  size under that architecture's data model (4-byte `long` and pointers on
+  386 and arm, a 4-aligned 64-bit integer on 386) in its `_IOC` encoding (13
+  size bits and 3 direction bits on mips and powerpc). No kernel build or
+  `syz-extract` is needed.
+
+A command bhf cannot describe, because its argument type is not defined in
+the source read (a kernel type such as `struct timespec64`, say), has a
+size no ioctl number holds, or has a layout syzkaller cannot give it, is
+left out: the description says why in a
+`# Not described:` comment, and stdout lists it. Name more of the source (the
+header that defines the type) to describe it. Not read: a command or type
+built by a function-like macro (`#define WIDGET_IOW(nr, t) _IOW('W', nr, t)`),
+`sizeof` in a command or array length, `__attribute__((aligned(N)))` on a
+member, `#pragma pack`, and a command whose number is computed at run time.
+Exit status: 0 when at least one command was described, 1 otherwise (no
+handler found, or no command describable).
+
+---
+
 ## What is and isn't proven
 
 - **Five levels of validation, kept apart:**
@@ -944,6 +1023,14 @@ them.
   and `crates/cli/tests/transport_fuzz_renode_cli.rs`, which skip without
   Renode; `BHF_RENODE=/path/to/renode` points them at a portable build). Vendor
   board scripts, peripherals and an RTOS under Renode are unvalidated.
+- **syzkaller descriptions (§10):** the description of the widget driver
+  fixture (`tests/fixtures/kernel_widget/`) is a snapshot the tests compare
+  byte for byte; the unit tests check the `_IOC` encoding against command
+  numbers the kernel defines (`FS_IOC_GETFLAGS`, `KVM_CREATE_VM`). That syz-sysgen
+  accepts it is checked by `kernel_syzlang_cli`'s gated test, which needs a
+  syzkaller checkout (`BHF_SYZKALLER_CLI=1`, `BHF_SYZKALLER=<checkout>`); no
+  CI job installs syzkaller. bhf runs no kernel and collects no KCOV
+  coverage: syzkaller does both.
 - **Not available yet:** typed mutation of a raw struct image in a big-endian
   target's byte order (decoded arguments are typed, little-endian as the
   decoder reads them; §5).

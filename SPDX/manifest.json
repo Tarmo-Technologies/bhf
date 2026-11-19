@@ -1335,6 +1335,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/c_parser/src/ioctl.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/c_parser/src/lib.rs",
       "license": "Apache-2.0"
     },
@@ -1924,6 +1928,10 @@
     },
     {
       "path": "crates/cli/src/introspect.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/kernel.rs",
       "license": "Apache-2.0"
     },
     {
@@ -3232,6 +3240,10 @@
     },
     {
       "path": "crates/cli/tests/java_driver_noise.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/kernel_syzlang_cli.rs",
       "license": "Apache-2.0"
     },
     {
@@ -6324,6 +6336,10 @@
     },
     {
       "path": "tests/fixtures/government_legacy_patterns/gpr/scenario_app.gpr",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/kernel_widget/linux/drivers/misc/widget.c",
       "license": "Apache-2.0"
     },
     {
