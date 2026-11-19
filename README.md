@@ -258,7 +258,7 @@ archives automatically; choose the installer or the archive.
 |---|---|
 | Install complete BHF on Linux with one `install.sh` | `bhf-dist-0.3.0-x86_64-unknown-linux-gnu.tar.gz` plus its `.sha256` and `.sig` files |
 | Run the CLI on Windows | `bhf-installer.ps1`, or `bhf-x86_64-pc-windows-msvc.zip` plus its `.sha256` file for a manual/offline install |
-| Run basic CLI workflows on Linux | `bhf-installer.sh`, or `bhf-x86_64-unknown-linux-gnu.tar.xz` plus its `.sha256` file |
+| Run basic CLI workflows on Linux | `bhf-installer.sh`, or `bhf-x86_64-unknown-linux-gnu.tar.xz` (`bhf-aarch64-unknown-linux-gnu.tar.xz` on 64-bit ARM) plus its `.sha256` file |
 | Get the full Linux `bhf auto` runtime audit and fake-resource support | Add `bhf_runtrace_shim-installer.sh`, or its matching `bhf_runtrace_shim-*.tar.xz` archive |
 | Recover complex C/C++ builds that use `--probe-build` or `--build-command` | Add `bhf_cc_intercept-installer.sh`, or its matching `bhf_cc_intercept-*.tar.xz` archive |
 | Use the IDE, JSON-RPC, or read-only MCP service | Add the OS-appropriate `bhf-daemon-installer.sh` / `.ps1`, or the matching daemon archive |
@@ -266,8 +266,10 @@ archives automatically; choose the installer or the archive.
 | Automate or verify downloads | The archive's `*.sha256` sidecar, or `sha256.sum` for all archives; `dist-manifest.json` is machine-readable component-release metadata |
 
 For a full Linux installation, use the bundle or place `bhf` and both shims
-in the same directory. On Windows, install the CLI; add the daemon for IDE/MCP
-use. The shims are Linux-only. See [INSTALL.md](INSTALL.md) for details.
+in the same directory. The bundle is x86_64 only; on 64-bit ARM Linux use the
+installers or the `aarch64-unknown-linux-gnu` archives. On Windows, install the
+CLI; add the daemon for IDE/MCP use. The shims are Linux-only. See
+[INSTALL.md](INSTALL.md) for details.
 
 #### Complete Linux install with `install.sh`
 
@@ -328,7 +330,8 @@ non-interactive, custom-prefix, offline, and smoke-test controls.
 #### Manual Linux component co-location
 
 After verifying and extracting the three matching Linux `.tar.xz` archives,
-copy both shims beside the CLI:
+copy both shims beside the CLI (on 64-bit ARM, the `aarch64-unknown-linux-gnu`
+archives in place of `x86_64-unknown-linux-gnu`):
 
 ```sh
 CLI_DIR=bhf-x86_64-unknown-linux-gnu

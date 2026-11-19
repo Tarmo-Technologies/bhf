@@ -207,6 +207,17 @@ CFI_CXXFLAGS ?= -O1 -g -std=$(CXX_STD) -Wno-reserved-user-defined-literal -flto 
 # nonblocking. It needs clang 20 or newer, which `auto` passes as RTSAN_CXX.
 RTSAN_CXX ?= clang++
 RTSAN_CXXFLAGS ?= -O1 -g -std=$(CXX_STD) -Wno-reserved-user-defined-literal -fsanitize=realtime -DBHF_RTSAN -fsanitize-coverage=trace-pc-guard,trace-cmp
+# MemorySanitizer build (#323): `auto` replays the corpus through it to find
+# reads of uninitialized memory. MSan needs every C++ library the program runs
+# instrumented: BHF_MSAN_LIBCXX is the prefix (include/c++/v1, lib) of a libc++
+# built with -fsanitize=memory, which the full image provides. Without one the
+# lane is not built.
+MSAN_CXX ?= clang++
+BHF_MSAN_LIBCXX ?=
+MSAN_CXXFLAGS ?= -O1 -g -std=$(CXX_STD) -Wno-reserved-user-defined-literal -fsanitize=memory -fsanitize-memory-track-origins=2 -fno-omit-frame-pointer -fsanitize-coverage=trace-pc-guard,trace-cmp
+MSAN_LIBCXX_FLAGS = $(if $(BHF_MSAN_LIBCXX),-stdlib=libc++ -nostdinc++ -isystem $(BHF_MSAN_LIBCXX)/include/c++/v1,)
+MSAN_LIBCXX_LDFLAGS = $(if $(BHF_MSAN_LIBCXX),-stdlib=libc++ -L$(BHF_MSAN_LIBCXX)/lib -Wl$(comma)-rpath$(comma)$(BHF_MSAN_LIBCXX)/lib -lc++abi,)
+comma := ,
 COV_CXX ?= clang++
 COV_CXXFLAGS ?= -O0 -g -std=$(CXX_STD) -Wno-reserved-user-defined-literal -fprofile-instr-generate -fcoverage-mapping
 # Differential build (two-compiler): a PORTABLE build (no clang-only coverage or
@@ -270,13 +281,13 @@ BHF_TOOLCHAIN_ID = $(CXX) $(BHF_CXX_FAMILY) $(CC) | $(strip $(BHF_CXXFLAGS) $(CX
 # it holds what their link recipes read, so a lane relinks when its compiler,
 # its flags (the dialect among them), a compatibility flag or a toolchain
 # define changes.
-BHF_LANE_TOOLCHAIN_ID = $(CFI_CXX) $(RTSAN_CXX) $(COV_CXX) $(DIFF_CXX) | $(BHF_DRIVER_CFLAGS) | $(CFI_CXXFLAGS) | $(RTSAN_CXXFLAGS) | $(COV_CXXFLAGS) | $(DIFF_CXXFLAGS) | $(CXX_COMPAT_FLAGS_CLANG) | $(BHF_TOOLCHAIN_CPPFLAGS) | $(BHF_TOOLCHAIN_CXX_CPPFLAGS) | $(BHF_TOOLCHAIN_LIBS)
+BHF_LANE_TOOLCHAIN_ID = $(CFI_CXX) $(RTSAN_CXX) $(MSAN_CXX) $(COV_CXX) $(DIFF_CXX) | $(BHF_DRIVER_CFLAGS) | $(CFI_CXXFLAGS) | $(RTSAN_CXXFLAGS) | $(MSAN_CXXFLAGS) $(BHF_MSAN_LIBCXX) | $(COV_CXXFLAGS) | $(DIFF_CXXFLAGS) | $(CXX_COMPAT_FLAGS_CLANG) | $(BHF_TOOLCHAIN_CPPFLAGS) | $(BHF_TOOLCHAIN_CXX_CPPFLAGS) | $(BHF_TOOLCHAIN_LIBS)
 # Driver stamp: every driver object depends on it instead, and it holds only
 # what their recipes use. A dialect ladder rung (CXX_STD), a repair round
 # (CXXFLAGS) or a compatibility flag relinks the harness without recompiling
 # the driver; a new compiler, target, define, include dir or driver flag still
 # rebuilds it.
-BHF_DRIVER_ID = $(CXX) $(BHF_CXX_FAMILY) $(CFI_CXX) $(RTSAN_CXX) $(COV_CXX) $(DIFF_CXX) | $(BHF_DRIVER_SOURCE) | $(BHF_DRIVER_CFLAGS) | $(BHF_TOOLCHAIN_TARGET_FLAGS) | $(BHF_DRIVER_TOOLCHAIN_CFLAGS) | $(BHF_TOOLCHAIN_CPPFLAGS) | $(FEATURE_TEST_FLAGS)
+BHF_DRIVER_ID = $(CXX) $(BHF_CXX_FAMILY) $(CFI_CXX) $(RTSAN_CXX) $(MSAN_CXX) $(COV_CXX) $(DIFF_CXX) | $(BHF_DRIVER_SOURCE) | $(BHF_DRIVER_CFLAGS) | $(BHF_TOOLCHAIN_TARGET_FLAGS) | $(BHF_DRIVER_TOOLCHAIN_CFLAGS) | $(BHF_TOOLCHAIN_CPPFLAGS) | $(FEATURE_TEST_FLAGS)
 # A lane links bhf_driver.o when its own driver compile would be the very
 # same command (one compiler for every lane and no toolchain target, flags or
 # defines, the usual case), and a driver object from its own compiler
@@ -286,6 +297,7 @@ bhf_same_words = $(if $(subst x$(strip $(1)),,x$(strip $(2)))$(subst x$(strip $(
 bhf_lane_driver = $(if $(call bhf_same_words,$(2) $(BHF_DRIVER_CFLAGS) $(FEATURE_TEST_FLAGS),$(BHF_DRIVER_COMPILE)),bhf_driver.o,$(1))
 BHF_CFI_DRIVER = $(call bhf_lane_driver,bhf_driver_cfi.o,$(CFI_CXX) -x c)
 BHF_RTSAN_DRIVER = $(call bhf_lane_driver,bhf_driver_rtsan.o,$(RTSAN_CXX) -x c)
+BHF_MSAN_DRIVER = $(call bhf_lane_driver,bhf_driver_msan.o,$(MSAN_CXX) -x c)
 BHF_COV_DRIVER = $(call bhf_lane_driver,bhf_driver_cov.o,$(COV_CXX) -x c)
 BHF_DIFF_DRIVER = $(call bhf_lane_driver,bhf_driver_diff.o,$(DIFF_CXX) -x c)
 -include build_context_objects.mk
@@ -294,6 +306,7 @@ CONTEXT_MAIN_OBJECTS ?=
 CONTEXT_AFL_OBJECTS ?=
 CONTEXT_CFI_OBJECTS ?=
 CONTEXT_RTSAN_OBJECTS ?=
+CONTEXT_MSAN_OBJECTS ?=
 CONTEXT_COV_OBJECTS ?=
 CONTEXT_DIFF_OBJECTS ?=
 CONTEXT_WINAFL_OBJECTS ?=
@@ -301,6 +314,7 @@ REPAIR_CONTEXT_MAIN_OBJECTS ?=
 REPAIR_CONTEXT_AFL_OBJECTS ?=
 REPAIR_CONTEXT_CFI_OBJECTS ?=
 REPAIR_CONTEXT_RTSAN_OBJECTS ?=
+REPAIR_CONTEXT_MSAN_OBJECTS ?=
 REPAIR_CONTEXT_COV_OBJECTS ?=
 REPAIR_CONTEXT_DIFF_OBJECTS ?=
 REPAIR_CONTEXT_WINAFL_OBJECTS ?=
@@ -309,10 +323,10 @@ ifdef BHF_CONTEXT_PREPARE_FAILED
 $(error $(BHF_CONTEXT_PREPARE_FAILED))
 endif
 
-.PHONY: all afl afl_cmplog winafl libfuzzer cfi rtsan cov diff syntaxcheck clean FORCE_TOOLCHAIN_STAMP
+.PHONY: all afl afl_cmplog winafl libfuzzer cfi rtsan msan cov diff syntaxcheck clean FORCE_TOOLCHAIN_STAMP
 all: main$(EXEEXT)
 # The bare goal names, for the binaries named with $(EXEEXT).
-BHF_BINARIES = main main_afl main_afl_cmplog main_winafl main_libfuzzer main_cfi main_rtsan main_cov main_diff
+BHF_BINARIES = main main_afl main_afl_cmplog main_winafl main_libfuzzer main_cfi main_rtsan main_msan main_cov main_diff
 ifneq ($(EXEEXT),)
 .PHONY: $(BHF_BINARIES)
 $(BHF_BINARIES): %: %$(EXEEXT)
@@ -344,6 +358,9 @@ bhf_driver_cfi.o:{% if bhf_driver_prereq %} $(BHF_DRIVER_SOURCE){% endif %} bhf_
 
 bhf_driver_rtsan.o:{% if bhf_driver_prereq %} $(BHF_DRIVER_SOURCE){% endif %} bhf_driver.stamp
 	$(RTSAN_CXX) -x c $(BHF_DRIVER_CFLAGS) $(FEATURE_TEST_FLAGS) -c -o $@ $(BHF_DRIVER_SOURCE)
+
+bhf_driver_msan.o:{% if bhf_driver_prereq %} $(BHF_DRIVER_SOURCE){% endif %} bhf_driver.stamp
+	$(MSAN_CXX) -x c $(BHF_DRIVER_CFLAGS) $(FEATURE_TEST_FLAGS) -c -o $@ $(BHF_DRIVER_SOURCE)
 
 bhf_driver_cov.o:{% if bhf_driver_prereq %} $(BHF_DRIVER_SOURCE){% endif %} bhf_driver.stamp
 	$(COV_CXX) -x c $(BHF_DRIVER_CFLAGS) $(FEATURE_TEST_FLAGS) -c -o $@ $(BHF_DRIVER_SOURCE)
@@ -417,6 +434,12 @@ rtsan: main_rtsan$(EXEEXT)
 main_rtsan$(EXEEXT): main.cpp $(BHF_RTSAN_DRIVER) bhf_lanes.stamp $(CONTEXT_RTSAN_OBJECTS) $(REPAIR_CONTEXT_RTSAN_OBJECTS)
 	$(RTSAN_CXX) $(RTSAN_CXXFLAGS) $(SECTION_FLAGS) $(CXX_COMPAT_FLAGS_CLANG) $(FEATURE_TEST_FLAGS) $(BHF_FUZZING_BUILD_MODE_FLAGS) $(COMPILE_DB_FLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_CXX_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(RTSAN_CXXFLAGS)) -DBHF_EXTERNAL_DRIVER -o $@ main.cpp{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_RTSAN_OBJECTS) $(REPAIR_CONTEXT_RTSAN_OBJECTS) $(AUTO_EXTRA_SOURCES) $(BHF_RTSAN_DRIVER) $(BUILD_CONTEXT_LDFLAGS) $(call BHF_SECTION_LDFLAGS,$(RTSAN_CXX)) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LIBS)
 
+msan: main_msan$(EXEEXT)
+
+main_msan$(EXEEXT): main.cpp $(BHF_MSAN_DRIVER) bhf_lanes.stamp $(CONTEXT_MSAN_OBJECTS) $(REPAIR_CONTEXT_MSAN_OBJECTS)
+	$(if $(BHF_MSAN_LIBCXX),,$(error the msan lane needs BHF_MSAN_LIBCXX, the prefix of a libc++ built with -fsanitize=memory))
+	$(MSAN_CXX) $(MSAN_CXXFLAGS) $(MSAN_LIBCXX_FLAGS) $(SECTION_FLAGS) $(CXX_COMPAT_FLAGS_CLANG) $(FEATURE_TEST_FLAGS) $(BHF_FUZZING_BUILD_MODE_FLAGS) $(COMPILE_DB_FLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_CXX_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(MSAN_CXXFLAGS)) -DBHF_EXTERNAL_DRIVER -o $@ main.cpp{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_MSAN_OBJECTS) $(REPAIR_CONTEXT_MSAN_OBJECTS) $(AUTO_EXTRA_SOURCES) $(BHF_MSAN_DRIVER) $(BUILD_CONTEXT_LDFLAGS) $(call BHF_SECTION_LDFLAGS,$(MSAN_CXX)) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LIBS) $(MSAN_LIBCXX_LDFLAGS)
+
 cov: main_cov$(EXEEXT)
 
 main_cov$(EXEEXT): main.cpp $(BHF_COV_DRIVER) bhf_lanes.stamp $(CONTEXT_COV_OBJECTS) $(REPAIR_CONTEXT_COV_OBJECTS)
@@ -433,5 +456,5 @@ main_diff$(EXEEXT): main.cpp $(BHF_DIFF_DRIVER) bhf_lanes.stamp $(CONTEXT_DIFF_O
 BHF_WINAFL_RUN_MARKERS = $(wildcard main_winafl-*.bhf-run)
 
 clean:
-	rm -f main$(EXEEXT) main_afl$(EXEEXT) main_afl_cmplog$(EXEEXT) main_winafl$(EXEEXT) main_libfuzzer$(EXEEXT) main_cfi$(EXEEXT) main_rtsan$(EXEEXT) main_cov$(EXEEXT) main_diff$(EXEEXT) main main_afl main_afl_cmplog main_winafl main_winafl.lib main_winafl.exp main_winafl.pdb $(BHF_WINAFL_RUN_MARKERS:.bhf-run=) $(BHF_WINAFL_RUN_MARKERS) main_libfuzzer main_cfi main_rtsan main_cov main_diff bhf_driver.o bhf_driver_cfi.o bhf_driver_rtsan.o bhf_driver_cov.o bhf_driver_diff.o bhf_libfuzzer.o bhf_driver_winafl.o bhf_toolchain.stamp bhf_lanes.stamp bhf_driver.stamp
+	rm -f main$(EXEEXT) main_afl$(EXEEXT) main_afl_cmplog$(EXEEXT) main_winafl$(EXEEXT) main_libfuzzer$(EXEEXT) main_cfi$(EXEEXT) main_rtsan$(EXEEXT) main_msan$(EXEEXT) main_cov$(EXEEXT) main_diff$(EXEEXT) main main_afl main_afl_cmplog main_winafl main_winafl.lib main_winafl.exp main_winafl.pdb $(BHF_WINAFL_RUN_MARKERS:.bhf-run=) $(BHF_WINAFL_RUN_MARKERS) main_libfuzzer main_cfi main_rtsan main_msan main_cov main_diff bhf_driver.o bhf_driver_cfi.o bhf_driver_rtsan.o bhf_driver_msan.o bhf_driver_cov.o bhf_driver_diff.o bhf_libfuzzer.o bhf_driver_winafl.o bhf_toolchain.stamp bhf_lanes.stamp bhf_driver.stamp
 	rm -rf context_objs repair_context_objs

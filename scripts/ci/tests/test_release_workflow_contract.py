@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import tomllib
 import unittest
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -149,8 +150,8 @@ class ReleaseWorkflowContracts(unittest.TestCase):
 
     def test_original_ci_lanes_remain_required(self):
         expected = {'changes', 'ci-policy', 'minimum-rust', 'build-test', 'arm64-build', 'container-core', 'container-full', 'rhel7-build',
-                    'rhel-family-smoke', 'ubuntu-release-smoke', 'windows-build', 'windows-current-build',
-                    'doc-contracts'}
+                    'rhel-family-smoke', 'ubuntu-release-smoke', 'arm64-release-build', 'windows-build',
+                    'windows-current-build', 'doc-contracts'}
         self.assertEqual(set(self.ci_jobs) - {'ci-acceptance'}, expected)
         self.assertEqual(needs(self.ci_jobs['ci-acceptance']), expected)
 
@@ -175,6 +176,60 @@ class ReleaseWorkflowContracts(unittest.TestCase):
     def test_all_needs_refer_to_declared_jobs(self):
         for name, block in self.jobs.items():
             self.assertTrue(needs(block) <= self.jobs.keys(), name)
+
+    def build_matrix(self):
+        block = self.jobs['build-local-artifacts']
+        include = block.split('        include:\n', 1)[1].split('\n    runs-on:', 1)[0]
+        entries = {}
+        for chunk in include.split('          - runner: ')[1:]:
+            target = re.search(r'^            targets: \["([^"]+)"\]$', chunk, re.M)[1]
+            image = re.search(r'^            build_image: (\S+)$', chunk, re.M)
+            entries[target] = (chunk.splitlines()[0].strip(), image[1] if image else None)
+        return entries
+
+    def test_static_build_matrix_covers_every_dist_target(self):
+        # The matrix is enumerated by hand (see its comment): each dist target
+        # has one entry, and each Linux target builds natively in the
+        # digest-pinned manylinux2014 image of its own architecture.
+        cargo = tomllib.loads((ROOT / 'Cargo.toml').read_text())
+        dist_targets = cargo['workspace']['metadata']['dist']['targets']
+        self.assertIn('aarch64-unknown-linux-gnu', dist_targets)
+        entries = self.build_matrix()
+        self.assertEqual(set(entries), set(dist_targets))
+        linux = sorted(target for target in dist_targets if target.endswith('-unknown-linux-gnu'))
+        for target in linux:
+            arch = target.split('-', 1)[0]
+            self.assertRegex(entries[target][1], rf'^quay\.io/pypa/manylinux2014_{arch}@sha256:[0-9a-f]{{64}}$')
+        self.assertEqual(entries['aarch64-unknown-linux-gnu'][0], 'ubuntu-24.04-arm')
+        self.assertIn('RHEL7_BUILD_IMAGE: ${{ matrix.build_image }}', self.jobs['build-local-artifacts'])
+        for package in ('cli', 'daemon', 'bhf_runtrace_shim', 'bhf_cc_intercept'):
+            manifest = tomllib.loads((ROOT / 'crates' / package / 'Cargo.toml').read_text())
+            targets = manifest['package']['metadata']['dist']['targets']
+            self.assertEqual(sorted(t for t in targets if 'linux' in t), linux, package)
+        self.assertEqual(sorted(cargo['workspace']['metadata']['dist']['min-glibc-version']), linux)
+
+    def test_only_x86_64_binaries_enter_the_signed_bundle(self):
+        block = self.jobs['build-local-artifacts']
+        step = block.split('      - name: Transfer raw Linux binaries to protected signing job\n', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn("env.DIST_TARGET == 'x86_64-unknown-linux-gnu'", step)
+        self.assertIn('name: linux-release-raw', step)
+
+    def test_aarch64_archives_are_smoke_tested_on_the_arm64_runner(self):
+        # The release job runs the archives it uploads; the CI dry run builds
+        # the same archives in the same image on every heavy change, and the
+        # release's own CI gate requires it.
+        block = self.jobs['build-local-artifacts']
+        step = block.split('      - name: Smoke-test the aarch64 archives on the ARM64 runner\n', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn("env.DIST_TARGET == 'aarch64-unknown-linux-gnu'", step)
+        self.assertIn('bash scripts/ci/linux-archive-smoke.sh target/distrib "$DIST_TARGET"', step)
+        self.assertLess(block.index('Validate install guide in every Linux component archive'),
+                        block.index('Smoke-test the aarch64 archives on the ARM64 runner'))
+        self.assertLess(block.index('Smoke-test the aarch64 archives on the ARM64 runner'),
+                        block.index('name: "Upload artifacts"'))
+        dry_run = self.ci_jobs['arm64-release-build']
+        self.assertIn('RHEL7_BUILD_IMAGE: ' + self.build_matrix()['aarch64-unknown-linux-gnu'][1], dry_run)
+        self.assertIn('bash scripts/ci/linux-archive-smoke.sh target/rhel7/distrib aarch64-unknown-linux-gnu', dry_run)
+        self.assertIn('arm64-release-build', needs(self.ci_jobs['ci-acceptance']))
 
 
 class ForcedClassificationShellTests(unittest.TestCase):

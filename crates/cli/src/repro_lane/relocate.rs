@@ -152,7 +152,40 @@ impl Relocator {
             var,
         });
     }
+}
 
+/// The spellings of `path` a file may name it by: as given and, when it
+/// differs, resolved (symlinks followed; on Windows, an 8.3 short name such
+/// as `ADMINI~1` long), longest first.
+fn spellings(path: &Path) -> Vec<String> {
+    let given = path.to_string_lossy().into_owned();
+    let resolved = crate::workdir::plain_canonical(path)
+        .to_string_lossy()
+        .into_owned();
+    let mut spellings = vec![given];
+    if resolved != spellings[0] {
+        spellings.push(resolved);
+    }
+    spellings.sort_by_key(|spelling| std::cmp::Reverse(spelling.len()));
+    spellings
+}
+
+/// Whether `inner` is `outer` or under it, by either's resolved path too.
+fn is_within(inner: &Path, outer: &Path) -> bool {
+    inner.starts_with(outer)
+        || crate::workdir::plain_canonical(inner)
+            .starts_with(crate::workdir::plain_canonical(outer))
+}
+
+/// The first of `paths`, by any spelling, that `text` names, and where.
+fn find_any(text: &str, paths: &[PathBuf]) -> Option<usize> {
+    paths
+        .iter()
+        .flat_map(|path| spellings(path))
+        .find_map(|spelling| find_path(text, &spelling))
+}
+
+impl Relocator {
     /// The capsule-relative path build.sh uses for an original path.
     pub(crate) fn build_path(&self, path: &Path) -> Option<String> {
         self.mount_of(path).map(|(mount, rel)| {
@@ -164,19 +197,23 @@ impl Relocator {
         })
     }
 
-    /// The deepest mount holding `path`, and `path` relative to it.
+    /// The deepest mount holding `path`, and `path` relative to it, by the
+    /// paths as given or resolved.
     fn mount_of(&self, path: &Path) -> Option<(&Mount, String)> {
+        let resolved = crate::workdir::plain_canonical(path);
         self.mounts
             .iter()
-            .filter(|mount| path.starts_with(&mount.from))
-            .max_by_key(|mount| mount.from.components().count())
-            .map(|mount| {
-                let rel = path
-                    .strip_prefix(&mount.from)
-                    .map(|rel| rel.to_string_lossy().replace('\\', "/"))
-                    .unwrap_or_default();
-                (mount, rel)
+            .filter_map(|mount| {
+                let rel = match path.strip_prefix(&mount.from) {
+                    Ok(rel) => rel.to_path_buf(),
+                    Err(_) => resolved
+                        .strip_prefix(crate::workdir::plain_canonical(&mount.from))
+                        .ok()?
+                        .to_path_buf(),
+                };
+                Some((mount, rel.to_string_lossy().replace('\\', "/")))
             })
+            .max_by_key(|(mount, _)| mount.from.components().count())
     }
 
     /// `text` with every path into a mount rewritten to its capsule path, or
@@ -186,27 +223,36 @@ impl Relocator {
         for slot in &self.tools {
             text = text.replace(&slot.original, &format!("\"{}\"", slot.placeholder()));
         }
-        let mut mounts: Vec<&Mount> = self.mounts.iter().collect();
-        mounts.sort_by_key(|mount| std::cmp::Reverse(mount.from.as_os_str().len()));
-        for mount in mounts {
+        // Each spelling of each mount, longest first, so a deeper mount is
+        // rewritten before the one holding it.
+        let mut rewrites: Vec<(String, &Mount)> = self
+            .mounts
+            .iter()
+            .flat_map(|mount| {
+                spellings(&mount.from)
+                    .into_iter()
+                    .map(move |from| (from, mount))
+            })
+            .collect();
+        rewrites.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
+        for (from, mount) in rewrites {
             // A protected dir inside this mount (a work dir inside the scanned
             // tree) must already be rewritten away: this mount would swallow
             // it into a copy that does not hold it.
-            for protected in &self.protected {
-                if protected != &mount.from && protected.starts_with(&mount.from) {
-                    if let Some(at) = find_path(&text, &protected.to_string_lossy()) {
-                        return Err(path_at(&text, at));
-                    }
-                }
+            let inside: Vec<PathBuf> = self
+                .protected
+                .iter()
+                .filter(|protected| **protected != mount.from && is_within(protected, &mount.from))
+                .cloned()
+                .collect();
+            if let Some(at) = find_any(&text, &inside) {
+                return Err(path_at(&text, at));
             }
-            let from = mount.from.to_string_lossy();
             let to = format!("{CAPSULE_ROOT}/{}", mount.target);
             text = replace_path(&text, &from, &to);
         }
-        for protected in &self.protected {
-            if let Some(at) = find_path(&text, &protected.to_string_lossy()) {
-                return Err(path_at(&text, at));
-            }
+        if let Some(at) = find_any(&text, &self.protected) {
+            return Err(path_at(&text, at));
         }
         Ok(text)
     }
@@ -289,9 +335,7 @@ impl Relocator {
         }
         let bytes = std::fs::read(file).ok()?;
         let text = text_of(&bytes)?;
-        self.protected.iter().find_map(|protected| {
-            find_path(text, &protected.to_string_lossy()).map(|at| path_at(text, at))
-        })
+        find_any(text, &self.protected).map(|at| path_at(text, at))
     }
 
     /// The build.sh lines that find each program, copy the rendered mounts
@@ -400,17 +444,22 @@ impl Relocator {
 /// host that runs it, or stopping with what is missing. The message is one
 /// single-quoted word, so a purpose that shows a command (`` `cargo
 /// +nightly` ``) or a `$` is printed, never run or expanded.
+///
+/// A name found only as one of Windows' app execution aliases (the
+/// `WindowsApps` stub that sends `python3` to the Microsoft Store when no
+/// such Python is installed) is not the program: the next name is tried.
 pub(crate) fn resolve_tool(var: &str, toolchain: &Toolchain) -> String {
     let env = toolchain.env_var;
-    let mut lookups = vec![format!(
-        "command -v \"${{{env}:-{}}}\"",
+    let found = |name: String| format!("command -v {name} | grep -iv '/WindowsApps/'");
+    let mut lookups = vec![found(format!(
+        "\"${{{env}:-{}}}\"",
         super::sh_double_quoted(toolchain.default)
-    )];
+    ))];
     lookups.extend(
         toolchain
             .fallbacks
             .iter()
-            .map(|name| format!("command -v {}", super::sh_word(name))),
+            .map(|name| found(super::sh_word(name))),
     );
     let message = format!(
         "build.sh: needs {} (or ${env}): it {}",
@@ -703,6 +752,49 @@ mod tests {
         }
     }
 
+    /// A name that resolves only to a Windows app execution alias (the
+    /// Microsoft Store's `python3` stub) gives way to the next name.
+    #[cfg(unix)]
+    #[test]
+    fn an_app_execution_alias_is_not_the_tool() {
+        const TOOL: Toolchain = Toolchain {
+            env_var: "BHF_WIDGET_TOOL",
+            default: "widget-tool3",
+            fallbacks: &["widget-tool"],
+            purpose: "runs the harness",
+            version_args: &["--version"],
+        };
+        let root = tempfile::tempdir().unwrap();
+        let alias = root.path().join("AppData/Local/Microsoft/WindowsApps");
+        let real = root.path().join("bin");
+        std::fs::create_dir_all(&alias).unwrap();
+        std::fs::create_dir_all(&real).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        for program in [alias.join("widget-tool3"), real.join("widget-tool")] {
+            std::fs::write(&program, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let snippet = format!(
+            "{}printf '%s\\n' \"$TOOL_WIDGET\"",
+            resolve_tool("TOOL_WIDGET", &TOOL)
+        );
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&snippet)
+            .env_remove("BHF_WIDGET_TOOL")
+            .env(
+                "PATH",
+                format!("{}:{}:/usr/bin:/bin", alias.display(), real.display()),
+            )
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim_end(),
+            real.join("widget-tool").display().to_string()
+        );
+    }
+
     #[cfg(unix)]
     fn relocator(work: &Path, tree: &Path) -> Relocator {
         Relocator {
@@ -726,6 +818,43 @@ mod tests {
             protected: vec![work.to_path_buf(), tree.to_path_buf()],
             exclude: vec![work.to_path_buf()],
         }
+    }
+
+    /// A file may name a mount by its resolved path while the mount was given
+    /// another spelling (a symlink here; a Windows 8.3 short name such as
+    /// `ADMINI~1`): both are rewritten, and both count as naming a protected
+    /// dir.
+    #[cfg(unix)]
+    #[test]
+    fn a_mount_is_rewritten_by_its_resolved_spelling_too() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        std::fs::create_dir_all(real.join("work/harnesses/H-P0001")).unwrap();
+        std::fs::create_dir_all(real.join("src")).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let resolved = real.canonicalize().unwrap();
+        let r = relocator(&link.join("work"), &link.join("src"));
+        let text = format!(
+            "MODULE={0}/src/parser.js DRIVER={0}/work/harnesses/H-P0001/driver.js\n",
+            resolved.display()
+        );
+        assert_eq!(
+            r.rewrite(&text).unwrap(),
+            format!(
+                "MODULE={CAPSULE_ROOT}/sources/parser.js \
+                 DRIVER={CAPSULE_ROOT}/build/harness/driver.js\n"
+            )
+        );
+        assert_eq!(
+            r.build_path(&resolved.join("src/parser.js")).as_deref(),
+            Some("sources/parser.js")
+        );
+        let stray = format!("{}/work/other.txt\n", resolved.display());
+        assert!(
+            r.rewrite(&stray).is_err(),
+            "the work dir by its resolved name"
+        );
     }
 
     /// A path is rewritten only as a whole name: `/t/src` does not touch

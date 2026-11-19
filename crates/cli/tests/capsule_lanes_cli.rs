@@ -285,10 +285,6 @@ def _walk(data, depth):
 /// A Python capsule round-trips; verify-poc names the interpreter it needs
 /// when that is missing.
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "Python runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn python_finding_round_trips_and_names_a_missing_interpreter() {
     skip_unless!(runs("python3", &["--version"]), "python3 not installed");
     let run = Run::new(&[("record_parser.py", PYTHON_TARGET)]);
@@ -322,10 +318,6 @@ fn python_finding_round_trips_and_names_a_missing_interpreter() {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "JavaScript runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn javascript_finding_round_trips() {
     skip_unless!(runs("node", &["--version"]), "node not installed");
     let run = Run::new(&[(
@@ -341,10 +333,6 @@ fn javascript_finding_round_trips() {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "TypeScript runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn typescript_finding_round_trips() {
     skip_unless!(runs("node", &["--version"]), "node not installed");
     // The TypeScript lane transpiles with esbuild, which Node.js does not ship.
@@ -866,10 +854,6 @@ fn rust_finding_with_a_registry_dependency_round_trips_vendored() {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "Java runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn java_finding_round_trips() {
     skip_unless!(
         runs("javac", &["-version"]) && runs("java", &["-version"]),
@@ -1096,10 +1080,6 @@ fn fortran_finding_round_trips_from_source() {
 /// SharpFuzz.Common.dll and the launcher) from the SharpFuzz command-line
 /// tool's own copy of the assembly.
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "C# runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn csharp_harness_round_trips() {
     skip_unless!(
         runs("dotnet", &["--version"]),
@@ -1139,10 +1119,6 @@ fn csharp_harness_round_trips() {
 /// Preloaded, the shim hung the CLR, which ignored SIGTERM, so every C#
 /// finding replayed as a timeout MISMATCH after ten seconds.
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "C# runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn csharp_finding_replays_as_a_match_without_the_shim() {
     skip_unless!(
         runs("dotnet", &["--version"]),
@@ -1219,10 +1195,6 @@ fn csharp_finding_replays_as_a_match_without_the_shim() {
 /// packed by the test into a local feed dir, which fills a package cache of
 /// the test's own without the network.
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "C# runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn csharp_finding_with_a_cached_package_round_trips_vendored() {
     skip_unless!(
         runs("dotnet", &["--version"]),

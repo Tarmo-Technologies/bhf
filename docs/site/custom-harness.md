@@ -295,19 +295,21 @@ bhf verify-poc bhf_work/capsules/capsule_<finding-id>
 An executable you cannot rebuild does not speak bhf's driver protocol, so fuzz
 it as a binary-only target. It receives each input as a file or on stdin.
 
-Mutation and coverage need AFL++ with QEMU mode (`afl-fuzz -Q`). With it
-installed, the default engine (`auto`) runs a coverage-guided campaign for the
-`--time` budget:
+Coverage-guided mutation needs AFL++ with QEMU mode (`afl-fuzz -Q`), which
+the container image ships (`afl-qemu-trace`, with Frida mode's
+`afl-frida-trace.so`). With it installed, the default engine (`auto`) runs a
+coverage-guided campaign for the `--time` budget:
 
 ```sh
 bhf binary fuzz path/to/tool --work-dir bhf_work --input-mode file \
   --seed-file samples/record.bin --time 60s
 ```
 
-Without AFL++ QEMU mode, `auto` falls back to the builtin engine, which only
-runs the seeds and reports the ones that crash: no mutation, no coverage, and
-`--time` is ignored. `--iterations` caps how many seed executions it runs.
-Pass `--engine afl-qemu` to fail instead of falling back.
+Without AFL++ QEMU mode, `auto` falls back to the builtin engine: it runs the
+seeds, then a blind havoc loop of stacked byte mutations with no coverage
+feedback, until `--iterations`, `--time` or the first crash. The run JSON
+marks it `degraded`. Pass `--engine afl-qemu` to fail instead of falling
+back.
 
 In a `bhf project` manifest, such an executable uses `engine = "binary"`.
 `engine = "builtin"` and `engine = "afl++"` expect a bhf harness binary, built

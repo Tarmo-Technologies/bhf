@@ -69,7 +69,12 @@ def _open():
         fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
         if os.fstat(fd).st_size < COV_BITS:
             os.ftruncate(fd, COV_BITS)
-        m = mmap.mmap(fd, COV_BITS, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+        if hasattr(mmap, "MAP_SHARED"):
+            m = mmap.mmap(fd, COV_BITS, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+        else:
+            # Windows: a file mapping is shared with every process mapping the
+            # same file, which is how the engine reads it.
+            m = mmap.mmap(fd, COV_BITS, access=mmap.ACCESS_WRITE)
         os.close(fd)
         return m
     except Exception:

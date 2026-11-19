@@ -58,11 +58,12 @@ fn release_targets_match_supported_cross_platform_binary_matrix() {
     let cargo_toml = read(root.join("Cargo.toml"));
     let docs = read(root.join("docs/release-packaging.md"));
 
-    assert!(
-        cargo_toml.contains("targets = [\"x86_64-unknown-linux-gnu\", \"x86_64-pc-windows-msvc\"]")
-    );
+    assert!(cargo_toml.contains(
+        "targets = [\"x86_64-unknown-linux-gnu\", \"aarch64-unknown-linux-gnu\", \"x86_64-pc-windows-msvc\"]"
+    ));
     assert!(docs.contains("The generated release workflow builds these target triples"));
     assert!(docs.contains("`x86_64-unknown-linux-gnu`"));
+    assert!(docs.contains("`aarch64-unknown-linux-gnu`"));
     assert!(docs.contains("`x86_64-pc-windows-msvc`"));
     assert!(docs.contains("preload shims remain Linux-only assets"));
 }
@@ -98,7 +99,7 @@ fn release_cli_is_self_contained_for_every_harness_runtime() {
 
     assert!(workflow.contains("Validate packaged harness runtimes (Linux)"));
     assert!(workflow.contains("Validate packaged harness runtimes (Windows)"));
-    assert!(workflow.contains("archive=target/distrib/bhf-x86_64-unknown-linux-gnu.tar.xz"));
+    assert!(workflow.contains("archive=\"target/distrib/bhf-$DIST_TARGET.tar.xz\""));
     assert!(workflow.contains("$archive = Get-Item target/distrib/bhf-x86_64-pc-windows-msvc.zip"));
     assert!(!workflow.contains("-name \"bhf-*.tar.xz\""));
     assert!(!workflow.contains("-Filter \"bhf-*.zip\""));

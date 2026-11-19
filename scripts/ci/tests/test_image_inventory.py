@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import copy
+import json
 import hashlib
 import importlib.util
 import pathlib
@@ -108,13 +109,25 @@ class InventoryTests(unittest.TestCase):
 
     def test_subset_requires_matching_image_selection(self):
         tools = {"flavor": "runtime", "languages": ["java", "python"], "components": []}
-        result = MERGE.reconcile_tools(self.merge(), tools, "runtime", ["java", "python"])
+        result = MERGE.reconcile_tools(self.merge(), tools, "runtime", ["java", "python"], "builtin")
         self.assertEqual(len(result["components"]), 4)
         with self.assertRaisesRegex(ValueError, "language inventory"):
-            MERGE.reconcile_tools(self.merge(), tools, "runtime", ["rust"])
+            MERGE.reconcile_tools(self.merge(), tools, "runtime", ["rust"], "builtin")
+
+    def test_default_engines_require_the_afl_binary_modes(self):
+        tools = {"flavor": "runtime", "languages": ["java"], "components": []}
+        with self.assertRaisesRegex(ValueError, "toolchain inventory"):
+            MERGE.reconcile_tools(self.merge(), tools, "runtime", ["java"], "default")
+        modes = [{"name": name, "bom-ref": "bhf:installed-tool:" + name,
+                  "properties": [{"name": "bhf:installed-files-sha256",
+                                  "value": json.dumps({"/usr/bin/" + name: "a" * 64})}]}
+                 for name in ("aflpp-qemu-mode", "aflpp-frida-mode")]
+        tools["components"] = modes
+        result = MERGE.reconcile_tools(self.merge(), tools, "runtime", ["java"], "default")
+        self.assertEqual(len(result["components"]), 6)
 
     def test_subset_cannot_omit_selected_standalone_tools(self):
-        for languages in [["rust"], ["go"], ["csharp"], ["javascript"], ["typescript"]]:
+        for languages in [["rust"], ["go"], ["csharp"], ["javascript"], ["typescript"], ["cpp"]]:
             tools = {"flavor": "runtime", "languages": languages, "components": []}
             with self.assertRaisesRegex(ValueError, "toolchain inventory"):
-                MERGE.reconcile_tools(self.merge(), tools, "runtime", languages)
+                MERGE.reconcile_tools(self.merge(), tools, "runtime", languages, "builtin")

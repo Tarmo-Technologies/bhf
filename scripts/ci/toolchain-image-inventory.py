@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -33,6 +34,32 @@ def component(name, version, purl, files, **details):
                            *[{"name": "bhf:" + k, "value": str(v)} for k, v in details.items()]]}
 
 
+def msan_libcxx(root=pathlib.Path("/opt/msan-libcxx")):
+    """The MSan-instrumented libc++, with the LLVM release it was built from."""
+    version = (root / "LLVM_VERSION").read_text().strip()
+    files = {str(path): digest(path) for path in sorted((root / "lib").iterdir())
+             if path.is_file() and not path.is_symlink()}
+    if not files:
+        raise ValueError("the MSan libc++ has no libraries")
+    return component("msan-libcxx", version, f"pkg:generic/llvm-libcxx-msan@{quote(version, safe='')}", files)
+
+
+def afl_binary_modes(licenses=pathlib.Path("/usr/share/bhf/licenses/afl")):
+    """AFL++'s QEMU and Frida modes, built from the sources the image lists."""
+    sources = dict(line.split(" ", 1) for line in (licenses / "UPSTREAM-SOURCES.txt").read_text().splitlines()
+                   if line.strip())
+    version = re.search(r"/v([0-9][^/]*)\.tar\.gz ", sources["AFLplusplus"] + " ").group(1)
+    qemuafl = sources["qemuafl"].split("git:", 1)[1].strip()
+    trace = pathlib.Path("/usr/bin/afl-qemu-trace")
+    frida = pathlib.Path("/usr/lib/afl/afl-frida-trace.so")
+    return [
+        component("aflpp-qemu-mode", version, f"pkg:generic/aflplusplus-qemu-mode@{quote(version, safe='')}",
+                  {str(trace): digest(trace)}, qemuafl_commit=qemuafl),
+        component("aflpp-frida-mode", version, f"pkg:generic/aflplusplus-frida-mode@{quote(version, safe='')}",
+                  {str(frida): digest(frida)}),
+    ]
+
+
 def rust_component_name(installed_name, rustc_details):
     host = next(line.removeprefix("host: ") for line in rustc_details.splitlines()
                 if line.startswith("host: "))
@@ -49,6 +76,11 @@ def inventory(flavor):
     languages = selection_path.read_text().strip().split(",") if selection_path.exists() else None
     if languages is not None:
         result["languages"] = languages
+    engines_path = pathlib.Path("/usr/local/share/bhf/selected-engines.txt")
+    engines = engines_path.read_text().strip() if engines_path.exists() else "default"
+    result["engines"] = engines
+    if engines == "default":
+        result["components"].extend(afl_binary_modes())
     commands = []
     if languages is None or {"javascript", "typescript"} & set(languages):
         commands.append(("node", "node", output("node", "--version").removeprefix("v")))
@@ -61,6 +93,8 @@ def inventory(flavor):
         commands.append(("dotnet-sdk", "dotnet", sdks[0]))
     if languages is None or "rust" in languages:
         commands.append(("rustup", "rustup", output("rustup", "--version").split()[1]))
+    if languages is None or "cpp" in languages:
+        result["components"].append(msan_libcxx())
     for name, command, version in commands:
         path = pathlib.Path(shutil.which(command)).resolve(strict=True)
         ecosystem = "npm" if name == "esbuild" else "generic"

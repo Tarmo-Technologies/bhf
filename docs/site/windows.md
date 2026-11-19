@@ -742,10 +742,27 @@ cmplog, and ASan all work natively on Windows.
   build on native Windows yet; run it under WSL/Linux. The Fortran lane's
   crash oracle is gfortran's AddressSanitizer, and MinGW-w64's GCC, the
   Windows gfortran, ships no sanitizer runtime; run it under WSL/Linux.
-- Java, Python, Perl, C#, JavaScript/TypeScript, Ruby, Lua, and PHP currently
-  emit POSIX `main` launchers even though discovery is portable. Run those lanes
-  under WSL/Linux for now; installing only the interpreter/JDK on native Windows
-  is not sufficient.
+- The Python lane runs on native Windows with a Python 3 on `PATH` (`python`
+  or `python3`). Its `main` is a POSIX launcher, so it also writes
+  `main.launch.json` beside it: the interpreter, the driver and the environment
+  the launcher sets, which the engine, `bhf replay` and `bhf minimize` run on
+  Windows in its place.
+- The C# lane runs on native Windows with the .NET 8 SDK and SharpFuzz (the
+  `sharpfuzz` tool and its NuGet package, as on Linux). Its `main` and
+  `main_symbols` launchers have launch specs (`dotnet` on the harness
+  assembly), and its driver maps the coverage file and speaks the framed
+  protocol through .NET's own file mapping and console streams there.
+- The Java lane runs on native Windows with a JDK (`java`, `javac`, `jar`) on
+  `PATH`: its launch spec runs `java` with the agent and a `;`-separated
+  classpath, and the agent jar is built by `java_runtime\build-agent.ps1`
+  (ASM 9.7 from Maven Central, checked against its pinned SHA-256, or from
+  `ASM_JAR_DIR`), cached in `%LOCALAPPDATA%\bhf\jvm` unless `BHF_JVM_CACHE`
+  names another place.
+- The JavaScript and TypeScript lanes run on native Windows with Node (and
+  esbuild for TypeScript): their launch spec runs `node` on the driver.
+- Perl, Ruby, Lua, and PHP currently emit POSIX `main` launchers even though
+  discovery is portable. Run those lanes under WSL/Linux for now; installing
+  only the interpreter on native Windows is not sufficient.
 - On native Windows `bhf auto` refuses the lanes that run under WSL (those
   above, Rust and Fortran) whatever is installed: its toolchain check marks
   each one `NOT ON NATIVE WINDOWS` with the reason, and their targets are

@@ -1137,8 +1137,14 @@ fn release_matrix_keeps_windows_apps_and_linux_only_shims_separate() {
         assert!(manifest.contains("x86_64-unknown-linux-gnu"));
         assert!(manifest.contains("x86_64-pc-windows-msvc"));
     }
+    for manifest in [&workspace, &cli, &daemon] {
+        assert!(manifest.contains(
+            "targets = [\"x86_64-unknown-linux-gnu\", \"aarch64-unknown-linux-gnu\", \"x86_64-pc-windows-msvc\"]"
+        ));
+    }
     for manifest in [&runtrace, &intercept] {
-        assert!(manifest.contains("targets = [\"x86_64-unknown-linux-gnu\"]"));
+        assert!(manifest
+            .contains("targets = [\"x86_64-unknown-linux-gnu\", \"aarch64-unknown-linux-gnu\"]"));
         assert!(!manifest.contains("x86_64-pc-windows-msvc"));
     }
     for manifest in [&cli, &daemon, &runtrace, &intercept] {

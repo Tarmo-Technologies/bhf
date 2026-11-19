@@ -45,10 +45,6 @@ const TARGETS: &[&str] = &[
 ];
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "Java runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn collection_parameters_build_and_a_list_of_strings_finds_the_planted_bug() {
     if !has_jdk() {
         eprintln!("skip: no JDK (native Java lane needs javac/java)");

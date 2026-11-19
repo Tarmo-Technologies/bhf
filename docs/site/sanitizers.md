@@ -596,8 +596,9 @@ safety, not clean. `--nonblocking` without the `realtime` lane is an error, and
 this run could not observe" list each class no lane of the run detects in the
 C/C++ targets it fuzzed, the languages it went unobserved in, and what would
 observe it: memory errors without ASan, undefined behavior without UBSan,
-leaks without LSan or ASan, uninitialized reads without the MSan replay (which
-has no C++ lane), data races without the TSan replay (C only), type
+leaks without LSan or ASan, uninitialized reads without the MSan replay (in
+C++ only with an MSan-instrumented libc++), data races without the TSan replay
+(C only), type
 confusion without the CFI replay, and real-time unsafe calls without the
 RealtimeSanitizer replay. A finding list without a class says nothing
 about it.
@@ -611,6 +612,36 @@ stops when it has taken the harness's `--per-target-time`. Every run is a line
 of `auto/sanitizer-replay.jsonl`: the sanitizer, harness, input, `elapsed_ms`,
 `timeout_ms` and the outcome (`completed`, `timeout`, `spawn_failed` or
 `skipped_known_hang`).
+
+### C++ under the MSan replay
+
+MemorySanitizer reports a read of memory never written only when every
+function that touched that memory is instrumented, the C++ standard library
+included. A C++ harness's `make msan` therefore builds against an
+MSan-instrumented libc++ and libc++abi: `BHF_MSAN_LIBCXX` names their install
+prefix (`include/c++/v1`, `lib`). The full image builds them from the LLVM
+release of its clang and sets `BHF_MSAN_LIBCXX=/opt/msan-libcxx`. Elsewhere,
+build them once with the LLVM runtimes build:
+
+```sh
+cmake -G Ninja -S llvm-project/runtimes -B msan-build \
+  -DLLVM_ENABLE_RUNTIMES='libcxx;libcxxabi' -DLLVM_USE_SANITIZER=MemoryWithOrigins \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX=/opt/msan-libcxx
+ninja -C msan-build install-cxx install-cxxabi
+export BHF_MSAN_LIBCXX=/opt/msan-libcxx
+```
+
+Use the LLVM release of the clang that builds the harnesses. Without
+`BHF_MSAN_LIBCXX` a C++ harness's `make msan` stops with that message, the
+replay skips it, and the run lists uninitialized reads as unobservable in C++.
+
+On a kernel with 32 bits of mmap randomization, an MSan process sometimes
+lands in an address-space layout that clashes with its shadow memory and
+re-runs itself with randomization off; a container's default seccomp profile
+refuses that (`MemorySanitizer: CHECK failed: msan_linux.cpp ...
+ADDR_NO_RANDOMIZE`). The process stopped before it ran the input, so bhf runs
+it again, up to 8 times.
 
 ## When to use which
 

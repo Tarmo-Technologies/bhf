@@ -54,5 +54,17 @@ class ArchiveIdentityTests(unittest.TestCase):
                 INSTALL.archive_binary_digest(path, "bhf")
 
 
+class ReleaseTargetTests(unittest.TestCase):
+    def test_each_linux_runner_installs_its_own_archives(self):
+        self.assertEqual(INSTALL.release_target(False, "x86_64"), "x86_64-unknown-linux-gnu")
+        self.assertEqual(INSTALL.release_target(False, "aarch64"), "aarch64-unknown-linux-gnu")
+        self.assertEqual(INSTALL.release_target(True, "AMD64"), "x86_64-pc-windows-msvc")
+
+    def test_unpublished_linux_machine_is_refused(self):
+        for machine in ("armv7l", "ppc64le", ""):
+            with self.subTest(machine=machine), self.assertRaises(ValueError):
+                INSTALL.release_target(False, machine)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1308,6 +1308,20 @@ pub(crate) struct WindowsBuild {
 pub(crate) const WINDOWS_BUILD_OUTPUTS: &[&str] =
     &["poc.exe", "poc.pdb", "poc.ilk", "poc.lib", "poc.exp"];
 
+/// The command that runs the rebuilt PoC: `poc.exe`, or `poc` itself, but on
+/// Windows a `poc` script (an interpreted lane's launcher) through `sh`, as
+/// its `build.sh` ran.
+pub(crate) fn poc_command(capsule: &Path) -> Command {
+    let poc = poc_path(capsule);
+    let script = std::fs::read(&poc).is_ok_and(|bytes| bytes.starts_with(b"#!"));
+    if cfg!(windows) && script {
+        let mut command = Command::new("sh");
+        command.arg(poc);
+        return command;
+    }
+    Command::new(poc)
+}
+
 /// The rebuilt PoC in a capsule: `poc.exe` when a Windows build wrote one,
 /// else `poc`.
 pub(crate) fn poc_path(capsule: &Path) -> PathBuf {
@@ -1600,7 +1614,7 @@ pub(crate) fn replay_poc_with_env(
 ) -> std::io::Result<ReplayOutput> {
     use crate::protocol_detect::HarnessProtocol;
     let capsule = &std::path::absolute(capsule)?;
-    let mut command = Command::new(poc_path(capsule));
+    let mut command = poc_command(capsule);
     configure_offline_replay(&mut command);
     command.envs(env.iter().map(|(key, value)| (key, value)));
     command.current_dir(capsule);

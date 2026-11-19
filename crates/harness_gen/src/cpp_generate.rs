@@ -3978,9 +3978,19 @@ mod tests {
         assert!(main.contains("int LLVMFuzzerTestOneInput"));
         assert!(makefile.contains("ifeq ($(origin CXX), default)"));
         assert!(makefile.contains("CXX = clang++"));
-        assert!(makefile
-            .contains(".PHONY: all afl afl_cmplog winafl libfuzzer cfi rtsan cov diff syntaxcheck clean"));
+        assert!(makefile.contains(
+            ".PHONY: all afl afl_cmplog winafl libfuzzer cfi rtsan msan cov diff syntaxcheck clean"
+        ));
         assert!(makefile.contains("winafl: main_winafl"));
+        // The MSan lane builds against the instrumented libc++ BHF_MSAN_LIBCXX
+        // names, and refuses to build without one (#323).
+        assert!(makefile.contains("msan: main_msan$(EXEEXT)"));
+        assert!(makefile.contains("MSAN_CXX ?= clang++"));
+        assert!(makefile
+            .contains("-stdlib=libc++ -nostdinc++ -isystem $(BHF_MSAN_LIBCXX)/include/c++/v1"));
+        assert!(makefile.contains("-Wl$(comma)-rpath$(comma)$(BHF_MSAN_LIBCXX)/lib -lc++abi"));
+        assert!(makefile
+            .contains("$(if $(BHF_MSAN_LIBCXX),,$(error the msan lane needs BHF_MSAN_LIBCXX"));
         assert!(makefile.contains("AFLPP_CXX ?= afl-clang-fast++"));
         assert!(makefile.contains("afl: main_afl"));
         // The CmpLog build afl-fuzz runs with `-c` (#274).

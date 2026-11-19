@@ -31,13 +31,18 @@ fn bhf_bin() -> PathBuf {
 }
 
 fn have_python() -> bool {
-    let present = {
-        Command::new("python3")
+    // As the lane looks for one: `python3`, else `python` (Windows' name).
+    let present = ["python3", "python"].iter().any(|python| {
+        Command::new(python)
             .arg("--version")
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    };
+            .is_ok_and(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .trim_start()
+                        .starts_with("Python 3")
+            })
+    });
     support::require_tool(present, "python")
 }
 

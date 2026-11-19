@@ -158,6 +158,21 @@ pub struct HarnessRunner {
     extra_rw_binds: Vec<PathBuf>,
     /// How long one run of the harness may take ([`HARNESS_TIMEOUT`]).
     timeout: Duration,
+    /// The program a launched harness runs as, in place of the harness file
+    /// itself ([`Self::launched`]).
+    launch: Option<Launch>,
+}
+
+/// How a harness whose `main` is not itself executable runs: the program
+/// (an interpreter), its arguments (the driver), and the environment it
+/// takes. The input follows the arguments, as it follows `main`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, serde::Deserialize)]
+pub struct Launch {
+    pub program: PathBuf,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,7 +212,24 @@ impl HarnessRunner {
             extra_ro_binds: Vec::new(),
             extra_rw_binds: Vec::new(),
             timeout: HARNESS_TIMEOUT,
+            launch: None,
         }
+    }
+
+    /// A harness at `harness_path` that runs as `launch` (an interpreter on
+    /// its driver), as a native Windows host runs the interpreted lanes,
+    /// whose `main` is a POSIX shell script there.
+    pub fn launched(harness_path: impl Into<PathBuf>, launch: Launch) -> Self {
+        Self {
+            launch: Some(launch),
+            ..Self::direct(harness_path)
+        }
+    }
+
+    /// The program, arguments and environment this runner launches the
+    /// harness as, if it is [`Self::launched`].
+    pub fn launch(&self) -> Option<&Launch> {
+        self.launch.as_ref()
     }
 
     pub fn qemu_user(
@@ -215,6 +247,7 @@ impl HarnessRunner {
             extra_ro_binds: Vec::new(),
             extra_rw_binds: Vec::new(),
             timeout: HARNESS_TIMEOUT,
+            launch: None,
         }
     }
 
@@ -289,6 +322,14 @@ impl HarnessRunner {
     /// path instead of spawning a bare `Command::new(harness)` (#81).
     pub fn command_wrapped(&self, io_file: &Path) -> Result<Command, ReplayError> {
         let sandbox = self.sandbox.resolve()?;
+        if let Some(launch) = &self.launch {
+            // A launched harness runs on a host with no sandbox tool (native
+            // Windows): the program, with its arguments and environment.
+            let mut command = Command::new(&launch.program);
+            command.args(&launch.args);
+            command.envs(launch.env.iter().map(|(key, value)| (key, value)));
+            return Ok(command);
+        }
         if let Some(qemu_user) = &self.qemu_user {
             let mut command = wrap_command(
                 sandbox,

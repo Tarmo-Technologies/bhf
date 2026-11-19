@@ -805,7 +805,32 @@ pub(crate) fn recorded_rss_limit_mb(raw: &Value) -> Option<usize> {
 /// With `rss_limit_mb`, the group is also killed as soon as the harness's
 /// resident set passes it, as the fuzz loop's `--rss-limit-mb` watchdog does,
 /// and the run reports that out-of-memory crash.
+///
+/// A run whose MSan runtime could not start (see
+/// [`crate::auto::msan::msan_could_not_start`]) never ran the testcase, and is
+/// run again.
 pub(crate) fn run_c_harness(
+    runner: &HarnessRunner,
+    input: CInput,
+    testcase_path: &Path,
+    timeout: Duration,
+    env: &[(String, String)],
+    rss_limit_mb: Option<usize>,
+) -> Result<CRun, String> {
+    let mut attempt = 1;
+    loop {
+        let run = run_c_harness_once(runner, input, testcase_path, timeout, env, rss_limit_mb)?;
+        if attempt == crate::auto::msan::MSAN_START_ATTEMPTS
+            || !crate::auto::msan::msan_could_not_start(&run.stderr)
+        {
+            return Ok(run);
+        }
+        attempt += 1;
+    }
+}
+
+/// One run of [`run_c_harness`].
+fn run_c_harness_once(
     runner: &HarnessRunner,
     input: CInput,
     testcase_path: &Path,

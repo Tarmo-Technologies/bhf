@@ -54,11 +54,12 @@ The runtrace shim package opts in with `package-libraries = ["cdylib"]` and
 `install-libraries = ["cdylib"]` so dist publishes a shim archive and installer
 containing `libbhf_runtrace_shim`. The runtime preload libraries are
 Linux-only. The generated workflow publishes the CLI and daemon for
-`x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc`, while publishing the
-two preload libraries only for Linux. The Linux target is built in a pinned
-manylinux2014 / CentOS 7 container and checked for a maximum glibc 2.17 ABI,
-covering Ubuntu 22.04/24.04/26.04 LTS and RHEL 7 through RHEL 10. Installer metadata
-explicitly uses that glibc 2.17 floor. The same gate
+`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` and
+`x86_64-pc-windows-msvc`, while publishing the two preload libraries only for
+the two Linux targets. Each Linux target is built natively, on a runner of its
+architecture, in a pinned manylinux2014 / CentOS 7 container and checked for a
+maximum glibc 2.17 ABI, covering Ubuntu 22.04/24.04/26.04 LTS and RHEL 7 through
+RHEL 10. Installer metadata explicitly uses that glibc 2.17 floor. The same gate
 verifies the runtrace shim's required interposition exports. For manual
 component installs, copy `libbhf_runtrace_shim.so` and
 `libbhf_cc_intercept.so` into the extracted `bhf-*` CLI directory, or
@@ -168,17 +169,25 @@ as first-class release assets.
 The generated release workflow builds these target triples:
 
 - `x86_64-unknown-linux-gnu`
+- `aarch64-unknown-linux-gnu` (component archives and installers; the
+  all-in-one signed bundle is x86_64 only)
 - `x86_64-pc-windows-msvc` (`bhf` and `bhf-daemon` only)
 
 Each archive has a SHA-256 checksum sidecar. The Linux binaries are built in the
-pinned manylinux2014 container for Ubuntu 22.04/24.04/26.04 LTS and RHEL 7
-through 10. Windows binaries are built and smoke-tested on Windows Server 2022,
+pinned manylinux2014 container of their architecture
+(`manylinux2014_x86_64` on an x86_64 runner, `manylinux2014_aarch64` on an
+`ubuntu-24.04-arm` runner) for Ubuntu 22.04/24.04/26.04 LTS and RHEL 7
+through 10. The aarch64 archives are unpacked and smoke-tested on the ARM64
+runner before upload, and CI's `arm64-release-build` job, which the release's
+CI gate requires, builds them the same way, installs them through the
+generated installers and runs the same smoke on every change that runs the
+full CI. Windows binaries are built and smoke-tested on Windows Server 2022,
 then the same binaries are exercised on Server 2025; Server 2019, Windows 11
 Enterprise 25H2, and Windows 11 Enterprise LTSC 2024 are covered by the platform
 VM validation. PowerShell installers are published alongside the Unix shell
 installers. The runtime and
-compiler-interception preload shims remain Linux-only assets. macOS,
-Linux/aarch64, and Windows-on-Arm artifacts are not currently published.
+compiler-interception preload shims remain Linux-only assets. macOS and
+Windows-on-Arm artifacts are not currently published.
 
 GitHub Artifact Attestations are disabled in the generated workflow because
 GitHub currently rejects attestation persistence for this private
@@ -226,8 +235,10 @@ semantic version, such as `v0.1.0`, run the full release workflow:
 0. bump `[workspace.package].version` in `Cargo.toml` to the exact release
    version and refresh `Cargo.lock`
 1. plan artifacts with `dist plan`
-2. build platform archives and checksums against the RHEL 7 ABI / native Windows
-3. inspect both CLI archives for every required harness runtime
+2. build platform archives and checksums against the RHEL 7 ABI (x86_64 and
+   aarch64) / native Windows, and smoke-test the aarch64 archives on the ARM64
+   runner
+3. inspect every CLI archive for every required harness runtime
 4. generate Unix shell and Windows PowerShell installers
 5. upload artifacts to a GitHub Release
 

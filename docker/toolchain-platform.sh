@@ -12,6 +12,8 @@ bhf_toolchain_platform() {
             BHF_GO_SHA256=7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840
             BHF_DOTNET_ARCH=x64
             BHF_DOTNET_SHA512=a7e10581123a8fc79bfa807f20cddec4ab1d190b1f7ee64dc690d0358cd3515d33462e54e109b5b9f55f6fbb75d16a54d01d7d35d25465f97765b86c48d79796
+            BHF_FRIDA_ARCH=x86_64
+            BHF_FRIDA_GUM_SHA256=7a3c3e5cc359292454323f2c5cb6dcfa4175fd11410879c2a34108117c1afa8c
             ;;
         arm64)
             BHF_RUST_HOST=aarch64-unknown-linux-gnu
@@ -21,10 +23,13 @@ bhf_toolchain_platform() {
             BHF_GO_SHA256=3392582988a273a87ab5043ee1b2c9c17a2c3c00580bf9326c47a2e0aaaeac92
             BHF_DOTNET_ARCH=arm64
             BHF_DOTNET_SHA512=a2598dbd6b207eaaed8bb1f4a546f3f405285606ba2301c6ee75b9dda08e0789bee51a20a3bb94d87f7a6e191e7e0b4932589df4d6c91709485932a75bf9fa66
+            BHF_FRIDA_ARCH=arm64
+            BHF_FRIDA_GUM_SHA256=4bcf99e7619cbd4f150f39c3e54d682c9a122f23595bdc95349859fa53cb7cfc
             ;;
         *) echo "unsupported container architecture: $1 (use amd64 or arm64)" >&2; return 2 ;;
     esac
     BHF_GO_ARCH="$1"
     export BHF_RUST_HOST BHF_NODE_ARCH BHF_GO_ARCH BHF_DOTNET_ARCH
     export BHF_RUSTUP_SHA256 BHF_NODE_SHA256 BHF_GO_SHA256 BHF_DOTNET_SHA512
+    export BHF_FRIDA_ARCH BHF_FRIDA_GUM_SHA256
 }

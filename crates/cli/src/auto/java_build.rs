@@ -173,7 +173,7 @@ pub fn build_java_harness(
             skip: false,
         };
     }
-    let harness_cp = format!("{}:{}", agent_jar.display(), target_cp);
+    let harness_cp = format!("{}{CP_SEP}{}", agent_jar.display(), target_cp);
     let harness_preview = match run_javac(
         &tc.javac,
         &[harness_cp.as_str()],
@@ -193,7 +193,7 @@ pub fn build_java_harness(
     // 5. Emit the launcher `main` script.
     let main_path = auto_dir.join("main");
     let classpath = format!(
-        "{}:{}:{}",
+        "{}{CP_SEP}{}{CP_SEP}{}",
         agent_jar.display(),
         target_cp,
         harness_classes.display()
@@ -240,6 +240,42 @@ pub fn build_java_harness(
     if let Err(e) = make_executable(&main_path) {
         return JavaBuildResult::Failed {
             reason: format!("chmod +x {}: {e}", main_path.display()),
+            skip: false,
+        };
+    }
+    // The same launch where the shell script cannot run (#307).
+    let mut args = Vec::new();
+    if harness_preview {
+        args.push("--enable-preview".to_owned());
+    }
+    args.extend([
+        format!("-javaagent:{}", agent_jar.display()),
+        "-cp".to_owned(),
+        classpath.clone(),
+        "com.bhf.Driver".to_owned(),
+        generated.harness_class.clone(),
+    ]);
+    let launch = replay_min::Launch {
+        program: tc.java.clone(),
+        args,
+        env: vec![
+            (
+                "BHF_EXPECTED_EXCEPTIONS".to_owned(),
+                expected_exceptions.clone(),
+            ),
+            (
+                "BHF_SCALAR_ONLY_TARGET".to_owned(),
+                if scalar_only_target { "1" } else { "0" }.to_owned(),
+            ),
+            (
+                "BHF_SINK_OUT".to_owned(),
+                auto_dir.join("sink_report.txt").display().to_string(),
+            ),
+        ],
+    };
+    if let Err(e) = crate::launch_spec::write(&main_path, &launch) {
+        return JavaBuildResult::Failed {
+            reason: format!("write the launch spec of {}: {e}", main_path.display()),
             skip: false,
         };
     }
@@ -602,7 +638,7 @@ fn run_javac(
         let mut cmd = Command::new(javac);
         cmd.arg("-d").arg(out_dir);
         if !classpath.is_empty() {
-            cmd.arg("-cp").arg(classpath.join(":"));
+            cmd.arg("-cp").arg(classpath.join(CP_SEP));
         }
         // `--enable-preview` is rejected on its own: javac requires an explicit
         // `--release` (or `-source`), and preview is only ever valid for the
@@ -979,9 +1015,12 @@ fn join_cp(classes: &Path, deps: &str) -> String {
     if deps.is_empty() {
         classes.display().to_string()
     } else {
-        format!("{}:{}", classes.display(), deps)
+        format!("{}{CP_SEP}{}", classes.display(), deps)
     }
 }
+
+/// The JVM's classpath separator on this host: `:`, or `;` on Windows.
+const CP_SEP: &str = if cfg!(windows) { ";" } else { ":" };
 
 /// A filesystem-safe cache key for a module directory.
 fn module_cache_key(module: &Path) -> String {
@@ -1105,14 +1144,32 @@ fn ensure_agent_jar() -> Result<PathBuf, String> {
     let cache = agent_jar_cache_path();
     let script = locate_build_agent_script()
         .ok_or_else(|| "could not locate java_runtime/build-agent.sh".to_owned())?;
+    // One build at a time: the run's jobs all ask for the jar, and on Windows
+    // a second build cannot replace the jar a first job's JVM has open.
+    static BUILDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _building = BUILDING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if cache.is_file() && !agent_jar_is_stale(&cache, &script) {
         return Ok(cache);
     }
+    // A Windows host builds it with the script's PowerShell twin (#307).
+    let mut build = if cfg!(windows) {
+        let mut command = crate::windows_env::windows_powershell();
+        command
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(script.with_file_name("build-agent.ps1"));
+        command
+    } else {
+        let mut command = Command::new("sh");
+        command.arg(&script);
+        command
+    };
     let out = crate::command_output::output_with_timeout(
-        Command::new("sh").arg(&script).arg(&cache),
+        build.arg(&cache),
         std::time::Duration::from_secs(10 * 60),
     )
-    .map_err(|e| format!("spawn build-agent.sh: {e}"))?;
+    .map_err(|e| format!("spawn build-agent: {e}"))?;
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr)
             .lines()
@@ -1162,6 +1219,14 @@ fn agent_jar_is_stale(jar: &Path, script: &Path) -> bool {
 fn agent_jar_cache_path() -> PathBuf {
     if let Ok(dir) = std::env::var("BHF_JVM_CACHE") {
         return PathBuf::from(dir).join("bhf-jvm-agent.jar");
+    }
+    if cfg!(windows) {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            return PathBuf::from(local)
+                .join("bhf")
+                .join("jvm")
+                .join("bhf-jvm-agent.jar");
+        }
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
     PathBuf::from(home)
@@ -1273,7 +1338,11 @@ mod tests {
     #[test]
     fn join_cp_and_cache_key_are_sane() {
         assert_eq!(join_cp(Path::new("/c"), ""), "/c");
-        assert_eq!(join_cp(Path::new("/c"), "/d/x.jar"), "/c:/d/x.jar");
+        // The host's classpath separator: `;` on Windows.
+        assert_eq!(
+            join_cp(Path::new("/c"), "/d/x.jar"),
+            format!("/c{CP_SEP}/d/x.jar")
+        );
         let key = module_cache_key(Path::new("/tmp/foo-bar/baz"));
         assert!(key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
     }

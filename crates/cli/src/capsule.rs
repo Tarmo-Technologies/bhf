@@ -1095,7 +1095,7 @@ fn uses_windows_build(cap: &Path) -> bool {
 /// `build.sh` through `sh`; with the script's name and the PoC it writes.
 fn build_command(cap: &Path) -> (Command, &'static str, &'static str) {
     if uses_windows_build(cap) {
-        let mut command = Command::new("powershell.exe");
+        let mut command = crate::windows_env::windows_powershell();
         command.args([
             "-NoProfile",
             "-NonInteractive",

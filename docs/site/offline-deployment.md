@@ -180,7 +180,8 @@ as a compatibility alias.
 ### A1. Use the published all-in-one bundle (preferred)
 
 The release publishes `bhf-dist-<version>-x86_64-unknown-linux-gnu.tar.gz`
-with its detached `.sig` and `.sha256` sidecars. It contains `install.sh`, the CLI, daemon, runtrace
+with its detached `.sig` and `.sha256` sidecars (x86_64 only; for a 64-bit ARM
+host, use the component archives below). It contains `install.sh`, the CLI, daemon, runtrace
 shim, compiler-interception shim, harness runtimes, content pack, and
 smoke fixture. No source checkout or component assembly is required.
 
@@ -248,7 +249,8 @@ and add no value on the disconnected side.
 On the **connected** host:
 
 ```sh
-# Download the archives + checksums for the published Linux target.
+# Download the archives + checksums for the host's Linux target
+# (aarch64-unknown-linux-gnu in these names for a 64-bit ARM host).
 gh release download vX.Y.Z --repo Tarmo-Technologies/bhf \
   --pattern 'bhf-x86_64-unknown-linux-gnu.tar.xz*' \
   --pattern 'bhf_runtrace_shim-x86_64-unknown-linux-gnu.tar.xz*' \

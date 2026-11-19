@@ -1256,6 +1256,16 @@ pub fn build_csharp_harness(
         if let Err(e) = make_executable(launcher) {
             return CSharpBuildResult::Failed(format!("chmod +x {}: {e}", launcher.display()));
         }
+        // The same launch where the shell script cannot run (#306).
+        if let Err(e) = crate::launch_spec::write(
+            launcher,
+            &launch_spec(&method.namespace, &dir.join("bhf_harness.dll")),
+        ) {
+            return CSharpBuildResult::Failed(format!(
+                "write the launch spec of {}: {e}",
+                launcher.display()
+            ));
+        }
     }
     CSharpBuildResult::Built {
         forced: (receiver_kind == Receiver::Uninitialized).then(|| {
@@ -1287,6 +1297,25 @@ fn launcher_script(namespace: &str, harness_dll: &Path) -> String {
          exec dotnet \"{dll}\" \"$@\"\n",
         dll = harness_dll.display(),
     )
+}
+
+/// [`launcher_script`] as a launch spec: `dotnet` on the harness assembly,
+/// with the environment the script sets.
+fn launch_spec(namespace: &str, harness_dll: &Path) -> replay_min::Launch {
+    replay_min::Launch {
+        program: "dotnet".into(),
+        args: vec![harness_dll.display().to_string()],
+        env: [
+            ("BHF_CS_NAMESPACE", namespace),
+            ("BHF_EXPECTED_EXCEPTIONS", ""),
+            ("DOTNET_CLI_TELEMETRY_OPTOUT", "1"),
+            ("DOTNET_NOLOGO", "1"),
+            ("DOTNET_ROLL_FORWARD", "Major"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect(),
+    }
 }
 
 /// Copy the files of `from` (not its subdirectories) into `to`.

@@ -526,13 +526,28 @@ const TEMP_FILE_CALL: &str = "bhfFileOf(";
 /// over a campaign — so the file is created once and truncated on every write.
 /// `deleteOnExit` covers the ordinary end of the run, and a persistent-mode fuzz
 /// process reuses the same path for its whole life.
+///
+/// The file is named by the process id and created with `createNewFile`, which
+/// never opens a file (or link) already there. `File.createTempFile` names it
+/// from `SecureRandom`, whose first seeding can take seconds, longer than an
+/// input's timeout: a Windows session where the JVM's native seed source fails
+/// falls back to seeding from thread timing.
 const TEMP_FILE_HELPER: &str = concat!(
     "\x20   /** Materialize this input as a file so a File/Path/URI parameter is a\n",
     "\x20    *  real byte channel. One file per process, truncated per input. */\n",
     "\x20   private static java.io.File bhfTempFile;\n",
     "\x20   private static java.io.File bhfFileOf(byte[] bytes) throws java.io.IOException {\n",
     "\x20       if (bhfTempFile == null) {\n",
-    "\x20           bhfTempFile = java.io.File.createTempFile(\"bhf-input\", \".bin\");\n",
+    "\x20           java.io.File dir = new java.io.File(System.getProperty(\"java.io.tmpdir\"));\n",
+    "\x20           long pid = ProcessHandle.current().pid();\n",
+    "\x20           for (int n = 0; bhfTempFile == null; n++) {\n",
+    "\x20               java.io.File file = new java.io.File(dir, \"bhf-input-\" + pid + \"-\" + n + \".bin\");\n",
+    "\x20               if (file.createNewFile()) {\n",
+    "\x20                   bhfTempFile = file;\n",
+    "\x20               } else if (n == 1000) {\n",
+    "\x20                   throw new java.io.IOException(\"no free bhf-input file name in \" + dir);\n",
+    "\x20               }\n",
+    "\x20           }\n",
     "\x20           bhfTempFile.deleteOnExit();\n",
     "\x20       }\n",
     "\x20       try (java.io.FileOutputStream out = new java.io.FileOutputStream(bhfTempFile)) {\n",
@@ -859,7 +874,11 @@ mod tests {
             Some(HARNESS_PACKAGE),
             HARNESS_CLASS,
         );
-        assert!(harness.contains("createTempFile"), "{harness}");
+        assert!(harness.contains("file.createNewFile()"), "{harness}");
+        assert!(
+            !harness.contains("createTempFile"),
+            "no SecureRandom-named temp file: {harness}"
+        );
         assert!(harness.contains("deleteOnExit"), "{harness}");
         assert!(
             harness.contains("if (bhfTempFile == null)"),

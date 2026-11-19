@@ -2853,6 +2853,55 @@
   when bhf panics.
 
 ### Added
+- The container image ships AFL++'s QEMU and Frida modes (#321):
+  `/usr/bin/afl-qemu-trace` and `/usr/lib/afl/afl-frida-trace.so`, built from
+  the AFL++ release Ubuntu's `afl++` package carries (4.09c), with the qemuafl
+  commit that release pins and a digest-checked Frida GumJS devkit, so
+  `bhf binary fuzz` fuzzes a binary without source with coverage there
+  instead of falling back to the blind builtin loop. The container
+  acceptance runs both modes on an uninstrumented binary, and the image
+  inventory lists them. `bhf binary fuzz --engine afl-qemu` now merges
+  `symbolize=0` into the `ASAN_OPTIONS`, `UBSAN_OPTIONS` and `LSAN_OPTIONS`
+  it passes `afl-fuzz`, which refuses a custom setting without it, as the
+  image's defaults are.
+- Linux aarch64 release binaries (#343): a release publishes
+  `aarch64-unknown-linux-gnu` archives of the CLI, the daemon and both preload
+  shims, and the shell installers install them on a 64-bit ARM host. They are
+  built natively on an `ubuntu-24.04-arm` runner in a digest-pinned
+  `manylinux2014_aarch64` image and held to the same glibc 2.17 ceiling as
+  x86_64; the runtrace shim links with the toolchain's own `rust-lld`. The
+  release job unpacks the aarch64 archives and runs the Linux release smoke on
+  the ARM64 runner before uploading them, and a new CI job,
+  `arm64-release-build`, which CI acceptance and so the release's CI gate
+  require, builds them the same way, installs them through the generated
+  installers and runs the same smoke. The all-in-one signed bundle stays
+  x86_64 only.
+- The MSan corpus replay covers C++ (#323): a C++ harness's `make msan` builds
+  against the MSan-instrumented libc++ `BHF_MSAN_LIBCXX` names, which the full
+  image builds into `/opt/msan-libcxx`. A run whose MSan runtime stops before
+  it runs the input (a refused re-run with address-space randomization off,
+  as in a container on a kernel with 32 bits of mmap randomization) is run
+  again.
+- `bhf export regression [--lang c|ada]` writes a work dir's harnesses,
+  corpora and findings' minimized inputs as a standalone regression suite
+  (#339): `run.sh` builds each harness against the scanned tree and fails
+  when an input crashes, so a finding fails it until its bug is fixed.
+- The Java, JavaScript and TypeScript lanes run on native Windows (#307):
+  their launchers have launch specs (`java` with the agent, `node` on the
+  driver), Java's classpaths take the host's separator, the JVM agent jar is
+  built by `build-agent.ps1` there (cached in `%LOCALAPPDATA%\bhf\jvm`), and
+  the JS lane's load check runs the launch spec.
+- The C# lane runs on native Windows (#306): its `main` and `main_symbols`
+  launchers have launch specs (`dotnet` on the harness assembly), and the
+  driver maps the coverage file and runs the framed protocol through .NET's
+  file mapping and console streams where there is no libc to call
+  (`BHF_CS_PORTABLE_IO=1` takes that path on any host).
+- The Python lane runs on native Windows (#305). Beside its POSIX `main`
+  launcher it writes `main.launch.json` (the interpreter, the driver and the
+  environment), which the harness runner execs directly where the launcher
+  cannot run; `PYTHONPATH` takes the host's separator and the coverage map is
+  mapped without `MAP_SHARED` there. `BHF_LAUNCH_SPEC=1` runs a harness from
+  its launch spec on any host.
 - A GitLab CI template (`ci/gitlab/bhf.gitlab-ci.yml`) and a GitLab SAST
   report (#320): `bhf ci --gitlab-sast <PATH>` and `bhf report --gitlab-sast`
   write `gl-sast-report.json` (GitLab's format 15.2.1) for a merge request's

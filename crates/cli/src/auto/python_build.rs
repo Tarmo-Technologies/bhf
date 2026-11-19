@@ -195,7 +195,7 @@ pub fn build_python_harness(
         }
     }
 
-    let pythonpath = format!("{}:{}", auto_dir.display(), import_root.display());
+    let pythonpath = crate::launch_spec::search_path(&[&auto_dir, &import_root]);
 
     // Import smoke-test: actually import the harness (which imports the target
     // module) so a target that isn't importable under this interpreter — a missing
@@ -255,12 +255,15 @@ pub fn build_python_harness(
          BHF_TARGET_PACKAGE=\"{pkg}\" \\\n\
          BHF_COVERED_LINES=\"{covered}\" \\\n\
          PYTHONDONTWRITEBYTECODE=1 \\\n\
-         PYTHONPATH=\"{pythonpath}:${{PYTHONPATH}}\" \\\n\
+         PYTHONPATH=\"{pythonpath}{separator}${{PYTHONPATH}}\" \\\n\
          exec \"{python}\" -B \"{driver}\" \"$@\"\n",
         trace = import_root.display(),
         pkg = module.split('.').next().unwrap_or(&module),
         covered = auto_dir.join("covered-lines.txt").display(),
         pythonpath = pythonpath,
+        // The host's separator: on Windows a `:` would join the inherited
+        // path onto the last entry, which then names no directory.
+        separator = if cfg!(windows) { ';' } else { ':' },
         python = python.display(),
         driver = driver.display(),
     );
@@ -273,6 +276,47 @@ pub fn build_python_harness(
     if let Err(e) = make_executable(&main_path) {
         return PythonBuildResult::Failed {
             reason: format!("chmod +x {}: {e}", main_path.display()),
+            skip: false,
+        };
+    }
+    // The same launch where the shell script cannot run (#305): a native
+    // Windows host execs the interpreter on the driver with this
+    // environment.
+    let inherited = std::env::var("PYTHONPATH").unwrap_or_default();
+    let launch = replay_min::Launch {
+        program: python.clone(),
+        args: vec!["-B".to_owned(), driver.display().to_string()],
+        env: vec![
+            ("BHF_HARNESS_MODULE".to_owned(), "bhfgen.harness".to_owned()),
+            (
+                "BHF_TRACE_PREFIX".to_owned(),
+                import_root.display().to_string(),
+            ),
+            (
+                "BHF_TARGET_PACKAGE".to_owned(),
+                module.split('.').next().unwrap_or(&module).to_owned(),
+            ),
+            (
+                "BHF_COVERED_LINES".to_owned(),
+                auto_dir.join("covered-lines.txt").display().to_string(),
+            ),
+            ("PYTHONDONTWRITEBYTECODE".to_owned(), "1".to_owned()),
+            (
+                "PYTHONPATH".to_owned(),
+                if inherited.is_empty() {
+                    pythonpath.clone()
+                } else {
+                    format!(
+                        "{pythonpath}{}{inherited}",
+                        if cfg!(windows) { ';' } else { ':' }
+                    )
+                },
+            ),
+        ],
+    };
+    if let Err(e) = crate::launch_spec::write(&main_path, &launch) {
+        return PythonBuildResult::Failed {
+            reason: format!("write launch spec in {}: {e}", auto_dir.display()),
             skip: false,
         };
     }

@@ -29,6 +29,7 @@
 
 using System;
 using System.IO;
+using System.IO.MemoryMappedFiles;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -71,6 +72,17 @@ internal static unsafe class Driver
     private const int MAP_SHARED = 0x1;
     private const int MAP_PRIVATE = 0x2;
     private const int MAP_ANONYMOUS = 0x20; // Linux
+
+    // Windows has no libc to call (#306): there the coverage map is a managed
+    // file mapping of the same file, and the framed protocol runs over the
+    // console streams. BHF_CS_PORTABLE_IO=1 takes this path on any host.
+    private static readonly bool PortableIo =
+        RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+        || Environment.GetEnvironmentVariable("BHF_CS_PORTABLE_IO") == "1";
+
+    // Kept alive for the process: the view's pointer is the coverage map.
+    private static MemoryMappedFile _covFile;
+    private static MemoryMappedViewAccessor _covView;
 
     // Exception TYPES (by base) that are input *rejection* or a harness artifact,
     // never a target bug — mirrors the Python driver's REJECTION_EXC. bhf
@@ -280,6 +292,11 @@ internal static unsafe class Driver
     private static void SetupCoverage()
     {
         var path = Environment.GetEnvironmentVariable("BHF_COV_SHM");
+        if (PortableIo)
+        {
+            SetupPortableCoverage(path);
+            return;
+        }
         if (!string.IsNullOrEmpty(path))
         {
             int fd = open(path, O_RDWR | O_CREAT, 0x180 /* 0600 */);
@@ -301,6 +318,82 @@ internal static unsafe class Driver
         SetTraceSharedMemory(anon == (IntPtr)(-1)
             ? (byte*)Marshal.AllocHGlobal(CovBits)
             : (byte*)anon);
+    }
+
+    // The file mapping every process mapping the file shares; the engine
+    // keeps the file open, so this opens it shared.
+    private static void SetupPortableCoverage(string path)
+    {
+        if (!string.IsNullOrEmpty(path))
+        {
+            try
+            {
+                var stream = new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite,
+                    FileShare.ReadWrite | FileShare.Delete);
+                if (stream.Length < CovBits)
+                {
+                    stream.SetLength(CovBits);
+                }
+                _covFile = MemoryMappedFile.CreateFromFile(stream, null, CovBits,
+                    MemoryMappedFileAccess.ReadWrite, HandleInheritability.None, false);
+                _covView = _covFile.CreateViewAccessor(0, CovBits, MemoryMappedFileAccess.ReadWrite);
+                byte* p = null;
+                _covView.SafeMemoryMappedViewHandle.AcquirePointer(ref p);
+                SetTraceSharedMemory(p + _covView.PointerOffset);
+                return;
+            }
+            catch (Exception)
+            {
+                // Fall through to a private map.
+            }
+        }
+        var private_ = (byte*)Marshal.AllocHGlobal(CovBits);
+        new Span<byte>(private_, CovBits).Clear();
+        SetTraceSharedMemory(private_);
+    }
+
+    private static bool ReadExact(Stream stream, byte[] buf, int n)
+    {
+        int got = 0;
+        while (got < n)
+        {
+            int r = stream.Read(buf, got, n - got);
+            if (r <= 0)
+            {
+                return false;
+            }
+            got += r;
+        }
+        return true;
+    }
+
+    // The framed protocol over the console streams: the target's prints go
+    // nowhere, so they cannot reach the sync channel.
+    private static void PortableFramedLoop()
+    {
+        var control = Console.OpenStandardOutput();
+        var input = Console.OpenStandardInput();
+        Console.SetOut(TextWriter.Null);
+        var one = new byte[] { 1 };
+        control.Write(one, 0, 1); // ready byte
+        control.Flush();
+        var len = new byte[4];
+        while (ReadExact(input, len, 4))
+        {
+            int n = len[0] | (len[1] << 8) | (len[2] << 16) | (len[3] << 24);
+            if (n < 0)
+            {
+                break;
+            }
+            var data = new byte[n];
+            if (n > 0 && !ReadExact(input, data, n))
+            {
+                break;
+            }
+            RunInput(data);
+            control.Write(one, 0, 1); // sync byte
+            control.Flush();
+        }
     }
 
     private static bool ReadExact(int fd, byte[] buf, int n)
@@ -385,7 +478,14 @@ internal static unsafe class Driver
 
         if (Environment.GetEnvironmentVariable("BHF_FRAMED") != null)
         {
-            FramedLoop();
+            if (PortableIo)
+            {
+                PortableFramedLoop();
+            }
+            else
+            {
+                FramedLoop();
+            }
             return 0;
         }
 

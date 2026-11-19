@@ -25,10 +25,6 @@ fn have_node() -> bool {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "JavaScript runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn a_target_s_escape_sequences_are_printed_escaped() {
     if !have_node() {
         eprintln!("skipping: no node runtime on PATH");

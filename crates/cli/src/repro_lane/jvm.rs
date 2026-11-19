@@ -52,7 +52,8 @@ pub(crate) struct JvmLaunch {
     pub(crate) preview: bool,
 }
 
-/// Read the agent jar, the classpath and the preview switch off a launcher.
+/// Read the agent jar, the classpath and the preview switch off a launcher
+/// (written on this host, so its classpath has this host's separator).
 pub(crate) fn parse_launcher(launcher: &str) -> Option<JvmLaunch> {
     let quoted_after = |needle: &str| -> Option<String> {
         let start = launcher.find(needle)? + needle.len();
@@ -61,10 +62,8 @@ pub(crate) fn parse_launcher(launcher: &str) -> Option<JvmLaunch> {
     };
     Some(JvmLaunch {
         agent: PathBuf::from(quoted_after("-javaagent:\"")?),
-        classpath: quoted_after("-cp \"")?
-            .split(':')
-            .filter(|entry| !entry.is_empty())
-            .map(PathBuf::from)
+        classpath: std::env::split_paths(&quoted_after("-cp \"")?)
+            .filter(|entry| !entry.as_os_str().is_empty())
             .collect(),
         preview: launcher.contains(" --enable-preview"),
     })
@@ -130,7 +129,7 @@ impl Lane for JavaLane {
         let jars: Vec<&PathBuf> = launch
             .classpath
             .iter()
-            .filter(|entry| **entry != launch.agent && !entry.starts_with(dir))
+            .filter(|entry| **entry != launch.agent && in_harness_dir(entry, dir).is_none())
             .collect();
         let mut harness_files = vec![PathBuf::from("main")];
         harness_files.extend(
@@ -217,12 +216,20 @@ impl Lane for JavaLane {
             executable: false,
         });
         let agent = format!("runtime/jvm/{}", agent_name.to_string_lossy());
-        let target_cp = jar_paths.join(":");
-        let harness_cp = std::iter::once(agent.clone())
-            .chain(std::iter::once("build/harness/target-classes".to_owned()))
-            .chain(jar_paths.iter().cloned())
-            .collect::<Vec<_>>()
-            .join(":");
+        // Joined with the separator of the host build.sh runs on: `;` for
+        // a Windows JDK under an MSYS shell.
+        let classpath = |entries: &mut dyn Iterator<Item = &str>| {
+            entries
+                .map(super::sh_word)
+                .collect::<Vec<_>>()
+                .join("\"$CP_SEP\"")
+        };
+        let target_cp = classpath(&mut jar_paths.iter().map(String::as_str));
+        let harness_cp = classpath(
+            &mut [agent.as_str(), "build/harness/target-classes"]
+                .into_iter()
+                .chain(jar_paths.iter().map(String::as_str)),
+        );
         let mut script = String::from(
             "#!/bin/sh\n\
              # Rebuild this bhf PoC offline. Needs only a JDK (javac and java, or $JAVAC\n\
@@ -235,6 +242,12 @@ impl Lane for JavaLane {
             script.push_str(&relocate::resolve_tool("TOOL_JAVA", &JAVA_TOOLS[1]));
         }
         script.push_str(&relocator.render_script(&relocated));
+        script.push_str(
+            "case \"$(uname -s 2>/dev/null)\" in\n  \
+             MINGW*|MSYS*|CYGWIN*) CP_SEP=';' ;;\n  \
+             *) CP_SEP=: ;;\n\
+             esac\n",
+        );
         if launch.preview {
             // Preview features compile only for javac's own feature release.
             script.push_str(
@@ -253,9 +266,8 @@ impl Lane for JavaLane {
             target_cp_flag = if target_cp.is_empty() {
                 String::new()
             } else {
-                format!("-cp {} ", super::sh_word(&target_cp))
+                format!("-cp {target_cp} ")
             },
-            harness_cp = super::sh_word(&harness_cp),
         ));
         let requires: Vec<_> = JAVA_TOOLS.iter().map(Toolchain::requirement).collect();
         let mut layout = vec![
@@ -320,9 +332,8 @@ fn classpath_problem(harness_dir: &Path, launch: &JvmLaunch) -> Option<String> {
         if *entry == launch.agent {
             continue;
         }
-        if entry.starts_with(harness_dir) {
-            let name = entry.strip_prefix(harness_dir).ok()?.to_string_lossy();
-            if name == "target-classes" || name == "harness-classes" {
+        if let Some(name) = in_harness_dir(entry, harness_dir) {
+            if name == Path::new("target-classes") || name == Path::new("harness-classes") {
                 continue;
             }
             return Some(format!(
@@ -350,6 +361,22 @@ fn classpath_problem(harness_dir: &Path, launch: &JvmLaunch) -> Option<String> {
         ));
     }
     None
+}
+
+/// `entry` relative to `harness_dir` when it is in it, by the paths as given
+/// or resolved: the launcher names it resolved, and a work dir given by a
+/// short name (Windows' `ADMINI~1`) spells the harness dir differently.
+fn in_harness_dir(entry: &Path, harness_dir: &Path) -> Option<PathBuf> {
+    entry
+        .strip_prefix(harness_dir)
+        .ok()
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            crate::workdir::plain_canonical(entry)
+                .strip_prefix(crate::workdir::plain_canonical(harness_dir))
+                .ok()
+                .map(Path::to_path_buf)
+        })
 }
 
 /// The `.java` files under `dir`, relative.
@@ -386,17 +413,57 @@ fn argument_file(paths: &[String]) -> String {
 mod tests {
     use super::*;
 
-    const LAUNCHER: &str = "#!/bin/sh\n# BHF_FRAMED BHF_JVM_LAUNCHER\nBHF_EXPECTED_EXCEPTIONS=\"\" \\\n\
-        exec \"/usr/bin/java\" -javaagent:\"/c/bhf-jvm-agent.jar\" -cp \"/c/bhf-jvm-agent.jar:/w/h/target-classes:/w/h/harness-classes\" \\\n    com.bhf.Driver bhfgen.Harness \"$@\"\n";
+    /// A launcher as this host's Java lane writes it, with its classpath
+    /// separator.
+    fn launcher() -> String {
+        let classpath = std::env::join_paths([
+            "/c/bhf-jvm-agent.jar",
+            "/w/h/target-classes",
+            "/w/h/harness-classes",
+        ])
+        .unwrap();
+        format!(
+            "#!/bin/sh\n# BHF_FRAMED BHF_JVM_LAUNCHER\nBHF_EXPECTED_EXCEPTIONS=\"\" \\\n\
+             exec \"/usr/bin/java\" -javaagent:\"/c/bhf-jvm-agent.jar\" -cp \"{}\" \\\n    \
+             com.bhf.Driver bhfgen.Harness \"$@\"\n",
+            classpath.to_string_lossy()
+        )
+    }
 
     #[test]
     fn the_launcher_names_agent_classpath_and_preview() {
-        let launch = parse_launcher(LAUNCHER).unwrap();
+        let launch = parse_launcher(&launcher()).unwrap();
         assert_eq!(launch.agent, PathBuf::from("/c/bhf-jvm-agent.jar"));
-        assert_eq!(launch.classpath.len(), 3);
+        assert_eq!(
+            launch.classpath,
+            [
+                PathBuf::from("/c/bhf-jvm-agent.jar"),
+                PathBuf::from("/w/h/target-classes"),
+                PathBuf::from("/w/h/harness-classes"),
+            ]
+        );
         assert!(!launch.preview);
-        let preview = LAUNCHER.replace("\"/usr/bin/java\"", "\"/usr/bin/java\" --enable-preview");
+        let preview = launcher().replace("\"/usr/bin/java\"", "\"/usr/bin/java\" --enable-preview");
         assert!(parse_launcher(&preview).unwrap().preview);
+    }
+
+    /// A Windows launcher's `C:\\...` entries are not split at the drive's
+    /// colon.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_classpath_keeps_its_drive_letters() {
+        let launch = parse_launcher(
+            "# BHF_JVM_LAUNCHER\nexec \"java\" -javaagent:\"C:\\a\\agent.jar\" \
+             -cp \"C:\\a\\agent.jar;C:\\w\\h\\target-classes\" com.bhf.Driver H \"$@\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            launch.classpath,
+            [
+                PathBuf::from(r"C:\a\agent.jar"),
+                PathBuf::from(r"C:\w\h\target-classes"),
+            ]
+        );
     }
 
     /// A target whose classes came from a Maven or Gradle build is refused
