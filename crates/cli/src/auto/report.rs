@@ -161,6 +161,10 @@ struct Summary {
     /// C/C++ targets it fuzzed, and what would. Empty when it fuzzed none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     unobservable_classes: Vec<UnobservableClass>,
+    /// Of the targets, how many are harnesses the project ships
+    /// (`targets[].provided_harness`). 0 (omitted) when none was.
+    #[serde(skip_serializing_if = "is_zero")]
+    provided_harnesses: usize,
 }
 
 /// A bug class the run's sanitizer lanes could not detect (#297).
@@ -456,6 +460,11 @@ struct TargetEntry<'a> {
     /// inputs (`--collector`, #278); omitted when it ran none.
     #[serde(skip_serializing_if = "Option::is_none")]
     collector: Option<serde_json::Value>,
+    /// Set when the target is a harness the project ships rather than one bhf
+    /// generated (a Go native fuzz test): its origin, entry point and the seeds
+    /// it came with. Omitted for a generated target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provided_harness: Option<crate::auto::provided::ProvidedRecord>,
 }
 
 /// The share of a target's first inputs that ended in a nil-value error, when
@@ -1830,8 +1839,13 @@ pub fn write_reports_with_output_limit(
             collector: std::fs::read(r.harness_dir.join(crate::auto::attempt::COLLECTOR_FILE))
                 .ok()
                 .and_then(|bytes| serde_json::from_slice(&bytes).ok()),
+            provided_harness: crate::auto::provided::target_record(&r.candidate, &r.harness_dir),
         })
         .collect();
+    summary.provided_harnesses = targets
+        .iter()
+        .filter(|target| target.provided_harness.is_some())
+        .count();
 
     // One format-string bug is one finding group (CWE-134), not a NULL
     // dereference, a wild write and an oracle hit apart.
@@ -4210,6 +4224,13 @@ fn render_target_md_line(t: &TargetEntry<'_>) -> String {
     }
     if let Some(stub) = &t.stub_executed {
         line.push_str(&format!("  [!] stub executed: {}", stub.note));
+    }
+    if let Some(provided) = &t.provided_harness {
+        line.push_str(&format!(
+            "  [provided harness: {}, {} seed(s)]",
+            provided.origin.as_str(),
+            provided.seeds
+        ));
     }
     line
 }

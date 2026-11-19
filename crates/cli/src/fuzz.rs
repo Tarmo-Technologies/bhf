@@ -4144,6 +4144,9 @@ fn prepare_with_runner(
     seeds.extend(crate::auto::go_build::load_structured_seed_inputs(
         &crate::auto::layout::harness_dir(&work_dir, &args.harness),
     )?);
+    seeds.extend(crate::auto::provided::load_seeds(
+        &crate::auto::layout::harness_dir(&work_dir, &args.harness),
+    ));
     bound_seed_corpus(&mut seeds, args.max_len.max(1));
     let mut extra_env = expand_work_dir_token(args.extra_env, &work_dir);
     extra_env.extend(sanitizer_env.clone());

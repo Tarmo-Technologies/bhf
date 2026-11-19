@@ -1615,6 +1615,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/auto/provided.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/auto/python_build.rs",
       "license": "Apache-2.0"
     },
@@ -2576,6 +2580,10 @@
     },
     {
       "path": "crates/cli/tests/auto_go_force.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_go_fuzz_test.rs",
       "license": "Apache-2.0"
     },
     {

@@ -3317,6 +3317,44 @@ fn is_under_header_api_root(path: &Path) -> bool {
         .any(|c| c.eq_ignore_ascii_case("include") || c.eq_ignore_ascii_case("inc"))
 }
 
+/// Whether the walk for the harnesses a project ships
+/// ([`crate::auto::provided`]) leaves `path` out. That walk looks where
+/// [`is_excluded_dir`] does not (tests, `fuzz/`, tools), since that is where a
+/// project keeps them, but not in the work dir, build output, VCS or hidden
+/// directories, a vendored dependency, `testdata/` (sample input, which the
+/// go tool ignores too), or a directory `--exclude-dir` names.
+pub(crate) fn is_excluded_provided_harness_dir(path: &Path, filter: &DirFilter) -> bool {
+    if filter.is_work_dir(path) {
+        return true;
+    }
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    name.starts_with('.')
+        || matches!(
+            lower.as_str(),
+            "generated_harnesses"
+                | "harnesses"
+                | "bhf_work"
+                | "target"
+                | "build"
+                | "node_modules"
+                | "vendor"
+                | "vendored"
+                | "third_party"
+                | "thirdparty"
+                | "third-party"
+                | "3rdparty"
+                | "3rd_party"
+                | "site-packages"
+                | "venv"
+                | "__pycache__"
+                | "testdata"
+        )
+        || filter.skips_user_only(name)
+}
+
 fn is_excluded_dir(path: &Path, filter: &DirFilter) -> bool {
     // The run's own work directory, even when custom-named and nested in the tree.
     if filter.is_work_dir(path) {

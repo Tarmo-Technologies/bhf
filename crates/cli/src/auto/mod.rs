@@ -63,6 +63,7 @@ pub mod php_build;
 pub mod preflight;
 pub mod progress;
 pub mod provenance;
+pub mod provided;
 pub mod python_build;
 pub mod recipe_mining;
 pub mod repair;

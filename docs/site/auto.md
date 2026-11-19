@@ -582,7 +582,7 @@ Per-file dispatch by extension:
 | `.java` | `java_parser::parse_java_methods` | `target_rank::rank_java_targets` |
 | `.py` | `python_parser::parse_python_functions` | `target_rank::rank_python_targets` |
 | `.pl`, `.pm` | `perl_parser::parse_perl_subs` | `target_rank::rank_perl_targets` |
-| `.go` (skips `_test.go`) | `go_parser::parse_go_functions` | `target_rank::rank_go_targets` |
+| `.go` (skips `_test.go`, whose fuzz tests are [provided harnesses](#provided-harnesses)) | `go_parser::parse_go_functions` | `target_rank::rank_go_targets` |
 | `.cob`, `.cbl`, `.cobol`, `.cble` | lane-specific `parse_cobol` | byte-buffer `LINKAGE` / `USING` eligibility |
 | `.f`, `.for`, `.f77`, `.f90`, `.f95`, `.f03`, `.f08` | lane-specific `parse_fortran` | character-argument eligibility |
 | `.cs` | lane-specific `parse_csharp` | public byte/string/stream input methods |
@@ -593,6 +593,52 @@ Per-file dispatch by extension:
 
 Candidates with unsupported parameter types are dropped before the attempt
 loop runs, so the report does not carry pre-doomed entries.
+
+### Provided harnesses
+
+A harness the project already ships is fuzzed too, as it is: it states how
+the project means its code to be fuzzed, so it is found where the walk above
+does not look (`_test.go` files, `fuzz/` and test directories), it ranks
+ahead of every generated target, and it starts from the seeds that come with
+it. `bhf auto` prints `provided harnesses: N the project ships (...)` after
+discovery, `run.json` marks each one with `targets[].provided_harness` (see
+[`run.json`](#runjson)), and the summary lists them under `Provided
+harnesses`. The walk for them skips the work dir, build output, VCS and other
+hidden directories, vendored dependencies (`vendor/`, `third_party/`, ...),
+`testdata/` and every `--exclude-dir`, and for Go fuzz tests a directory whose
+name starts with `_`, which the go tool ignores too; `--languages`,
+`--target` and the other filters apply to them as to any target.
+
+- **Go native fuzz tests.** A top-level `func FuzzXxx(f *testing.F)` in a
+  `_test.go` file, the entry point `go test -fuzz` runs, is a target named
+  `FuzzXxx` (`H-G` id). `go test` runs it with its own engine, so bhf builds
+  it the way OSS-Fuzz builds native Go fuzzers: the test file is copied into
+  its package as an ordinary source, with its `testing` import pointed at a
+  stand-in package whose `f.Fuzz` hands bhf's inputs to the fuzz target, and
+  a generated `main` runs the fuzz test in its package's directory, as `go
+  test` does. The package and what it imports from its module are copied
+  into the harness dir (`bhf_module/`), each file with a `//line` directive
+  naming the original, so `go build -cover` gives edge coverage and a panic
+  names the project's file and line; the scanned tree is not written to. An
+  external test (`package x_test`) is copied into a harness package of its
+  own. When the fuzz test needs a helper another test file of its package
+  defines, the build is retried with the package's other test files, and an
+  external test's then with its package's internal test files too, compiled
+  into the package's copy as `go test` compiles them (an `export_test.go`
+  that exports what the external test calls). The
+  fuzz target's arguments (`[]byte`, `string`, `bool`, the integer types,
+  `float32`, `float64`) are decoded from each input in the layout bhf's
+  generated Go harnesses use: a `[]byte` or `string` takes the rest of the
+  input when it is the last argument, else one length byte and that many
+  bytes; a `bool` or `byte` one byte; any other integer, and a float, 8
+  bytes, little-endian. The fuzz test's `f.Add` seeds and the files of its
+  seed corpus, `testdata/fuzz/FuzzXxx/` in the `go test fuzz v1` encoding,
+  are written in that layout to `harnesses/<id>/provided-seeds/` and start
+  the fuzz passes; one that is not of the fuzz target's argument types is
+  counted in the record's `notes`. A recovered panic is a finding, and so is
+  a failure the fuzz target reports through its `*testing.T` (`t.Error`,
+  `t.Fatal`), as it is to `go test`; `t.Skip` skips the input. A fuzz test
+  that fails or skips before reaching `f.Fuzz` is skipped with the reason.
 
 C and C++ harnesses are Makefile-based. Auto uses `clang` / `clang++` for the
 default coverage-guided sanitizer build unless `CC` / `CXX` are set. See
@@ -807,6 +853,15 @@ The machine report. Each `built_and_fuzzed` target carries, under
 The top-level `summary` carries `fuzz_confirmed` — how many static findings a
 fuzz/oracle hit confirmed at the same source site (omitted when zero). See
 [Fuzz-confirmation](#fuzz-confirmation).
+
+A target that is a harness the project ships ([Provided
+harnesses](#provided-harnesses)) carries `targets[].provided_harness`:
+`origin` (`go-fuzz-test`), `entry` (the fuzz test's name), `source` (the file
+that defines it), `seeds` (how many starting inputs came with it),
+`seed_sources` (its seed corpus directory) and `notes` (seeds it came with
+that could not be used, and why). The top-level `summary.provided_harnesses`
+counts them (omitted when zero), and `run.md` tags each one's row
+`[provided harness: <origin>, N seed(s)]`.
 
 The top-level `seeds` block records where the run's seeds came from:
 `source` (`user`, `mined` or `none`), `count`, `mining` (`ran`,

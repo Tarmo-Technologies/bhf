@@ -3737,6 +3737,8 @@ fn run_attempt(
                     crate::auto::go_build::load_structured_seed_inputs(&harness_dir)
                         .map_err(anyhow::Error::msg)?,
                 );
+                // A provided harness's own seeds: its `f.Add` calls and corpus.
+                seeds.extend(crate::auto::provided::load_seeds(&harness_dir));
                 crate::fuzz::expand_sequence_portfolio_seeds(&harness_dir, &mut seeds);
                 // Start each target's edge-coverage bitmap empty; passes then
                 // accumulate into it (#385).

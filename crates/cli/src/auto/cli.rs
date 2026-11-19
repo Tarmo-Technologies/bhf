@@ -74,6 +74,8 @@ interpreter for the languages you select. For Windows C/C++, install VS Build
 Tools with the C++ workload (bhf finds it and its clang; no Developer shell
 needed) and GNU make; `--cc cl` builds the harnesses with cl.exe. A Visual
 Studio solution in the tree is imported for its include dirs and defines.
+Harnesses the project already ships (Go native fuzz tests) are fuzzed first,
+from the seeds that come with them.
 Read results/INDEX.md for findings
 and auto/summary.txt for targets that built, fuzzed, or were skipped.
 Add --resume to the same command to continue a stopped run.";
@@ -1895,6 +1897,15 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         args.discovery_cache.as_deref(),
         args.preprocess,
     )?;
+    // The harnesses the project ships (Go native fuzz tests) live where
+    // discovery of generated targets does not look; they go first.
+    crate::auto::provided::merge_into(
+        &mut candidates,
+        crate::auto::provided::discover(&path, &dir_filter),
+    );
+    if let Some(note) = crate::auto::provided::discovered_note(&candidates) {
+        bhfeprintln!("{note}");
+    }
     if let Some(note) =
         default_skips_note(&crate::auto::discovery::default_skips(&path, &dir_filter))
     {
@@ -3679,7 +3690,8 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         stopped_by_operator,
     );
 
-    let rendered = summary.render();
+    let mut rendered = summary.render();
+    rendered.push_str(&crate::auto::provided::render_summary(&results));
     bhfeprintln!();
     // Findings are the operator's primary deliverable: show the severe digest
     // before campaign mechanics and blocker diagnostics.

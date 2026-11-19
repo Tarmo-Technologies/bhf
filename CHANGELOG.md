@@ -2969,6 +2969,18 @@
   `binary rehost` (a value added to the `bhf.findings.v1` schema's
   `producer` enum) and the reproduce command `bhf replay findings/<id>`;
   they get no `replay.py`.
+- `bhf auto` fuzzes the Go native fuzz tests a project ships (#336): each
+  `func FuzzXxx(f *testing.F)` in a `_test.go` file is a target, built
+  against a stand-in for `testing` whose `f.Fuzz` hands bhf's inputs to the
+  fuzz target, with `go build -cover` edge coverage, and started from its
+  `f.Add` seeds and its `testdata/fuzz/FuzzXxx` corpus. A panic, or a failure
+  the fuzz target reports through `t.Error`/`t.Fatal`, is a finding. An
+  external test that calls what its package's `export_test.go` exports
+  builds too. `testdata/` and `_`-prefixed directories are skipped, as the
+  go tool skips them. These
+  provided harnesses rank ahead of generated targets; `run.json` marks each
+  with `targets[].provided_harness` and counts them in
+  `summary.provided_harnesses` (both new, omitted otherwise).
 - `bhf differential --metamorphic-transform` has a transform registry (#330):
   `append-newline`, `trailing-whitespace` (a space and a tab at the end of
   every line), `reorder-json-keys` (every JSON object's members in reverse
