@@ -33,6 +33,25 @@ pub fn require_tool_with(available: bool, what: &str, required: bool) -> bool {
     available
 }
 
+/// rustup's `cargo` proxy (`$CARGO_HOME/bin/cargo`), which takes a
+/// `+toolchain` argument, else `cargo` from PATH. Under `cargo test` on
+/// Windows, rustup puts the running toolchain's own `bin` first on PATH, and
+/// that cargo refuses `+nightly`.
+pub fn rustup_cargo() -> PathBuf {
+    std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+                .map(|home| PathBuf::from(home).join(".cargo"))
+        })
+        .map(|home| {
+            home.join("bin")
+                .join(if cfg!(windows) { "cargo.exe" } else { "cargo" })
+        })
+        .filter(|cargo| cargo.is_file())
+        .unwrap_or_else(|| PathBuf::from("cargo"))
+}
+
 /// The `.bhf-build` a build probe of `bhf auto --work-dir work` wrote, in its
 /// probe home under `work/probe/`: the probe builds outside the scanned tree.
 /// Panics unless there is exactly one.

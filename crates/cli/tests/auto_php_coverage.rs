@@ -95,10 +95,6 @@ fn covered_fixture_lines(work: &Path) -> Vec<u32> {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "PHP runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn fuzzing_one_function_marks_none_of_its_siblings_lines() {
     if !have_php_with_pcov() {
         eprintln!("skipping: no php with pcov on PATH");
@@ -119,10 +115,6 @@ fn fuzzing_one_function_marks_none_of_its_siblings_lines() {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "PHP runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn a_string_gated_division_by_zero_is_found_within_twenty_thousand_inputs() {
     if !have_php_with_pcov() {
         eprintln!("skipping: no php with pcov on PATH");

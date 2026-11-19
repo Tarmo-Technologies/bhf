@@ -144,7 +144,7 @@ fn afl_fuzzes_a_fortran_routine_and_finds_its_overflow() {
 }
 
 fn cargo_nightly() -> bool {
-    let present = Command::new("cargo")
+    let present = Command::new(support::rustup_cargo())
         .args(["+nightly", "--version"])
         .output()
         .is_ok_and(|output| output.status.success());

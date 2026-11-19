@@ -2853,6 +2853,53 @@
   when bhf panics.
 
 ### Added
+- The Fortran lane runs on native Windows (#327). MinGW-w64's gfortran ships
+  no AddressSanitizer, so there the Fortran objects are compiled with
+  gfortran's bounds and pointer checks, a failed check is a crash instead of
+  an `exit(2)`, MinGW's gcc builds the driver and glue, and each finding's
+  `fidelity.sanitizers` says `none (toolchain limit)` with the reason. With
+  it no lane is refused on native Windows any more.
+- The Rust lane runs on native Windows (#326): the harness crate builds as
+  an MSVC staticlib with SanitizerCoverage, AddressSanitizer and the static
+  CRT, and clang links it with the driver and the system libraries rustc's
+  `native-static-libs` note names. The harness sets ASan's
+  `windows_hook_rtl_allocators=1` default, since Rust's allocator calls the
+  Windows heap directly. A Rust capsule's `build.sh` rebuilds the same way
+  on an MSVC host, and its vendored packages are found there.
+- The Perl, Ruby, Lua and PHP lanes run on native Windows (#325): each `main`
+  launcher has a launch spec, `PERL5LIB` and the Ruby load path take the
+  host's separator, and Perl's driver sends the target's output to the
+  platform's null device. Lua reads its standard input in text mode on
+  Windows, so there its driver asks for hex frames: a harness whose ready
+  byte is `H` is sent each input as hex digits.
+  `scripts/ci/install-lua-windows.ps1` builds Lua 5.4 from lua.org's source,
+  and the Windows CI job runs the four lanes' tests.
+- `bhf fuzz --extension` gives the builtin loop the extension's mutation
+  stage (#314): one in four mutated children is the extension's
+  `mutator.mutate` of the base the loop picked, within at most 1000 calls and
+  a quarter of the pass's `--time`; a call that times out cuts the stage off
+  and the campaign goes on. The run summary's `extension.stages` records it.
+- With `codec.decode` and `codec.encode`, a child is the base decoded, one
+  value of it mutated and encoded back, so a framed format keeps its length
+  and checksum right (#373). Codec errors are counted, never findings.
+- The extension's `lifecycle.setup`, `reset` and `teardown` run around the
+  campaign and between its cases (#374). A setup or reset the extension
+  answers as failed stops the campaign with its message.
+- `bhf binary fuzz --engine afl-frida` runs AFL++'s Frida mode (`afl-fuzz
+  -O`) on a binary without source (#322). Both binary-only modes record their
+  engine, the trace program or library, `executions` and a `fidelity` object
+  (coverage source, CmpLog, edges found) in the run JSON, and the container
+  acceptance runs both through bhf.
+- `bhf binary fuzz --persistent-addr <ADDR>` runs the target in AFL++'s
+  persistent loop from that address under QEMU or Frida mode
+  (`AFL_QEMU_PERSISTENT_ADDR` with `AFL_QEMU_PERSISTENT_GPR=1`, or
+  `AFL_FRIDA_PERSISTENT_ADDR`), and `--entrypoint <ADDR>` starts the fork
+  server later (`AFL_ENTRYPOINT`) (#375).
+- QEMU- and Frida-mode runs of `bhf binary fuzz` use CmpLog (`afl-fuzz -c 0`)
+  by default; `--no-cmplog` turns it off (#376).
+- The nightly builds AFL++'s QEMU and Frida modes with
+  `scripts/ci/build-afl-binary-modes.sh`, which the container image's stage
+  now runs too, and runs the binary-only tests against them.
 - The container image ships AFL++'s QEMU and Frida modes (#321):
   `/usr/bin/afl-qemu-trace` and `/usr/lib/afl/afl-frida-trace.so`, built from
   the AFL++ release Ubuntu's `afl++` package carries (4.09c), with the qemuafl
@@ -2967,6 +3014,42 @@
   reproduces with that build; a harness whose CFI build fails is named.
   `run.json` (`summary.unobservable_classes`) and `run.md` list the bug classes
   no lane of the run could observe in its C/C++ targets, and what would.
+- A protocol profile of `kind = "giop"` drives a CORBA servant (#315):
+  every message is a GIOP 1.2 Request, its fields the operation's `in`
+  parameters at their IDL types (`octet`, `boolean`, `short`, `long`, their
+  unsigned forms, `enum`, `string`, `sequence<octet>`), marshalled in CDR by
+  the `iiop` crate, which no command used before, and sent over the session
+  lane's TCP transport. A `[giop]` table gives the object key and byte
+  order; replies are framed by their GIOP header (`framing = "giop"`) and
+  must answer the request's id, and a capture reads the Reply's
+  `reply_status` or `request_id` or the next value of its body, so a
+  captured handle can be passed to a later operation. The `iiop` crate
+  gains a GIOP 1.2 Reply encoder and a CDR string from raw bytes. A test
+  fixture server built on `iiop` has a servant that crashes on a store into
+  a slot past a bin's, behind an `open_bin` handle; the campaign finds it as
+  a dropped session at that store, which `bhf replay` reproduces.
+- Reference protocol profiles for CoAP and RTPS/DDS over UDP (#372), in
+  `profiles/protocols/coap.toml` and `rtps.toml`, for the session lane's
+  `udp:` backend. The CoAP session discovers `/.well-known/core`, reads
+  `/limit` and updates it with a conditional PUT whose If-Match carries the
+  ETag the read returned; only a piggybacked 2.05 or 2.04 advances it. The
+  RTPS 2.3 session announces a participant (SPDP), heartbeats its SEDP
+  publications writer to the participant that answered, addressed with the
+  GUID prefix that participant announced, and sends the publication at the
+  sequence number the reader's ACKNACK asked for. Each profile is tested
+  against a fixture server over UDP.
+- Reference protocol profiles for Modbus/TCP and MQTT 3.1.1 (#311), in
+  `profiles/protocols/modbus-tcp.toml` and `mqtt-3.1.1.toml`. The Modbus
+  session reads a holding register, writes back the value it read and writes
+  a block of registers; the MQTT session connects, subscribes, publishes at
+  QoS 2, releases the publication with the packet id the broker's PUBREC
+  named, and pings. A state is reached only on the reply that answers the
+  request: a Modbus exception response or a refused CONNECT does not advance
+  the session. A profile's `[framing]` can be `length_field`, for a protocol
+  whose header carries the message's length (Modbus's MBAP length at byte 4,
+  MQTT's Remaining Length, a variable byte integer, at byte 1): a request is
+  written as it is and a reply read by that length, header included. Each
+  profile is tested against a fixture server.
 - Ada harnesses get a coverage report too (#310): the replay records the PC
   of each trace-pc edge an input reaches (`BHF_COV_PCS`, in the Ada coverage
   runtime), takes the binary's calls to the callback as the instrumented

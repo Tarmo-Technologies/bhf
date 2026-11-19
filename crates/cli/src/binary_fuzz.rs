@@ -93,11 +93,35 @@ pub struct BinaryFuzzArgs {
     /// `--iterations`, `--time` or the first crash. `afl-qemu` drives AFL++ in
     /// QEMU mode (`afl-fuzz -Q`) so a binary-only / foreign-arch target with NO
     /// source still gets coverage-guided mutation — qemu's DBT injects edge
-    /// coverage during translation. `auto` (default) uses afl-qemu when its
-    /// toolchain is present, else falls back to builtin; the run JSON says so
-    /// (`degraded`).
+    /// coverage during translation. `afl-frida` drives AFL++ in Frida mode
+    /// (`afl-fuzz -O`), which instruments the binary as it runs on the host
+    /// CPU: for a native binary QEMU mode emulates poorly or slowly. `auto`
+    /// (default) uses afl-qemu when its toolchain is present, else falls back
+    /// to builtin; the run JSON says so (`degraded`).
     #[arg(long, value_enum, default_value_t = BinaryFuzzEngine::Auto)]
     pub engine: BinaryFuzzEngine,
+
+    /// QEMU or Frida mode: run the target in a persistent loop from this
+    /// address (hex), restoring its registers on each pass, so the binary is
+    /// not started again for every input. The loop ends where the function at
+    /// the address returns. Sets `AFL_QEMU_PERSISTENT_ADDR` (with
+    /// `AFL_QEMU_PERSISTENT_GPR=1`) or `AFL_FRIDA_PERSISTENT_ADDR`. A
+    /// position-independent binary's addresses are where the emulator loads
+    /// it, not what `nm` prints.
+    #[arg(long = "persistent-addr", value_name = "ADDR", value_parser = parse_address)]
+    pub persistent_addr: Option<u64>,
+
+    /// QEMU or Frida mode: start the fork server at this address (hex)
+    /// instead of the binary's entry point (`AFL_ENTRYPOINT`), so each run
+    /// skips the start-up before it.
+    #[arg(long = "entrypoint", value_name = "ADDR", value_parser = parse_address)]
+    pub entrypoint: Option<u64>,
+
+    /// QEMU or Frida mode: run without CmpLog. By default afl-fuzz runs with
+    /// `-c 0`: it logs the target's comparisons and puts their operands into
+    /// the input, which solves a magic value the havoc stage rarely guesses.
+    #[arg(long = "no-cmplog")]
+    pub no_cmplog: bool,
 
     /// Wall-clock budget (e.g. 30s, 5m). For afl-qemu it defaults to ~100ms per
     /// `--iterations`, clamped to [1s,30s]; the builtin engine stops at it, or
@@ -176,7 +200,20 @@ pub enum BinaryFuzzEngine {
     Builtin,
     #[value(name = "afl-qemu")]
     AflQemu,
+    #[value(name = "afl-frida")]
+    AflFrida,
     Auto,
+}
+
+/// A `--persistent-addr` or `--entrypoint` address: hex, with or without
+/// `0x`.
+fn parse_address(value: &str) -> Result<u64, String> {
+    let digits = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    u64::from_str_radix(digits, 16)
+        .map_err(|_| format!("{value:?} is not a hex address (e.g. 0x401136)"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -222,7 +259,7 @@ impl TargetInvocation {
 
     /// Reject invocations that cannot be launched coherently, with an actionable
     /// message. Pure over the fields so it is unit-testable.
-    fn validate(&self, mode: BinaryInputMode, engine_is_afl_qemu: bool) -> anyhow::Result<()> {
+    fn validate(&self, mode: BinaryInputMode, engine_is_afl: bool) -> anyhow::Result<()> {
         if self.runner.is_none() && !self.runner_args.is_empty() {
             return Err(anyhow!(
                 "--runner-arg requires --runner (the program to pass the args to)"
@@ -235,11 +272,11 @@ impl TargetInvocation {
                  use --input-mode file, or drop the '@@'"
             ));
         }
-        if engine_is_afl_qemu && self.runner.is_some() {
+        if engine_is_afl && self.runner.is_some() {
             return Err(anyhow!(
-                "--runner is not supported with the afl-qemu engine (afl-fuzz -Q provides its \
-                 own QEMU runner); use --engine builtin to run under a custom runner, or drop \
-                 --runner"
+                "--runner is not supported with the afl-qemu or afl-frida engine (afl-fuzz runs \
+                 the binary under QEMU or Frida itself); use --engine builtin to run under a \
+                 custom runner, or drop --runner"
             ));
         }
         Ok(())
@@ -343,27 +380,30 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
     // foreign-arch targets via QEMU DBT; builtin just replays the seeds.
     let engine = resolve_binary_engine(args.engine)?;
     let invocation = TargetInvocation::from_args(&args);
-    invocation.validate(
-        args.input_mode,
-        matches!(engine, ResolvedEngine::AflQemu(_)),
-    )?;
+    invocation.validate(args.input_mode, matches!(engine, ResolvedEngine::Afl(_)))?;
     // #55: user postconditions are a builtin-engine capability; the afl-qemu
     // adapter path is out of scope here.
-    if args.oracle_command.is_some() && matches!(engine, ResolvedEngine::AflQemu(_)) {
+    if args.oracle_command.is_some() && matches!(engine, ResolvedEngine::Afl(_)) {
         return Err(anyhow!(
             "--oracle-command (user postcondition oracles) is supported only with \
              --engine builtin; drop --oracle-command or pass --engine builtin"
         ));
     }
     let degraded = match engine {
-        ResolvedEngine::AflQemu(aq) => {
+        ResolvedEngine::Afl(afl) => {
             let mut summary =
-                run_afl_qemu(&args, &aq, &seeds, hints.as_ref(), &env, &findings_dir)?;
+                run_afl_binary(&args, &afl, &seeds, hints.as_ref(), &env, &findings_dir)?;
             summary["adapter_report"] = adapter_report;
             return Ok(summary);
         }
         ResolvedEngine::Builtin { degraded } => degraded,
     };
+    if args.persistent_addr.is_some() || args.entrypoint.is_some() {
+        return Err(anyhow!(
+            "--persistent-addr and --entrypoint need --engine afl-qemu or afl-frida (the \
+             builtin engine starts the binary for every input)"
+        ));
+    }
     let time_budget = match args.time.as_deref() {
         Some(time) => Some(Duration::from_secs(parse_duration_secs(time).ok_or_else(
             || anyhow!("--time {time:?} is not a duration (e.g. 30s, 5m)"),
@@ -877,10 +917,9 @@ fn runtime_oracle_provenance(
 #[derive(Debug)]
 enum ResolvedEngine {
     /// The blind havoc loop, and why it runs without coverage.
-    Builtin {
-        degraded: String,
-    },
-    AflQemu(AflQemu),
+    Builtin { degraded: String },
+    /// AFL++ in QEMU or Frida mode.
+    Afl(AflBinary),
 }
 
 /// The builtin engine's blind havoc mutator: each input is a seed, picked at
@@ -926,16 +965,71 @@ impl<'a> BlindHavoc<'a> {
     }
 }
 
-/// AFL++ QEMU-mode toolchain: `afl-fuzz` plus the `afl-qemu-trace` it shells out
-/// to for DBT-injected edge coverage.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AflQemu {
-    pub(crate) afl_fuzz: PathBuf,
-    pub(crate) afl_qemu_trace: PathBuf,
+/// How AFL++ instruments a binary without source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AflBinaryMode {
+    /// `afl-fuzz -Q`: QEMU user mode translates the binary and injects edge
+    /// coverage as it does.
+    Qemu,
+    /// `afl-fuzz -O`: Frida instruments the binary as it runs on the host CPU.
+    Frida,
 }
 
-/// Resolve the concrete engine. Explicit `afl-qemu` hard-requires the toolchain
-/// (actionable error if missing); `auto` falls back to builtin with a note.
+impl AflBinaryMode {
+    /// The afl-fuzz flag that selects the mode.
+    fn flag(self) -> &'static str {
+        match self {
+            Self::Qemu => "-Q",
+            Self::Frida => "-O",
+        }
+    }
+
+    /// The `--engine` value, as the run JSON records it.
+    fn engine(self) -> &'static str {
+        match self {
+            Self::Qemu => "afl-qemu",
+            Self::Frida => "afl-frida",
+        }
+    }
+
+    /// The mode's name in messages.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Qemu => "AFL++ QEMU mode",
+            Self::Frida => "AFL++ Frida mode",
+        }
+    }
+
+    /// Where the coverage comes from, as the run JSON's fidelity says.
+    fn coverage(self) -> &'static str {
+        match self {
+            Self::Qemu => "edges, injected by QEMU as it translates the binary",
+            Self::Frida => "edges, instrumented by Frida as the binary runs",
+        }
+    }
+
+    /// The variable that sets the persistent loop's address.
+    fn persistent_var(self) -> &'static str {
+        match self {
+            Self::Qemu => "AFL_QEMU_PERSISTENT_ADDR",
+            Self::Frida => "AFL_FRIDA_PERSISTENT_ADDR",
+        }
+    }
+}
+
+/// AFL++'s toolchain for a binary-only mode: `afl-fuzz`, plus the program
+/// (`afl-qemu-trace`) or library (`afl-frida-trace.so`) the mode runs the
+/// binary with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AflBinary {
+    pub(crate) mode: AflBinaryMode,
+    pub(crate) afl_fuzz: PathBuf,
+    pub(crate) trace: PathBuf,
+}
+
+/// Resolve the concrete engine. An explicit `afl-qemu` or `afl-frida`
+/// hard-requires its toolchain (actionable error if missing); `auto` falls
+/// back to builtin with a note.
 fn resolve_binary_engine(engine: BinaryFuzzEngine) -> anyhow::Result<ResolvedEngine> {
     match engine {
         BinaryFuzzEngine::Builtin => Ok(ResolvedEngine::Builtin {
@@ -944,10 +1038,13 @@ fn resolve_binary_engine(engine: BinaryFuzzEngine) -> anyhow::Result<ResolvedEng
                 .to_owned(),
         }),
         BinaryFuzzEngine::AflQemu => resolve_afl_qemu()
-            .map(ResolvedEngine::AflQemu)
+            .map(ResolvedEngine::Afl)
+            .map_err(|reason| anyhow!(reason)),
+        BinaryFuzzEngine::AflFrida => resolve_afl_frida()
+            .map(ResolvedEngine::Afl)
             .map_err(|reason| anyhow!(reason)),
         BinaryFuzzEngine::Auto => match resolve_afl_qemu() {
-            Ok(aq) => Ok(ResolvedEngine::AflQemu(aq)),
+            Ok(afl) => Ok(ResolvedEngine::Afl(afl)),
             Err(reason) => {
                 bhfeprintln!(
                     "bhf binary-fuzz: {reason}; falling back to the builtin engine's \
@@ -959,21 +1056,69 @@ fn resolve_binary_engine(engine: BinaryFuzzEngine) -> anyhow::Result<ResolvedEng
     }
 }
 
-/// Resolve the AFL++ QEMU-mode toolchain, or an ACTIONABLE reason it's missing.
-pub(crate) fn resolve_afl_qemu() -> Result<AflQemu, String> {
-    let afl_fuzz = which_on_path("afl-fuzz").ok_or_else(|| {
+/// `afl-fuzz` on PATH, or an actionable reason it is missing.
+fn resolve_afl_fuzz() -> Result<PathBuf, String> {
+    which_on_path("afl-fuzz").ok_or_else(|| {
         "afl-fuzz not found on PATH; install AFL++ (apt install afl++, or build AFLplusplus)"
             .to_owned()
-    })?;
-    let afl_qemu_trace = resolve_afl_qemu_trace().ok_or_else(|| {
+    })
+}
+
+/// Resolve the AFL++ QEMU-mode toolchain, or an ACTIONABLE reason it's missing.
+pub(crate) fn resolve_afl_qemu() -> Result<AflBinary, String> {
+    let afl_fuzz = resolve_afl_fuzz()?;
+    let trace = resolve_afl_qemu_trace().ok_or_else(|| {
         "afl-qemu-trace not found (AFL++ QEMU mode is built separately); run \
          `AFLplusplus/qemu_mode/build_qemu_support.sh` or set BHF_AFL_QEMU_TRACE to its path"
             .to_owned()
     })?;
-    Ok(AflQemu {
+    Ok(AflBinary {
+        mode: AflBinaryMode::Qemu,
         afl_fuzz,
-        afl_qemu_trace,
+        trace,
     })
+}
+
+/// Resolve the AFL++ Frida-mode toolchain, or an actionable reason it is
+/// missing.
+pub(crate) fn resolve_afl_frida() -> Result<AflBinary, String> {
+    let afl_fuzz = resolve_afl_fuzz()?;
+    let override_var = std::env::var_os("BHF_AFL_FRIDA_TRACE").map(PathBuf::from);
+    let afl_path = std::env::var_os("AFL_PATH").map(PathBuf::from);
+    let trace = afl_frida_trace_candidates(override_var, afl_path, &afl_fuzz)
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            "afl-frida-trace.so not found (AFL++ Frida mode is built separately); run `make` \
+             in AFLplusplus/frida_mode or set BHF_AFL_FRIDA_TRACE to its path"
+                .to_owned()
+        })?;
+    Ok(AflBinary {
+        mode: AflBinaryMode::Frida,
+        afl_fuzz,
+        trace,
+    })
+}
+
+/// Ordered candidate paths for `afl-frida-trace.so`: the explicit override,
+/// `AFL_PATH`, the `lib/afl` beside the `afl-fuzz` in use, then the common
+/// install dirs. Pure (no FS/env) so the precedence is unit-testable.
+fn afl_frida_trace_candidates(
+    override_var: Option<PathBuf>,
+    afl_path: Option<PathBuf>,
+    afl_fuzz: &Path,
+) -> Vec<PathBuf> {
+    const NAME: &str = "afl-frida-trace.so";
+    let mut candidates: Vec<PathBuf> = override_var.into_iter().collect();
+    if let Some(afl_path) = afl_path {
+        candidates.push(afl_path.join(NAME));
+    }
+    if let Some(prefix) = afl_fuzz.parent().and_then(Path::parent) {
+        candidates.push(prefix.join("lib/afl").join(NAME));
+    }
+    candidates.push(PathBuf::from("/usr/lib/afl").join(NAME));
+    candidates.push(PathBuf::from("/usr/local/lib/afl").join(NAME));
+    candidates
 }
 
 /// Locate `afl-qemu-trace`: explicit `BHF_AFL_QEMU_TRACE` override, then PATH,
@@ -1021,14 +1166,18 @@ fn which_on_path(name: &str) -> Option<PathBuf> {
     })
 }
 
-/// Build the `afl-fuzz -Q` argv for a binary-only target. File-input mode appends
-/// `@@` (AFL substitutes the testcase path); stdin mode omits it (AFL feeds the
-/// testcase on stdin). `-t` sets the per-exec timeout (ms) and `-m` the child
-/// memory limit so the campaign matches the replay oracle. Kept pure for testing.
+/// Build the `afl-fuzz -Q` (or `-O`) argv for a binary-only target.
+/// File-input mode appends `@@` (AFL substitutes the testcase path); stdin
+/// mode omits it (AFL feeds the testcase on stdin). `-t` sets the per-exec
+/// timeout (ms) and `-m` the child memory limit so the campaign matches the
+/// replay oracle. With `cmplog`, `-c 0` runs CmpLog through the same binary,
+/// as the binary-only modes do. Kept pure for testing.
 // A flat flag-bundle builder: the inputs are distinct afl-fuzz knobs, and a
 // struct would only scatter the same fields without clarifying the one argv.
 #[allow(clippy::too_many_arguments)]
-fn afl_qemu_argv(
+fn afl_binary_argv(
+    afl_mode: AflBinaryMode,
+    cmplog: bool,
     binary: &Path,
     seeds_dir: &Path,
     out_dir: &Path,
@@ -1038,8 +1187,11 @@ fn afl_qemu_argv(
     mode: BinaryInputMode,
     target_args: &[String],
 ) -> Vec<String> {
-    let mut argv = vec![
-        "-Q".to_owned(),
+    let mut argv = vec![afl_mode.flag().to_owned()];
+    if cmplog {
+        argv.extend(["-c".to_owned(), "0".to_owned()]);
+    }
+    argv.extend([
         "-i".to_owned(),
         seeds_dir.display().to_string(),
         "-o".to_owned(),
@@ -1052,7 +1204,7 @@ fn afl_qemu_argv(
         mem.to_owned(),
         "--".to_owned(),
         binary.display().to_string(),
-    ];
+    ]);
     // Fixed target args follow the binary; AFL substitutes a `@@` among them with
     // the testcase path. If file mode has no explicit `@@`, append one so AFL
     // still passes the testcase as a file argument (its default is stdin).
@@ -1094,33 +1246,71 @@ fn parse_duration_secs(value: &str) -> Option<u64> {
     Some(duration.as_secs() + u64::from(duration.subsec_nanos() > 0))
 }
 
-/// The lineage of a crash AFL++ QEMU mode found: unknown, since AFL++
-/// schedules its own queue and bhf does not see what the input was mutated
-/// from. Nothing is guessed; the reason names the crash file.
-fn afl_qemu_lineage(crash: &Path) -> corpus::lineage::FindingLineage {
+/// The variables that set up a persistent loop or a later fork-server start
+/// for `afl_mode`: `--persistent-addr` (with the registers restored on each
+/// QEMU pass) and `--entrypoint`. Pure, for testing.
+fn afl_binary_env(
+    afl_mode: AflBinaryMode,
+    persistent_addr: Option<u64>,
+    entrypoint: Option<u64>,
+) -> Vec<(&'static str, String)> {
+    let mut env = Vec::new();
+    if let Some(addr) = persistent_addr {
+        env.push((afl_mode.persistent_var(), format!("0x{addr:x}")));
+        if afl_mode == AflBinaryMode::Qemu {
+            env.push(("AFL_QEMU_PERSISTENT_GPR", "1".to_owned()));
+        }
+    }
+    if let Some(addr) = entrypoint {
+        env.push(("AFL_ENTRYPOINT", format!("0x{addr:x}")));
+    }
+    env
+}
+
+/// The lineage of a crash AFL++ found in a binary-only mode: unknown, since
+/// AFL++ schedules its own queue and bhf does not see what the input was
+/// mutated from. Nothing is guessed; the reason names the crash file.
+fn afl_binary_lineage(afl_mode: AflBinaryMode, crash: &Path) -> corpus::lineage::FindingLineage {
     let name = crash
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
     corpus::lineage::FindingLineage::unknown(format!(
-        "found by AFL++ QEMU mode, which schedules its own queue; bhf does not see which \
-         input this one was mutated from (AFL++ crash file {name})"
+        "found by {}, which schedules its own queue; bhf does not see which input this one \
+         was mutated from (AFL++ crash file {name})",
+        afl_mode.name()
     ))
 }
 
-/// Drive AFL++ in QEMU mode (`afl-fuzz -Q`) against a binary-only target: qemu's
-/// DBT injects edge coverage so a foreign-arch / no-source binary gets
-/// coverage-guided mutation. Harvest `out/default/crashes/` and confirm+record
-/// each as a `binary_crash` finding via the same crash oracle as builtin.
-fn run_afl_qemu(
+/// `fuzzer_stats`'s numeric fields, by name (`execs_done`, `edges_found`).
+fn afl_fuzzer_stats(path: &Path) -> BTreeMap<String, u64> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            Some((key.trim().to_owned(), value.trim().parse().ok()?))
+        })
+        .collect()
+}
+
+/// Drive AFL++ in QEMU mode (`afl-fuzz -Q`) or Frida mode (`afl-fuzz -O`)
+/// against a binary-only target: qemu's DBT, or Frida's instrumentation,
+/// gives a no-source binary coverage-guided mutation. Harvest
+/// `out/default/crashes/` and confirm+record each as a `binary_crash` finding
+/// via the same crash oracle as builtin.
+fn run_afl_binary(
     args: &BinaryFuzzArgs,
-    aq: &AflQemu,
+    afl: &AflBinary,
     seeds: &[Vec<u8>],
     hints: Option<&crate::binary_adapter::hints::AdapterHints>,
     env: &BTreeMap<String, String>,
     findings_dir: &Path,
 ) -> anyhow::Result<Value> {
-    let afl_out = args.work_dir.join("afl_qemu_out");
+    let afl_out = args.work_dir.join(match afl.mode {
+        AflBinaryMode::Qemu => "afl_qemu_out",
+        AflBinaryMode::Frida => "afl_frida_out",
+    });
     let _ = fs::remove_dir_all(&afl_out);
     let seeds_dir = afl_out.join("seeds");
     let out_dir = afl_out.join("out");
@@ -1142,7 +1332,10 @@ fn run_afl_qemu(
 
     let secs = afl_qemu_budget_secs(args.time.as_deref(), args.iterations);
     let (mem_arg, mem_provenance) = afl_mem_arg(&args.mem_mb)?;
-    let mut argv = afl_qemu_argv(
+    let cmplog = !args.no_cmplog;
+    let mut argv = afl_binary_argv(
+        afl.mode,
+        cmplog,
         &args.binary,
         &seeds_dir,
         &out_dir,
@@ -1166,15 +1359,16 @@ fn run_afl_qemu(
             .unwrap_or(argv.len());
         argv.splice(at..at, ["-x".to_owned(), dictionary.display().to_string()]);
     }
-    let afl_trace_dir = aq
-        .afl_qemu_trace
+    let afl_trace_dir = afl
+        .trace
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let mut cmd = Command::new(&aq.afl_fuzz);
+    let mut cmd = Command::new(&afl.afl_fuzz);
     cmd.args(&argv)
-        // afl-fuzz -Q finds afl-qemu-trace via AFL_PATH (then alongside afl-fuzz).
+        // afl-fuzz -Q finds afl-qemu-trace, and -O afl-frida-trace.so, via
+        // AFL_PATH (then alongside afl-fuzz).
         .env("AFL_PATH", &afl_trace_dir)
         .env("AFL_NO_UI", "1")
         .env("AFL_SKIP_CPUFREQ", "1")
@@ -1182,6 +1376,9 @@ fn run_afl_qemu(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for (key, value) in env {
+        cmd.env(key, value);
+    }
+    for (key, value) in afl_binary_env(afl.mode, args.persistent_addr, args.entrypoint) {
         cmd.env(key, value);
     }
     // afl-fuzz refuses a custom `<SAN>_OPTIONS` without `symbolize=0`
@@ -1198,7 +1395,7 @@ fn run_afl_qemu(
     }
     let output = cmd
         .output()
-        .with_context(|| format!("spawn afl-fuzz '{}'", aq.afl_fuzz.display()))?;
+        .with_context(|| format!("spawn afl-fuzz '{}'", afl.afl_fuzz.display()))?;
     // afl-fuzz self-terminates by signal when -V expires (code None) — that's the
     // intended end of a time-boxed run, not a failure. A positive exit is a real
     // error (bad seed, core_pattern, missing afl-qemu-trace, …).
@@ -1219,7 +1416,8 @@ fn run_afl_qemu(
             .collect::<Vec<_>>()
             .join("\n");
         return Err(anyhow!(
-            "afl-fuzz -Q exited non-zero ({:?}). Output tail:\n{tail}",
+            "afl-fuzz {} exited non-zero ({:?}). Output tail:\n{tail}",
+            afl.mode.flag(),
             output.status.code()
         ));
     }
@@ -1263,7 +1461,7 @@ fn run_afl_qemu(
             corpus::finding::write_sanitizer_log(&dir, run.stderr.as_bytes())?;
             let mut finding = render_finding(&id, args, &input, env, &run)?;
             corpus::finding::stamp_v1(&mut finding, corpus::finding::finding_kind::BINARY);
-            let lineage = afl_qemu_lineage(&crash);
+            let lineage = afl_binary_lineage(afl.mode, &crash);
             crate::fuzz_lineage::insert(&mut finding, &lineage);
             fs::write(
                 dir.join("finding.json"),
@@ -1281,11 +1479,14 @@ fn run_afl_qemu(
     let collector = match collector_run::resolve(&args.collector, args.collector_window_ms)? {
         None => collector_run::inactive_run_provenance(&args.collector),
         Some(resolved) => {
-            let queued = afl_queue_replays(&out_dir.join("default").join("queue"))?;
+            let queued = afl_queue_replays(afl.mode, &out_dir.join("default").join("queue"))?;
             let seeded = seeds.iter().enumerate().map(|(idx, seed)| {
                 (
                     collector_run::ReplayTestcase::new(format!("seed-{idx:04}"), seed.clone()),
-                    corpus::lineage::FindingLineage::unknown("a seed of an AFL++ QEMU mode run"),
+                    corpus::lineage::FindingLineage::unknown(format!(
+                        "a seed of an {} run",
+                        afl.mode.name()
+                    )),
                 )
             });
             let replay_inputs: Vec<_> = retained.into_iter().chain(queued).chain(seeded).collect();
@@ -1306,24 +1507,41 @@ fn run_afl_qemu(
     };
     let _ = fs::remove_dir_all(&tmp_dir);
 
-    Ok(json!({
+    let stats = afl_fuzzer_stats(&out_dir.join("default").join("fuzzer_stats"));
+    let mut summary = json!({
         "schema_version": "bhf.binary_fuzz.run.v1",
         "binary": args.binary,
         "input_mode": args.input_mode.as_str(),
-        "engine": "afl-qemu",
-        "afl_qemu_trace": aq.afl_qemu_trace,
+        "engine": afl.mode.engine(),
+        "fidelity": {
+            "mutation": "AFL++ with coverage feedback",
+            "coverage": afl.mode.coverage(),
+            "cmplog": cmplog,
+            "persistent_addr": args.persistent_addr.map(|addr| format!("0x{addr:x}")),
+            "entrypoint": args.entrypoint.map(|addr| format!("0x{addr:x}")),
+            "edges_found": stats.get("edges_found"),
+        },
+        "degraded": false,
+        "executions": stats.get("execs_done"),
         "time_secs": secs,
         "timeout_ms": args.timeout_ms,
         "mem_limit_mb": mem_provenance,
         "collector": collector,
         "findings": finding_ids
-    }))
+    });
+    let trace_key = match afl.mode {
+        AflBinaryMode::Qemu => "afl_qemu_trace",
+        AflBinaryMode::Frida => "afl_frida_trace",
+    };
+    summary[trace_key] = json!(afl.trace);
+    Ok(summary)
 }
 
 /// The entries of an AFL++ `queue/` dir to replay under the collector: those
 /// whose name says they found new coverage (`+cov`) first, then the rest, each
 /// in AFL++'s order.
 fn afl_queue_replays(
+    afl_mode: AflBinaryMode,
     queue: &Path,
 ) -> anyhow::Result<
     Vec<(
@@ -1349,8 +1567,8 @@ fn afl_queue_replays(
         .map(|(_, name, path)| {
             let input = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
             let lineage = corpus::lineage::FindingLineage::unknown(format!(
-                "AFL++ QEMU mode queue entry {name}; bhf does not see which input it was \
-                 mutated from"
+                "{} queue entry {name}; bhf does not see which input it was mutated from",
+                afl_mode.name()
             ));
             // `id:000012,src:000003,...,+cov`: the id names the entry.
             let id = name.split(',').next().unwrap_or(&name).replace(':', "-");
@@ -3005,6 +3223,9 @@ mod tests {
             collector: crate::collector_run::CollectorSpec::Off,
             collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
             adapter_report: None,
+            persistent_addr: None,
+            entrypoint: None,
+            no_cmplog: false,
             rng_seed: 0,
         };
 
@@ -3064,14 +3285,16 @@ mod tests {
             fs::write(dir.join(name), body).unwrap();
         }
         fs::create_dir(dir.join(".state")).unwrap();
-        let replays = afl_queue_replays(&dir).unwrap();
+        let replays = afl_queue_replays(AflBinaryMode::Qemu, &dir).unwrap();
         let names: Vec<&str> = replays.iter().map(|(r, _)| r.testcase.as_str()).collect();
         assert_eq!(
             names,
             ["queue-id-000002", "queue-id-000000", "queue-id-000001"]
         );
         assert_eq!(replays[0].0.input, b"cov");
-        assert!(afl_queue_replays(&dir.join("absent")).unwrap().is_empty());
+        assert!(afl_queue_replays(AflBinaryMode::Qemu, &dir.join("absent"))
+            .unwrap()
+            .is_empty());
     }
 
     #[cfg(unix)]
@@ -3123,7 +3346,9 @@ mod afl_qemu_tests {
 
     #[test]
     fn argv_stdin_mode_has_no_at_at() {
-        let argv = afl_qemu_argv(
+        let argv = afl_binary_argv(
+            AflBinaryMode::Qemu,
+            false,
             Path::new("/b/target"),
             Path::new("/s"),
             Path::new("/o"),
@@ -3155,7 +3380,9 @@ mod afl_qemu_tests {
 
     #[test]
     fn argv_file_mode_appends_at_at() {
-        let argv = afl_qemu_argv(
+        let argv = afl_binary_argv(
+            AflBinaryMode::Qemu,
+            false,
             Path::new("/b/target"),
             Path::new("/s"),
             Path::new("/o"),
@@ -3173,7 +3400,9 @@ mod afl_qemu_tests {
     fn argv_carries_timeout_and_memory_limits() {
         // Issue #44: `--timeout-ms` must reach afl-fuzz as `-t`, and `--mem-mb`
         // as `-m`, so the mutation campaign and the replay oracle agree.
-        let argv = afl_qemu_argv(
+        let argv = afl_binary_argv(
+            AflBinaryMode::Qemu,
+            false,
             Path::new("/b/target"),
             Path::new("/s"),
             Path::new("/o"),
@@ -3271,6 +3500,119 @@ mod afl_qemu_tests {
         assert_eq!(parse_duration_secs("0.5s"), Some(1));
     }
 
+    /// Frida mode is `afl-fuzz -O`, in place of QEMU mode's `-Q`, with the
+    /// same campaign flags (#322).
+    #[test]
+    fn frida_mode_runs_afl_fuzz_with_o() {
+        let argv = afl_binary_argv(
+            AflBinaryMode::Frida,
+            false,
+            Path::new("/b/target"),
+            Path::new("/s"),
+            Path::new("/o"),
+            7,
+            1000,
+            "none",
+            BinaryInputMode::File,
+            &[],
+        );
+        assert_eq!(
+            argv,
+            [
+                "-O",
+                "-i",
+                "/s",
+                "-o",
+                "/o",
+                "-V",
+                "7",
+                "-t",
+                "1000",
+                "-m",
+                "none",
+                "--",
+                "/b/target",
+                "@@"
+            ]
+        );
+        assert_eq!(AflBinaryMode::Frida.engine(), "afl-frida");
+    }
+
+    /// CmpLog runs through the same binary (`-c 0`) unless it is turned off
+    /// (#376).
+    #[test]
+    fn cmplog_is_c_0_unless_turned_off() {
+        for afl_mode in [AflBinaryMode::Qemu, AflBinaryMode::Frida] {
+            let argv = |cmplog| {
+                afl_binary_argv(
+                    afl_mode,
+                    cmplog,
+                    Path::new("/b/target"),
+                    Path::new("/s"),
+                    Path::new("/o"),
+                    7,
+                    1000,
+                    "none",
+                    BinaryInputMode::Stdin,
+                    &[],
+                )
+            };
+            let on = argv(true);
+            assert_eq!(on[..3], [afl_mode.flag(), "-c", "0"], "{on:?}");
+            assert!(!argv(false).iter().any(|arg| arg == "-c"));
+        }
+        #[derive(clap::Parser)]
+        struct Fuzz {
+            #[command(flatten)]
+            args: BinaryFuzzArgs,
+        }
+        let parsed = |extra: &[&str]| {
+            <Fuzz as clap::Parser>::try_parse_from(["fuzz", "bin"].iter().chain(extra).copied())
+                .map(|fuzz| fuzz.args.no_cmplog)
+        };
+        assert!(!parsed(&[]).unwrap(), "CmpLog is on by default");
+        assert!(parsed(&["--no-cmplog"]).unwrap());
+    }
+
+    /// `--persistent-addr` and `--entrypoint` set each mode's variables, and
+    /// QEMU mode's loop restores the registers (#375).
+    #[test]
+    fn persistent_and_entrypoint_set_the_mode_variables() {
+        assert_eq!(
+            afl_binary_env(AflBinaryMode::Qemu, Some(0x401136), Some(0x401000)),
+            [
+                ("AFL_QEMU_PERSISTENT_ADDR", "0x401136".to_owned()),
+                ("AFL_QEMU_PERSISTENT_GPR", "1".to_owned()),
+                ("AFL_ENTRYPOINT", "0x401000".to_owned()),
+            ]
+        );
+        assert_eq!(
+            afl_binary_env(AflBinaryMode::Frida, Some(0x401136), None),
+            [("AFL_FRIDA_PERSISTENT_ADDR", "0x401136".to_owned())]
+        );
+        assert!(afl_binary_env(AflBinaryMode::Qemu, None, None).is_empty());
+        assert_eq!(parse_address("0x401136"), Ok(0x401136));
+        assert_eq!(parse_address("401136"), Ok(0x401136));
+        assert!(parse_address("main").is_err());
+    }
+
+    #[test]
+    fn frida_trace_is_looked_for_beside_afl_fuzz() {
+        let candidates = afl_frida_trace_candidates(
+            Some(PathBuf::from("/x/frida.so")),
+            Some(PathBuf::from("/afl")),
+            Path::new("/opt/aflpp/bin/afl-fuzz"),
+        );
+        assert_eq!(
+            candidates[..3],
+            [
+                PathBuf::from("/x/frida.so"),
+                PathBuf::from("/afl/afl-frida-trace.so"),
+                PathBuf::from("/opt/aflpp/lib/afl/afl-frida-trace.so"),
+            ]
+        );
+    }
+
     #[test]
     fn engine_builtin_is_always_builtin() {
         assert!(matches!(
@@ -3287,8 +3629,20 @@ mod afl_qemu_tests {
         let explicit = resolve_binary_engine(BinaryFuzzEngine::AflQemu);
         let auto = resolve_binary_engine(BinaryFuzzEngine::Auto);
         if available {
-            assert!(matches!(explicit.unwrap(), ResolvedEngine::AflQemu(_)));
-            assert!(matches!(auto.unwrap(), ResolvedEngine::AflQemu(_)));
+            assert!(matches!(
+                explicit.unwrap(),
+                ResolvedEngine::Afl(AflBinary {
+                    mode: AflBinaryMode::Qemu,
+                    ..
+                })
+            ));
+            assert!(matches!(
+                auto.unwrap(),
+                ResolvedEngine::Afl(AflBinary {
+                    mode: AflBinaryMode::Qemu,
+                    ..
+                })
+            ));
         } else {
             let err = explicit.unwrap_err().to_string();
             assert!(
@@ -3387,6 +3741,9 @@ mod afl_qemu_tests {
             collector: crate::collector_run::CollectorSpec::Off,
             collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
             adapter_report: None,
+            persistent_addr: None,
+            entrypoint: None,
+            no_cmplog: false,
             rng_seed: 0,
         };
         let summary = run_inner(args).expect("binary fuzz run");
@@ -3476,6 +3833,9 @@ mod afl_qemu_tests {
             collector: crate::collector_run::CollectorSpec::Auto,
             collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
             adapter_report: None,
+            persistent_addr: None,
+            entrypoint: None,
+            no_cmplog: false,
             rng_seed: 0,
         };
         let summary = run_inner(args).expect("binary fuzz run");
@@ -3790,6 +4150,9 @@ mod afl_qemu_tests {
             collector: crate::collector_run::CollectorSpec::Off,
             collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
             adapter_report: None,
+            persistent_addr: None,
+            entrypoint: None,
+            no_cmplog: false,
             rng_seed: 0,
         };
         let summary = run_inner(args).expect("binary fuzz run");

@@ -3,13 +3,36 @@
 use std::io::{Read, Result};
 
 fn main() -> Result<()> {
-    let mut input = String::new();
-    std::io::stdin().read_to_string(&mut input)?;
+    let mut raw = Vec::new();
+    std::io::stdin().read_to_end(&mut raw)?;
+    let input = String::from_utf8_lossy(&raw).into_owned();
     let event_path = std::env::var("BHF_EVENTS_PATH").map_err(std::io::Error::other)?;
     let mut bytes = Vec::new();
     push_begin(&mut bytes, 1);
     push_target(&mut bytes, 0x42);
     push_crumb(&mut bytes, 1);
+    // Bugs behind gates the builtin mutator does not pass by itself
+    // (`bhf fuzz --extension` stages, #314 and #373): an eight-byte magic,
+    // and an OPEN path longer than its 8-byte buffer inside a frame whose
+    // length and CRC-32 are right.
+    if input.contains("BHFMAGIC") {
+        push_top_level(
+            &mut bytes,
+            "CONSTRAINT_ERROR",
+            "magic.adb:3 index check failed",
+        );
+        push_end(&mut bytes, 0);
+        return std::fs::write(event_path, bytes);
+    }
+    if frame_path(&raw).is_some_and(|path| path.len() > 8) {
+        push_top_level(
+            &mut bytes,
+            "CONSTRAINT_ERROR",
+            "frame.adb:12 length check failed",
+        );
+        push_end(&mut bytes, 0);
+        return std::fs::write(event_path, bytes);
+    }
     // Exceptions that escape the target: an explicit raise with a message,
     // and a failed runtime check GNAT locates in its message.
     match input.as_str() {
@@ -75,6 +98,29 @@ fn main() -> Result<()> {
     );
     push_end(&mut bytes, 0);
     std::fs::write(event_path, bytes)
+}
+
+/// The path of a `[u16 BE length][OPEN <path>][u32 BE CRC-32]` frame whose
+/// length and CRC are right.
+fn frame_path(frame: &[u8]) -> Option<&[u8]> {
+    let payload = frame.get(2..frame.len().checked_sub(4)?)?;
+    let declared = u16::from_be_bytes([frame[0], frame[1]]);
+    let crc = u32::from_be_bytes(frame[frame.len() - 4..].try_into().ok()?);
+    (usize::from(declared) == payload.len() && crc == crc32(payload))
+        .then_some(payload)?
+        .strip_prefix(b"OPEN ")
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
 }
 
 fn push_begin(bytes: &mut Vec<u8>, testcase_id: u64) {

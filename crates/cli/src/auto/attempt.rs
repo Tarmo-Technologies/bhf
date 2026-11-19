@@ -1599,13 +1599,6 @@ fn attempt_unclassified(
     options: AttemptOptions,
     progress: &dyn crate::auto::progress::ProgressSink,
 ) -> Result<AttemptResult> {
-    // A lane that does not run on native Windows (it runs under WSL there) is
-    // refused up front with that reason, rather than failing later in its build
-    // or its launcher in words that read like a missing module or a compile
-    // error.
-    if let Some(reason) = crate::auto::preflight::native_windows_refusal(candidate.lang) {
-        return report_only_attempt(candidate, work_dir, reason);
-    }
     if !options.run_untrusted
         && matches!(
             candidate.lang,
@@ -2805,7 +2798,8 @@ fn run_attempt(
     // coverage + `-fcheck`), wrap it in a glue that calls the routine via the
     // gfortran C ABI, and build on the passthrough C fork-server path. ASan reports
     // memory corruption as a genuine crash with the `.f90:line` — no exit()
-    // interposition needed (unlike COBOL).
+    // interposition needed (unlike COBOL). On native Windows, where MinGW's
+    // gfortran has no ASan, gfortran's bounds checks stand in (#327).
     if matches!(candidate.lang, crate::auto::candidate::Lang::Fortran) {
         progress.update(&ProgressUpdate::phase(Phase::Generate));
         let source_root = options
@@ -6811,7 +6805,10 @@ fn try_build(
         // is build-time (build_classifier::cargo) inside Step 0a, not the C/Ada
         // header/stub repair loop, so there is nothing to retry here.
         Lang::Rust => {
-            let main_bin = crate::auto::layout::harness_dir(work_dir, harness_id).join("main");
+            let main_bin = crate::auto::layout::harness_exe(
+                &crate::auto::layout::harness_dir(work_dir, harness_id),
+                "main",
+            );
             if main_bin.is_file() {
                 BuildOutcome::Success
             } else {
@@ -6899,7 +6896,10 @@ fn try_build(
         }
         // Fortran compiled its C harness binary in Step 0 (gfortran + passthrough driver).
         Lang::Fortran => {
-            let main_bin = crate::auto::layout::harness_dir(work_dir, harness_id).join("main");
+            let main_bin = crate::auto::layout::harness_exe(
+                &crate::auto::layout::harness_dir(work_dir, harness_id),
+                "main",
+            );
             if main_bin.is_file() {
                 BuildOutcome::Success
             } else {

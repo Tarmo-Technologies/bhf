@@ -205,6 +205,27 @@ impl SessionServer {
         self.starts
     }
 
+    /// The service's command, with the environment bhf runs it in: ASan's
+    /// options unless the operator set them, the coverage map and the
+    /// runtrace shim when armed, and no debuginfod server. A sanitizer
+    /// report symbolizes through debuginfod when `DEBUGINFOD_URLS` names one
+    /// (stock Ubuntu sets it), and its lookups can hold a crashed service up
+    /// past the lane's exit grace, which then records a hang, not the crash.
+    fn server_command(&self) -> Command {
+        let mut command = shell_command(&self.command);
+        command.env("DEBUGINFOD_URLS", "");
+        if std::env::var_os("ASAN_OPTIONS").is_none() {
+            command.env("ASAN_OPTIONS", DEFAULT_ASAN_OPTIONS);
+        }
+        if let Some(coverage) = &self.coverage {
+            command.env("BHF_COV_SHM", &coverage.path);
+        }
+        if let Some(runtrace) = &self.runtrace {
+            command.envs(runtrace.env.iter().map(|(key, value)| (key, value)));
+        }
+        command
+    }
+
     /// Start the service and wait until it serves its port: a TCP service
     /// when it accepts a connection, a UDP one when it has run for a moment.
     /// The error names why it did not start and carries its stderr.
@@ -218,20 +239,11 @@ impl SessionServer {
             .join(format!("server-{}.stderr.log", self.starts));
         let stderr =
             std::fs::File::create(&log).map_err(|e| format!("create {}: {e}", log.display()))?;
-        let mut command = shell_command(&self.command);
+        let mut command = self.server_command();
         command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(stderr);
-        if std::env::var_os("ASAN_OPTIONS").is_none() {
-            command.env("ASAN_OPTIONS", DEFAULT_ASAN_OPTIONS);
-        }
-        if let Some(coverage) = &self.coverage {
-            command.env("BHF_COV_SHM", &coverage.path);
-        }
-        if let Some(runtrace) = &self.runtrace {
-            command.envs(runtrace.env.iter().map(|(key, value)| (key, value)));
-        }
         replay_min::process::isolate_process_group(&mut command);
         let child = command
             .spawn()
@@ -463,5 +475,31 @@ mod tests {
         assert!(error.contains("exited before it served"), "{error}");
         assert!(error.contains("exit status 3"), "{error}");
         assert!(error.contains("cannot bind"), "{error}");
+    }
+
+    /// The service runs with no debuginfod server, whatever bhf's own
+    /// environment names: its sanitizer report would otherwise wait on the
+    /// network past the lane's exit grace.
+    #[test]
+    fn the_service_runs_without_a_debuginfod_server() {
+        let server = SessionServer::new(
+            "true".to_owned(),
+            "127.0.0.1".to_owned(),
+            free_port(),
+            false,
+            Path::new("unused"),
+        );
+        let command = server.server_command();
+        let debuginfod: Vec<_> = command
+            .get_envs()
+            .filter(|(key, _)| *key == "DEBUGINFOD_URLS")
+            .collect();
+        assert_eq!(
+            debuginfod,
+            [(
+                std::ffi::OsStr::new("DEBUGINFOD_URLS"),
+                Some(std::ffi::OsStr::new(""))
+            )]
+        );
     }
 }

@@ -32,7 +32,7 @@ fn bhf_bin() -> PathBuf {
 
 fn has_cargo_nightly() -> bool {
     let present = {
-        Command::new("cargo")
+        Command::new(support::rustup_cargo())
             .args(["+nightly", "--version"])
             .output()
             .map(|o| o.status.success())
@@ -103,11 +103,6 @@ fn attempt_findings(attempt: &serde_json::Value, name: &str) -> usize {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "the Rust lane builds its harness as a Unix static archive (lib*.a, linked with \
-              libpthread and libdl) and runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn reader_trait_method_builds_fuzzes_and_finds_planted_crash() {
     let bin = bhf_bin();
     if !bin.exists() {
@@ -157,11 +152,6 @@ fn reader_trait_method_builds_fuzzes_and_finds_planted_crash() {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "the Rust lane builds its harness as a Unix static archive (lib*.a, linked with \
-              libpthread and libdl) and runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn private_module_target_builds_and_fuzzes_in_crate() {
     let bin = bhf_bin();
     if !bin.exists() {
@@ -220,11 +210,6 @@ fn private_module_target_builds_and_fuzzes_in_crate() {
 /// workspace's `[workspace.package]` and `[workspace.dependencies]`, with the
 /// workspace's `Cargo.lock`, and builds offline.
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "the Rust lane builds its harness as a Unix static archive (lib*.a, linked with \
-              libpthread and libdl) and runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn a_workspace_member_inheriting_its_dependencies_builds_and_fuzzes_in_crate() {
     if !has_cargo_nightly() {
         eprintln!("skip: no `cargo +nightly` toolchain (native Rust lane needs it)");
@@ -257,11 +242,6 @@ fn a_workspace_member_inheriting_its_dependencies_builds_and_fuzzes_in_crate() {
 /// UFCS, and a unit-enum parameter gets a `crate`-rooted variant pick; each
 /// planted bug is found.
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "the Rust lane builds its harness as a Unix static archive (lib*.a, linked with \
-              libpthread and libdl) and runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn private_trait_impls_and_an_enum_parameter_fuzz_in_crate() {
     if !has_cargo_nightly() {
         eprintln!("skip: no `cargo +nightly` toolchain (native Rust lane needs it)");
@@ -305,11 +285,6 @@ fn private_trait_impls_and_an_enum_parameter_fuzz_in_crate() {
 /// took neither `impl AsRef<Path>` nor a seed name other than `db`, so the
 /// file the opener reads was never written.
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "the Rust lane builds its harness as a Unix static archive (lib*.a, linked with \
-              libpthread and libdl) and runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn an_impl_asref_path_opener_fuzzes_with_the_file_it_joins() {
     if !has_cargo_nightly() {
         eprintln!("skip: no `cargo +nightly` toolchain (native Rust lane needs it)");

@@ -19,7 +19,7 @@ use crate::binding::{Bindings, BoundValue};
 use crate::model::{EncodeError, ProtocolModel};
 use crate::novelty::TransitionId;
 use crate::profile::OracleDef;
-use crate::response::{extract, ResponseError};
+use crate::response::{extract_reply, ResponseError};
 use crate::testcase::{encode_message, MessageInstance, SessionTestcase};
 
 /// A request/response transport to a target. The only live I/O seam; a drive
@@ -291,8 +291,7 @@ impl<'a> SessionRunner<'a> {
             };
             captured_responses.push(reply.clone());
 
-            let captures = extract(&instance.message, &compiled.response, &reply)
-                .map_err(RunnerError::Response)?;
+            let captures = extract_reply(compiled, &reply).map_err(RunnerError::Response)?;
             let mut local: BTreeMap<String, BoundValue> = BTreeMap::new();
             for (capture, (source, value)) in compiled.response.iter().zip(captures.iter()) {
                 bindings.bind(source.clone(), value.clone());

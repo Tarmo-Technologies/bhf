@@ -618,6 +618,34 @@ impl From<u32> for CompletionStatus {
     }
 }
 
+/// The wire code of a status, as [`ReplyStatus::from`] reads it.
+impl From<ReplyStatus> for u32 {
+    fn from(status: ReplyStatus) -> Self {
+        match status {
+            ReplyStatus::NoException => 0,
+            ReplyStatus::UserException => 1,
+            ReplyStatus::SystemException => 2,
+            ReplyStatus::LocationForward => 3,
+            ReplyStatus::LocationForwardPerm => 4,
+            ReplyStatus::NeedsAddressingMode => 5,
+            ReplyStatus::Unknown(code) => code,
+        }
+    }
+}
+
+/// The wire code of a completion status, as [`CompletionStatus::from`]
+/// reads it.
+impl From<CompletionStatus> for u32 {
+    fn from(status: CompletionStatus) -> Self {
+        match status {
+            CompletionStatus::CompletedYes => 0,
+            CompletionStatus::CompletedNo => 1,
+            CompletionStatus::CompletedMaybe => 2,
+            CompletionStatus::Unknown(code) => code,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TaggedProfile<'a> {
     pub tag: u32,

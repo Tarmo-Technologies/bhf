@@ -62,10 +62,9 @@ pub fn build_php_harness(
         Err(reason) => return PhpBuildResult::Failed { reason, skip: true },
     };
 
-    let target_abs = candidate
-        .source_path
-        .canonicalize()
-        .unwrap_or_else(|_| candidate.source_path.clone());
+    // Without Windows' verbatim `\\?\` prefix, which the interpreter cannot
+    // open there (#325).
+    let target_abs = crate::workdir::plain_canonical(&candidate.source_path);
     let target_dir = target_abs
         .parent()
         .map(Path::to_path_buf)
@@ -222,6 +221,38 @@ pub fn build_php_harness(
     if let Err(e) = make_executable(&main_path) {
         return PhpBuildResult::Failed {
             reason: format!("chmod +x {}: {e}", main_path.display()),
+            skip: false,
+        };
+    }
+    // Where `main` cannot run (native Windows, #325): php on the driver with
+    // the settings and environment the script gives it.
+    let launch = replay_min::Launch {
+        program: php.clone(),
+        args: vec![
+            "-d".to_owned(),
+            "pcov.enabled=1".to_owned(),
+            "-d".to_owned(),
+            format!("pcov.directory={}", source_root.display()),
+            "-d".to_owned(),
+            "memory_limit=512M".to_owned(),
+            driver.display().to_string(),
+        ],
+        env: vec![
+            ("BHF_HARNESS".to_owned(), harness_path.display().to_string()),
+            ("BHF_TARGET_NS".to_owned(), target_ns.clone()),
+            (
+                "BHF_TRACE_PREFIX".to_owned(),
+                source_root.display().to_string(),
+            ),
+            (
+                "BHF_COVERED_LINES".to_owned(),
+                auto_dir.join("covered-lines.txt").display().to_string(),
+            ),
+        ],
+    };
+    if let Err(e) = crate::launch_spec::write(&main_path, &launch) {
+        return PhpBuildResult::Failed {
+            reason: format!("write launch spec in {}: {e}", auto_dir.display()),
             skip: false,
         };
     }

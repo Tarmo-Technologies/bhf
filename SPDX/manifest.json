@@ -1851,6 +1851,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/fuzz/extension_stage.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/fuzz/honggfuzz.rs",
       "license": "Apache-2.0"
     },
@@ -2531,6 +2535,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_fortran_lane.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_frankenstein.rs",
       "license": "Apache-2.0"
     },
@@ -2883,6 +2891,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/binary_fuzz_afl_modes.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/binary_fuzz_cli.rs",
       "license": "Apache-2.0"
     },
@@ -3084,6 +3096,10 @@
     },
     {
       "path": "crates/cli/tests/fuzz_crash_throughput.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/fuzz_extension_stages.rs",
       "license": "Apache-2.0"
     },
     {
@@ -3348,6 +3364,14 @@
     },
     {
       "path": "crates/cli/tests/session_fuzz_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/session_giop_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/session_reference_profiles_cli.rs",
       "license": "Apache-2.0"
     },
     {
@@ -4403,6 +4427,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/protocol_session/src/giop.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/protocol_session/src/lib.rs",
       "license": "Apache-2.0"
     },
@@ -4435,7 +4463,15 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/protocol_session/tests/fixtures/giop-warehouse.toml",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/protocol_session/tests/fixtures/toy-open-write.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/protocol_session/tests/reference_profiles.rs",
       "license": "Apache-2.0"
     },
     {
@@ -5692,6 +5728,22 @@
     },
     {
       "path": "examples/swallowed_constraint_error/pkg.ads",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "profiles/protocols/coap.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "profiles/protocols/modbus-tcp.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "profiles/protocols/mqtt-3.1.1.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "profiles/protocols/rtps.toml",
       "license": "Apache-2.0"
     },
     {

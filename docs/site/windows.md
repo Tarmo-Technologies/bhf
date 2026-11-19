@@ -96,9 +96,8 @@ winget install --id Rustlang.Rustup -e                  # build bhf from source
 ```
 
 Optional per-lane toolchains are needed only for a lane you actually run. See
-the limitations below before installing them: several managed/interpreted lanes
-currently emit POSIX launchers and should be run under WSL/Linux rather than
-native Windows.
+the limitations below before installing them: the Fortran lane runs without
+sanitizers on native Windows.
 
 ## Getting `bhf.exe`
 
@@ -737,11 +736,27 @@ cmplog, and ASan all work natively on Windows.
   `bhf verify-poc` needs a POSIX `sh` on `PATH` (Git for Windows' will do).
   Ada and COBOL also produce native binaries but their Windows toolchain
   combinations are less exercised; validate them on a representative target
-  before relying on a campaign. The Rust lane builds its harness as a Unix
-  static archive (`lib*.a`, linked with `libpthread` and `libdl`) and does not
-  build on native Windows yet; run it under WSL/Linux. The Fortran lane's
-  crash oracle is gfortran's AddressSanitizer, and MinGW-w64's GCC, the
-  Windows gfortran, ships no sanitizer runtime; run it under WSL/Linux.
+  before relying on a campaign. The Rust lane runs on native Windows with a
+  nightly Rust for `x86_64-pc-windows-msvc` and LLVM's clang: the harness
+  crate builds as an MSVC staticlib (`bhf_rust_harness.lib`) with
+  SanitizerCoverage, AddressSanitizer and the static CRT clang links an
+  ASan program with, and clang links it with the driver and the system
+  libraries rustc names for it. Rust's allocator calls the Windows heap directly, so the
+  harness sets ASan's `windows_hook_rtl_allocators=1` default; without it
+  ASan would see no Rust heap block's bounds.
+- The Fortran lane runs on native Windows with MinGW-w64's gfortran and gcc
+  on `PATH` (Strawberry Perl's `C:\Strawberry\c\bin`, or MSYS2's
+  `mingw-w64-ucrt-x86_64-gcc-fortran`). MinGW-w64's GCC ships no sanitizer
+  runtime, so the lane builds without AddressSanitizer there: the Fortran
+  objects are compiled with gfortran's bounds and pointer checks
+  (`-fcheck=bounds,pointer`), and a failed check is reported as a crash
+  instead of gfortran's `exit(2)`. The gcc beside gfortran builds bhf's
+  driver and the glue, and the harness links gfortran's runtime statically.
+  Each finding's `fidelity.sanitizers` says `none (toolchain limit)` with the
+  reason: an overflow the checks do not cover (a write through an
+  assumed-size array, a C buffer) is not found there, as it is under ASan on
+  Linux. `bhf capsule` does not yet rebuild such a harness: its objects
+  link only with MinGW's gcc, which a capsule's build does not drive.
 - The Python lane runs on native Windows with a Python 3 on `PATH` (`python`
   or `python3`). Its `main` is a POSIX launcher, so it also writes
   `main.launch.json` beside it: the interpreter, the driver and the environment
@@ -760,13 +775,16 @@ cmplog, and ASan all work natively on Windows.
   names another place.
 - The JavaScript and TypeScript lanes run on native Windows with Node (and
   esbuild for TypeScript): their launch spec runs `node` on the driver.
-- Perl, Ruby, Lua, and PHP currently emit POSIX `main` launchers even though
-  discovery is portable. Run those lanes under WSL/Linux for now; installing
-  only the interpreter on native Windows is not sufficient.
-- On native Windows `bhf auto` refuses the lanes that run under WSL (those
-  above, Rust and Fortran) whatever is installed: its toolchain check marks
-  each one `NOT ON NATIVE WINDOWS` with the reason, and their targets are
-  reported static-only with that reason, pointing at WSL.
+- The Perl, Ruby, Lua and PHP lanes run on native Windows with their
+  interpreter on `PATH` (Strawberry Perl, RubyInstaller's Ruby, a Lua 5.3 or
+  later, PHP): each `main` launcher has a launch spec, `PERL5LIB` and the Ruby
+  load path take `;`. Lua cannot put its standard input in binary mode, and
+  on Windows it reads it in text mode (CR LF becomes LF, a Ctrl-Z ends it),
+  so there its driver asks bhf for hex frames: each input is sent as hex
+  digits, which text mode leaves alone. The packaged Windows Lua builds are 5.1:
+  `scripts\ci\install-lua-windows.ps1 -Dest C:\tools\lua54` builds Lua 5.4
+  from lua.org's source with clang. PHP's coverage comes from the `pcov`
+  extension, as on Linux; without it the lane fuzzes without coverage.
 - The persistent fork-server + coverage-guided engine run on Windows the same as
   on Linux (shared-memory coverage via Win32 file mapping).
 - Microsoft Defender's real-time scanning does not slow fuzzing down, and a

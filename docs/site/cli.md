@@ -455,10 +455,10 @@ bhf binary fuzz ./stock_dll_harness.exe --runner wine \
 
 The runner, runner args, target args, and the full `@@`-marked argv are recorded
 in the finding, so `bhf replay` and `bhf minimize` reproduce the exact launch.
-`--runner` is builtin-engine only (afl-qemu provides its own `-Q` runner);
-`--target-arg` applies to both engines.
+`--runner` is builtin-engine only (afl-qemu and afl-frida run the binary
+under QEMU or Frida themselves); `--target-arg` applies to every engine.
 
-`--engine builtin|afl-qemu|auto` selects the execution engine: `builtin`
+`--engine builtin|afl-qemu|afl-frida|auto` selects the execution engine: `builtin`
 runs the seeds, then a blind havoc loop (each input a seed with 1, 2 or 4
 byte-level mutations stacked on it, from `--rng-seed`, with no coverage
 feedback) until `--iterations`, `--time` or the first crash; its run JSON says
@@ -466,13 +466,44 @@ so (`engine`, `fidelity` with `seeds_run` and `mutated_inputs`, `degraded:
 true` and `degraded_reason`, which names the missing afl-qemu tool when `auto`
 fell back). `afl-qemu` drives
 coverage-guided mutation on a binary-only / foreign-arch target via AFL++'s QEMU
-mode (`afl-fuzz -Q`); `auto` (the default) uses `afl-qemu` when its toolchain is
-present and otherwise falls back to `builtin`. Under `afl-qemu`, `--timeout-ms`
+mode (`afl-fuzz -Q`). `afl-frida` drives AFL++'s Frida mode (`afl-fuzz -O`),
+which instruments the binary as it runs on the host CPU: for a native binary
+QEMU mode emulates poorly or slowly. `auto` (the default) uses `afl-qemu` when
+its toolchain is present and otherwise falls back to `builtin`. bhf finds
+`afl-qemu-trace` through `BHF_AFL_QEMU_TRACE`, `PATH`, `AFL_PATH` and the
+AFL++ install dirs, and `afl-frida-trace.so` through `BHF_AFL_FRIDA_TRACE`,
+`AFL_PATH`, the `lib/afl` beside `afl-fuzz` and the install dirs; the container
+image ships both. Under `afl-qemu` and `afl-frida`, `--timeout-ms`
 is passed to `afl-fuzz` as the per-execution timeout (`-t`) so the mutation
 campaign and the crash-replay oracle share one policy, and `--mem-mb <MiB|none>`
 sets the child memory limit (`afl-fuzz -m`); it defaults to `none` because QEMU
 mode maps a large virtual address space and a tight cap aborts the campaign.
-Both effective limits are recorded in the run-provenance JSON.
+Both effective limits are recorded in the run-provenance JSON, with `engine`,
+the trace program or library, `executions` and a `fidelity` object: the
+coverage source, `cmplog`, `edges_found` and the persistent and entry
+addresses.
+
+The two AFL++ modes also take:
+
+- `--persistent-addr <ADDR>` — run the target in a persistent loop from this
+  address (hex), restoring its registers on each pass, so the binary is not
+  started again for every input: `AFL_QEMU_PERSISTENT_ADDR` with
+  `AFL_QEMU_PERSISTENT_GPR=1`, or `AFL_FRIDA_PERSISTENT_ADDR`. Point it at a
+  function that reads one input and returns, such as the one `main` calls
+  with the input file's path; the loop ends where that function returns. A
+  position-independent binary's addresses are where the emulator loads it,
+  not what `nm` prints, so a non-PIE build is the simple case.
+- `--entrypoint <ADDR>` — start the fork server at this address (hex)
+  instead of the binary's entry point (`AFL_ENTRYPOINT`), so each run skips
+  the start-up before it.
+- `--no-cmplog` — run without CmpLog. By default `afl-fuzz` runs `-c 0`: it
+  logs the target's comparisons and puts their operands into the input, which
+  solves a magic value the havoc stage rarely guesses.
+
+```sh
+bhf binary fuzz ./parser --engine afl-qemu --input-mode file \
+  --seed-file samples/record.bin --persistent-addr 0x4011b6 --time 10m
+```
 
 `--runtime-oracles auto|on|off` (on `bhf fuzz` and `bhf binary fuzz`) loads the
 runtrace sink oracles via the `LD_PRELOAD` shim so a **clean-exit** semantic
@@ -1451,7 +1482,7 @@ so a run whose crashes were all known does not read as clean.
 - `--sanitizers <asan,msan,ubsan,tsan,lsan|none>` — native C/C++ sanitizer campaign matrix; other lanes own their instrumentation.
 - `--target-transport <SPEC>` — run the loop against an off-host / on-target backend instead of the host lane (additive; absent = host path unchanged). Spec forms: `agent:tcp:HOST:PORT`, `agent:serial:/dev/ttyX[,baud=N]` (a Windows port is `COM3`), `gdb:HOST:PORT[,done=ADDR][,fault=ADDR][,reset=restart|monitor:CMD]`, `qemu-system:qmp=…,gdb=…[,snapshot=TAG]`. On-device agent, debug-probe/emulator gdbstub, or full-system `qemu-system` snapshot. With `--workers N`, the spec names each worker's target, `{worker}` its number (0 to N-1) and `{BASE+worker}` a port per worker (`agent:tcp:127.0.0.1:{9000+worker}`); the N workers share one corpus, coverage map and finding set, and `--iterations` and `--time` are the campaign's. A spec without either is refused with `--workers`. See [On-Target & Embedded](./on-target-fuzzing.md).
 - `--transport-coverage-map <SPEC>` — for the memory-read transports (`gdb`, `qemu-system`), locate the on-target coverage ring: `input=<addr>,input_cap=<n>,ring=<addr>,write=<addr>,wrapped=<addr>,cap=<n>` (decimal or `0x`-hex), plus `input_len=<addr>` when the firmware reads the input's length from a `u32` there, and `cmplog=<addr>,cmplog_cap=<n>` to read the comparisons the firmware records for CmpLog ([CmpLog on the target](on-target-fuzzing.md#cmplog-on-the-target)). `input_cap`, the staging buffer's size, is required: `--max-len` is cut to it and no input is written past it (see [On-target fuzzing](on-target-fuzzing.md#coverage-map-spec)). The `agent` transport carries coverage over its protocol and rejects this. With `--session-transport transport:gdb:…` or `transport:qemu-system:…` it locates the same ring for the session lane.
-- `--protocol-profile <PATH>` — load a versioned protocol profile (TOML, `bhf.protocol.v1`) and fuzz the target as a **response-dependent, multi-message session** instead of single opaque inputs (additive; absent = the paths above are unchanged). Presence routes to the session lane, which needs `--session-transport`. See [Stateful protocol sessions](#stateful-protocol-sessions-hdf-7) below.
+- `--protocol-profile <PATH>` — load a versioned protocol profile (TOML, `bhf.protocol.v1`) and fuzz the target as a **response-dependent, multi-message session** instead of single opaque inputs (additive; absent = the paths above are unchanged). Presence routes to the session lane, which needs `--session-transport`. See [Stateful protocol sessions](#stateful-protocol-sessions-hdf-7) below; `profiles/protocols/` holds [reference profiles](#reference-profiles) for Modbus/TCP and MQTT 3.1.1 over TCP and CoAP and RTPS/DDS over UDP, and a `kind = "giop"` profile sends [GIOP requests](#giop-profiles) to an IIOP endpoint.
 - `--board-profile <PATH>` — take `--target-transport` and `--transport-coverage-map` from a board profile: a TOML file of one board's specs, `gdb` and `coverage_map` for its debug probe and `serial` for the agent on its UART (`docs/hil-boards/nucleo-f411re.toml` is the template). Every spec in it is checked when it is read, and either flag beside it is refused (exit `2`). `--board-lane <gdb|serial>` (default `gdb`) picks the lane. The bring-up is in `docs/hil-bringup.md`.
 - `--session-transport <SPEC>` — request/response backend for the session lane. `tcp:HOST:PORT` connects a socket per session. `udp:HOST:PORT` sends each message as one datagram, from a socket of its own per session (so the target sees a new source port), and waits for one reply datagram. `serial:PATH[,baud=N]` drives a UART or a pty, opened raw as the agent's `serial:` transport is (no echo, line editing or newline translation; 8N1, no flow control), at baud `N` when given; requests and replies are framed as the profile says, and `--session-reset reconnect` reopens the device while `none` keeps it open. `transport:TARGET-TRANSPORT-SPEC` drives a session through a `--target-transport` backend (`transport:agent:tcp:HOST:PORT`, `transport:gdb:HOST:PORT` with `--transport-coverage-map`, …): each message is one execution on the target, a fault, a crash or a hang ends the session at that message, and the executions' edges feed the code channel. A reply is the backend's stdout, which the agent backends do not have, so a profile over them captures nothing from replies. `--session-reset reconnect` arms a fresh target session for each protocol session; `none` keeps one armed. See [On-target fuzzing](on-target-fuzzing.md#3d-protocol-sessions-on-the-target). Required with `--protocol-profile`.
 - `--session-reply-timeout <DURATION>` — how long the session lane waits for a reply before the target is taken to have ended the session: 5s over TCP and 1s over UDP by default. A UDP datagram that gets no reply in time, or that the target's host refuses (port unreachable), ends the session as a closed TCP connection does. A finding records the timeout, and `bhf replay` waits as long.
@@ -1571,6 +1602,7 @@ transport adds nothing of its own:
 |---|---|---|
 | `raw` (the default) | written as it is | when no byte arrives for `reply_idle_ms` (50) after the first, or the peer closes |
 | `length_prefix` | preceded by its length in `width` bytes (1, 2 or 4; 2 by default), `endian` `big` (the default) or `little`; `includes_prefix = true` when the length counts the prefix | after the length its prefix declares |
+| `length_field` | written as it is: its length is a field of its own header at byte `offset` (0 by default), which the profile computes with `length(..)`, `width` 1, 2 or 4 bytes in `endian` order, or `"varint"` (MQTT's variable byte integer), counting the bytes after the field | after the length its field declares; the reply is the whole message, header included |
 | `delimiter` | followed by `delimiter` (`"\r\n"`) | at the delimiter, which is not part of the reply |
 | `fixed` | `size` bytes: a shorter request is padded with zeros, a longer one cut | after `size` bytes |
 
@@ -1581,7 +1613,92 @@ width = 2
 endian = "big"
 ```
 
-The run summary's `framing` names it (`length_prefix(u16 big)`).
+The run summary's `framing` names it (`length_prefix(u16 big)`,
+`length_field(varint at 1)`).
+
+#### Reference profiles
+
+bhf ships profiles for real protocols under `profiles/protocols/`; each
+file's header says what it models and how to point it at a server. Every
+state they declare is reached only when the server answers with the reply
+the request expects (each captures the reply's type as an enum naming only
+that reply), so the summary's `states_covered` counts states the server took
+the session to.
+
+| Profile | Protocol | The session |
+|---|---|---|
+| `modbus-tcp.toml` | Modbus/TCP (`--session-transport tcp:HOST:502`) | Read Holding Registers, Write Single Register with the value the read returned, Write Multiple Registers; an exception response does not advance it |
+| `mqtt-3.1.1.toml` | MQTT 3.1.1 (`tcp:HOST:1883`) | CONNECT, SUBSCRIBE, PUBLISH at QoS 2, PUBREL with the packet id the PUBREC named, PINGREQ; a refused CONNECT does not advance it |
+| `coap.toml` | CoAP, RFC 7252 (`udp:HOST:5683`) | Confirmable GET of `/.well-known/core`, GET of `/limit`, PUT of `/limit` with an If-Match of the ETag the GET returned; only the piggybacked 2.05 or 2.04 advances it |
+| `rtps.toml` | RTPS 2.3, the DDS wire protocol (`udp:HOST:7410`) | an SPDP participant announcement, a HEARTBEAT of the SEDP publications writer to the participant that answered (an INFO_DST of the GUID prefix it announced), the publication at the sequence number its ACKNACK asked for; the participant must answer to the datagram's source |
+
+```sh
+bhf fuzz bhf_work --harness H-MODBUS \
+  --protocol-profile profiles/protocols/modbus-tcp.toml \
+  --session-transport tcp:192.0.2.10:502 --iterations 5000
+```
+
+A server that closes the connection on a malformed request, as an MQTT
+broker must, has the session lane record each such session as dropped (a
+`session-disconnect` finding, see below). Run under `--session-server-cmd`,
+a server that crashes is a `session-server-crash` or `session-server-exit`
+finding instead, which a close is not.
+
+#### GIOP profiles
+
+A profile with `kind = "giop"` makes every message a GIOP 1.2 Request, for
+an IIOP endpoint over `--session-transport tcp:HOST:PORT`. The `[giop]`
+table gives the `object_key` the requests address (a message can give its
+own) and their `endian` (`big`, the default, or `little`). A message's
+`operation` is the operation it invokes (its name by default), and its
+fields are the operation's `in` parameters, in order, at their IDL types:
+`octet`, `boolean`, `char`, `short`, `unsigned short`, `long`, `unsigned
+long`, `enum` (marshalled as an unsigned long), `string` and
+`sequence<octet>`; a signed type's seed may be negative, and a field may be a
+`ref` to a captured value. bhf marshals them in CDR with its `iiop` crate,
+so a giop message has no computed or `tlv` fields: CDR carries its own
+lengths. Each reply is framed by its GIOP header (the summary's `framing` is
+`giop`) and must be the Reply to the request's id. A capture named
+`reply_status` or `request_id` reads that field of the Reply header, and
+every other capture reads the next value of the body (the result, then the
+out parameters), so a capture takes no `at`. A body capture needs a reply
+with no exception; a `reply_status` enum of `{ no_exception = 0 }` has only
+such a reply advance the session.
+
+```toml
+kind = "giop"
+
+[giop]
+object_key = "Warehouse"
+
+[[message]]
+name = "STORE"
+operation = "store"
+
+[[message.field]]
+name = "bin"
+type = "unsigned long"
+ref = "OPEN_BIN.response.bin"
+
+[[message.field]]
+name = "slot"
+type = "unsigned short"
+value = 1
+
+[message.response]
+[[message.response.capture]]
+name = "reply_status"
+type = "enum"
+variants = { no_exception = 0 }
+
+[[message.response.capture]]
+name = "stocked"
+type = "long"
+```
+
+A servant that crashes on a request takes its connection with it, which the
+session lane records as a dropped session (a `session-disconnect` finding at
+that message).
 
 A response capture of `type = "tlv"` takes the value of a tag-length-value
 record in the reply: the records from `at` are walked until one has `tag`
@@ -2122,13 +2239,40 @@ bhf extension evaluate --manifest path/to/extension.toml --input case.bin --work
 bhf extension session --manifest path/to/extension.toml --input seed.bin --work bhf_work \
   --mutate 42 --repair true
 
-# Drive the just-retained corpus of a fuzz campaign through the extension oracle
-# after the run (not in the hot mutation loop); when the extension provides
+# Fuzz with the extension's stages in the builtin loop (below), then drive the
+# just-retained corpus through its oracle; when the extension provides
 # codec.repair, a recognized frame is repaired before the oracle sees it (a raw
 # corpus entry the extension rejects is evaluated verbatim). An extension fault
 # never aborts the campaign nor becomes a target finding.
 bhf fuzz bhf_work --harness H-0001 --extension path/to/extension.toml
 ```
+
+**Stages in the fuzz loop.** `bhf fuzz --extension` also gives the builtin
+loop the stages the extension provides:
+
+- `mutator.mutate`: one in four mutated children is the extension's mutation
+  of the base the loop picked.
+- `codec.decode` with `codec.encode`: a child is the base decoded to the
+  extension's structured value, one value of it mutated (a number nudged or
+  set to a boundary, a string edited or doubled, a boolean flipped, an array
+  element duplicated or dropped), and encoded back, so a framed format keeps
+  its length and checksum fields right. With both stages the two take turns.
+  A decode or encode the extension rejects is counted (`codec_errors`), never
+  a finding.
+- `lifecycle.setup`, `reset` and `teardown`: setup runs before the campaign
+  with a case root (`<work-dir>/fuzz_scratch/extension-<harness>`), reset
+  before every case after the first, and teardown after the campaign. A setup
+  or reset the extension answers as failed (`infrastructure_error`) or
+  unsupported stops the campaign with its message, since the cases would run
+  on a fixture the extension did not prepare.
+
+The mutation and codec stages make at most 1000 calls per pass and spend at
+most a quarter of its `--time` (60 s without one). A call that times out, an
+extension that crashes or answers garbage, or a stage past its bound is cut off
+for the rest of the pass, and the campaign goes on with the builtin mutations.
+The run summary's `extension.stages` records what each stage did: `calls`,
+`mutated`, `encoded`, `codec_errors`, `lifecycle.resets` and `cut_off` (why a
+stage stopped, or `null`).
 
 `bhf extension evaluate` / `session` exit `0` for a benign input, `1` when a
 semantic finding is emitted, `2` for a manifest/usage error, and `4` for a bounded

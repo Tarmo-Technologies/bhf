@@ -15,15 +15,11 @@ pub struct LaneStatus {
     /// Missing required tools (a group where NONE of the alternatives is installed).
     pub missing: Vec<&'static str>,
     pub install_hint: &'static str,
-    /// Why the lane does not fuzz on this host whatever is installed (a lane
-    /// that runs under WSL on native Windows); its toolchain is then not
-    /// checked.
-    pub unsupported: Option<&'static str>,
 }
 
 impl LaneStatus {
     pub fn ok(&self) -> bool {
-        self.missing.is_empty() && self.unsupported.is_none()
+        self.missing.is_empty()
     }
 }
 
@@ -48,13 +44,7 @@ impl PreflightReport {
         }
         let mut out = String::from("bhf auto: toolchain check\n");
         for lane in &self.lanes {
-            if let Some(why) = lane.unsupported {
-                out.push_str(&format!(
-                    "  {:<6} ({} targets): NOT ON NATIVE WINDOWS — {why}; the lane runs under \
-                     WSL (see docs/site/windows.md), so these targets are only statically analyzed\n",
-                    lane.lang, lane.targets,
-                ));
-            } else if lane.ok() {
+            if lane.ok() {
                 out.push_str(&format!(
                     "  {:<6} ({} targets): ok\n",
                     lane.lang, lane.targets
@@ -184,7 +174,11 @@ fn install_hint(lang: Lang, windows: bool) -> &'static str {
             Lang::Perl => "install a Windows Perl distribution",
             Lang::Go => "install Go for Windows",
             Lang::Cobol => "install a Windows GnuCOBOL toolchain or use WSL/Linux",
-            Lang::Fortran => "install a Windows gfortran toolchain or use WSL/Linux",
+            Lang::Fortran => {
+                "install MinGW-w64's gfortran and gcc (Strawberry Perl's, or MSYS2's \
+                 mingw-w64-ucrt-x86_64-gcc-fortran); bhf builds Fortran without sanitizers \
+                 there, since MinGW's GCC ships none"
+            }
             Lang::CSharp => CSHARP_HINT,
             Lang::Js => "install Node.js for Windows",
             Lang::Ts => "install Node.js + esbuild (`npm i -g esbuild`)",
@@ -216,59 +210,9 @@ fn install_hint(lang: Lang, windows: bool) -> &'static str {
     }
 }
 
-/// Why `lang`'s lane cannot fuzz on native Windows whatever is installed
-/// there, or `None` for a lane that runs there: what it builds needs a POSIX
-/// host or a sanitizer runtime Windows' toolchain for it lacks. Such a lane
-/// runs under WSL (docs/site/windows.md). Holds on every host;
-/// [`native_windows_refusal`] applies it on Windows.
-pub(crate) fn windows_wsl_only(lang: Lang) -> Option<&'static str> {
-    match lang {
-        Lang::Perl | Lang::Ruby | Lang::Lua | Lang::Php => {
-            Some("its harness launcher is a POSIX shell script")
-        }
-        Lang::Rust => Some("its harness is a Unix static archive linked with libpthread and libdl"),
-        Lang::Fortran => Some(
-            "its crash oracle is gfortran's AddressSanitizer, and MinGW-w64's GCC ships no \
-             sanitizer runtime",
-        ),
-        // Python, C#, Java and JavaScript/TypeScript run from their launch
-        // specs where their shell launchers cannot (#305, #306, #307).
-        Lang::Ada
-        | Lang::C
-        | Lang::Cpp
-        | Lang::Go
-        | Lang::Cobol
-        | Lang::Python
-        | Lang::CSharp
-        | Lang::Java
-        | Lang::Js
-        | Lang::Ts => None,
-    }
-}
-
 /// The lane's own name, as the banner prints it (`TypeScript`).
 pub(crate) fn lane_name(lang: Lang) -> &'static str {
     requirements(lang).0
-}
-
-/// The reason a target of `lang` is not fuzzed here: on native Windows, for a
-/// lane that runs under WSL there ([`windows_wsl_only`]); `None` on any other
-/// host or lane.
-pub(crate) fn native_windows_refusal(lang: Lang) -> Option<String> {
-    if cfg!(windows) {
-        wsl_refusal(lang)
-    } else {
-        None
-    }
-}
-
-fn wsl_refusal(lang: Lang) -> Option<String> {
-    let why = windows_wsl_only(lang)?;
-    Some(format!(
-        "the {} lane does not run on native Windows ({why}); run it under WSL \
-         (see docs/site/windows.md) — discovered and statically analyzed, not fuzzed",
-        lane_name(lang)
-    ))
 }
 
 /// The reason a C or C++ target is not fuzzed on native Windows when its
@@ -317,25 +261,15 @@ pub fn run(candidates: &[Candidate], scan_root: Option<&Path>) -> PreflightRepor
             continue;
         }
         let (name, groups, hint) = requirements(lang);
-        // Installing a toolchain cannot help a lane that does not run on this
-        // host, so its tools are not asked for.
-        let unsupported = cfg!(windows).then(|| windows_wsl_only(lang)).flatten();
-        let missing: Vec<&'static str> = if unsupported.is_some() {
-            Vec::new()
-        } else {
-            groups
-                .iter()
-                .filter_map(|g| {
-                    missing_group_with(g, |tool| lane_has(tool, &lane_targets, scan_root))
-                })
-                .collect()
-        };
+        let missing: Vec<&'static str> = groups
+            .iter()
+            .filter_map(|g| missing_group_with(g, |tool| lane_has(tool, &lane_targets, scan_root)))
+            .collect();
         lanes.push(LaneStatus {
             lang: name,
             targets,
             missing,
             install_hint: hint,
-            unsupported,
         });
     }
     PreflightReport { lanes }
@@ -425,7 +359,6 @@ mod tests {
             targets: 2,
             missing: vec![SHARPFUZZ_NUGET],
             install_hint: CSHARP_HINT,
-            unsupported: None,
         };
         let rendered = PreflightReport { lanes: vec![lane] }.render();
         assert!(
@@ -474,14 +407,12 @@ mod tests {
                     targets: 12,
                     missing: vec!["clang++"],
                     install_hint: "apt-get install clang make",
-                    unsupported: None,
                 },
                 LaneStatus {
                     lang: "Ada",
                     targets: 3,
                     missing: vec![],
                     install_hint: "",
-                    unsupported: None,
                 },
             ],
         };
@@ -490,78 +421,6 @@ mod tests {
         assert!(text.contains("Ada") && text.contains("(3 targets): ok"));
         assert!(report.any_missing());
         assert_eq!(report.missing_lanes().count(), 1);
-    }
-
-    /// A lane that does not run on native Windows says so and points at WSL;
-    /// it is neither ok nor a missing toolchain, since installing one there
-    /// would not help.
-    #[test]
-    fn render_names_a_lane_that_runs_under_wsl_on_windows() {
-        let report = PreflightReport {
-            lanes: vec![LaneStatus {
-                lang: "PHP",
-                targets: 2,
-                missing: vec![],
-                install_hint: "install PHP",
-                unsupported: windows_wsl_only(Lang::Php),
-            }],
-        };
-        let text = report.render();
-        assert!(
-            text.contains(
-                "PHP    (2 targets): NOT ON NATIVE WINDOWS — its harness launcher is a \
-                 POSIX shell script; the lane runs under WSL (see docs/site/windows.md)"
-            ),
-            "{text}"
-        );
-        assert!(!text.contains("ok"), "{text}");
-        assert!(!report.lanes[0].ok());
-        assert!(!report.any_missing());
-        assert_eq!(report.missing_lanes().count(), 0);
-    }
-
-    /// The lanes docs/site/windows.md sends to WSL are refused on native
-    /// Windows with the reason and a pointer at WSL; the native lanes are not.
-    #[test]
-    fn the_lanes_that_run_under_wsl_on_windows_are_refused_with_the_reason() {
-        let wsl = [
-            Lang::Perl,
-            Lang::Ruby,
-            Lang::Lua,
-            Lang::Php,
-            Lang::Rust,
-            Lang::Fortran,
-        ];
-        for lang in LANES {
-            let refusal = wsl_refusal(lang);
-            if wsl.contains(&lang) {
-                let refusal = refusal.unwrap_or_else(|| panic!("{lang:?} runs under WSL"));
-                assert!(
-                    refusal.starts_with(&format!(
-                        "the {} lane does not run on native Windows (",
-                        lane_name(lang)
-                    )) && refusal.contains("run it under WSL (see docs/site/windows.md)")
-                        && refusal.ends_with("discovered and statically analyzed, not fuzzed"),
-                    "{refusal}"
-                );
-            } else {
-                assert_eq!(refusal, None, "{lang:?} runs natively");
-            }
-        }
-        assert_eq!(
-            wsl_refusal(Lang::Lua).unwrap(),
-            "the Lua lane does not run on native Windows (its harness launcher is a \
-             POSIX shell script); run it under WSL (see docs/site/windows.md) — discovered and \
-             statically analyzed, not fuzzed"
-        );
-        assert!(wsl_refusal(Lang::Fortran)
-            .unwrap()
-            .contains("MinGW-w64's GCC ships no sanitizer runtime"));
-        // Only native Windows refuses them; Python runs there from its
-        // launch spec (#305).
-        assert_eq!(native_windows_refusal(Lang::Perl).is_some(), cfg!(windows));
-        assert_eq!(native_windows_refusal(Lang::Python), None);
-        assert_eq!(native_windows_refusal(Lang::Go), None);
     }
 
     #[test]

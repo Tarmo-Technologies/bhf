@@ -297,8 +297,10 @@ it as a binary-only target. It receives each input as a file or on stdin.
 
 Coverage-guided mutation needs AFL++ with QEMU mode (`afl-fuzz -Q`), which
 the container image ships (`afl-qemu-trace`, with Frida mode's
-`afl-frida-trace.so`). With it installed, the default engine (`auto`) runs a
-coverage-guided campaign for the `--time` budget:
+`afl-frida-trace.so` for `--engine afl-frida`). With it installed, the
+default engine (`auto`) runs a coverage-guided campaign for the `--time`
+budget, with CmpLog, and `--persistent-addr` runs a function that reads one
+input in a loop (see the CLI reference):
 
 ```sh
 bhf binary fuzz path/to/tool --work-dir bhf_work --input-mode file \

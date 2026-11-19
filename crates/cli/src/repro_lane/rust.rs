@@ -40,6 +40,11 @@ const RUST_TOOLS: &[Toolchain] = &[
     Toolchain::new("CC", "clang", "links the harness with bhf's driver"),
 ];
 
+/// The ASan default an MSVC rebuild links with
+/// (`rust_build::WINDOWS_ASAN_OPTIONS_C`, on one line for `printf`).
+const WINDOWS_ASAN_OPTIONS: &str =
+    "const char *__asan_default_options(void) { return \"windows_hook_rtl_allocators=1\"; }";
+
 /// The flags bhf builds the harness crate with (`rust_build::sancov_rustflags`).
 const RUSTFLAGS: &str = "-Cpasses=sancov-module -Cllvm-args=-sanitizer-coverage-level=4 \
                          -Cllvm-args=-sanitizer-coverage-trace-pc-guard \
@@ -164,15 +169,34 @@ impl Lane for RustLane {
         script.push_str(&relocate::resolve_tool("TOOL_CARGO", &RUST_TOOLS[0]));
         script.push_str(&relocate::resolve_tool("TOOL_CC", &RUST_TOOLS[1]));
         script.push_str(&relocator.render_script(&relocated));
+        // An MSVC host (#326) builds the staticlib with the static CRT clang
+        // links an ASan program with, names it `bhf_rust_harness.lib`, and
+        // links it with Windows' system libraries and the ASan default that
+        // hooks the heap Rust's allocator calls, into `poc.exe`. The library's
+        // path is not in `$LIB`: a Visual Studio environment exports that as
+        // the linker's search path, and setting it would replace it.
         script.push_str(&format!(
             "CHANNEL=\"+${{BHF_RUST_NIGHTLY:-nightly}}\"\n\
-             HOST=$(\"$TOOL_CARGO\" \"$CHANNEL\" -vV | sed -n 's/^host: //p')\n\
-             RUSTFLAGS=\"{RUSTFLAGS}\" \"$TOOL_CARGO\" \"$CHANNEL\" build --offline \\\n\
+             HOST=$(\"$TOOL_CARGO\" \"$CHANNEL\" -vV | sed -n 's/^host: //p' | tr -d '\\r')\n\
+             FLAGS=\"{RUSTFLAGS}\"\n\
+             case \"$HOST\" in *-windows-msvc) FLAGS=\"$FLAGS -Ctarget-feature=+crt-static\" ;; esac\n\
+             RUSTFLAGS=\"$FLAGS\" \"$TOOL_CARGO\" \"$CHANNEL\" build --offline \\\n\
              \x20 --manifest-path build/harness/rust_harness/Cargo.toml \\\n\
              \x20 --target-dir build/cargo --target \"$HOST\"\n\
-             LIB=$(ls build/cargo/\"$HOST\"/debug/libbhf_rust_harness*.a | head -n 1)\n\
-             \"$TOOL_CC\" -O1 -g -fsanitize=address -fsanitize-coverage=trace-pc-guard,trace-cmp \\\n\
-             \x20 -o poc build/harness/main.c \"$LIB\" -lpthread -ldl -lm -lrt\n"
+             case \"$HOST\" in\n\
+             \x20 *-windows-msvc)\n\
+             \x20   STATICLIB=$(ls build/cargo/\"$HOST\"/debug/bhf_rust_harness*.lib | head -n 1)\n\
+             \x20   printf '%s\\n' '{asan_options}' > build/bhf_asan_options.c\n\
+             \x20   \"$TOOL_CC\" -O1 -g -fsanitize=address -fsanitize-coverage=trace-pc-guard,trace-cmp \\\n\
+             \x20     -D_CRT_SECURE_NO_WARNINGS -o poc.exe build/harness/main.c build/bhf_asan_options.c \\\n\
+             \x20     \"$STATICLIB\" {windows_libs} ;;\n\
+             \x20 *)\n\
+             \x20   STATICLIB=$(ls build/cargo/\"$HOST\"/debug/libbhf_rust_harness*.a | head -n 1)\n\
+             \x20   \"$TOOL_CC\" -O1 -g -fsanitize=address -fsanitize-coverage=trace-pc-guard,trace-cmp \\\n\
+             \x20     -o poc build/harness/main.c \"$STATICLIB\" -lpthread -ldl -lm -lrt ;;\n\
+             esac\n",
+            asan_options = WINDOWS_ASAN_OPTIONS,
+            windows_libs = crate::auto::rust_build::WINDOWS_NATIVE_LIBS.join(" "),
         ));
         let requires: Vec<_> = RUST_TOOLS.iter().map(Toolchain::requirement).collect();
         let mut layout = vec![
@@ -214,7 +238,7 @@ impl Lane for RustLane {
             }),
             requires,
             layout,
-            build_outputs: vec!["poc", "build"],
+            build_outputs: [&["poc", "build"][..], super::WINDOWS_BUILD_OUTPUTS].concat(),
             warnings: relocated.warnings,
             windows: None,
             portability: Default::default(),
@@ -297,10 +321,29 @@ fn vendored_packages(harness_dir: &Path) -> anyhow::Result<Option<(tempfile::Tem
              they cannot be vendored for an offline rebuild: {reason}"
         )));
     }
-    let printed = String::from_utf8_lossy(&output.stdout);
-    let vendor_dir = scratch.path().join("vendor");
-    let config = printed.replace(&vendor_dir.to_string_lossy().into_owned(), "vendor");
-    Ok(Some((scratch, config)))
+    Ok(Some((
+        scratch,
+        vendor_config(&String::from_utf8_lossy(&output.stdout)),
+    )))
+}
+
+/// The cargo config `cargo vendor` printed, with its vendored source's
+/// `directory` the capsule's `vendor`. Matched by key rather than by the
+/// scratch path, which cargo spells as a TOML string: with its backslashes
+/// doubled on Windows.
+fn vendor_config(printed: &str) -> String {
+    printed
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("directory = ") {
+                "directory = \"vendor\""
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
 }
 
 /// Every file under `root`, relative.
@@ -343,6 +386,20 @@ mod tests {
                 PathBuf::from("/t/my src"),
                 PathBuf::from("/bhf/crates/rust_runtime")
             ]
+        );
+    }
+
+    /// The vendored source points at the capsule's `vendor` however cargo
+    /// spelled the scratch dir (a Windows path's backslashes come doubled).
+    #[test]
+    fn the_vendored_source_is_the_capsules_vendor_dir() {
+        let printed = "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n\
+                       [source.vendored-sources]\n\
+                       directory = \"C:\\\\Users\\\\ADMINI~1\\\\Temp\\\\bhf-cargo-vendor-x\\\\vendor\"\n";
+        assert_eq!(
+            vendor_config(printed),
+            "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n\
+             [source.vendored-sources]\ndirectory = \"vendor\"\n"
         );
     }
 

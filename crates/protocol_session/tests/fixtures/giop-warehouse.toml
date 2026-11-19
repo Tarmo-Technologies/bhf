@@ -1,0 +1,125 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# A giop protocol profile (bhf.protocol.v1, kind = "giop") for the
+# Inventory::Warehouse interface in warehouse.idl, which the session lane's
+# GIOP test server serves (#315).
+#
+# Each message is a GIOP 1.2 Request to the object key in [giop]: the
+# message's operation, with its fields as the operation's in parameters, in
+# order, marshalled in CDR at their IDL types. A reply is the GIOP Reply to
+# the request's id: a `reply_status` capture reads its status, and each other
+# capture reads the next value of its body (the result, then any out
+# parameters).
+#
+# The session opens a bin, whose handle open_bin returns, stores a quantity
+# in one of the bin's slots through the handle it captured, and counts the
+# slot. A state is reached only on a reply with no exception.
+
+schema = "bhf.protocol.v1"
+kind = "giop"
+transport = "tcp"
+start = "start"
+
+[giop]
+object_key = "Warehouse"
+endian = "big"
+
+# unsigned long open_bin(in string label);
+[[message]]
+name = "OPEN_BIN"
+operation = "open_bin"
+
+[[message.field]]
+name = "label"
+type = "string"
+max = 32
+value = "spares"
+
+[message.response]
+[[message.response.capture]]
+name = "reply_status"
+type = "enum"
+variants = { no_exception = 0 }
+
+[[message.response.capture]]
+name = "bin"
+type = "unsigned long"
+
+# long store(in unsigned long bin, in unsigned short slot, in long quantity);
+[[message]]
+name = "STORE"
+operation = "store"
+
+[[message.field]]
+name = "bin"
+type = "unsigned long"
+ref = "OPEN_BIN.response.bin"
+
+[[message.field]]
+name = "slot"
+type = "unsigned short"
+value = 1
+
+[[message.field]]
+name = "quantity"
+type = "long"
+value = 5
+
+[message.response]
+[[message.response.capture]]
+name = "reply_status"
+type = "enum"
+variants = { no_exception = 0 }
+
+[[message.response.capture]]
+name = "stocked"
+type = "long"
+
+# long count(in unsigned long bin, in unsigned short slot);
+[[message]]
+name = "COUNT"
+operation = "count"
+
+[[message.field]]
+name = "bin"
+type = "unsigned long"
+ref = "OPEN_BIN.response.bin"
+
+[[message.field]]
+name = "slot"
+type = "unsigned short"
+value = 1
+
+[message.response]
+[[message.response.capture]]
+name = "reply_status"
+type = "enum"
+variants = { no_exception = 0 }
+
+[[message.response.capture]]
+name = "quantity"
+type = "long"
+
+[[transition]]
+from = "start"
+send = "OPEN_BIN"
+to = "opened"
+
+[[transition]]
+from = "opened"
+send = "STORE"
+to = "stocked"
+
+[[transition]]
+from = "stocked"
+send = "STORE"
+to = "stocked"
+
+[[transition]]
+from = "stocked"
+send = "COUNT"
+to = "stocked"
+
+# A new connection for every session: the servant's bins are per connection.
+[session]
+reset = "reconnect"

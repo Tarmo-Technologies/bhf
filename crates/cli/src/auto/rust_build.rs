@@ -113,10 +113,27 @@ fn parse_host_triple(version_verbose: &str) -> Option<String> {
         .map(|t| t.trim().to_owned())
 }
 
+/// rustup's `cargo` proxy (`$CARGO_HOME/bin/cargo`), the one that takes a
+/// `+toolchain` argument, when it is installed. Under `cargo run` or `cargo
+/// test` on Windows, rustup puts the running toolchain's own `bin` first on
+/// PATH, and that cargo refuses `+nightly`.
+fn rustup_cargo() -> Option<PathBuf> {
+    let home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+                .map(|home| PathBuf::from(home).join(".cargo"))
+        })?;
+    let cargo = home
+        .join("bin")
+        .join(if cfg!(windows) { "cargo.exe" } else { "cargo" });
+    cargo.is_file().then_some(cargo)
+}
+
 /// Probe for a usable Rust toolchain with nightly sancov support. Returns `None`
 /// (skip the lane) when cargo is absent or no nightly is installed.
 fn probe_toolchain() -> Option<RustToolchain> {
-    let cargo = which::which("cargo").ok()?;
+    let cargo = rustup_cargo().or_else(|| which::which("cargo").ok())?;
     // A container can supply a dated, preinstalled channel to avoid resolving a
     // rolling nightly while disconnected. Confirm a nightly
     // rustc actually exists by asking for its verbose version through cargo's
@@ -215,6 +232,107 @@ fn sancov_rustflags() -> String {
         "-Zsanitizer=address",
     ]
     .join(" ")
+}
+
+/// The RUSTFLAGS a harness build runs with: [`sancov_rustflags`], and on
+/// Windows rustc's `native-static-libs` note too, which names the system
+/// libraries the staticlib needs there ([`rust_native_libs`]), and the
+/// static CRT: clang links an ASan program with the static CRT's runtime
+/// thunk, which a std built for the dynamic CRT duplicates `malloc` and
+/// `free` against.
+fn build_rustflags() -> String {
+    if cfg!(windows) {
+        format!(
+            "{} -Ctarget-feature=+crt-static --print=native-static-libs",
+            sancov_rustflags()
+        )
+    } else {
+        sancov_rustflags()
+    }
+}
+
+/// The libraries a Rust staticlib needs beside it at the link: on Windows
+/// those rustc's `native-static-libs` note in `cargo_stderr` names (else
+/// the usual set), elsewhere libstd's pthread, dl, m and rt.
+fn rust_native_libs(cargo_stderr: &str) -> Vec<String> {
+    if !cfg!(windows) {
+        return ["-lpthread", "-ldl", "-lm", "-lrt"]
+            .map(String::from)
+            .to_vec();
+    }
+    let noted: Vec<String> = cargo_stderr
+        .lines()
+        .filter_map(|line| line.split_once("native-static-libs:").map(|(_, libs)| libs))
+        .next_back()
+        .map(|libs| {
+            libs.split_whitespace()
+                .filter_map(|lib| lib.strip_suffix(".lib"))
+                .map(|lib| format!("-l{lib}"))
+                .collect()
+        })
+        .unwrap_or_default();
+    if noted.is_empty() {
+        WINDOWS_NATIVE_LIBS.map(String::from).to_vec()
+    } else {
+        noted
+    }
+}
+
+/// The system libraries an MSVC Rust staticlib's std needs when rustc names
+/// none: the usual `native-static-libs` set, which `bhf capsule`'s rebuild
+/// links with too.
+pub(crate) const WINDOWS_NATIVE_LIBS: [&str; 8] = [
+    "-lkernel32",
+    "-lntdll",
+    "-luserenv",
+    "-lws2_32",
+    "-ldbghelp",
+    "-lsynchronization",
+    "-ladvapi32",
+    "-lbcrypt",
+];
+
+/// The C source an MSVC Rust harness links with: ASan's default options
+/// hook the system heap, which Rust's allocator calls on Windows. Without
+/// it ASan sees no Rust heap block's bounds, and an overflow reads past one
+/// unreported.
+const WINDOWS_ASAN_OPTIONS_C: &str =
+    "/* bhf: Rust's allocator calls the system heap on Windows; hook it\n\
+ * so AddressSanitizer sees the bounds of its blocks. */\n\
+const char *__asan_default_options(void) { return \"windows_hook_rtl_allocators=1\"; }\n";
+
+/// Link the driver `main_c` with the Rust `staticlib` into `main_bin`, the
+/// driver instrumented as the staticlib is. On Windows (#326) the link takes
+/// the ASan options of [`WINDOWS_ASAN_OPTIONS_C`].
+fn link_rust_harness(
+    main_c: &Path,
+    staticlib: &Path,
+    c_runtime_dir: &Path,
+    main_bin: &Path,
+    native_libs: &[String],
+) -> std::io::Result<std::process::Output> {
+    let mut link = Command::new("clang");
+    link.args([
+        "-O1",
+        "-g",
+        "-fsanitize=address",
+        "-fsanitize-coverage=trace-pc-guard,trace-cmp",
+    ]);
+    if cfg!(windows) {
+        let options = main_c.with_file_name("bhf_asan_options.c");
+        std::fs::write(&options, WINDOWS_ASAN_OPTIONS_C)?;
+        // The UCRT marks getenv and fopen deprecated; their warnings would
+        // bury a link error in the failure bhf reports.
+        link.arg("-D_CRT_SECURE_NO_WARNINGS").arg(options);
+    }
+    link.arg("-I")
+        .arg(c_runtime_dir)
+        .arg("-o")
+        .arg(main_bin)
+        .arg(main_c)
+        .arg(staticlib)
+        .args(native_libs);
+    crate::command_output::output_with_timeout(&mut link, std::time::Duration::from_secs(10 * 60))
 }
 
 /// Walk up from `source` to the nearest directory containing a `Cargo.toml`;
@@ -3856,7 +3974,7 @@ pub fn build_rust_harness(
             // them. Output then lands in `target/<triple>/debug/`.
             .arg("--target")
             .arg(&toolchain.host_triple)
-            .env("RUSTFLAGS", sancov_rustflags()),
+            .env("RUSTFLAGS", build_rustflags()),
         std::time::Duration::from_secs(30 * 60),
     );
     let build = match build {
@@ -3901,7 +4019,7 @@ pub fn build_rust_harness(
         Some(p) => p,
         None => {
             return RustBuildResult::Failed {
-                reason: "cargo build succeeded but produced no staticlib (.a)".to_owned(),
+                reason: "cargo build succeeded but produced no staticlib".to_owned(),
                 skip: false,
             }
         }
@@ -3909,26 +4027,9 @@ pub fn build_rust_harness(
 
     // clang-link: driver main.c + the Rust staticlib -> harnesses/<id>/main, with the
     // SAME sancov+ASan instrumentation on the driver so its callbacks match.
-    let main_bin = auto_dir.join("main");
-    let link = crate::command_output::output_with_timeout(
-        Command::new("clang")
-            .arg("-O1")
-            .arg("-g")
-            .arg("-fsanitize=address")
-            .arg("-fsanitize-coverage=trace-pc-guard,trace-cmp")
-            .arg("-I")
-            .arg(c_runtime_dir)
-            .arg("-o")
-            .arg(&main_bin)
-            .arg(&main_c)
-            .arg(&staticlib)
-            // The Rust staticlib needs libstd's transitive C deps.
-            .arg("-lpthread")
-            .arg("-ldl")
-            .arg("-lm")
-            .arg("-lrt"),
-        std::time::Duration::from_secs(10 * 60),
-    );
+    let main_bin = crate::auto::layout::harness_exe(&auto_dir, "main");
+    let native_libs = rust_native_libs(&String::from_utf8_lossy(&build.stderr));
+    let link = link_rust_harness(&main_c, &staticlib, c_runtime_dir, &main_bin, &native_libs);
     let link = match link {
         Ok(o) => o,
         Err(e) => {
@@ -3959,7 +4060,11 @@ pub fn build_rust_harness(
         c_runtime_dir,
         &toolchain,
         "rust_harness",
-        "libbhf_rust_harness*.a",
+        if cfg!(windows) {
+            "bhf_rust_harness.lib"
+        } else {
+            "libbhf_rust_harness*.a"
+        },
         &[],
     );
     RustBuildResult::Built
@@ -4421,7 +4526,7 @@ fn build_in_crate(
         .arg(&target_dir)
         .arg("--target")
         .arg(&toolchain.host_triple)
-        .env("RUSTFLAGS", sancov_rustflags());
+        .env("RUSTFLAGS", build_rustflags());
     if !target_features.is_empty() {
         cargo.arg("--features").arg(target_features.join(","));
     }
@@ -4471,32 +4576,16 @@ fn build_in_crate(
             Some(p) => p,
             None => {
                 return RustBuildResult::Failed {
-                    reason: "in-crate build succeeded but produced no staticlib (.a)".to_owned(),
+                    reason: "in-crate build succeeded but produced no staticlib".to_owned(),
                     skip: false,
                 }
             }
         };
 
     // clang-link the driver + the crate staticlib -> harnesses/<id>/main.
-    let main_bin = auto_dir.join("main");
-    let link = crate::command_output::output_with_timeout(
-        Command::new("clang")
-            .arg("-O1")
-            .arg("-g")
-            .arg("-fsanitize=address")
-            .arg("-fsanitize-coverage=trace-pc-guard,trace-cmp")
-            .arg("-I")
-            .arg(c_runtime_dir)
-            .arg("-o")
-            .arg(&main_bin)
-            .arg(&main_c)
-            .arg(&staticlib)
-            .arg("-lpthread")
-            .arg("-ldl")
-            .arg("-lm")
-            .arg("-lrt"),
-        std::time::Duration::from_secs(10 * 60),
-    );
+    let main_bin = crate::auto::layout::harness_exe(&auto_dir, "main");
+    let native_libs = rust_native_libs(&String::from_utf8_lossy(&build.stderr));
+    let link = link_rust_harness(&main_c, &staticlib, c_runtime_dir, &main_bin, &native_libs);
     let link = match link {
         Ok(o) => o,
         Err(e) => {
@@ -5282,11 +5371,16 @@ fn find_incrate_staticlib(
     crate_name: &str,
 ) -> Option<PathBuf> {
     let debug = target_dir.join(host_triple).join("debug");
-    let preferred = format!("lib{crate_name}.a");
+    // `lib<name>.a`, or on MSVC `<name>.lib`.
+    let (preferred, extension) = if host_triple.ends_with("-msvc") {
+        (format!("{crate_name}.lib"), "lib")
+    } else {
+        (format!("lib{crate_name}.a"), "a")
+    };
     let mut first_a = None;
     for entry in std::fs::read_dir(&debug).ok()?.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("a") {
+        if path.extension().and_then(|e| e.to_str()) != Some(extension) {
             continue;
         }
         match path.file_name().and_then(|n| n.to_str()) {
@@ -5617,11 +5711,13 @@ fn find_staticlib(target_dir: &Path, host_triple: &str) -> Option<PathBuf> {
     let entries = std::fs::read_dir(&debug).ok()?;
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("a") {
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with("libbhf_rust_harness") {
-                    return Some(path);
-                }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            // `libbhf_rust_harness.a`, or on MSVC `bhf_rust_harness.lib`.
+            if (path.extension().and_then(|e| e.to_str()) == Some("a")
+                && name.starts_with("libbhf_rust_harness"))
+                || name == "bhf_rust_harness.lib"
+            {
+                return Some(path);
             }
         }
     }
@@ -5737,7 +5833,11 @@ mod tests {
             &c_runtime,
             &toolchain,
             "rust_harness",
-            "libbhf_rust_harness*.a",
+            if cfg!(windows) {
+                "bhf_rust_harness.lib"
+            } else {
+                "libbhf_rust_harness*.a"
+            },
             &[],
         );
         // The portability artifacts + the build script must be emitted.
@@ -6425,6 +6525,51 @@ mod tests {
         assert_eq!(find_staticlib(tmp.path(), triple), Some(ours));
         // Nothing under the plain target/debug/ (old layout) must NOT match.
         assert!(find_staticlib(tmp.path(), "aarch64-unknown-linux-gnu").is_none());
+    }
+
+    /// MSVC names a staticlib `<name>.lib`, without the `lib` prefix (#326).
+    #[test]
+    fn an_msvc_staticlib_is_found_by_its_msvc_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let triple = "x86_64-pc-windows-msvc";
+        let debug = tmp.path().join(triple).join("debug");
+        std::fs::create_dir_all(&debug).unwrap();
+        std::fs::write(debug.join("other.lib"), b"").unwrap();
+        let ours = debug.join("bhf_rust_harness.lib");
+        std::fs::write(&ours, b"").unwrap();
+        assert_eq!(find_staticlib(tmp.path(), triple), Some(ours));
+        let crate_lib = debug.join("widget.lib");
+        std::fs::write(&crate_lib, b"").unwrap();
+        assert_eq!(
+            find_incrate_staticlib(tmp.path(), triple, "widget"),
+            Some(crate_lib)
+        );
+    }
+
+    /// The link takes the libraries rustc names for the staticlib's std
+    /// (Windows), or libstd's usual C dependencies.
+    #[test]
+    fn the_staticlib_links_with_the_libraries_its_std_needs() {
+        let note = "   Compiling bhf_rust_harness v0.1.0\n\
+                    note: native-static-libs: kernel32.lib ntdll.lib userenv.lib ws2_32.lib \
+                    dbghelp.lib synchronization.lib /defaultlib:msvcrt\n";
+        let libs = rust_native_libs(note);
+        if cfg!(windows) {
+            assert_eq!(
+                libs,
+                [
+                    "-lkernel32",
+                    "-lntdll",
+                    "-luserenv",
+                    "-lws2_32",
+                    "-ldbghelp",
+                    "-lsynchronization"
+                ]
+            );
+            assert!(rust_native_libs("").contains(&"-lsynchronization".to_owned()));
+        } else {
+            assert_eq!(libs, ["-lpthread", "-ldl", "-lm", "-lrt"]);
+        }
     }
 
     #[test]

@@ -190,6 +190,7 @@ dependencies = [
  "governance",
  "harness_gen",
  "idl_parser",
+ "iiop",
  "instrumenter",
  "java_parser",
  "jiff",
@@ -1758,6 +1759,8 @@ version = "0.3.0"
 dependencies = [
  "ada_state_machine",
  "fuzz_engine_builtin",
+ "idl_parser",
+ "iiop",
  "serde",
  "serde_json",
  "sha2",

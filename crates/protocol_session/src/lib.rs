@@ -12,6 +12,9 @@
 //! novelty tracking, and session drive / replay / minimization over a transport
 //! seam.
 //!
+//! A `kind = "giop"` profile's messages are GIOP 1.2 Requests whose fields
+//! are IDL-typed arguments, marshalled with the `iiop` crate ([`giop`]).
+//!
 //! It is deliberately hardware-free: the live socket backend and the `bhf fuzz`
 //! campaign loop live in the `bhf` binary crate. Here the transport is the
 //! [`runner::SessionTransport`] trait, exercised in tests by the in-memory
@@ -23,6 +26,7 @@
 
 pub mod binding;
 pub mod framing;
+pub mod giop;
 pub mod model;
 pub mod mutate;
 pub mod novelty;
@@ -32,7 +36,8 @@ pub mod runner;
 pub mod testcase;
 
 pub use binding::{Bindings, BoundValue};
-pub use framing::{Framing, FramingError, ReplyProgress, DEFAULT_REPLY_IDLE_MS};
+pub use framing::{Framing, FramingError, LengthWidth, ReplyProgress, DEFAULT_REPLY_IDLE_MS};
+pub use giop::{CdrKind, GiopDef, GiopRequest, ReplyField};
 pub use model::{
     CaptureSpec, CompiledCapture, CompiledField, CompiledMessage, ComputedSpec, DataSpec,
     EncodeError, FieldRole, FieldValue, ModelError, ProtocolModel, RefEncoding,
@@ -44,9 +49,9 @@ pub use mutate::{
 pub use novelty::{CodeCoverageNovelty, StateNovelty, StateNoveltyDelta, TransitionId};
 pub use profile::{
     ByteOrder, CaptureDef, FieldDef, FieldType, MessageDef, OracleDef, Profile, ProfileError,
-    ResponseDef, SessionDef, TransitionDef, SCHEMA_V1,
+    ProfileKind, ResponseDef, SessionDef, TransitionDef, SCHEMA_V1,
 };
-pub use response::{extract, ResponseError};
+pub use response::{extract, extract_reply, ResponseError};
 pub use runner::{
     RunnerError, ScriptedTransport, SessionOracle, SessionRun, SessionRunner, SessionTransport,
     SessionVerdict, TransportError,

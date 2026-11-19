@@ -16,6 +16,8 @@ fn bhf() -> Command {
     Command::new(env!("CARGO_BIN_EXE_bhf"))
 }
 
+mod support;
+
 /// Whether `program <args>` runs successfully here.
 fn runs(program: &str, args: &[&str]) -> bool {
     Command::new(program)
@@ -350,10 +352,6 @@ fn typescript_finding_round_trips() {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "Ruby runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn ruby_finding_round_trips() {
     skip_unless!(runs("ruby", &["--version"]), "ruby not installed");
     let run = Run::new(&[(
@@ -368,10 +366,6 @@ fn ruby_finding_round_trips() {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "Perl runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn perl_finding_round_trips() {
     skip_unless!(runs("perl", &["-v"]), "perl not installed");
     let run = Run::new(&[(
@@ -387,10 +381,6 @@ fn perl_finding_round_trips() {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "PHP runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn php_finding_round_trips() {
     skip_unless!(runs("php", &["--version"]), "php not installed");
     let run = Run::new(&[(
@@ -402,49 +392,6 @@ fn php_finding_round_trips() {
         .auto("php", 6, &[])
         .expect("bhf auto must find the crash");
     run.round_trip(&id, "php");
-}
-
-/// On native Windows a lane that runs under WSL there is refused up front,
-/// whether or not its interpreter is installed: the toolchain check says so
-/// and the target is reported static-only with the reason, instead of
-/// failing in its launcher in words that read like a missing module.
-#[cfg(windows)]
-#[test]
-fn a_lane_that_runs_under_wsl_is_refused_on_native_windows() {
-    let run = Run::new(&[(
-        "parser.php",
-        "<?php\nfunction parse_record(string $text): int {\n    \
-         return intdiv(1000, strlen($text));\n}\n",
-    )]);
-    let out = run
-        .bhf()
-        .arg("auto")
-        .arg(&run.src)
-        .arg("--work-dir")
-        .arg(&run.work)
-        .args(["--languages", "php", "--max-targets", "1", "--jobs", "1"])
-        .args(["--per-target-time", "2", "--no-discovery-cache"])
-        .output()
-        .expect("run bhf auto");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains(
-            "PHP    (1 targets): NOT ON NATIVE WINDOWS — its harness launcher is a POSIX shell \
-             script; the lane runs under WSL (see docs/site/windows.md)"
-        ),
-        "{stderr}"
-    );
-    let report: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(run.work.join("auto/run.json")).unwrap()).unwrap();
-    let outcome = &report["targets"][0]["outcome"];
-    assert_eq!(outcome["outcome"], "report_only", "{outcome}");
-    assert_eq!(
-        outcome["reason"],
-        "the PHP lane does not run on native Windows (its harness launcher is a POSIX shell \
-         script); run it under WSL (see docs/site/windows.md) — discovered and statically \
-         analyzed, not fuzzed",
-        "{outcome}"
-    );
 }
 
 // Builds a PATH of symlinks into /usr/bin.
@@ -738,14 +685,12 @@ fn crc32(data: &[u8]) -> u32 {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "the Rust lane builds its harness as a Unix static archive (lib*.a, linked with \
-              libpthread and libdl) and does not build on native Windows"
-)]
 fn rust_finding_round_trips() {
     skip_unless!(
-        runs("cargo", &["+nightly", "--version"]),
+        runs(
+            &support::rustup_cargo().to_string_lossy(),
+            &["+nightly", "--version"]
+        ),
         "cargo with a rustup nightly toolchain not installed"
     );
     skip_unless!(runs("clang", &["--version"]), "clang not installed");
@@ -803,14 +748,12 @@ fn cargo_crate_cached(name: &str) -> bool {
 /// A Rust target depending on a crates.io package ships it vendored, and the
 /// capsule rebuilds offline from the vendored copy.
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "the Rust lane builds its harness as a Unix static archive (lib*.a, linked with \
-              libpthread and libdl) and does not build on native Windows"
-)]
 fn rust_finding_with_a_registry_dependency_round_trips_vendored() {
     skip_unless!(
-        runs("cargo", &["+nightly", "--version"]),
+        runs(
+            &support::rustup_cargo().to_string_lossy(),
+            &["+nightly", "--version"]
+        ),
         "cargo with a rustup nightly toolchain not installed"
     );
     skip_unless!(runs("clang", &["--version"]), "clang not installed");
@@ -1046,8 +989,8 @@ fn cobol_finding_round_trips() {
 #[test]
 #[cfg_attr(
     windows,
-    ignore = "Fortran runs under WSL on Windows (MinGW-w64's GCC has no AddressSanitizer \
-              runtime); see docs/site/windows.md"
+    ignore = "a capsule does not yet rebuild a Fortran harness built with MinGW-w64's \
+              gfortran, the Windows one (#430)"
 )]
 fn fortran_finding_round_trips_from_source() {
     skip_unless!(

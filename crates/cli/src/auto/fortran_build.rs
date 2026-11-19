@@ -9,6 +9,13 @@
 //! `LLVMFuzzerTestOneInput` glue that calls the routine via the gfortran C ABI
 //! (`name_`, args by reference, a hidden `size_t` length per character arg), and
 //! build+link on the passthrough C fork-server path with `-lgfortran`.
+//!
+//! On native Windows (#327) the gfortran is MinGW-w64's, which ships no
+//! AddressSanitizer: the objects are compiled with `-fcheck=bounds,pointer`
+//! instead, the link wraps gfortran's runtime-error entry so a failed check
+//! is a crash rather than an `exit(2)` input rejection, MinGW's gcc builds
+//! the C driver and glue (clang's would be MSVC's ABI and runtime), and the
+//! harness records [`WINDOWS_SANITIZER_LIMIT`] for the findings' fidelity.
 
 use crate::auto::candidate::Candidate;
 use crate::auto::fortran::{FortranArg, FortranArgKind, FortranResult};
@@ -19,6 +26,40 @@ pub enum FortranBuildResult {
     Built,
     Skip(String),
     Failed(String),
+}
+
+/// The memory oracle every Fortran object is compiled with: AddressSanitizer,
+/// or on native Windows, where MinGW's gfortran has none, gfortran's own
+/// bounds and pointer checks.
+const MEMORY_CHECK: &str = if cfg!(windows) {
+    "-fcheck=bounds,pointer"
+} else {
+    "-fsanitize=address"
+};
+
+/// The harness-dir file a harness built without sanitizers writes, holding
+/// why; its findings' fidelity takes it as the sanitizers' reason.
+pub(crate) const SANITIZER_LIMIT_RECORD: &str = "bhf_sanitizer_limit.txt";
+
+/// What a native Windows Fortran harness records in [`SANITIZER_LIMIT_RECORD`].
+pub(crate) const WINDOWS_SANITIZER_LIMIT: &str =
+    "none (toolchain limit): MinGW-w64's gfortran ships no AddressSanitizer; gfortran's \
+     bounds and pointer checks (-fcheck=bounds,pointer) stood in for it";
+
+/// The C flags a native Windows Fortran harness's driver and glue build with:
+/// the Makefile's gcc flags without the sanitizers MinGW's gcc lacks.
+const WINDOWS_C_FLAGS: &str = "-O1 -g -fsanitize-coverage=trace-pc,trace-cmp";
+
+/// The C compiler a native Windows Fortran harness links with: MinGW's gcc
+/// beside the gfortran on PATH, which shares its ABI and runtime, else `gcc`.
+fn mingw_gcc() -> PathBuf {
+    std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path).find(|dir| dir.join("gfortran.exe").is_file())
+        })
+        .map(|dir| dir.join("gcc.exe"))
+        .filter(|gcc| gcc.is_file())
+        .unwrap_or_else(|| PathBuf::from("gcc"))
 }
 
 /// A stable, per-project `.mod` directory under the work dir (keyed on the source
@@ -133,7 +174,7 @@ fn precompile_project_modules(source_root: &Path, moddir: &Path) {
             let obj = moddir.join(format!("{stem}.o"));
             let ok = crate::command_output::output_with_timeout(
                 Command::new("gfortran")
-                    .args(["-O1", "-g", "-fsanitize=address"])
+                    .args(["-O1", "-g", MEMORY_CHECK])
                     .arg("-fsanitize-coverage=trace-pc,trace-cmp")
                     .arg("-cpp")
                     .arg("-ffree-line-length-none")
@@ -332,7 +373,9 @@ fn have_gfortran() -> bool {
         .unwrap_or(false)
 }
 
-/// The directory holding `libgfortran.so`, for the harness link.
+/// The directory holding `libgfortran.so`, for the harness link. `None`
+/// when gfortran does not know it (it then prints the bare name, as MinGW's
+/// does, whose gcc links its own runtime without being told where).
 fn gfortran_libdir() -> Option<String> {
     let out = Command::new("gfortran")
         .arg("-print-file-name=libgfortran.so")
@@ -343,6 +386,7 @@ fn gfortran_libdir() -> Option<String> {
     Path::new(path)
         .parent()
         .map(|d| d.to_string_lossy().into_owned())
+        .filter(|dir| !dir.is_empty())
 }
 
 /// gfortran default ABI: lowercase the name and append a trailing underscore.
@@ -576,11 +620,36 @@ fn glue_file(
          #include <stdint.h>\n\
          #include <stdlib.h>\n\
          #include <string.h>\n\
+         #ifdef _WIN32\n\
+         #include <stdarg.h>\n\
+         #include <stdio.h>\n\
+         #define WIN32_LEAN_AND_MEAN\n\
+         #include <windows.h>\n\
+         #else\n\
          #include <unistd.h>\n\
          #include <fcntl.h>\n\
          #include <sys/mman.h>\n\
+         #endif\n\
          extern void {entry}({extern_sig});\n\
          extern void bhf_target_enter(void);\n\
+         #ifdef _WIN32\n\
+         /* Native Windows: MinGW's gfortran has no AddressSanitizer, so its bounds\n\
+         \x20* and pointer checks (-fcheck=bounds,pointer) are the memory oracle. A\n\
+         \x20* failed check prints its message and exits 2, which bhf reads as an\n\
+         \x20* input rejection; the link wraps it (--wrap=_gfortran_runtime_error_at)\n\
+         \x20* to print the same message and end the process as bhf's driver ends a\n\
+         \x20* faulting one: its BHF_CRASH line and exit code (BHF_WIN_CRASH_EXIT).\n\
+         \x20* Raising the exception instead would not do: MinGW's runtime resumes\n\
+         \x20* after an array-bounds exception. The driver defines the trace-pc hook. */\n\
+         void __wrap__gfortran_runtime_error_at(const char *where, const char *message, ...) {{\n\
+         \x20   va_list args;\n\
+         \x20   fprintf(stderr, \"%s\\nFortran runtime error: \", where);\n\
+         \x20   va_start(args, message); vfprintf(stderr, message, args); va_end(args);\n\
+         \x20   fprintf(stderr, \"\\nBHF_CRASH code=0x%lx\\n\", (unsigned long)EXCEPTION_ARRAY_BOUNDS_EXCEEDED);\n\
+         \x20   fflush(stderr);\n\
+         \x20   TerminateProcess(GetCurrentProcess(), 0x39);\n\
+         }}\n\
+         #else\n\
          /* gfortran instruments with -fsanitize-coverage=trace-pc (no guard); the\n\
          \x20* bhf Linux driver only provides trace-pc-guard, so define the\n\
          \x20* trace-pc hook here, writing into the same shared edge map the engine\n\
@@ -608,6 +677,7 @@ fn glue_file(
          \x20   unsigned h = ((unsigned)(pc * 2654435761u) >> 4) & (BHF_COV_BITS - 1);\n\
          \x20   bhf_cov[h] = 1;\n\
          }}\n\
+         #endif\n\
          int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {{\n\
          \x20   size_t bhf_primary_len = 0; (void)bhf_primary_len; (void)Data;\n\
          {decls}\
@@ -739,7 +809,7 @@ fn array_wrapper_source(proc: &crate::auto::fortran::FortranProc) -> Option<Stri
 fn compile_array_wrapper(source: &Path, object: &Path, hdir: &Path, moddir: &Path) -> bool {
     crate::command_output::output_with_timeout(
         Command::new("gfortran")
-            .args(["-O1", "-g", "-fsanitize=address"])
+            .args(["-O1", "-g", MEMORY_CHECK])
             .arg("-fsanitize-coverage=trace-pc,trace-cmp")
             .arg("-ffree-line-length-none")
             .arg("-J")
@@ -815,7 +885,7 @@ pub fn build_fortran_harness(
         // ASan crash with the exact `.f90:line`. trace-pc/trace-cmp feed the engine.
         let compiled = crate::command_output::output_with_timeout(
             Command::new("gfortran")
-                .args(["-O1", "-g", "-fsanitize=address"])
+                .args(["-O1", "-g", MEMORY_CHECK])
                 .arg("-fsanitize-coverage=trace-pc,trace-cmp")
                 .arg("-cpp")
                 .arg("-ffree-line-length-none")
@@ -961,6 +1031,11 @@ pub fn build_fortran_harness(
     if let Some(dir) = gfortran_libdir() {
         ldflags.push_str(&format!("-L{dir} "));
     }
+    if cfg!(windows) {
+        // gfortran's runtime-error entry, as the glue's comment says, and
+        // its runtime linked in, so the harness runs without MinGW's DLLs.
+        ldflags.push_str("-static -Wl,--wrap=_gfortran_runtime_error_at ");
+    }
     ldflags.push_str("-lgfortran -lquadmath -lm");
     // How each Fortran object of the link was compiled, so `bhf capsule` can
     // rebuild it from source: the project's module objects, the target, the
@@ -1004,7 +1079,7 @@ pub fn build_fortran_harness(
 const FORTRAN_FLAGS: &[&str] = &[
     "-O1",
     "-g",
-    "-fsanitize=address",
+    MEMORY_CHECK,
     "-fsanitize-coverage=trace-pc,trace-cmp",
     "-cpp",
     "-ffree-line-length-none",
@@ -1012,7 +1087,7 @@ const FORTRAN_FLAGS: &[&str] = &[
 const CLOSURE_FLAGS: &[&str] = &[
     "-O1",
     "-g",
-    "-fsanitize=address",
+    MEMORY_CHECK,
     "-fsanitize-coverage=trace-pc,trace-cmp",
     "-cpp",
     "-ffree-line-length-none",
@@ -1021,7 +1096,7 @@ const CLOSURE_FLAGS: &[&str] = &[
 const WRAPPER_FLAGS: &[&str] = &[
     "-O1",
     "-g",
-    "-fsanitize=address",
+    MEMORY_CHECK,
     "-fsanitize-coverage=trace-pc,trace-cmp",
     "-ffree-line-length-none",
 ];
@@ -1061,7 +1136,7 @@ fn link_with_project_closure(
     mut recorded: Vec<(PathBuf, PathBuf, &[&str])>,
 ) -> FortranBuildResult {
     const MAX_ROUNDS: usize = 8;
-    let main_bin = hdir.join("main");
+    let main_bin = crate::auto::layout::harness_exe(hdir, "main");
     let mut extra_objects: Vec<PathBuf> = Vec::new();
     let mut index: Option<std::collections::HashMap<String, PathBuf>> = None;
     let mut last_output = String::new();
@@ -1073,16 +1148,25 @@ fn link_with_project_closure(
             ldflags.push(' ');
             ldflags.push_str(&obj.display().to_string());
         }
+        let mut make = Command::new("make");
+        make.current_dir(hdir).env("AUTO_EXTRA_LDFLAGS", &ldflags);
+        if cfg!(windows) {
+            make.env("CC", mingw_gcc())
+                .env("BHF_CC_FAMILY", "gcc")
+                .env(crate::build::MAKE_BHF_CFLAGS, WINDOWS_C_FLAGS);
+        }
         let built = crate::command_output::output_with_timeout(
-            Command::new("make")
-                .current_dir(hdir)
-                .env("AUTO_EXTRA_LDFLAGS", &ldflags),
+            &mut make,
             std::time::Duration::from_secs(30 * 60),
         );
         let output = match built {
             Ok(o) if o.status.success() && main_bin.is_file() => {
                 write_build_record(hdir, &recorded);
                 crate::build::record_lane_ldflags(hdir, &ldflags);
+                if cfg!(windows) {
+                    let _ =
+                        std::fs::write(hdir.join(SANITIZER_LIMIT_RECORD), WINDOWS_SANITIZER_LIMIT);
+                }
                 return FortranBuildResult::Built;
             }
             Ok(o) => {
@@ -1176,7 +1260,7 @@ fn link_with_project_closure(
 fn compile_dependency(source: &Path, obj: &Path, moddir: &Path) -> bool {
     crate::command_output::output_with_timeout(
         Command::new("gfortran")
-            .args(["-O1", "-g", "-fsanitize=address"])
+            .args(["-O1", "-g", MEMORY_CHECK])
             .arg("-fsanitize-coverage=trace-pc,trace-cmp")
             .arg("-cpp")
             .arg("-ffree-line-length-none")

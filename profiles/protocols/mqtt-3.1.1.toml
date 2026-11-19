@@ -1,0 +1,349 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# MQTT 3.1.1 reference protocol profile (bhf.protocol.v1).
+#
+# Models an MQTT 3.1.1 client session with a broker (TCP port 1883), per
+# OASIS MQTT Version 3.1.1. Every packet is a fixed header (the packet type
+# and flags in one byte, then the Remaining Length) and the rest of the
+# packet; the framing reads each reply by its Remaining Length.
+#
+# The session connects (CONNECT -> CONNACK), subscribes to a topic filter
+# with a packet id (SUBSCRIBE -> SUBACK), publishes at QoS 2 (PUBLISH ->
+# PUBREC) and releases the publication with the packet id the broker's
+# PUBREC named (PUBREL -> PUBCOMP), and pings (PINGREQ -> PINGRESP). A state
+# is reached only on the packet that answers the request: each reply's
+# packet type is captured as an enum naming only that packet, and a CONNACK
+# only when it accepts the connection, since a broker closes the connection
+# after one that refuses it.
+#
+# The Remaining Length is a variable byte integer. The requests compute it as
+# one byte, which is that integer's one-byte form below 128, and their
+# fields are bounded to keep every packet below 128 bytes. The subscribed
+# filter and the published topic do not overlap, so the broker routes
+# nothing back on the session. PUBLISH is at QoS 2 because a QoS 0 PUBLISH
+# has no reply. A broker closes the connection on a malformed packet
+# (MQTT-4.8.0-1), which the session lane records as a dropped session
+# (session-disconnect); a broker run with --session-server-cmd that crashes
+# is a session-server-crash or session-server-exit finding instead.
+#
+#   bhf fuzz <work> --harness <ID> \
+#     --protocol-profile profiles/protocols/mqtt-3.1.1.toml \
+#     --session-transport tcp:HOST:1883
+
+schema = "bhf.protocol.v1"
+transport = "tcp"
+start = "start"
+
+# The Remaining Length, a variable byte integer at byte 1, ends each packet.
+[framing]
+kind = "length_field"
+offset = 1
+width = "varint"
+
+# ---------------------------------------------------------------------------
+# CONNECT: protocol name "MQTT", level 4 (3.1.1), a clean session.
+# ---------------------------------------------------------------------------
+[[message]]
+name = "CONNECT"
+max_len = 128
+
+[[message.field]]
+name = "packet_type"
+type = "u8"
+value = 0x10
+
+[[message.field]]
+name = "remaining_length"
+type = "u8"
+computed = "length(protocol_name_length,protocol_name,protocol_level,connect_flags,keep_alive,client_id_length,client_id)"
+
+[[message.field]]
+name = "protocol_name_length"
+type = "u16"
+endian = "big"
+computed = "length(protocol_name)"
+
+[[message.field]]
+name = "protocol_name"
+type = "bytes"
+max = 16
+value = "MQTT"
+
+[[message.field]]
+name = "protocol_level"
+type = "u8"
+value = 4
+
+# Clean Session; no will, user name or password.
+[[message.field]]
+name = "connect_flags"
+type = "u8"
+value = 0x02
+
+[[message.field]]
+name = "keep_alive"
+type = "u16"
+endian = "big"
+value = 60
+
+[[message.field]]
+name = "client_id_length"
+type = "u16"
+endian = "big"
+computed = "length(client_id)"
+
+# A broker accepts 1 to 23 bytes (MQTT-3.1.3-5) and may accept more.
+[[message.field]]
+name = "client_id"
+type = "bytes"
+max = 64
+value = "bhf-session"
+
+# CONNACK: 0x20, 2, the session-present flag, the return code.
+[message.response]
+[[message.response.capture]]
+name = "packet_type"
+type = "enum"
+at = 0
+variants = { connack = 0x20 }
+
+[[message.response.capture]]
+name = "session_present"
+type = "u8"
+at = 2
+
+[[message.response.capture]]
+name = "return_code"
+type = "enum"
+at = 3
+variants = { accepted = 0 }
+
+# ---------------------------------------------------------------------------
+# SUBSCRIBE: one topic filter at QoS 1. Its fixed-header flags are 0b0010.
+# ---------------------------------------------------------------------------
+[[message]]
+name = "SUBSCRIBE"
+max_len = 128
+
+[[message.field]]
+name = "packet_type"
+type = "u8"
+value = 0x82
+
+[[message.field]]
+name = "remaining_length"
+type = "u8"
+computed = "length(packet_id,filter_length,filter,requested_qos)"
+
+[[message.field]]
+name = "packet_id"
+type = "u16"
+endian = "big"
+value = 1
+
+[[message.field]]
+name = "filter_length"
+type = "u16"
+endian = "big"
+computed = "length(filter)"
+
+[[message.field]]
+name = "filter"
+type = "bytes"
+max = 96
+value = "bhf/session/commands/#"
+
+[[message.field]]
+name = "requested_qos"
+type = "u8"
+value = 1
+
+# SUBACK: 0x90, 3, the packet id, the granted QoS or 0x80 (failure).
+[message.response]
+[[message.response.capture]]
+name = "packet_type"
+type = "enum"
+at = 0
+variants = { suback = 0x90 }
+
+[[message.response.capture]]
+name = "packet_id"
+type = "u16"
+at = 2
+endian = "big"
+
+[[message.response.capture]]
+name = "return_code"
+type = "enum"
+at = 4
+variants = { granted_qos_0 = 0, granted_qos_1 = 1, granted_qos_2 = 2, failure = 0x80 }
+
+# ---------------------------------------------------------------------------
+# PUBLISH at QoS 2 (0x34: PUBLISH, QoS 2, no DUP, no RETAIN).
+# ---------------------------------------------------------------------------
+[[message]]
+name = "PUBLISH"
+max_len = 128
+
+[[message.field]]
+name = "packet_type"
+type = "u8"
+value = 0x34
+
+[[message.field]]
+name = "remaining_length"
+type = "u8"
+computed = "length(topic_length,topic,packet_id,payload)"
+
+[[message.field]]
+name = "topic_length"
+type = "u16"
+endian = "big"
+computed = "length(topic)"
+
+[[message.field]]
+name = "topic"
+type = "bytes"
+max = 64
+value = "bhf/session/telemetry"
+
+[[message.field]]
+name = "packet_id"
+type = "u16"
+endian = "big"
+value = 2
+
+[[message.field]]
+name = "payload"
+type = "bytes"
+max = 56
+value = "21.5"
+
+# PUBREC: 0x50, 2, the packet id.
+[message.response]
+[[message.response.capture]]
+name = "packet_type"
+type = "enum"
+at = 0
+variants = { pubrec = 0x50 }
+
+[[message.response.capture]]
+name = "packet_id"
+type = "u16"
+at = 2
+endian = "big"
+
+# ---------------------------------------------------------------------------
+# PUBREL: release the publication the PUBREC acknowledged. Its fixed-header
+# flags are 0b0010.
+# ---------------------------------------------------------------------------
+[[message]]
+name = "PUBREL"
+max_len = 128
+
+[[message.field]]
+name = "packet_type"
+type = "u8"
+value = 0x62
+
+[[message.field]]
+name = "remaining_length"
+type = "u8"
+computed = "length(packet_id)"
+
+[[message.field]]
+name = "packet_id"
+type = "u16"
+endian = "big"
+ref = "PUBLISH.response.packet_id"
+
+# PUBCOMP: 0x70, 2, the packet id.
+[message.response]
+[[message.response.capture]]
+name = "packet_type"
+type = "enum"
+at = 0
+variants = { pubcomp = 0x70 }
+
+[[message.response.capture]]
+name = "packet_id"
+type = "u16"
+at = 2
+endian = "big"
+
+# ---------------------------------------------------------------------------
+# PINGREQ: 0xC0 and a Remaining Length of 0. The length is computed over a
+# body that is always empty, as a PINGREQ's is: a mutated Remaining Length
+# would only leave the broker waiting for bytes that never come.
+# ---------------------------------------------------------------------------
+[[message]]
+name = "PINGREQ"
+max_len = 128
+
+[[message.field]]
+name = "packet_type"
+type = "u8"
+value = 0xc0
+
+[[message.field]]
+name = "remaining_length"
+type = "u8"
+computed = "length(body)"
+
+[[message.field]]
+name = "body"
+type = "bytes"
+max = 0
+value = ""
+
+# PINGRESP: 0xD0, 0.
+[message.response]
+[[message.response.capture]]
+name = "packet_type"
+type = "enum"
+at = 0
+variants = { pingresp = 0xd0 }
+
+# ---------------------------------------------------------------------------
+# Legal message ordering. CONNECT comes first and only once (MQTT-3.1.0-1,
+# -2); a QoS 2 publication is released before the next one is sent.
+# ---------------------------------------------------------------------------
+[[transition]]
+from = "start"
+send = "CONNECT"
+to = "connected"
+
+[[transition]]
+from = "connected"
+send = "SUBSCRIBE"
+to = "subscribed"
+
+[[transition]]
+from = "connected"
+send = "PINGREQ"
+to = "connected"
+
+[[transition]]
+from = "subscribed"
+send = "SUBSCRIBE"
+to = "subscribed"
+
+[[transition]]
+from = "subscribed"
+send = "PUBLISH"
+to = "publish_received"
+
+[[transition]]
+from = "subscribed"
+send = "PINGREQ"
+to = "subscribed"
+
+[[transition]]
+from = "publish_received"
+send = "PUBREL"
+to = "subscribed"
+
+# A new connection for every session: a broker keeps no state for a
+# clean session once it ends.
+[session]
+reset = "reconnect"

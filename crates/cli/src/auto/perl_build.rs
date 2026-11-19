@@ -92,10 +92,9 @@ pub fn build_perl_harness(
         Err(reason) => return PerlBuildResult::Failed { reason, skip: true },
     };
 
-    let target_abs = match candidate.source_path.canonicalize() {
-        Ok(p) => p,
-        Err(_) => candidate.source_path.clone(),
-    };
+    // Without Windows' verbatim `\\?\` prefix, which `require` cannot
+    // open there (#325).
+    let target_abs = crate::workdir::plain_canonical(&candidate.source_path);
     let (module_root, _) = resolve_module_root(&target_abs, &sub.package);
 
     let auto_dir = crate::auto::layout::harness_dir(work_dir, harness_id);
@@ -137,16 +136,8 @@ pub fn build_perl_harness(
 
     // Build gate 1: `perl -c` the harness (syntax only; the `require` inside is a
     // runtime op, so this does not execute the target).
-    let perl5lib = format!(
-        "{}:{}:{}",
-        auto_dir.display(),
-        module_root.display(),
-        target_abs
-            .parent()
-            .map(Path::display)
-            .map(|d| d.to_string())
-            .unwrap_or_default()
-    );
+    let target_dir = target_abs.parent().unwrap_or(Path::new("")).to_path_buf();
+    let perl5lib = crate::launch_spec::search_path(&[&auto_dir, &module_root, &target_dir]);
     let compile = crate::command_output::output_with_timeout(
         Command::new(&perl)
             .arg("-c")
@@ -218,13 +209,14 @@ pub fn build_perl_harness(
          BHF_TARGET_PACKAGE=\"{pkg}\" \\\n\
          BHF_TRACE_PREFIX=\"{trace}\" \\\n\
          BHF_COVERED_LINES=\"{covered}\" \\\n\
-         PERL5LIB=\"{perl5lib}:${{PERL5LIB}}\" \\\n\
+         PERL5LIB=\"{perl5lib}{separator}${{PERL5LIB}}\" \\\n\
          exec \"{perl}\" -d:BhfCov \"{driver}\" \"$@\"\n",
         harness = harness_path.display(),
         pkg = top_pkg,
         trace = module_root.display(),
         covered = auto_dir.join("covered-lines.txt").display(),
         perl5lib = perl5lib,
+        separator = if cfg!(windows) { ';' } else { ':' },
         perl = perl.display(),
         driver = driver.display(),
     );
@@ -237,6 +229,39 @@ pub fn build_perl_harness(
     if let Err(e) = make_executable(&main_path) {
         return PerlBuildResult::Failed {
             reason: format!("chmod +x {}: {e}", main_path.display()),
+            skip: false,
+        };
+    }
+    // Where `main` cannot run (native Windows, #325): perl on the driver with
+    // the environment the script sets.
+    let inherited = std::env::var("PERL5LIB").unwrap_or_default();
+    let launch = replay_min::Launch {
+        program: perl.clone(),
+        args: vec!["-d:BhfCov".to_owned(), driver.display().to_string()],
+        env: vec![
+            ("BHF_HARNESS".to_owned(), harness_path.display().to_string()),
+            ("BHF_TARGET_PACKAGE".to_owned(), top_pkg.to_owned()),
+            (
+                "BHF_TRACE_PREFIX".to_owned(),
+                module_root.display().to_string(),
+            ),
+            (
+                "BHF_COVERED_LINES".to_owned(),
+                auto_dir.join("covered-lines.txt").display().to_string(),
+            ),
+            (
+                "PERL5LIB".to_owned(),
+                if inherited.is_empty() {
+                    perl5lib.clone()
+                } else {
+                    crate::launch_spec::search_path(&[Path::new(&perl5lib), Path::new(&inherited)])
+                },
+            ),
+        ],
+    };
+    if let Err(e) = crate::launch_spec::write(&main_path, &launch) {
+        return PerlBuildResult::Failed {
+            reason: format!("write launch spec in {}: {e}", auto_dir.display()),
             skip: false,
         };
     }
@@ -277,7 +302,8 @@ fn resolve_target(candidate: &Candidate) -> Result<(PerlSub, String), String> {
 }
 
 /// Compute the `@INC` root for a Perl module so its own `use`/`require` resolve:
-/// strip the `Package/Path.pm` suffix from the file path. Falls back to the file's
+/// strip the `Package/Path.pm` components from the end of the file path, by
+/// component so a Windows path's separators count too. Falls back to the file's
 /// directory for a `package main` script or a path/package mismatch.
 fn resolve_module_root(target_abs: &Path, package: &str) -> (PathBuf, ()) {
     let dir = target_abs
@@ -287,15 +313,22 @@ fn resolve_module_root(target_abs: &Path, package: &str) -> (PathBuf, ()) {
     if package == "main" || package.is_empty() {
         return (dir, ());
     }
-    let rel = format!("{}.pm", package.replace("::", "/"));
-    let path_str = target_abs.to_string_lossy();
-    if let Some(stripped) = path_str.strip_suffix(&rel) {
-        let root = stripped.trim_end_matches('/');
-        if !root.is_empty() {
-            return (PathBuf::from(root), ());
+    let parts: Vec<&str> = package.split("::").collect();
+    let mut parts = parts.into_iter().rev();
+    let file = parts.next().map(|last| format!("{last}.pm"));
+    if target_abs.file_name().and_then(|name| name.to_str()) != file.as_deref() {
+        return (dir, ());
+    }
+    let mut root = dir.clone();
+    for part in parts {
+        if root.file_name().and_then(|name| name.to_str()) != Some(part) || !root.pop() {
+            return (dir, ());
         }
     }
-    (dir, ())
+    if root.as_os_str().is_empty() {
+        return (dir, ());
+    }
+    (root, ())
 }
 
 /// Emit `bhfgen.pm` exposing `bhfgen::bhf_run_one($bytes)`.
@@ -420,6 +453,29 @@ mod tests {
     fn module_root_strips_package_path() {
         let (root, _) = resolve_module_root(Path::new("/proj/lib/My/Parser.pm"), "My::Parser");
         assert_eq!(root, Path::new("/proj/lib"));
+    }
+
+    /// The package's path is matched by component, so a Windows path's
+    /// separators count, no separator is left at the root's end (it would
+    /// escape the quote that ends it in the launcher), and a directory that
+    /// only ends like the package's is not taken for it.
+    #[test]
+    fn module_root_strips_the_package_path_by_component() {
+        let (root, _) = resolve_module_root(Path::new("/proj/lib/RecordParser.pm"), "RecordParser");
+        assert_eq!(root.as_os_str(), "/proj/lib");
+        let (root, _) = resolve_module_root(Path::new("/proj/libMy/Parser.pm"), "My::Parser");
+        assert_eq!(
+            root,
+            Path::new("/proj/libMy"),
+            "a mismatch falls back to the dir"
+        );
+        let (root, _) = resolve_module_root(Path::new("/proj/lib/Other.pm"), "My::Parser");
+        assert_eq!(root, Path::new("/proj/lib"));
+        if cfg!(windows) {
+            let (root, _) =
+                resolve_module_root(Path::new(r"C:\proj\lib\My\Parser.pm"), "My::Parser");
+            assert_eq!(root.as_os_str(), r"C:\proj\lib");
+        }
     }
 
     #[test]

@@ -163,3 +163,6 @@ which.workspace = true
 # artifact from the real session types. Both are internal workspace crates.
 protocol_session = { path = "../protocol_session" }
 fuzz_engine_builtin = { path = "../fuzz_engine/builtin" }
+# The GIOP session test's fixture server decodes requests and encodes replies
+# with the iiop crate a giop profile marshals with.
+iiop = { path = "../iiop" }

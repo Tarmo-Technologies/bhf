@@ -160,7 +160,8 @@ if (defined $ENV{BHF_FRAMED}) {
     open(my $CTL, '>&', \*STDOUT) or die "dup control: $!\n";
     binmode $CTL;
     $CTL->autoflush(1);
-    open(STDOUT, '>', '/dev/null') or die "redirect stdout: $!\n";
+    require File::Spec;
+    open(STDOUT, '>', File::Spec->devnull) or die "redirect stdout: $!\n";
     syswrite($CTL, "\x01");    # ready byte
     my $count = 0;
     while (1) {

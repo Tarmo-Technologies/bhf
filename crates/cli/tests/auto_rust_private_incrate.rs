@@ -36,7 +36,7 @@ fn bhf_bin() -> PathBuf {
 
 fn has_cargo_nightly() -> bool {
     let present = {
-        Command::new("cargo")
+        Command::new(support::rustup_cargo())
             .args(["+nightly", "--version"])
             .output()
             .map(|o| o.status.success())
@@ -139,11 +139,6 @@ fn snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "the Rust lane builds its harness as a Unix static archive (lib*.a, linked with \
-              libpthread and libdl) and runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn private_path_opener_builds_fuzzes_and_finds_planted_crash_in_crate() {
     let bin = bhf_bin();
     if !bin.exists() {
@@ -222,7 +217,9 @@ fn private_path_opener_builds_fuzzes_and_finds_planted_crash_in_crate() {
 
     // The built binary exists and the transient in-crate Cargo cache was cleaned.
     assert!(
-        harness_root.join("main").is_file(),
+        harness_root
+            .join(if cfg!(windows) { "main.exe" } else { "main" })
+            .is_file(),
         "in-crate `main` binary exists: {}",
         harness_root.display()
     );
@@ -400,11 +397,6 @@ fn the_config_key_enables_the_lane_and_an_unsupported_setup_has_its_own_outcome(
 /// `src/store/mod.rs`) is visible only inside that module: the harness is
 /// declared as its child, so it builds, fuzzes and finds the planted bug.
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "the Rust lane builds its harness as a Unix static archive (lib*.a, linked with \
-              libpthread and libdl) and runs under WSL on Windows; see docs/site/windows.md"
-)]
 fn a_private_associated_function_of_a_submodule_builds_and_its_bug_is_found() {
     if !bhf_bin().exists() || !has_cargo_nightly() {
         eprintln!("skip: needs the bhf binary and `cargo +nightly`");

@@ -38,17 +38,28 @@ function Get-Asm([string]$Name) {
         Remove-Item -Force $cached
     }
     $artifact = $Name -replace "-$AsmVersion\.jar$", ''
-    $url = "https://repo1.maven.org/maven2/org/ow2/asm/$artifact/$AsmVersion/$Name"
+    $path = "org/ow2/asm/$artifact/$AsmVersion/$Name"
     $part = "$cached.part.$PID"
-    for ($try = 1; ; $try++) {
-        try {
-            Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $part
-            break
-        } catch {
-            if ($try -ge 6) { throw "build-agent.ps1: could not fetch $url ($_); pre-stage it in ASM_JAR_DIR" }
-            Start-Sleep -Seconds 5
+    # Maven Central, then Google's mirror of it: Central's CDN has answered
+    # some networks with errors for an hour at a time. The pinned digest
+    # holds the jar to the same bytes whichever one serves it.
+    $bases = @('https://repo1.maven.org/maven2', 'https://maven-central.storage-download.googleapis.com/maven2')
+    $fetched = $false
+    foreach ($base in $bases) {
+        $url = "$base/$path"
+        for ($try = 1; $try -le 6; $try++) {
+            try {
+                Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $part
+                $fetched = $true
+                break
+            } catch {
+                $failure = $_
+                Start-Sleep -Seconds 5
+            }
         }
+        if ($fetched) { break }
     }
+    if (-not $fetched) { throw "build-agent.ps1: could not fetch $path ($failure); pre-stage it in ASM_JAR_DIR" }
     $got = Sha256Of $part
     if ($got -ne $want) {
         Remove-Item -Force $part

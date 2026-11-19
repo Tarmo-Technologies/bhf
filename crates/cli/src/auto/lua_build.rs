@@ -64,10 +64,9 @@ pub fn build_lua_harness(
         Err(reason) => return LuaBuildResult::Failed { reason, skip: true },
     };
 
-    let target_abs = candidate
-        .source_path
-        .canonicalize()
-        .unwrap_or_else(|_| candidate.source_path.clone());
+    // Without Windows' verbatim `\\?\` prefix, which the interpreter cannot
+    // open there (#325).
+    let target_abs = crate::workdir::plain_canonical(&candidate.source_path);
     let target_dir = target_abs
         .parent()
         .map(Path::to_path_buf)
@@ -112,7 +111,7 @@ pub fn build_lua_harness(
             .arg("-e")
             .arg(format!(
                 "local f=assert(loadfile('{}')); f()",
-                harness_path.display()
+                lua_path(&harness_path)
             ))
             .current_dir(&auto_dir),
         Duration::from_secs(30),
@@ -165,6 +164,34 @@ pub fn build_lua_harness(
             skip: false,
         };
     }
+    // Where `main` cannot run (native Windows, #325): lua on the driver with
+    // the environment the script sets. Lua's stdin stays in text mode there,
+    // so the driver asks for hex frames (BHF_TEXT_FRAMES).
+    let mut env = vec![
+        ("BHF_HARNESS".to_owned(), harness_path.display().to_string()),
+        (
+            "BHF_TRACE_PREFIX".to_owned(),
+            source_root.display().to_string(),
+        ),
+        (
+            "BHF_COVERED_LINES".to_owned(),
+            auto_dir.join("covered-lines.txt").display().to_string(),
+        ),
+    ];
+    if cfg!(windows) {
+        env.push(("BHF_TEXT_FRAMES".to_owned(), "1".to_owned()));
+    }
+    let launch = replay_min::Launch {
+        program: lua.clone(),
+        args: vec![driver.display().to_string()],
+        env,
+    };
+    if let Err(e) = crate::launch_spec::write(&main_path, &launch) {
+        return LuaBuildResult::Failed {
+            reason: format!("write launch spec in {}: {e}", auto_dir.display()),
+            skip: false,
+        };
+    }
     LuaBuildResult::Built
 }
 
@@ -212,7 +239,7 @@ fn generate_harness(target_abs: &Path, load_roots: &[std::path::PathBuf], call: 
     let search: String = load_roots
         .iter()
         .map(|root| {
-            let dir = root.display();
+            let dir = lua_path(root);
             format!("{dir}/?.lua;{dir}/?/init.lua;")
         })
         .collect();
@@ -263,9 +290,15 @@ fn generate_harness(target_abs: &Path, load_roots: &[std::path::PathBuf], call: 
          \x20 {call}\n\
          end\n",
         search = search,
-        target = target_abs.display(),
+        target = lua_path(target_abs),
         call = call,
     )
+}
+
+/// `path` as a Lua string literal's text: a Lua string reads `\` as an
+/// escape, so Windows' separators become `/`, which Windows takes as well.
+fn lua_path(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
 }
 
 #[cfg(unix)]

@@ -817,7 +817,6 @@ mod tests {
                 targets: 2,
                 missing: vec!["definitely-missing-gnat-test"],
                 install_hint: "install GNAT",
-                unsupported: None,
             }],
         };
         let manifest = scan(&root, &[], &preflight, &[], &root.join("work"), false);

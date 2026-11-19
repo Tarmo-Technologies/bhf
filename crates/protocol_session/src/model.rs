@@ -19,6 +19,10 @@
 //!    `initial()` (which falls back to index 0 when no state is named `ready`)
 //!    resolves to the profile's start state. Mutation legality and novelty are
 //!    both driven off this graph.
+//!
+//! A `giop` profile's messages compile the same way, except that a message's
+//! frame is the GIOP 1.2 Request [`crate::giop`] marshals from its fields,
+//! and its captures read the GIOP Reply.
 
 use std::collections::BTreeMap;
 
@@ -30,7 +34,10 @@ use fuzz_engine_builtin::{
 use serde::{Deserialize, Serialize};
 
 use crate::binding::{Bindings, BoundValue};
-use crate::profile::{ByteOrder, FieldDef, FieldType, MessageDef, OracleDef, Profile, SessionDef};
+use crate::giop::{CdrKind, GiopDef, GiopRequest, ReplyField};
+use crate::profile::{
+    ByteOrder, FieldDef, FieldType, MessageDef, OracleDef, Profile, ProfileKind, SessionDef,
+};
 
 /// A concrete value assigned to a data field of a message instance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,12 +164,22 @@ pub enum CaptureSpec {
         len_width: IntWidth,
         endian: Endian,
     },
+    /// A value of a GIOP Reply, in a `giop` message: a field of its header,
+    /// or the body's next value at its CDR kind, an enum's code mapped by
+    /// `variants`.
+    Giop {
+        field: ReplyField,
+        kind: CdrKind,
+        variants: Option<BTreeMap<String, u64>>,
+    },
 }
 
 /// A compiled response capture.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledCapture {
     pub name: String,
+    /// The capture's offset in the reply (0 for a `giop` capture, which
+    /// reads the reply's values in order).
     pub at: usize,
     pub spec: CaptureSpec,
 }
@@ -174,6 +191,8 @@ pub struct CompiledMessage {
     pub max_len: usize,
     pub fields: Vec<CompiledField>,
     pub response: Vec<CompiledCapture>,
+    /// In a `giop` profile, the request the message's frame is.
+    pub giop: Option<GiopRequest>,
 }
 
 impl CompiledMessage {
@@ -219,6 +238,14 @@ impl CompiledMessage {
         values: &BTreeMap<String, FieldValue>,
         bindings: &Bindings,
     ) -> Result<EncodedMessage, EncodeError> {
+        if let Some(request) = &self.giop {
+            // The GIOP message is the frame: one field, bounded by `max_len`.
+            let frame = crate::giop::encode_request(request, &self.fields, values, bindings)?;
+            return Message::new(vec![Field::bytes("giop", frame)])
+                .with_max_len(self.max_len)
+                .encode()
+                .map_err(EncodeError::Frame);
+        }
         let mut fields: Vec<Field> = Vec::with_capacity(self.fields.len());
         let mut refs: Vec<(String, String, IntWidth, Endian)> = Vec::new();
 
@@ -324,10 +351,15 @@ pub struct ProtocolModel {
 impl ProtocolModel {
     /// Compile a validated [`Profile`] into an executable model.
     pub fn from_profile(profile: &Profile) -> Result<Self, ModelError> {
+        let giop = match profile.kind() {
+            ProfileKind::Binary => None,
+            ProfileKind::Giop => Some(profile.giop()),
+        };
         let messages = profile
             .messages()
             .iter()
-            .map(compile_message)
+            .enumerate()
+            .map(|(index, def)| compile_message(def, index, giop))
             .collect::<Result<Vec<_>, _>>()?;
 
         let graph = build_state_graph(profile)?;
@@ -382,7 +414,13 @@ impl ProtocolModel {
     }
 }
 
-fn compile_message(def: &MessageDef) -> Result<CompiledMessage, ModelError> {
+/// Compile one message; `giop` is a `giop` profile's `[giop]` table (`None`
+/// inside when it has none), and `None` for a binary profile.
+fn compile_message(
+    def: &MessageDef,
+    index: usize,
+    giop: Option<Option<&GiopDef>>,
+) -> Result<CompiledMessage, ModelError> {
     let field_names: Vec<&str> = def.fields.iter().map(|f| f.name.as_str()).collect();
     let optional_names: Vec<&str> = def
         .fields
@@ -391,6 +429,9 @@ fn compile_message(def: &MessageDef) -> Result<CompiledMessage, ModelError> {
         .map(|f| f.name.as_str())
         .collect();
 
+    let request = giop
+        .map(|giop| crate::giop::compile_request(def, index, giop))
+        .transpose()?;
     let mut fields = Vec::with_capacity(def.fields.len());
     for field in &def.fields {
         fields.push(compile_field(
@@ -398,6 +439,7 @@ fn compile_message(def: &MessageDef) -> Result<CompiledMessage, ModelError> {
             field,
             &field_names,
             &optional_names,
+            request.is_some(),
         )?);
     }
 
@@ -407,7 +449,7 @@ fn compile_message(def: &MessageDef) -> Result<CompiledMessage, ModelError> {
         .map(|r| {
             r.captures
                 .iter()
-                .map(|c| compile_capture(&def.name, c))
+                .map(|c| compile_capture(&def.name, c, request.is_some()))
                 .collect::<Result<Vec<_>, _>>()
         })
         .transpose()?
@@ -420,6 +462,7 @@ fn compile_message(def: &MessageDef) -> Result<CompiledMessage, ModelError> {
             .unwrap_or(fuzz_engine_builtin::binframe::DEFAULT_MAX_LEN),
         fields,
         response,
+        giop: request,
     })
 }
 
@@ -428,6 +471,7 @@ fn compile_field(
     def: &FieldDef,
     field_names: &[&str],
     optional_names: &[&str],
+    giop: bool,
 ) -> Result<CompiledField, ModelError> {
     let endian = to_endian(def.endian);
 
@@ -435,7 +479,7 @@ fn compile_field(
         compile_computed(message, def, spec, field_names, optional_names)?
     } else if let Some(source) = &def.reference {
         let encoding = match def.ty {
-            FieldType::Bytes => RefEncoding::Bytes,
+            FieldType::Bytes | FieldType::String => RefEncoding::Bytes,
             FieldType::Tlv => RefEncoding::Tlv {
                 tag: def.tag.unwrap_or(0),
                 tag_width: IntWidth::U16,
@@ -456,7 +500,7 @@ fn compile_field(
             encoding,
         }
     } else {
-        FieldRole::Data(compile_data_spec(message, def, endian)?)
+        FieldRole::Data(compile_data_spec(message, def, endian, giop)?)
     };
 
     // Optional applies only to concrete data fields.
@@ -482,9 +526,19 @@ fn compile_data_spec(
     message: &str,
     def: &FieldDef,
     endian: Endian,
+    giop: bool,
 ) -> Result<DataSpec, ModelError> {
     Ok(match def.ty {
         FieldType::Bytes => DataSpec::Bytes { max: def.max },
+        // A CDR string is mutated as the bytes it carries.
+        FieldType::String if giop => DataSpec::Bytes { max: def.max },
+        FieldType::String => {
+            return Err(ModelError::IllegalFieldType {
+                message: message.to_owned(),
+                field: def.name.clone(),
+                reason: "a string is a CDR string, which only a giop profile marshals".to_owned(),
+            })
+        }
         FieldType::U8 => DataSpec::Int {
             width: IntWidth::U8,
             endian,
@@ -511,7 +565,13 @@ fn compile_data_spec(
                     field: def.name.clone(),
                 });
             }
-            let width = enum_width(message, &def.name, def.width, &variants)?;
+            // CDR marshals an enum as an unsigned long.
+            let declared = if giop {
+                def.width.or(Some(FieldType::U32))
+            } else {
+                def.width
+            };
+            let width = enum_width(message, &def.name, declared, &variants)?;
             DataSpec::Enum {
                 width,
                 endian,
@@ -628,7 +688,19 @@ fn compile_computed(
 fn compile_capture(
     message: &str,
     def: &crate::profile::CaptureDef,
+    giop: bool,
 ) -> Result<CompiledCapture, ModelError> {
+    if giop {
+        return Ok(CompiledCapture {
+            name: def.name.clone(),
+            at: 0,
+            spec: crate::giop::compile_capture(message, def)?,
+        });
+    }
+    let at = def.at.ok_or_else(|| ModelError::CaptureWithoutAt {
+        message: message.to_owned(),
+        field: def.name.clone(),
+    })?;
     let endian = to_endian(def.endian);
     let spec = match def.ty {
         FieldType::U8 => CaptureSpec::Int {
@@ -664,6 +736,13 @@ fn compile_capture(
                 field: def.name.clone(),
             })?,
         },
+        FieldType::String => {
+            return Err(ModelError::IllegalFieldType {
+                message: message.to_owned(),
+                field: def.name.clone(),
+                reason: "a string is a CDR string, which only a giop profile reads".to_owned(),
+            })
+        }
         FieldType::Tlv => {
             let width = |declared: Option<FieldType>, key: &str| match declared {
                 None => Ok(IntWidth::U16),
@@ -683,7 +762,7 @@ fn compile_capture(
     };
     Ok(CompiledCapture {
         name: def.name.clone(),
-        at: def.at,
+        at,
         spec,
     })
 }
@@ -881,11 +960,24 @@ fn seed_from_toml(
                 FieldValue::Tlv { value: bytes }
             }
         }
-        DataSpec::Int { .. } => {
-            let n = value.as_integer().ok_or_else(bad)?;
-            FieldValue::Int {
-                value: u64::try_from(n).map_err(|_| bad())?,
-            }
+        DataSpec::Int { width, .. } => {
+            let n = value
+                .as_integer()
+                .or_else(|| value.as_bool().map(i64::from))
+                .ok_or_else(bad)?;
+            // A negative seed is its two's complement at the field's width,
+            // as a signed IDL type (`short`, `long`) marshals it.
+            let value = match u64::try_from(n) {
+                Ok(value) => value,
+                Err(_) => {
+                    let bits = 8 * width.size() as u32;
+                    if n < -(1i64 << (bits - 1)) {
+                        return Err(bad());
+                    }
+                    (n as u64) & width_max(*width)
+                }
+            };
+            FieldValue::Int { value }
         }
         DataSpec::Enum { variants, .. } => {
             let symbol = value.as_str().ok_or_else(bad)?.to_owned();
@@ -912,7 +1004,7 @@ fn toml_to_bytes(value: &toml::Value) -> Option<Vec<u8>> {
     }
 }
 
-fn spec_kind(spec: &DataSpec) -> &'static str {
+pub(crate) fn spec_kind(spec: &DataSpec) -> &'static str {
     match spec {
         DataSpec::Bytes { .. } => "bytes",
         DataSpec::Int { .. } => "int",
@@ -921,7 +1013,7 @@ fn spec_kind(spec: &DataSpec) -> &'static str {
     }
 }
 
-fn value_kind(value: &FieldValue) -> &'static str {
+pub(crate) fn value_kind(value: &FieldValue) -> &'static str {
     match value {
         FieldValue::Bytes { .. } => "bytes",
         FieldValue::Int { .. } => "int",
@@ -1030,6 +1122,10 @@ pub enum ModelError {
     EnumWithoutVariants { message: String, field: String },
     #[error("bytes response capture {message}.{field} is missing a `len`")]
     CaptureWithoutLen { message: String, field: String },
+    #[error("response capture {message}.{field} is missing an `at`")]
+    CaptureWithoutAt { message: String, field: String },
+    #[error("giop message {message}: {reason}")]
+    Giop { message: String, reason: String },
     #[error("computed field {message}.{field} has a malformed spec {spec:?}")]
     BadComputedSpec {
         message: String,
@@ -1083,6 +1179,8 @@ pub enum EncodeError {
     Unresolved { field: String, reference: String },
     #[error("frame assembly failed: {0}")]
     Frame(BinFrameError),
+    #[error("GIOP request encoding failed: {0}")]
+    Giop(String),
 }
 
 #[cfg(test)]
@@ -1343,6 +1441,76 @@ variants = { ok = 0, huge = 4294967296 }
                     if field == "mode" && value == 4_294_967_296
             ),
             "the oversized variant code must surface as ValueTooWide, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_negative_seed_is_its_twos_complement_and_a_boolean_seed_is_0_or_1() {
+        let src = r#"
+schema = "bhf.protocol.v1"
+start = "s"
+[[message]]
+name = "M"
+[[message.field]]
+name = "quantity"
+type = "long"
+endian = "big"
+value = -5
+[[message.field]]
+name = "delta"
+type = "short"
+endian = "little"
+value = -32768
+[[message.field]]
+name = "flag"
+type = "boolean"
+value = true
+"#;
+        let model =
+            ProtocolModel::from_profile(&Profile::from_toml(src).expect("parse")).expect("compile");
+        let m = model.message("M").unwrap();
+        let frame = m.build_frame(&m.seed_values(), &Bindings::new()).unwrap();
+        assert_eq!(frame.bytes(), [0xff, 0xff, 0xff, 0xfb, 0x00, 0x80, 0x01]);
+
+        let too_negative = src.replace("value = -32768", "value = -32769");
+        let error =
+            ProtocolModel::from_profile(&Profile::from_toml(&too_negative).unwrap()).unwrap_err();
+        assert!(
+            matches!(error, ModelError::BadSeedValue { ref field, .. } if field == "delta"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_binary_profile_refuses_a_string_and_a_capture_with_no_offset() {
+        let string = r#"
+schema = "bhf.protocol.v1"
+[[message]]
+name = "M"
+[[message.field]]
+name = "s"
+type = "string"
+"#;
+        let error = ProtocolModel::from_profile(&Profile::from_toml(string).unwrap()).unwrap_err();
+        assert!(
+            matches!(error, ModelError::IllegalFieldType { ref field, .. } if field == "s"),
+            "{error:?}"
+        );
+        let no_offset = r#"
+schema = "bhf.protocol.v1"
+[[message]]
+name = "M"
+[message.response]
+[[message.response.capture]]
+name = "status"
+type = "u8"
+"#;
+        assert_eq!(
+            ProtocolModel::from_profile(&Profile::from_toml(no_offset).unwrap()).unwrap_err(),
+            ModelError::CaptureWithoutAt {
+                message: "M".to_owned(),
+                field: "status".to_owned()
+            }
         );
     }
 }

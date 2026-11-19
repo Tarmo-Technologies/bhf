@@ -60,10 +60,22 @@ fn main() {
         .to_string();
 
     // `no-cap` advertises only a capability the host does not require, so the
-    // required `oracle.evaluate` fails negotiation up front. Otherwise advertise
-    // the full surface (the host narrows it to what it asked for).
+    // required `oracle.evaluate` fails negotiation up front. The fuzz-stage
+    // modes advertise only the stage they drive (with the oracle). Otherwise
+    // advertise the full surface (the host narrows it to what it asked for).
     let provided: Vec<&str> = if mode == "no-cap" {
         vec!["codec.decode"]
+    } else if mode == "magic-mutator" || mode == "slow-mutator" {
+        vec!["oracle.evaluate", "mutator.mutate"]
+    } else if mode == "codec-only" {
+        vec!["oracle.evaluate", "codec.decode", "codec.encode"]
+    } else if mode == "count-resets" || mode == "failing-setup" {
+        vec![
+            "oracle.evaluate",
+            "lifecycle.setup",
+            "lifecycle.reset",
+            "lifecycle.teardown",
+        ]
     } else {
         vec![
             "oracle.evaluate",
@@ -129,6 +141,55 @@ fn main() {
             }
             "crash" => {
                 exit(101);
+            }
+            // `bhf fuzz` stage modes (#314, #374).
+            "magic-mutator" if capability == "mutator.mutate" => {
+                // Whatever the base, the mutation is the input the target's
+                // gated bug needs.
+                let out = b"..BHFMAGIC..";
+                reply(
+                    &mut stdout,
+                    ok(
+                        &protocol,
+                        &case,
+                        Some(json!({ "output_b64": b64_encode(out) })),
+                    ),
+                );
+            }
+            "slow-mutator" if capability == "mutator.mutate" => {
+                std::thread::sleep(Duration::from_secs(30));
+            }
+            "failing-setup" if capability == "lifecycle.setup" => {
+                reply(
+                    &mut stdout,
+                    json!({
+                        "protocol": protocol,
+                        "case": case,
+                        "result": "infrastructure_error",
+                        "detail": "the fixture is not ready",
+                    }),
+                );
+            }
+            "count-resets" if capability == "lifecycle.reset" => {
+                // One line per reset in the case root's `resets.log`.
+                let response = handle(
+                    &protocol,
+                    &case,
+                    &capability,
+                    &request,
+                    &mut state,
+                    defect_oracle,
+                );
+                if let Some(root) = &state.root {
+                    let log = std::path::Path::new(root).join("resets.log");
+                    let mut file = fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(log)
+                        .expect("open resets.log");
+                    writeln!(file, "reset").expect("write resets.log");
+                }
+                reply(&mut stdout, response);
             }
             "crash-then-unhandshake" => {
                 // Record that this (first) child reached a request, then crash. A
