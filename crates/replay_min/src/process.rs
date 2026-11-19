@@ -354,7 +354,8 @@ pub fn wait_exit_within(
 }
 
 /// Milliseconds left until `deadline`, rounded up so a sub-millisecond
-/// remainder still waits, and capped at `max`.
+/// remainder still waits, and capped at `max`. Only the blocking waits use it.
+#[cfg(any(target_os = "linux", windows))]
 fn millis_until(deadline: Instant, max: u32) -> u32 {
     let left = deadline.saturating_duration_since(Instant::now());
     left.as_nanos().div_ceil(1_000_000).min(u128::from(max)) as u32

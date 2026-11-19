@@ -358,6 +358,31 @@ cargo build --release --target x86_64-pc-windows-msvc -p bhf
 including Visual Studio solutions (`.sln`/`.vcxproj`) via `--probe-build`. See
 [windows.md](./windows.md) for the full guide.
 
+## macOS (Apple Silicon) from source
+
+No macOS release binaries are published yet, but bhf builds and fuzzes
+natively on Apple Silicon (`aarch64-apple-darwin`); CI builds it on a
+`macos-14` runner and checks that `bhf auto` finds a planted C overflow
+there. You need Rust and the Xcode Command Line Tools (`xcode-select
+--install`), whose `clang` and `make` build the C/C++ harnesses with
+AddressSanitizer, UBSan and SanitizerCoverage:
+
+```sh
+git clone https://github.com/Tarmo-Technologies/bhf.git && cd bhf
+cargo build --locked --release -p bhf
+./target/release/bhf auto path/to/src --work-dir bhf_work --per-target-time 60
+```
+
+The runtrace shim is an `LD_PRELOAD` library built for Linux only, so on macOS
+native harnesses run without it: there are no behavioral sink oracles and no
+record of the files, environment variables and network the target used.
+`run.json` and every finding say so: the target's `behavioral_oracles` is
+`off`, its `fidelity.runtime_shim` is `not_exercised` with the reason, and the
+finding's `runtime_mode.shim_armed` is `false`. Coverage, CmpLog, the
+fork-server and the sanitizers work as on Linux. `--rss-limit-mb` is not
+enforced on macOS. The Linux toolchain lanes, including the shim, run on a Mac
+through Docker Desktop ([docker.md](./docker.md)).
+
 ## Offline / air-gapped install
 
 bhf runs with no network access and never auto-updates. To install or update

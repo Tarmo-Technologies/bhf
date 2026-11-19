@@ -94,6 +94,16 @@ int bhf_no_fuzzer_initialize(int *argc, char ***argv) {
 #pragma comment(linker, "/alternatename:LLVMFuzzerInitialize=bhf_no_fuzzer_initialize")
 extern int LLVMFuzzerInitialize(int *argc, char ***argv);
 #define BHF_FUZZER_INITIALIZE(argc, argv) LLVMFuzzerInitialize((argc), (argv))
+#elif defined(__APPLE__)
+/* Mach-O links a weak reference only to a definition that exists (a symbol no
+ * image defines is an undefined-symbol error), so a weak no-op definition
+ * stands in, and a harness's own LLVMFuzzerInitialize replaces it. */
+__attribute__((weak)) int LLVMFuzzerInitialize(int *argc, char ***argv) {
+    (void)argc;
+    (void)argv;
+    return 0;
+}
+#define BHF_FUZZER_INITIALIZE(argc, argv) LLVMFuzzerInitialize((argc), (argv))
 #else
 extern int LLVMFuzzerInitialize(int *argc, char ***argv) __attribute__((weak));
 #define BHF_FUZZER_INITIALIZE(argc, argv) \
@@ -105,8 +115,10 @@ extern int LLVMFuzzerInitialize(int *argc, char ***argv) __attribute__((weak));
  * shim is Linux-only. COFF gives separate __attribute__((weak)) references
  * different fallback symbols in each translation unit, and link.exe rejects
  * those defaults with LNK1227 when this driver is linked to a generated
- * harness, so Windows must not emit the weak reference at all. */
-#if defined(_WIN32)
+ * harness, so Windows must not emit the weak reference at all. Nor macOS:
+ * Mach-O fails the link of a weak reference to a symbol no image defines,
+ * and no shim is built there. */
+#if defined(_WIN32) || defined(__APPLE__)
 #define BHF_PUBLISH_INPUT(data, size) ((void)0)
 #else
 extern void bhf_shim_set_fuzz_input(const uint8_t *data, size_t size) __attribute__((weak));
@@ -129,7 +141,7 @@ extern void bhf_shim_set_fuzz_input(const uint8_t *data, size_t size) __attribut
  * builds the driver with -DBHF_NO_ASAN_ON_ERROR (toolchain.cflags reach the
  * driver's -D words); its own hook then runs and the shim keeps its other
  * report-time protections (the symbolizer's paths are never faked). */
-#if !defined(_WIN32) && !defined(BHF_NO_ASAN_ON_ERROR)
+#if !defined(_WIN32) && !defined(__APPLE__) && !defined(BHF_NO_ASAN_ON_ERROR)
 extern void bhf_shim_sanitizer_reporting(void) __attribute__((weak));
 void __asan_on_error(void) {
     if (bhf_shim_sanitizer_reporting) bhf_shim_sanitizer_reporting();
@@ -301,8 +313,9 @@ static __thread int bhf_ev_unwinding = 0;
 #endif
 /* The runtrace shim says when the calling thread is inside one of its hooks:
  * its own string and buffer compares reach the sanitizer's comparison hooks
- * too, and are not the target's. Not on Windows (see BHF_PUBLISH_INPUT). */
-#if defined(_WIN32)
+ * too, and are not the target's. Not on Windows or macOS (see
+ * BHF_PUBLISH_INPUT). */
+#if defined(_WIN32) || defined(__APPLE__)
 #define BHF_IN_SHIM() 0
 #else
 extern int bhf_shim_in_hook(void) __attribute__((weak));
@@ -1211,11 +1224,17 @@ BHF_NOCOV static void bhf_run_one_bytes(const uint8_t *data, size_t size) {
  * passed on as this process's own end, so the engine isolates the input in a
  * fresh process as it does any crash. Kept in step with the copy in
  * direct_harness.c.tera. */
+#if defined(__APPLE__)
+/* No shim on macOS (see BHF_PUBLISH_INPUT), so no desocket mode. */
+#define BHF_DESOCKET_ACTIVE() 0
+#else
 extern int bhf_shim_desocket_active(void) __attribute__((weak));
+#define BHF_DESOCKET_ACTIVE() (bhf_shim_desocket_active && bhf_shim_desocket_active())
+#endif
 BHF_NOCOV static void bhf_run_framed(const uint8_t *input, size_t len) {
     pid_t pid;
     int status = 0;
-    if (!(bhf_shim_desocket_active && bhf_shim_desocket_active())) {
+    if (!BHF_DESOCKET_ACTIVE()) {
         BHF_STACK_BEGIN();
         bhf_run_one_bytes(input, len);
         BHF_STACK_END();

@@ -12,6 +12,10 @@
 //!   4. A sibling `bhf_runtrace_shim-*` dist archive directory.
 //!   5. None — the shim isn't on disk; caller falls back to
 //!      audit-disabled mode with a one-line warning.
+//!
+//! The shim is an `LD_PRELOAD` library built for Linux only. On every other
+//! platform (macOS, Windows) none is located, whatever is on disk, and
+//! [`unavailable_reason`] says the platform has none.
 
 use std::path::{Path, PathBuf};
 
@@ -25,6 +29,9 @@ use std::path::{Path, PathBuf};
 /// staged at a path ld.so reads whole (`stage_for_preload`), and that copy
 /// is what this returns.
 pub fn locate() -> Option<PathBuf> {
+    if !BUILT_FOR_THIS_PLATFORM {
+        return None;
+    }
     let shim = locate_on_disk()?;
     if is_preload_safe(&shim) {
         return Some(shim);
@@ -50,6 +57,9 @@ pub fn locate() -> Option<PathBuf> {
 /// it is not installed where bhf looks, or it is installed under a path that
 /// `LD_PRELOAD` cannot carry and no copy could be staged.
 pub fn unavailable_reason() -> String {
+    if !BUILT_FOR_THIS_PLATFORM {
+        return not_built_message(std::env::consts::OS);
+    }
     if let Some(shim) = UNPRELOADABLE.get() {
         return format!(
             "the runtrace shim {} is under a path with a space or colon, which LD_PRELOAD \
@@ -62,6 +72,49 @@ pub fn unavailable_reason() -> String {
         exe.as_deref(),
         std::env::var_os("BHF_RUNTRACE_SHIM").as_deref(),
     )
+}
+
+/// Whether bhf has a runtrace shim on this platform: the shim is an
+/// `LD_PRELOAD` library, built for Linux only (its crate builds an empty
+/// library elsewhere, which bhf never loads).
+pub(crate) const BUILT_FOR_THIS_PLATFORM: bool = cfg!(target_os = "linux");
+
+/// [`unavailable_reason`] on a platform (`os`, as `std::env::consts::OS`
+/// names it) for which no runtrace shim is built.
+fn not_built_message(os: &str) -> String {
+    format!(
+        "the runtrace shim is built for Linux only (it is loaded with LD_PRELOAD), so on {os} \
+         bhf runs native harnesses without it"
+    )
+}
+
+/// The file beside a harness that records why its last builtin fuzz pass ran
+/// without the runtrace shim (one line, [`unavailable_reason`]). The target's
+/// fidelity reports it as `runtime_shim`.
+pub(crate) const UNAVAILABLE_RECORD: &str = "runtrace_shim_unavailable.txt";
+
+/// Record beside the harness in `harness_dir` that its fuzz pass ran without
+/// the runtrace shim for `reason`, or, with `None` (the shim was loaded, or the
+/// harness never takes it), remove that record. Best-effort.
+pub(crate) fn record_unavailable(harness_dir: &Path, reason: Option<&str>) {
+    let record = harness_dir.join(UNAVAILABLE_RECORD);
+    match reason {
+        Some(reason) => {
+            let _ = std::fs::write(record, format!("{}\n", reason.trim()));
+        }
+        None => {
+            let _ = std::fs::remove_file(record);
+        }
+    }
+}
+
+/// The reason [`record_unavailable`] recorded beside the harness in
+/// `harness_dir`, or `None` when its fuzz pass had the shim (or never took it).
+pub(crate) fn recorded_unavailable(harness_dir: &Path) -> Option<String> {
+    std::fs::read_to_string(harness_dir.join(UNAVAILABLE_RECORD))
+        .ok()
+        .map(|reason| reason.trim().to_owned())
+        .filter(|reason| !reason.is_empty())
 }
 
 /// [`unavailable_reason`] for a shim that is not installed, naming every
@@ -629,6 +682,47 @@ mod tests {
         set_mtime(&cargo_shim, now);
 
         assert_eq!(locate_next_to_exe(&exe), Some(cargo_shim));
+    }
+
+    /// Off Linux no runtrace shim is built (it is an `LD_PRELOAD` library), so
+    /// the reason names the platform instead of an install path to fix.
+    #[test]
+    fn the_reason_off_linux_names_the_platform() {
+        let message = not_built_message("macos");
+        assert_eq!(
+            message,
+            "the runtrace shim is built for Linux only (it is loaded with LD_PRELOAD), so on \
+             macos bhf runs native harnesses without it"
+        );
+        assert!(!message.contains("BHF_RUNTRACE_SHIM"), "{message}");
+    }
+
+    /// Where no shim is built for the platform, none is ever located, and the
+    /// reason says the platform has none.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn no_shim_is_located_where_none_is_built() {
+        assert_eq!(locate(), None);
+        assert_eq!(
+            unavailable_reason(),
+            not_built_message(std::env::consts::OS)
+        );
+    }
+
+    /// The record of a pass run without the shim holds the reason, and a pass
+    /// with the shim removes it.
+    #[test]
+    fn a_pass_without_the_shim_is_recorded_beside_the_harness() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(recorded_unavailable(dir.path()), None);
+        record_unavailable(dir.path(), Some("no shim here"));
+        assert_eq!(
+            recorded_unavailable(dir.path()).as_deref(),
+            Some("no shim here")
+        );
+        record_unavailable(dir.path(), None);
+        assert_eq!(recorded_unavailable(dir.path()), None);
+        assert!(!dir.path().join(UNAVAILABLE_RECORD).exists());
     }
 
     #[test]

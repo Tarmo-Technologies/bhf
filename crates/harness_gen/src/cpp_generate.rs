@@ -2743,9 +2743,9 @@ mod tests {
         assert!(main.contains("LLVMFuzzerTestOneInput"));
         assert!(
             main.contains(
-                "#if defined(BHF_WINDOWS_CRT)\n#define BHF_PUBLISH_INPUT(data, size) ((void)0)"
+                "#if defined(BHF_WINDOWS_CRT) || defined(__APPLE__)\n#define BHF_PUBLISH_INPUT(data, size) ((void)0)"
             ) && main.contains("BHF_PUBLISH_INPUT(Data, Size);"),
-            "Windows harnesses must omit the Linux-only weak runtrace hook:\n{main}"
+            "Windows and macOS harnesses must omit the Linux-only weak runtrace hook:\n{main}"
         );
         // A forward declaration must precede the entrypoint definition so the
         // harness compiles under projects that promote -Wmissing-prototypes to an
@@ -8139,6 +8139,120 @@ mod tests {
             "expected an ASan/libFuzzer crash report, got:\n{err}"
         );
         fs::remove_dir_all(&out).ok();
+    }
+
+    /// A macOS build of a passthrough harness around a project's
+    /// `LLVMFuzzerTestOneInput` without bhf's driver (the AFL++ lane's and a
+    /// capsule build script's) references no symbol only weakly: Mach-O fails
+    /// the link of a weak reference to a symbol no image defines, and a
+    /// project need not define `LLVMFuzzerInitialize`. Compiled with the
+    /// predefined macros of a macOS build in place of Linux's.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_macos_build_of_a_standalone_passthrough_harness_makes_no_unresolvable_weak_reference() {
+        let tools = ["clang++", "nm"].iter().all(|tool| {
+            Command::new(tool)
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        });
+        if !tools {
+            eprintln!("skipping: clang++/nm unavailable");
+            return;
+        }
+        let (_out_guard, out) = temp_dir("cpp-macho-weak-passthrough");
+        let source = out.join("fuzz_record.cpp");
+        fs::write(
+            &source,
+            "#include <cstddef>\n#include <cstdint>\n\
+             extern \"C\" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {\n\
+             \x20   return size && data[0] == 'Q';\n\
+             }\n",
+        )
+        .unwrap();
+        let args = GenerateCppDirectArgs {
+            decoder_limits: Default::default(),
+            force: false,
+            harness_id: "H-CPP-WEAK-PT".to_owned(),
+            output_dir: out.clone(),
+            source_path: source.clone(),
+            target: cppfunction("LLVMFuzzerTestOneInput"),
+            params: vec![
+                CppParameter {
+                    name: "data".to_owned(),
+                    cpp_type: "const uint8_t *".to_owned(),
+                },
+                CppParameter {
+                    name: "size".to_owned(),
+                    cpp_type: "size_t".to_owned(),
+                },
+            ],
+            return_type: "int".to_owned(),
+            target_includes: Vec::new(),
+            target_includes_dirs: vec![out.clone()],
+            target_sources: vec![source.clone()],
+            compile_flags: Vec::new(),
+            c_runtime_include: runtime_dir(),
+            using_namespaces: Vec::new(),
+            result_cleanup: None,
+            constructor_params: Vec::new(),
+            type_defs: Vec::new(),
+            default_constructible_classes: Vec::new(),
+            parameter_constructions: Vec::new(),
+            receiver_class_override: None,
+            factory_plan: None,
+        };
+        generate_cpp_direct_harness(args).unwrap();
+        let weak = |flags: &[&str]| -> Vec<String> {
+            let object = out.join("main.o");
+            let built = Command::new("clang++")
+                .current_dir(&out)
+                .args(["-O1", "-c", "-I"])
+                .arg(runtime_dir())
+                .args(flags)
+                .arg("-o")
+                .arg(&object)
+                .arg("main.cpp")
+                .output()
+                .unwrap();
+            assert!(
+                built.status.success(),
+                "{flags:?}: {}",
+                String::from_utf8_lossy(&built.stderr)
+            );
+            let symbols = Command::new("nm").arg(&object).output().unwrap();
+            let mut weak: Vec<String> = String::from_utf8_lossy(&symbols.stdout)
+                .lines()
+                .filter_map(|line| {
+                    // An undefined weak symbol is `w` (or `v`, an object) with no address.
+                    let mut fields = line.split_whitespace();
+                    match (fields.next(), fields.next(), fields.next()) {
+                        (Some("w" | "v"), Some(name), None) => Some(name.to_owned()),
+                        _ => None,
+                    }
+                })
+                .collect();
+            weak.sort();
+            weak
+        };
+        let macos_predefines = [
+            "-D__APPLE__",
+            "-D__MACH__",
+            "-U__ELF__",
+            "-U__linux__",
+            "-U__linux",
+            "-Ulinux",
+            "-U__gnu_linux__",
+        ];
+        for lane in [&[][..], &["-DBHF_AFL"][..]] {
+            let linux = weak(lane);
+            assert!(
+                linux.iter().any(|name| name == "LLVMFuzzerInitialize"),
+                "{lane:?}: {linux:?}"
+            );
+            let macos = weak(&[lane, &macos_predefines[..]].concat());
+            assert_eq!(macos, Vec::<String>::new(), "{lane:?}");
+        }
     }
 
     /// A harness around the project's own `LLVMFuzzerTestOneInput` builds its

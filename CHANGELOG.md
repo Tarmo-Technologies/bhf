@@ -124,6 +124,19 @@
   (`BHF_DESOCKET`, `BHF_FAKE_CLOCK`) in a new `shim_env` block, and replay,
   minimize, env-capsule, the capsule's `verify-poc` and `replay.py` set them
   again.
+- bhf builds and fuzzes natively on Apple Silicon Macs from source (#344): a
+  new `macos-build` CI job, which CI acceptance requires, builds the
+  workspace for `aarch64-apple-darwin` on `macos-14` and runs a `bhf auto` C
+  smoke. The builtin engine's coverage and CmpLog maps now work on macOS, and
+  the C driver and generated C/C++ harnesses leave out the weak references
+  Mach-O cannot link there: those to the runtrace shim's hooks, and the one
+  to a project's `LLVMFuzzerInitialize`, which a weak no-op definition
+  replaces (in the driver and in a passthrough harness's own `main`). The
+  runtrace shim is built for Linux only, and a native target fuzzed without
+  one (on macOS and Windows, which never locate one now, or on Linux with
+  none installed) records `fidelity.runtime_shim` (`not_exercised`, with the
+  reason) on its run.json entry, the campaign rollup and its findings
+  (additive).
 
 ### Changed
 - The in-crate lane for private Rust targets (#83) is `bhf auto

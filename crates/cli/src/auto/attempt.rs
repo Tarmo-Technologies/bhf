@@ -5375,6 +5375,42 @@ static SHIM_MISSING_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new()
 /// The collector's run provenance for a target, beside its harness (#278).
 pub(crate) const COLLECTOR_FILE: &str = "collector.json";
 
+/// Load the runtrace shim (`shim`, as [`crate::auto::shim_path::locate`]
+/// found it) into a native pass's environment, with the target-entry gate a
+/// launcher that takes it needs (`gated_launcher`). With no shim available
+/// (none is built for this platform, or none is installed) the pass runs
+/// without it: bhf says so once, and records beside the harness why, which the
+/// target's fidelity reports as `runtime_shim`.
+pub(crate) fn preload_runtrace_shim(
+    child_env: &mut Vec<(String, String)>,
+    harness_dir: &std::path::Path,
+    shim: Option<&std::path::Path>,
+    gated_launcher: bool,
+) {
+    let Some(shim) = shim else {
+        let reason = crate::auto::shim_path::unavailable_reason();
+        crate::auto::shim_path::record_unavailable(harness_dir, Some(&reason));
+        if SHIM_MISSING_WARNED.set(()).is_ok() {
+            bhfeprintln!("bhf auto: {reason}; running fuzz without the runtrace shim");
+        }
+        return;
+    };
+    crate::auto::shim_path::record_unavailable(harness_dir, None);
+    let ld_preload = crate::auto::shim_path::ld_preload_value_with(
+        shim,
+        std::env::var("LD_PRELOAD").ok().as_deref(),
+    );
+    child_env.push(("LD_PRELOAD".to_owned(), ld_preload));
+    if gated_launcher {
+        child_env.push(("BHF_RUNTRACE_AFTER_TARGET_ENTRY".to_owned(), "1".to_owned()));
+        // The driver writes each input there for the shim's taint check.
+        child_env.push((
+            "BHF_SHIM_INPUT_FILE".to_owned(),
+            harness_dir.join("shim_input.bin").display().to_string(),
+        ));
+    }
+}
+
 /// Run one fuzz pass with the runtrace shim loaded. Returns the
 /// FuzzRunSummary plus the parsed event list (empty when the shim
 /// isn't available on disk). `pass` selects the cascade mode —
@@ -5536,24 +5572,13 @@ fn run_fuzz_with_runtrace(
     let gated_launcher = launcher.is_some_and(shim_preloaded_into_launcher);
     if cross_wrapper.is_some() || (launcher.is_some() && !gated_launcher) {
         // no shim for emulated targets or interpreter/VM lanes
-    } else if let Some(shim) = crate::auto::shim_path::locate() {
-        let ld_preload = crate::auto::shim_path::ld_preload_value_with(
-            &shim,
-            std::env::var("LD_PRELOAD").ok().as_deref(),
-        );
-        child_env.push(("LD_PRELOAD".to_owned(), ld_preload));
-        if gated_launcher {
-            child_env.push(("BHF_RUNTRACE_AFTER_TARGET_ENTRY".to_owned(), "1".to_owned()));
-            // The driver writes each input there for the shim's taint check.
-            child_env.push((
-                "BHF_SHIM_INPUT_FILE".to_owned(),
-                harness_dir.join("shim_input.bin").display().to_string(),
-            ));
-        }
-    } else if SHIM_MISSING_WARNED.set(()).is_ok() {
-        bhfeprintln!(
-            "bhf auto: {}; running fuzz without the runtrace shim",
-            crate::auto::shim_path::unavailable_reason()
+        crate::auto::shim_path::record_unavailable(harness_dir, None);
+    } else {
+        preload_runtrace_shim(
+            &mut child_env,
+            harness_dir,
+            crate::auto::shim_path::locate().as_deref(),
+            gated_launcher,
         );
     }
     for (k, v) in extra_env {

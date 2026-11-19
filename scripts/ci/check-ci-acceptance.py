@@ -22,6 +22,7 @@ HEAVY_JOBS = (
     "minimum-rust",
     "build-test",
     "arm64-build",
+    "macos-build",
     "container-core",
     "container-full",
     "rhel7-build",

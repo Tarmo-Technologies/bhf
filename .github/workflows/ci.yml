@@ -297,6 +297,57 @@ jobs:
           BHF_REQUIRE_TOOLS: "1"
         run: cargo nextest run --locked -p bhf --test auto_hwasan --no-fail-fast --profile ci
 
+  macos-build:
+    name: macOS build, shim gating and auto smoke
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: macos-14
+    timeout-minutes: 75
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.99.0
+
+      - name: Cache the cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: macos-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: macos-cargo-
+
+      # A native aarch64-apple-darwin build. The runtrace shim is an LD_PRELOAD
+      # library built for Linux only: its crate builds an empty library here,
+      # and no shim lands beside bhf. Xcode's clang builds the harnesses.
+      - name: Build the workspace for aarch64-apple-darwin
+        run: |
+          uname -sm
+          clang --version | head -1
+          cargo build --locked --workspace
+          file target/debug/bhf | grep 'Mach-O 64-bit executable arm64'
+
+      # The shared-map readers' tests, without the one that builds harnesses
+      # with gcc, which on macOS is Apple's clang.
+      - name: Test the shim gating and the shared coverage maps
+        env:
+          RAYON_NUM_THREADS: "1"
+        run: >-
+          cargo test --locked -p bhf --lib --
+          auto::shim_path:: fuzz::coverage_tracker_tests:: fuzz::redqueen_cmplog_tests::
+          auto::report::tests::a_target_fuzzed_without_a_built_shim
+          --skip fuzz::redqueen_cmplog_tests::coverage_source_names_the_instrumentation
+
+      - name: Find a planted bug with bhf auto, without the runtrace shim
+        run: bash scripts/ci/macos-auto-smoke.sh target/debug/bhf
+
   doc-contracts:
     name: Release and docs contract tests
     needs: changes
@@ -963,6 +1014,7 @@ jobs:
       - minimum-rust
       - build-test
       - arm64-build
+      - macos-build
       - container-core
       - container-full
       - rhel7-build

@@ -179,6 +179,11 @@ pub struct FidelityFacts {
     /// The parts of the environment the target expects that bhf stood in for
     /// (`"browser globals: window, navigator"`), or `None` (#288).
     pub environment_shim: Option<String>,
+    /// Why a native harness that takes the runtrace shim ran without it: no
+    /// shim is built for this platform (it is a Linux `LD_PRELOAD` library) or
+    /// none is installed beside bhf. `None` when the shim was there, or for a
+    /// lane that never takes it.
+    pub runtime_shim_unavailable: Option<String>,
 }
 
 /// Whether a C/C++ harness was built with OSS-Fuzz's
@@ -206,6 +211,7 @@ impl FidelityFacts {
             runner: None,
             fuzzing_build_mode: None,
             environment_shim: None,
+            runtime_shim_unavailable: None,
         }
     }
 }
@@ -242,6 +248,15 @@ pub struct Fidelity {
     /// on the target's real environment. Absent when bhf stood in for none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment_shim: Option<String>,
+    /// The runtrace shim's runtime observation (the files, environment
+    /// variables and network the target used, and the behavioral sink
+    /// oracles), `NotExercised` with the reason when the native harness ran
+    /// without the shim because none is available on this platform or
+    /// install. Fuzzing depth, like `concurrency`, not target platform
+    /// fidelity. Absent when the shim was loaded, or for a lane that never
+    /// takes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_shim: Option<FidelityDimension>,
 }
 
 impl Fidelity {
@@ -261,6 +276,10 @@ impl Fidelity {
         } else {
             FidelityDimension::exercised(format!("ran under {}", facts.sanitizers.join("+")))
         };
+        let runtime_shim = facts
+            .runtime_shim_unavailable
+            .clone()
+            .map(FidelityDimension::not_exercised);
 
         match facts.platform_stub.as_deref() {
             // Host stub-isolation lane: the platform was faked to compile the
@@ -284,6 +303,7 @@ impl Fidelity {
                 sanitizers,
                 fuzzing_build_mode: facts.fuzzing_build_mode,
                 environment_shim: facts.environment_shim.clone(),
+                runtime_shim: runtime_shim.clone(),
             },
             // A cross-built target run under user-mode emulation: its own ISA
             // and byte order ran (emulated), never the host's; a user-mode
@@ -313,6 +333,7 @@ impl Fidelity {
                     sanitizers,
                     fuzzing_build_mode: facts.fuzzing_build_mode,
                     environment_shim: facts.environment_shim.clone(),
+                    runtime_shim: runtime_shim.clone(),
                 }
             }
             // Native host target: the host IS the target, so arch and byte order
@@ -336,6 +357,7 @@ impl Fidelity {
                 sanitizers,
                 fuzzing_build_mode: facts.fuzzing_build_mode,
                 environment_shim: facts.environment_shim.clone(),
+                runtime_shim: runtime_shim.clone(),
             },
         }
     }
@@ -355,6 +377,7 @@ impl Fidelity {
             sanitizers: dim(),
             fuzzing_build_mode: None,
             environment_shim: None,
+            runtime_shim: None,
         }
     }
 
@@ -446,6 +469,10 @@ impl Fidelity {
                 (Some(left), Some(right)) if left != right => Some(format!("{left}; {right}")),
                 (left, right) => left.clone().or_else(|| right.clone()),
             },
+            runtime_shim: match (&self.runtime_shim, &other.runtime_shim) {
+                (Some(left), Some(right)) => Some(worst(left, right)),
+                (left, right) => left.clone().or_else(|| right.clone()),
+            },
         }
     }
 
@@ -499,6 +526,46 @@ mod tests {
         );
     }
 
+    /// A native harness that ran without the runtrace shim, because none is
+    /// available on this platform or install, records that as a
+    /// `runtime_shim` gap with the reason. It is fuzzing depth, not target
+    /// platform fidelity: no reduced-fidelity caveat on a native run. A run
+    /// with the shim has no `runtime_shim` at all, and a rollup keeps the gap.
+    #[test]
+    fn a_run_without_the_runtrace_shim_records_it_unavailable() {
+        let reason = "the runtrace shim is built for Linux only; on macos bhf runs without it";
+        let mut facts = FidelityFacts::host();
+        facts.sanitizers = vec!["asan".to_owned()];
+        facts.runtime_shim_unavailable = Some(reason.to_owned());
+        let without = Fidelity::from_facts(&facts);
+        let shim = without.runtime_shim.as_ref().expect("a runtime_shim gap");
+        assert_eq!(shim.status, FidelityStatus::NotExercised);
+        assert_eq!(shim.reason.as_deref(), Some(reason));
+        assert!(!without.is_reduced_fidelity());
+        assert_eq!(without.caveat(), None);
+        let json = serde_json::to_value(&without).unwrap();
+        assert_eq!(json["runtime_shim"]["status"], "not_exercised");
+        assert_eq!(json["runtime_shim"]["reason"], reason);
+        let back: Fidelity = serde_json::from_value(json).unwrap();
+        assert_eq!(back, without);
+
+        let with = Fidelity::from_facts(&FidelityFacts::host());
+        assert_eq!(with.runtime_shim, None);
+        assert!(serde_json::to_value(&with)
+            .unwrap()
+            .get("runtime_shim")
+            .is_none());
+        // A record written before the field existed still reads.
+        let mut old = serde_json::to_value(&with).unwrap();
+        old.as_object_mut().unwrap().remove("runtime_shim");
+        assert_eq!(serde_json::from_value::<Fidelity>(old).unwrap(), with);
+
+        let rollup = Fidelity::rollup([&with, &without]).unwrap();
+        assert_eq!(rollup.runtime_shim, without.runtime_shim);
+        let rollup = Fidelity::rollup([&without, &with]).unwrap();
+        assert_eq!(rollup.runtime_shim, without.runtime_shim);
+    }
+
     fn vxworks_facts() -> FidelityFacts {
         FidelityFacts {
             platform_stub: Some("vxworks".to_owned()),
@@ -510,6 +577,7 @@ mod tests {
             runner: None,
             fuzzing_build_mode: None,
             environment_shim: None,
+            runtime_shim_unavailable: None,
         }
     }
 

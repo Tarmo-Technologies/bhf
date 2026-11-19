@@ -71,6 +71,30 @@ class WorkflowContractTests(unittest.TestCase):
         installer = (ROOT / "scripts/ci/install-nextest.sh").read_text()
         self.assertIn('"Linux aarch64")', installer)
 
+    def test_macos_job_builds_natively_without_the_shim_and_finds_a_bug(self):
+        # A macos-14 runner builds the workspace for aarch64-apple-darwin, runs
+        # the shim-gating and shared-map unit tests there, and the auto smoke,
+        # which finds the planted bug with the shim-unavailable fidelity, on
+        # every heavy change; CI acceptance requires it.
+        job = self.jobs["macos-build"]
+        self.assertIn("runs-on: macos-14", job)
+        self.assertIn("if: needs.changes.outputs.heavy == 'true'", job)
+        steps = [
+            "cargo build --locked --workspace",
+            "Mach-O 64-bit executable arm64",
+            "cargo test --locked -p bhf --lib --",
+            "bash scripts/ci/macos-auto-smoke.sh target/debug/bhf",
+        ]
+        for earlier, later in zip(steps, steps[1:]):
+            self.assertLess(job.index(earlier), job.index(later), later)
+        for tests in ("auto::shim_path::", "fuzz::coverage_tracker_tests::",
+                      "auto::report::tests::a_target_fuzzed_without_a_built_shim"):
+            self.assertIn(tests, job)
+        self.assertIn("macos-build", GATE.HEAVY_JOBS)
+        smoke = (ROOT / "scripts/ci/macos-auto-smoke.sh").read_text()
+        self.assertIn('"runtime_shim"', smoke)
+        self.assertIn("built for Linux only", smoke)
+
     def test_arm64_release_dry_run_builds_installs_and_smokes_the_archives(self):
         # The aarch64 counterpart of rhel7-build: dist builds the release
         # archives in the pinned manylinux2014_aarch64 image, the generated

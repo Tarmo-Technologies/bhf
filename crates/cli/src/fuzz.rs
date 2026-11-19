@@ -4268,9 +4268,9 @@ fn prepare_with_runner(
 
     // #400 RedQueen per-input operand capture (offset-aware splice), gated on the
     // same `BHF_DISABLE_REDQUEEN=1` kill-switch `auto` honors. Only wired on the
-    // platforms whose `CmpShmReader` is a live mmap (linux/windows); a no-op stub
-    // elsewhere, so arming it there would be inert.
-    #[cfg(any(target_os = "linux", windows))]
+    // platforms whose `CmpShmReader` is a live mapping (Unix, macOS included,
+    // and Windows); a no-op stub elsewhere, so arming it there would be inert.
+    #[cfg(any(unix, windows))]
     let local_cmp_map = if builtin_framed
         && !extra_env.iter().any(|(key, _)| key == "BHF_CMP_SHM")
         && std::env::var("BHF_DISABLE_REDQUEEN").as_deref() != Ok("1")
@@ -4281,7 +4281,7 @@ fn prepare_with_runner(
     } else {
         None
     };
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(not(any(unix, windows)))]
     let local_cmp_map: Option<shared_map::SharedMapFile> = None;
 
     let afl_workers = afl_worker_count(args.engine, args.workers);
@@ -4363,7 +4363,7 @@ const BHF_COV_BITS: usize = 1 << 16;
 /// `direct_harness.c.tera` and `direct_harness.cpp.tera` — the driver and this
 /// reader map the same file. Same size as the edge bitmap so site hashing has
 /// the same collision envelope.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(unix, windows))]
 const BHF_CMPP_BITS: usize = 1 << 16;
 
 /// Map a per-input edge hit count to an AFL-style logarithmic bucket (#420) so a
@@ -4373,7 +4373,7 @@ const BHF_CMPP_BITS: usize = 1 << 16;
 /// channel) — keep the two IDENTICAL: 1->0, 2->1, 3->2, 4..=7->3, 8..=15->4,
 /// 16..=31->5, 32..=127->6, 128..->7. The argument is a saturating `u8` map byte,
 /// so 255 lands in the top bucket exactly like 128+.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(unix, windows))]
 fn count_to_bucket(count: u8) -> u8 {
     match count {
         0 | 1 => 0,
@@ -4457,10 +4457,10 @@ mod win_shm {
 
 /// Open (creating + sizing) the file at `path` and map `len` bytes of it as a
 /// shared read+write region the driver also maps, returning the base pointer or
-/// `None`. The mapping outlives the file handle on both platforms (Linux kernel
-/// keeps the mmap; Windows keeps the section). This is the one place the
-/// coverage/cmplog readers touch platform shared-memory APIs.
-#[cfg(any(target_os = "linux", windows))]
+/// `None`. The mapping outlives the file handle on both platforms (a Unix
+/// kernel, Linux or macOS, keeps the mmap; Windows keeps the section). This is
+/// the one place the coverage/cmplog readers touch platform shared-memory APIs.
+#[cfg(any(unix, windows))]
 fn map_shared_file(path: &str, len: usize) -> Option<*mut u8> {
     let file = fs::OpenOptions::new()
         .read(true)
@@ -4470,7 +4470,7 @@ fn map_shared_file(path: &str, len: usize) -> Option<*mut u8> {
         .open(path)
         .ok()?;
     file.set_len(len as u64).ok()?;
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
         // SAFETY: mapping `len` bytes of a file sized to `len`; the kernel keeps
@@ -4498,12 +4498,12 @@ fn map_shared_file(path: &str, len: usize) -> Option<*mut u8> {
 }
 
 /// Release a region from [`map_shared_file`].
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(unix, windows))]
 fn unmap_shared(ptr: *mut u8, _len: usize) {
     if ptr.is_null() {
         return;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     // SAFETY: `ptr`/`_len` are the region returned by our mmap.
     unsafe {
         libc::munmap(ptr as *mut libc::c_void, _len);
@@ -4512,7 +4512,7 @@ fn unmap_shared(ptr: *mut u8, _len: usize) {
     win_shm::unmap(ptr);
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(unix, windows))]
 struct CoverageTracker {
     map: *mut u8,
     len: usize,
@@ -4565,7 +4565,7 @@ fn stack_depth_bucket(depth: u64) -> u32 {
     1 + log * 4 + fraction
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(unix, windows))]
 impl CoverageTracker {
     fn new(extra_env: &[(String, String)]) -> Option<Self> {
         let (_, path) = extra_env.iter().find(|(k, _)| k == "BHF_COV_SHM")?;
@@ -4809,7 +4809,7 @@ impl CoverageTracker {
     }
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(unix, windows))]
 impl Drop for CoverageTracker {
     fn drop(&mut self) {
         unmap_shared(self.map, self.len);
@@ -4819,10 +4819,10 @@ impl Drop for CoverageTracker {
     }
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(unix, windows)))]
 struct CoverageTracker;
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(unix, windows)))]
 impl CoverageTracker {
     fn new(_extra_env: &[(String, String)]) -> Option<Self> {
         None
@@ -5082,15 +5082,15 @@ impl PoolEntry {
 /// (`crates/harness_gen/src/templates/direct_harness.c.tera`): header
 /// `[u32 armed][u32 count]` then `BHF_CMP_CAP` records of
 /// `[u8 len_a][u8 len_b][u8 a[OPMAX]][u8 b[OPMAX]]`.
-// Used by the mmap/file-mapping CmpShmReader on linux + windows (and its tests);
+// Used by the mmap/file-mapping CmpShmReader on Unix + Windows (and its tests);
 // the reader is a no-op stub on other platforms, so gate these to match.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(unix, windows))]
 const BHF_CMP_CAP: usize = 2048;
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(unix, windows))]
 const BHF_CMP_OPMAX: usize = 32;
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(unix, windows))]
 const BHF_CMP_REC: usize = 2 + 2 * BHF_CMP_OPMAX;
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(unix, windows))]
 const BHF_CMP_BYTES: usize = 8 + BHF_CMP_CAP * BHF_CMP_REC;
 
 /// Reads (and arms) the driver's per-exec cmplog operand ring (#400). RedQueen
@@ -5099,13 +5099,13 @@ const BHF_CMP_BYTES: usize = 8 + BHF_CMP_CAP * BHF_CMP_REC;
 /// run produced), then builds a `CmpLog` whose `splice_candidates` find those
 /// operands at the offsets they were compared in *that* input. Mapped
 /// `MAP_SHARED` read+write so the engine can set `armed` and zero `count`.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(unix, windows))]
 struct CmpShmReader {
     map: *mut u8,
     len: usize,
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(unix, windows))]
 impl CmpShmReader {
     fn new(extra_env: &[(String, String)]) -> Option<Self> {
         let (_, path) = extra_env.iter().find(|(k, _)| k == "BHF_CMP_SHM")?;
@@ -5184,17 +5184,17 @@ impl CmpShmReader {
     }
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(unix, windows))]
 impl Drop for CmpShmReader {
     fn drop(&mut self) {
         unmap_shared(self.map, self.len);
     }
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(unix, windows)))]
 struct CmpShmReader;
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(unix, windows)))]
 impl CmpShmReader {
     fn new(_extra_env: &[(String, String)]) -> Option<Self> {
         None
@@ -13915,6 +13915,80 @@ mod signal_classification_tests {
     }
 }
 
+/// A macOS build of bhf's driver references no symbol only weakly: Mach-O
+/// fails the link of a weak reference to a symbol no image defines (the
+/// runtrace shim's hooks, which no macOS build has, and a harness's optional
+/// `LLVMFuzzerInitialize`). The driver is compiled here with the predefined
+/// macros of a macOS build in place of Linux's.
+#[cfg(all(test, target_os = "linux"))]
+mod mach_o_driver_tests {
+    use std::path::Path;
+    use std::process::Command;
+
+    /// The symbols `driver` references only weakly when compiled with `defines`,
+    /// or `None` when clang or nm is not there.
+    fn weak_references(dir: &Path, defines: &[&str]) -> Option<Vec<String>> {
+        let driver = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../c_runtime/bhf_driver.c");
+        let object = dir.join("bhf_driver.o");
+        let built = Command::new("clang")
+            .args(["-O1", "-c", "-o"])
+            .arg(&object)
+            .args(defines)
+            .arg(&driver)
+            .output()
+            .ok()?;
+        assert!(
+            built.status.success(),
+            "{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let symbols = Command::new("nm").arg(&object).output().ok()?;
+        assert!(symbols.status.success());
+        let mut weak: Vec<String> = String::from_utf8_lossy(&symbols.stdout)
+            .lines()
+            .filter_map(|line| {
+                // An undefined weak symbol is `w` (or `v`, an object) with no address.
+                let mut fields = line.split_whitespace();
+                match (fields.next(), fields.next(), fields.next()) {
+                    (Some("w" | "v"), Some(name), None) => Some(name.to_owned()),
+                    _ => None,
+                }
+            })
+            .collect();
+        weak.sort();
+        Some(weak)
+    }
+
+    #[test]
+    fn a_macos_build_of_the_driver_makes_no_unresolvable_weak_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(linux) = weak_references(dir.path(), &[]) else {
+            eprintln!("skipping: no clang or nm");
+            return;
+        };
+        // On Linux the shim's hooks are weak references, resolved when the
+        // shim is preloaded.
+        assert!(
+            linux.iter().any(|name| name == "bhf_shim_set_fuzz_input"),
+            "{linux:?}"
+        );
+        let macos = weak_references(
+            dir.path(),
+            &[
+                "-D__APPLE__",
+                "-D__MACH__",
+                "-U__ELF__",
+                "-U__linux__",
+                "-U__linux",
+                "-Ulinux",
+                "-U__gnu_linux__",
+            ],
+        )
+        .unwrap();
+        assert_eq!(macos, Vec::<String>::new());
+    }
+}
+
 /// bhf's driver in a build without a sanitizer runtime reports where a fatal
 /// signal hit before it dies by that signal, so frame-less crashes of one
 /// harness can be told apart.
@@ -14850,7 +14924,7 @@ mod resolve_iterations_tests {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, unix))]
 mod coverage_tracker_tests {
     use super::{
         count_to_bucket, stack_depth_bucket, CoverageNovelty, CoverageTracker, BHF_COV_BITS,
@@ -20062,7 +20136,7 @@ computed = "crc16(op, len, seq, body, opt)"
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, unix))]
 mod redqueen_cmplog_tests {
     use super::{
         CmpShmReader, CoverageTracker, BHF_CMP_BYTES, BHF_CMP_CAP, BHF_CMP_OPMAX, BHF_CMP_REC,

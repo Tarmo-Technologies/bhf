@@ -201,8 +201,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size);
 /* Auto-injected by bhf: republish fuzz input to the Linux runtrace shim so
  * fuzz-driven mode can route the current iteration's bytes into fake fds /
  * socket peers / dlopen stubs. Windows has no preload shim and must not emit a
- * COFF weak reference: multiple weak defaults conflict under link.exe. */
-#if defined(BHF_WINDOWS_CRT)
+ * COFF weak reference: multiple weak defaults conflict under link.exe. Nor
+ * macOS, which has no shim either: Mach-O fails the link of a weak reference
+ * to a symbol no image defines. */
+#if defined(BHF_WINDOWS_CRT) || defined(__APPLE__)
 #define BHF_PUBLISH_INPUT(data, size) ((void)0)
 #else
 extern void bhf_shim_set_fuzz_input(const uint8_t *data, size_t size) __attribute__((weak));

@@ -724,7 +724,8 @@ cmplog, and ASan all work natively on Windows.
 
 ## Notes / current limitations
 
-- bhf itself runs on Linux and Windows; macOS is not yet a target.
+- bhf itself runs on Linux, Windows and, built from source, macOS on Apple
+  Silicon ([install.md](./install.md#macos-apple-silicon-from-source)).
 - The **C/C++ lane** (including Visual Studio solutions) is the primary,
   most-exercised native-Windows path. It builds with clang or cl: GCC
   (MinGW-w64's, Cygwin's, MSYS2's) ships no AddressSanitizer or UBSan runtime
