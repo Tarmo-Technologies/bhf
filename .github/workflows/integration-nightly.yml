@@ -280,6 +280,23 @@ jobs:
           distribution: temurin
           java-version: 21
 
+      # The JVM agent shades ASM, which java_runtime/build-agent.sh fetches
+      # from Maven Central into its cache (~/.cache/bhf/jvm) and checks
+      # against pinned digests. The cache keeps the two jars between runs, so
+      # an outage there does not fail the Java lane's tests.
+      - name: Cache the ASM jars the JVM agent shades
+        id: asm-jars
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/bhf/jvm/asm-9.7.jar
+            ~/.cache/bhf/jvm/asm-tree-9.7.jar
+          key: asm-jars-${{ hashFiles('java_runtime/build-agent.sh') }}
+
+      - name: Fetch the ASM jars
+        if: steps.asm-jars.outputs.cache-hit != 'true'
+        run: sh java_runtime/build-agent.sh "$RUNNER_TEMP/bhf-jvm-agent.jar"
+
       - name: Install Node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
