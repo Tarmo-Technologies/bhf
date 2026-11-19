@@ -256,7 +256,8 @@ fn rebuild(finding_dir: &Path, endpoint: Option<&str>) -> Result<Rebuilt, String
     // whole; replay it the same way.
     let coverage_map = coverage_map.map(|map| with_recorded_input_cap(&map, input.len()));
     let plan = TransportPlan::parse(&spec, coverage_map.as_deref())
-        .map_err(|error| format!("rebuild transport from profile: {error}"))?;
+        .map_err(|error| format!("rebuild transport from profile: {error}"))?
+        .replay_from_baseline();
     // A replay on another build of the firmware is a different experiment
     // (re-checking a fix is one): say so rather than compare silently (#248).
     if let (Some(path), Some(recorded)) = (
@@ -1024,6 +1025,82 @@ mod tests {
         let id = replay_identity(&outcome).expect("a timeout reproduces a BHF-555 identity");
         assert_eq!(id.rule_id, "BHF-555");
         assert_eq!(id.site, "unlocalized");
+    }
+
+    /// #346: a finding from a `reset=persistent` campaign is replayed with a
+    /// `loadvm` before every run, so each judged run (the stability runs, and
+    /// every minimization candidate after a clean one) starts from the
+    /// snapshot, not from where the run before it left the guest.
+    #[test]
+    fn a_persistent_finding_replays_every_run_from_the_snapshot() {
+        use target_transport::testsupport::{
+            encode_event_stream, simulate_ring, MockGdbStub, MockQmpServer,
+        };
+        let qmp_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let gdb_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let qmp_port = qmp_listener.local_addr().unwrap().port();
+        let gdb_port = gdb_listener.local_addr().unwrap().port();
+        let qmp_log = Arc::new(Mutex::new(Vec::new()));
+        let gdb_log = Arc::new(Mutex::new(Vec::new()));
+        {
+            let log = Arc::clone(&qmp_log);
+            std::thread::spawn(move || {
+                let (stream, _) = qmp_listener.accept().unwrap();
+                let _ = MockQmpServer::new(stream, log).serve();
+            });
+        }
+        {
+            let log = Arc::clone(&gdb_log);
+            std::thread::spawn(move || {
+                let (stream, _) = gdb_listener.accept().unwrap();
+                stream.set_nodelay(true).unwrap();
+                let (image, write, wrapped) = simulate_ring(
+                    &encode_event_stream(&[event_log::Event::Crumb { id: 0x10 }]),
+                    64,
+                );
+                // Every run is clean, so a persistent session would park.
+                let _ = MockGdbStub::new(stream, log)
+                    .with_region(0x1000, vec![0; 64])
+                    .with_region(0x4000, image)
+                    .with_region(0x5000, write.to_le_bytes().to_vec())
+                    .with_region(0x5100, vec![u8::from(wrapped)])
+                    .with_run_write(0x5000, write.to_le_bytes().to_vec())
+                    .with_run_write(0x5100, vec![u8::from(wrapped)])
+                    .serve();
+            });
+        }
+        let dir = temp_dir("persistent");
+        let spec = format!(
+            "qemu-system:qmp=127.0.0.1:{qmp_port},gdb=127.0.0.1:{gdb_port},done=0x1a8,\
+             reset=persistent"
+        );
+        std::fs::write(
+            dir.join(TRANSPORT_PROFILE_FILE),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": "bhf.transport-profile.v1",
+                "spec": spec,
+                "coverage_map":
+                    "input=0x1000,input_cap=64,ring=0x4000,write=0x5000,wrapped=0x5100,cap=64",
+                "transport_label": "qemu-system",
+                "backend": "qemu-system",
+                "timing": { "per_input_timeout_ms": 10_000, "deadline_ms": null },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("testcase.bin"), b"payload").unwrap();
+        write_finding(&dir, "BHF-0001", "0x20004000");
+
+        replay_transport_outcome(&dir, None, 3).unwrap();
+        let loadvms = qmp_log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.starts_with("hmp:loadvm"))
+            .count();
+        assert_eq!(loadvms, 3, "{:?}", qmp_log.lock().unwrap());
+        let gdb = gdb_log.lock().unwrap();
+        assert!(!gdb.iter().any(|packet| packet == "s"), "{gdb:?}");
     }
 
     #[test]

@@ -830,6 +830,17 @@ impl<C: Read + Write> GdbClient<C> {
         let response = self.command(format!("z0,{address:x},{kind:x}").as_bytes())?;
         self.expect_ok(&response, "remove software breakpoint")
     }
+
+    /// Execute one instruction via `s` and return the stop it reports.
+    ///
+    /// A `c` from a stop at a software breakpoint stops there again at once,
+    /// so a target parked on one is stepped off it first, with the breakpoint
+    /// removed for the step as gdb does (see
+    /// [`crate::fullsystem::FullSystemReset::Persistent`]).
+    pub fn step(&mut self) -> Result<StopReply> {
+        let reply = self.command(b"s")?;
+        StopReply::parse(&reply)
+    }
 }
 
 /// How [`GdbRemoteTransport`] resets the target before each input (#293).
@@ -1666,6 +1677,20 @@ mod tests {
             log.iter().any(|p| p == "z0,a8,2"),
             "log missing z0 remove: {log:?}"
         );
+    }
+
+    #[test]
+    fn client_steps_one_instruction_and_parses_the_stop() {
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (client_end, stub_end) = duplex();
+        let stub = MockGdbStub::new(stub_end, Arc::clone(&log));
+        let handle = thread::spawn(move || stub.serve());
+
+        let mut client = GdbClient::new(client_end);
+        assert_eq!(client.step().unwrap(), StopReply::Signal(gdb_signal::TRAP));
+        drop(client);
+        handle.join().unwrap().unwrap();
+        assert_eq!(*log.lock().unwrap(), vec!["s".to_owned()]);
     }
 
     #[test]

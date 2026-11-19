@@ -104,11 +104,17 @@ static void emit_crumb(uint32_t id){
 #endif
 volatile uint8_t  bhf_input[64];
 volatile uint32_t bhf_fault_flag = 0;
+#ifdef BHF_PERSISTENT
+/* reset=persistent: done returns into the input loop in Reset_Handler. */
+__attribute__((noinline)) void harness_done(void){ __asm volatile("" ::: "memory"); }
+#else
 void harness_done(void){ while(1){} }
+#endif
 void HardFault_Handler(void){
   emit_crumb(0xFA17);
   bhf_fault_flag = 0xDEADFA11u;
   harness_done();
+  for (;;) {}
 }
 #ifdef BHF_CMPLOG
 /* The comparison record bhf reads after each run (#386), filled by the
@@ -152,7 +158,7 @@ void Reset_Handler(void){
   harness_done();
 }
 #else
-void Reset_Handler(void){
+static void run_one(void){
   emit_crumb(0x100);
   emit_crumb(0x101);
   uint8_t b = bhf_input[0];
@@ -166,7 +172,14 @@ void Reset_Handler(void){
   } else {
     emit_crumb(0x300);
   }
+}
+void Reset_Handler(void){
+#ifdef BHF_PERSISTENT
+  for (;;) { run_one(); harness_done(); }
+#else
+  run_one();
   harness_done();
+#endif
 }
 #endif
 "#;
@@ -286,6 +299,20 @@ impl Fixture {
     /// its crumbs to the semihosting channel instead of the ring, under a
     /// QEMU that routes semihosting to the debugger.
     fn boot_with(test: &str, dir: &Path, cmplog: bool, semihosting: bool) -> Option<Self> {
+        Self::boot_opts(test, dir, cmplog, semihosting, false, None)
+    }
+
+    /// [`Self::boot_with`]; with `persistent`, the variant whose
+    /// `harness_done` returns into an input loop (`reset=persistent`), and
+    /// with `ports`, QMP and the gdbstub on those `(qmp, gdb)` ports.
+    fn boot_opts(
+        test: &str,
+        dir: &Path,
+        cmplog: bool,
+        semihosting: bool,
+        persistent: bool,
+        ports: Option<(u16, u16)>,
+    ) -> Option<Self> {
         for tool in [CC, QEMU, QEMU_IMG, NM] {
             if !tool_present(tool) {
                 eprintln!("SKIP {test}: {tool} not on PATH");
@@ -318,6 +345,9 @@ impl Fixture {
         if semihosting {
             link.arg("-DBHF_SEMIHOSTING");
         }
+        if persistent {
+            link.arg("-DBHF_PERSISTENT");
+        }
         let built = link
             .arg("-T")
             .arg(&ld)
@@ -341,8 +371,7 @@ impl Fixture {
         // The CLI parses only TCP HOST:PORT endpoints, so expose qmp AND gdb over
         // TCP (this also exercises the #79 doc correction that qmp must be a TCP
         // socket).
-        let qmp_port = free_port();
-        let gdb_port = free_port();
+        let (qmp_port, gdb_port) = ports.unwrap_or_else(|| (free_port(), free_port()));
         let mut qemu = Command::new(QEMU);
         if semihosting {
             qemu.args(["-semihosting-config", "enable=on,target=gdb"]);
@@ -692,6 +721,105 @@ fn cli_qemu_system_semihosting_coverage_grows_with_each_path() {
         fault["findings"].as_array().map(Vec::len),
         Some(1),
         "the fault seed's crash was not recorded: {fault:#}"
+    );
+}
+
+/// #346: `reset=persistent` through the shipped CLI. The guest's own input
+/// loop runs the seeds; the planted fault, met on a continuation, is still a
+/// finding; its transport profile records the campaign's exec/s and the
+/// reset; and `bhf replay` reproduces it from the snapshot on a fresh guest.
+#[test]
+fn cli_qemu_system_persistent_reset_finds_the_fault_and_records_executions_per_sec() {
+    let test = "cli_qemu_system_persistent_reset_finds_the_fault_and_records_executions_per_sec";
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    let Some(fixture) = Fixture::boot_opts(test, dir, false, false, true, None) else {
+        return;
+    };
+    let seeds = [0x42_u8, 0x00, 0xF7, 0x42, 0x00];
+    let work = dir.join("work");
+    let mut fuzz = Command::new(bhf_bin());
+    fuzz.args([
+        "fuzz",
+        "--target-transport",
+        &format!("{},reset=persistent", fixture.spec()),
+    ])
+    .args(["--transport-coverage-map", &fixture.coverage_map(64)])
+    .args(["--harness", "cortex-m-fixture"]);
+    for (i, byte) in seeds.iter().enumerate() {
+        let seed = dir.join(format!("seed-{i}.bin"));
+        std::fs::write(&seed, [*byte]).unwrap();
+        fuzz.arg("--seed-file").arg(seed);
+    }
+    let out = fuzz
+        .args(["--iterations", &seeds.len().to_string(), "--time", "60s"])
+        .args(["--timeout", "10s"])
+        .arg(&work)
+        .output()
+        .expect("run bhf fuzz");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "bhf fuzz reset=persistent failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let summary: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("summary JSON: {e}\n{stdout}"));
+    assert_eq!(summary["executions"], seeds.len(), "{summary:#}");
+    assert_eq!(summary["crashes"], 1, "{summary:#}");
+    assert!(
+        summary["executions_per_sec"]
+            .as_f64()
+            .is_some_and(|rate| rate > 0.0),
+        "{summary:#}"
+    );
+    let findings = summary["findings"].as_array().expect("findings array");
+    assert_eq!(findings.len(), 1, "{summary:#}");
+
+    let finding = work
+        .join("results/findings")
+        .join(findings[0].as_str().unwrap());
+    let profile: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(finding.join("transport_profile.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        profile["throughput"]["executions"],
+        seeds.len(),
+        "{profile:#}"
+    );
+    assert!(
+        profile["throughput"]["executions_per_sec"]
+            .as_f64()
+            .is_some_and(|rate| rate > 0.0),
+        "{profile:#}"
+    );
+    assert!(
+        profile["reset_mechanism"]
+            .as_str()
+            .is_some_and(|reset| reset.starts_with("guest persistent loop")),
+        "{profile:#}"
+    );
+    eprintln!(
+        "cli persistent: {} executions at {} exec/s, finding {}",
+        summary["executions"], summary["executions_per_sec"], findings[0]
+    );
+
+    // The guest the campaign leaves is no baseline: replay on a fresh one at
+    // the recorded endpoints.
+    let ports = (fixture.qmp_port, fixture.gdb_port);
+    drop(fixture);
+    let _fresh = Fixture::boot_opts(test, dir, false, false, true, Some(ports))
+        .expect("tools were present a moment ago");
+    let replay = Command::new(bhf_bin())
+        .arg("replay")
+        .arg(&finding)
+        .output()
+        .expect("run bhf replay");
+    let replay_stdout = String::from_utf8_lossy(&replay.stdout);
+    assert!(
+        replay.status.success() && replay_stdout.contains("MATCH"),
+        "bhf replay of a persistent finding: {replay_stdout}\n{}",
+        String::from_utf8_lossy(&replay.stderr)
     );
 }
 

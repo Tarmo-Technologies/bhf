@@ -70,7 +70,7 @@ pub use cmplog::{CmpLogRegion, Comparison};
 pub use coverage::{edges_from_events, MemoryBufferReader, SemihostingReader};
 pub use error::{Result, TransportError};
 pub use fullsystem::{
-    FullSystemSession, FullSystemTransport, GuestFaultStatus, QmpClient, QmpLimits,
+    FullSystemReset, FullSystemSession, FullSystemTransport, GuestFaultStatus, QmpClient, QmpLimits,
 };
 pub use gdb::{
     read_coverage_ring, stage_input, GdbClient, GdbConnection, GdbMemoryMap, GdbRemoteTransport,

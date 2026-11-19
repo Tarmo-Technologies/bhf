@@ -37,8 +37,9 @@
 //! * `agent:serial:PATH[,baud=N]` — [`AgentTransport`] over a serial device,
 //!   opened raw with reads bounded by `--timeout`.
 //! * `gdb:HOST:PORT`         — [`GdbRemoteTransport`]; needs `--transport-coverage-map`.
-//! * `qemu-system:qmp=HOST:PORT,gdb=HOST:PORT[,snapshot=TAG]` — [`FullSystemTransport`];
-//!   needs `--transport-coverage-map`.
+//! * `qemu-system:qmp=HOST:PORT,gdb=HOST:PORT[,snapshot=TAG][,reset=loadvm|persistent]` —
+//!   [`FullSystemTransport`]; needs `--transport-coverage-map`, and `reset=persistent`
+//!   needs `done=`.
 //! * `renode:monitor=HOST:PORT,gdb=HOST:PORT[,snapshot=PATH]` — [`RenodeTransport`]
 //!   over Renode's telnet monitor; needs `--transport-coverage-map`.
 //!
@@ -59,9 +60,9 @@ use fuzz_engine_builtin::{
 use serde::Serialize;
 use target_transport::cycles::{CycleCounter, CycleSource};
 use target_transport::{
-    AgentTransport, CmpLogRegion, ExitKind, FullSystemTransport, GdbMemoryMap, GdbRemoteTransport,
-    GuestFaultStatus, InputContract, RenodeTransport, ResetMode, RunOutcome, TargetSession,
-    TargetTransport, TransportError,
+    AgentTransport, CmpLogRegion, ExitKind, FullSystemReset, FullSystemTransport, GdbMemoryMap,
+    GdbRemoteTransport, GuestFaultStatus, InputContract, RenodeTransport, ResetMode, RunOutcome,
+    TargetSession, TargetTransport, TransportError,
 };
 
 use crate::fuzz::FuzzArgs;
@@ -216,6 +217,8 @@ pub(crate) enum TransportPlan {
         /// The staging region's capacity and length word.
         input: InputContract,
         snapshot_tag: String,
+        /// How the guest is brought back before each input (`reset=`).
+        reset: FullSystemReset,
         /// Completion breakpoint `(address, RSP kind)` planted at arm so a
         /// self-HardFaulting Cortex-M target halts back to the debugger instead
         /// of running `c` unbounded (#71). `None` for targets that trap on their
@@ -555,6 +558,7 @@ impl TransportPlan {
                 map,
                 input,
                 snapshot_tag,
+                reset,
                 harness_done,
                 fault_status,
                 firmware: _,
@@ -570,6 +574,7 @@ impl TransportPlan {
                     map,
                     snapshot_tag,
                 )?
+                .with_reset(reset)
                 .with_input_contract(Some(input))
                 .with_cycle_counter(cycles)
                 .with_task_id(task_id)
@@ -632,6 +637,29 @@ impl TransportPlan {
                 Ok(Box::new(transport))
             }
         }
+    }
+
+    /// The plan `bhf replay` rebuilds a finding's target from: a persistent
+    /// `qemu-system:` spec restores the snapshot before every input instead,
+    /// so each replay and minimization run starts from the snapshot rather
+    /// than from whatever the run before it left.
+    pub(crate) fn replay_from_baseline(mut self) -> Self {
+        if let Self::QemuSystem { reset, .. } = &mut self {
+            *reset = FullSystemReset::Loadvm;
+        }
+        self
+    }
+
+    /// Whether the plan continues the guest's own input loop between clean
+    /// inputs (`qemu-system:...,reset=persistent`).
+    pub(crate) fn continues_the_guest_loop(&self) -> bool {
+        matches!(
+            self,
+            Self::QemuSystem {
+                reset: FullSystemReset::Persistent,
+                ..
+            }
+        )
     }
 
     /// The staging region contract of a memory-read backend; `None` for the
@@ -735,6 +763,27 @@ fn parse_qemu_system(
     semihosting: bool,
 ) -> Result<TransportPlan, TransportSpecError> {
     let parsed = SnapshotSpec::parse("qemu-system", "qmp", DEFAULT_SNAPSHOT_TAG, spec, rest)?;
+    let malformed = |reason: String| TransportSpecError::Malformed {
+        backend: "qemu-system",
+        spec: spec.to_owned(),
+        reason,
+    };
+    let reset = match parsed.reset.as_deref() {
+        None | Some("loadvm") => FullSystemReset::Loadvm,
+        Some("persistent") => FullSystemReset::Persistent,
+        Some(other) => {
+            return Err(malformed(format!(
+                "reset={other:?}: expected loadvm or persistent"
+            )))
+        }
+    };
+    if reset == FullSystemReset::Persistent && parsed.harness_done.is_none() {
+        return Err(malformed(
+            "reset=persistent needs done=ADDR: the guest parks at its completion breakpoint \
+             between inputs"
+                .to_owned(),
+        ));
+    }
     Ok(TransportPlan::QemuSystem {
         qmp_host: parsed.control.0,
         qmp_port: parsed.control.1,
@@ -743,6 +792,7 @@ fn parse_qemu_system(
         map,
         input,
         snapshot_tag: parsed.snapshot,
+        reset,
         harness_done: parsed.harness_done,
         fault_status: parsed.fault_status,
         firmware: parsed.firmware,
@@ -765,6 +815,8 @@ struct SnapshotSpec {
     firmware: Option<PathBuf>,
     cycles: Option<CycleCounter>,
     task_id: Option<u64>,
+    /// `reset=`, which only `qemu-system:` takes.
+    reset: Option<String>,
     notes: Vec<String>,
 }
 
@@ -784,6 +836,8 @@ impl SnapshotSpec {
         let mut firmware: Option<PathBuf> = None;
         let mut cycles = CycleKeys::default();
         let mut task_id: Option<u64> = None;
+        let mut reset: Option<String> = None;
+        let takes_reset = backend == "qemu-system";
 
         let malformed = |reason: String| TransportSpecError::Malformed {
             backend,
@@ -808,13 +862,15 @@ impl SnapshotSpec {
                 "snapshot" => snapshot = value.to_owned(),
                 "firmware" => firmware = Some(PathBuf::from(value)),
                 "task_id" => task_id = Some(parse_int("task_id", value)?),
+                "reset" if takes_reset => reset = Some(value.to_owned()),
                 key if cycles.take(key, value)? => {}
                 key if contract.take(key, value)? => {}
                 other => {
                     return Err(malformed(format!(
                         "unknown key {other:?}; allowed: {control_key}, gdb, snapshot, done, \
                          done_kind, fault, fault_width, fault_clear, firmware, cycles, cpu_hz, \
-                         task_id"
+                         task_id{}",
+                        if takes_reset { ", reset" } else { "" }
                     )))
                 }
             }
@@ -833,6 +889,7 @@ impl SnapshotSpec {
             firmware,
             cycles: cycles.counter(backend, spec)?,
             task_id,
+            reset,
             notes,
         })
     }
@@ -1279,6 +1336,28 @@ pub(crate) struct TransportFuzzSummary {
     /// (`cmplog=`, #386).
     pub comparisons: usize,
     pub elapsed_secs: f64,
+    /// `executions / elapsed_secs` (0.0 when no measurable time elapsed), as
+    /// in a host run's `run.json`; also in each finding's transport profile.
+    pub executions_per_sec: f64,
+}
+
+/// The campaign's throughput, recorded in each finding's transport profile.
+#[derive(Debug, Clone, Copy, Serialize)]
+struct Throughput {
+    executions: usize,
+    elapsed_secs: f64,
+    executions_per_sec: f64,
+}
+
+impl Throughput {
+    fn new(executions: usize, elapsed: Duration) -> Self {
+        let elapsed_secs = elapsed.as_secs_f64();
+        Self {
+            executions,
+            elapsed_secs,
+            executions_per_sec: crate::fuzz::executions_per_sec(executions, elapsed_secs),
+        }
+    }
 }
 
 /// The fewest and most target cycles any completed run took, over `runs`.
@@ -1307,7 +1386,9 @@ impl CycleStats {
 
 /// How long a run took for the deadline oracle, and what measured it: the
 /// target's cycles at `cpu_hz` when the spec names both and the counter
-/// advanced, else the host's round-trip time.
+/// advanced, else the host's round-trip time `host` of the `run_input` call,
+/// or of the reported run alone when the session ran more than it (a
+/// `reset=persistent` continuation run again from the snapshot, #346).
 pub(crate) fn run_time(
     counter: Option<CycleCounter>,
     outcome: &RunOutcome,
@@ -1322,7 +1403,10 @@ pub(crate) fn run_time(
             duration,
             format!("target execution time ({cycles} cycles at {hz} Hz)"),
         ),
-        None => (host, "host-observed execution time".to_owned()),
+        None => (
+            outcome.target.host_run_time.unwrap_or(host),
+            "host-observed execution time".to_owned(),
+        ),
     }
 }
 
@@ -1629,9 +1713,15 @@ impl Campaign {
             .state
             .into_inner()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let throughput = Throughput::new(state.executions, start.elapsed());
         // Persist a replayable target profile next to each finding (#80), with
         // the spec of the worker whose transport found it.
-        persist_transport_profiles(config, &state.finding_ids, &state.finding_workers);
+        persist_transport_profiles(
+            config,
+            &state.finding_ids,
+            &state.finding_workers,
+            throughput,
+        );
         let snapshot = state.coverage.snapshot();
         Ok(TransportFuzzSummary {
             schema_version: 1,
@@ -1651,7 +1741,8 @@ impl Campaign {
             target_cycles: state.target_cycles,
             workers: config.worker_specs.len().max(1),
             comparisons: state.comparisons,
-            elapsed_secs: start.elapsed().as_secs_f64(),
+            elapsed_secs: throughput.elapsed_secs,
+            executions_per_sec: throughput.executions_per_sec,
         })
     }
 }
@@ -1809,6 +1900,17 @@ fn run_worker(
 const TRANSPORT_PROFILE_SCHEMA: &str = "bhf.transport-profile.v1";
 pub(crate) const TRANSPORT_PROFILE_FILE: &str = "transport_profile.json";
 
+/// Whether a `qemu-system:` spec continues the guest's own input loop
+/// between clean inputs (`reset=persistent`).
+fn resets_persistently(spec: &str) -> bool {
+    let spec = spec.trim();
+    spec.starts_with("qemu-system:")
+        && spec.split(',').any(|part| {
+            part.split_once('=')
+                .is_some_and(|(key, value)| key.trim() == "reset" && value.trim() == "persistent")
+        })
+}
+
 /// The backend and reset mechanism a spec implies, for the replay profile.
 fn backend_and_reset(spec: &str) -> (&'static str, &'static str) {
     let spec = spec.trim();
@@ -1816,6 +1918,12 @@ fn backend_and_reset(spec: &str) -> (&'static str, &'static str) {
         ("agent", "agent-protocol reset")
     } else if spec.starts_with("gdb:") {
         ("gdb-remote", "gdb R restart")
+    } else if resets_persistently(spec) {
+        (
+            "qemu-system",
+            "guest persistent loop; qmp loadvm before the first input and after a crash, hang \
+             or inconclusive run",
+        )
     } else if spec.starts_with("qemu-system:") {
         ("qemu-system", "qmp savevm/loadvm snapshot")
     } else if spec.starts_with("renode:") {
@@ -1835,6 +1943,7 @@ fn persist_transport_profiles(
     config: &TransportFuzzConfig,
     finding_ids: &[String],
     finding_workers: &std::collections::HashMap<String, usize>,
+    throughput: Throughput,
 ) {
     for id in finding_ids {
         // The spec of the worker whose transport found it (#316).
@@ -1843,12 +1952,27 @@ fn persist_transport_profiles(
             .filter(|_| config.worker_specs.len() > 1)
             .and_then(|worker| config.worker_specs.get(*worker))
             .unwrap_or(&config.spec);
-        persist_transport_profile(config, spec, id);
+        persist_transport_profile(config, spec, id, throughput);
     }
 }
 
-fn persist_transport_profile(config: &TransportFuzzConfig, spec: &str, id: &str) {
+fn persist_transport_profile(
+    config: &TransportFuzzConfig,
+    spec: &str,
+    id: &str,
+    throughput: Throughput,
+) {
     let (backend, reset) = backend_and_reset(spec);
+    let mut limitations = vec!["host-observed timing"];
+    if config.firmware_identity.is_none() {
+        limitations.push("firmware identity not recorded (name the ELF with firmware=)");
+    }
+    if resets_persistently(spec) {
+        limitations.push(
+            "reset=persistent: guest state carries over between clean inputs, so a finding \
+             may depend on the inputs before it; bhf replay replays it from the snapshot",
+        );
+    }
     // Persist the timing contract so `bhf replay` can reproduce a timing finding:
     // the per-input execution deadline (rebuild the transport with the SAME bound
     // so an execution-timeout re-times-out) and the response-time deadline (so a
@@ -1879,11 +2003,9 @@ fn persist_transport_profile(config: &TransportFuzzConfig, spec: &str, id: &str)
             "length_word": contract.length_word,
         })),
         "firmware_identity": config.firmware_identity,
-        "limitations": if config.firmware_identity.is_some() {
-            "host-observed timing"
-        } else {
-            "host-observed timing; firmware identity not recorded (name the ELF with firmware=)"
-        },
+        // The campaign's executions per second (#346).
+        "throughput": throughput,
+        "limitations": limitations.join("; "),
     });
     let Ok(body) = serde_json::to_vec_pretty(&profile) else {
         return;
@@ -1908,10 +2030,11 @@ fn persist_transport_profile(config: &TransportFuzzConfig, spec: &str, id: &str)
 }
 
 /// How a single transport execution concluded (#70): it ran (carrying the
-/// outcome and the host-observed duration for the deadline oracle), or it hit a
-/// bounded, non-clean run-control halt (a target hang or a lost transport).
+/// outcome, boxed as the far larger variant, and the host-observed duration
+/// for the deadline oracle), or it hit a bounded, non-clean run-control halt
+/// (a target hang or a lost transport).
 enum Step {
-    Ran(RunOutcome, Duration),
+    Ran(Box<RunOutcome>, Duration),
     Halt(String),
 }
 
@@ -1962,7 +2085,7 @@ fn run_one_input(
 ) -> Result<Step, TransportFuzzError> {
     let start = Instant::now();
     match session.run_input(input) {
-        Ok(outcome) => Ok(Step::Ran(outcome, start.elapsed())),
+        Ok(outcome) => Ok(Step::Ran(Box::new(outcome), start.elapsed())),
         Err(err) => match classify_run_failure(&err) {
             RunFailure::ControlTimeout => {
                 Ok(Step::Halt(format!("transport control timeout: {err}")))
@@ -2595,6 +2718,14 @@ mod tests {
             run_time(None, &outcome, host).1,
             "host-observed execution time"
         );
+        // A session that reports a run of its own (#346) is timed by it.
+        outcome.target.host_run_time = Some(Duration::from_millis(3));
+        assert_eq!(run_time(None, &outcome, host).0, Duration::from_millis(3));
+        assert_eq!(
+            run_time(counter, &outcome, host).0,
+            Duration::from_micros(2_500),
+            "target cycles still come first"
+        );
     }
 
     #[test]
@@ -2696,6 +2827,7 @@ mod tests {
                 snapshot_tag,
                 harness_done,
                 fault_status,
+                reset,
                 firmware: _,
                 cycles: _,
                 task_id: _,
@@ -2704,6 +2836,11 @@ mod tests {
                 notes,
             } => {
                 assert!(notes.is_empty(), "{notes:?}");
+                assert_eq!(
+                    reset,
+                    FullSystemReset::Loadvm,
+                    "a loadvm per input by default"
+                );
                 assert_eq!(input.capacity, 64);
                 assert_eq!(qmp_host, "127.0.0.1");
                 assert_eq!(qmp_port, 4444);
@@ -2937,6 +3074,185 @@ mod tests {
             matches!(error, TransportSpecError::Transport(_)),
             "expected a transport validation error, got: {error}"
         );
+    }
+
+    #[test]
+    fn the_qemu_system_spec_takes_a_persistent_reset_with_its_done_breakpoint() {
+        let map_spec = "input=4096,input_cap=64,ring=16384,write=20480,wrapped=20736,cap=32";
+        let reset_of = |spec: &str| match TransportPlan::parse(spec, Some(map_spec)) {
+            Ok(TransportPlan::QemuSystem { reset, .. }) => Ok(reset),
+            Ok(other) => panic!("expected QemuSystem, got {other:?}"),
+            Err(error) => Err(error.to_string()),
+        };
+        assert_eq!(
+            reset_of("qemu-system:qmp=h:1,gdb=h:2,done=0x1a8,reset=persistent"),
+            Ok(FullSystemReset::Persistent)
+        );
+        assert_eq!(
+            reset_of("qemu-system:qmp=h:1,gdb=h:2,reset=loadvm"),
+            Ok(FullSystemReset::Loadvm)
+        );
+        // The guest parks at the completion breakpoint between inputs.
+        let error = reset_of("qemu-system:qmp=h:1,gdb=h:2,reset=persistent").unwrap_err();
+        assert!(error.contains("reset=persistent needs done="), "{error}");
+        let error = reset_of("qemu-system:qmp=h:1,gdb=h:2,done=0x1a8,reset=fast").unwrap_err();
+        assert!(error.contains("expected loadvm or persistent"), "{error}");
+        // Renode's Load is the only reset it has.
+        let error = TransportPlan::parse(
+            "renode:monitor=h:1,gdb=h:2,done=0x1a8,reset=persistent",
+            Some(RENODE_MAP),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("unknown key \"reset\""), "{error}");
+        assert_eq!(
+            backend_and_reset("qemu-system:qmp=h:1,gdb=h:2,done=0x1a8, reset=persistent"),
+            (
+                "qemu-system",
+                "guest persistent loop; qmp loadvm before the first input and after a crash, \
+                 hang or inconclusive run"
+            )
+        );
+        assert_eq!(
+            backend_and_reset("qemu-system:qmp=h:1,gdb=h:2,reset=loadvm"),
+            ("qemu-system", "qmp savevm/loadvm snapshot")
+        );
+    }
+
+    /// A mock QMP monitor and gdb server on loopback for a persistent
+    /// `qemu-system:` spec: a guest that writes edges 0x10 and 0x11 on every
+    /// run, its successive `c`s answered by `stops` (an empty one never
+    /// stops). Returns the spec and the two logs.
+    #[allow(clippy::type_complexity)]
+    fn persistent_qemu_mocks(
+        stops: Vec<Vec<u8>>,
+    ) -> (String, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>) {
+        use std::net::TcpListener;
+        use target_transport::testsupport::{
+            encode_event_stream, simulate_ring, MockGdbStub, MockQmpServer,
+        };
+        let qmp_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let gdb_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let qmp_port = qmp_listener.local_addr().unwrap().port();
+        let gdb_port = gdb_listener.local_addr().unwrap().port();
+        let qmp_log = Arc::new(Mutex::new(Vec::new()));
+        let gdb_log = Arc::new(Mutex::new(Vec::new()));
+        {
+            let log = Arc::clone(&qmp_log);
+            thread::spawn(move || {
+                let (stream, _) = qmp_listener.accept().unwrap();
+                let _ = MockQmpServer::new(stream, log).serve();
+            });
+        }
+        {
+            let log = Arc::clone(&gdb_log);
+            thread::spawn(move || {
+                let (stream, _) = gdb_listener.accept().unwrap();
+                stream.set_nodelay(true).unwrap();
+                let events: Vec<event_log::Event> = [0x10, 0x11]
+                    .into_iter()
+                    .map(|id| event_log::Event::Crumb { id })
+                    .collect();
+                let (image, write, wrapped) = simulate_ring(&encode_event_stream(&events), 64);
+                let _ = MockGdbStub::new(stream, log)
+                    .with_stop_sequence(stops)
+                    .with_region(0x1000, vec![0; 64])
+                    .with_region(0x4000, image)
+                    .with_region(0x5000, write.to_le_bytes().to_vec())
+                    .with_region(0x5100, vec![u8::from(wrapped)])
+                    .with_run_write(0x5000, write.to_le_bytes().to_vec())
+                    .with_run_write(0x5100, vec![u8::from(wrapped)])
+                    .serve();
+            });
+        }
+        let spec = format!(
+            "qemu-system:qmp=127.0.0.1:{qmp_port},gdb=127.0.0.1:{gdb_port},done=0x1a8,\
+             reset=persistent"
+        );
+        (spec, qmp_log, gdb_log)
+    }
+
+    const PERSISTENT_MAP: &str =
+        "input=0x1000,input_cap=64,ring=0x4000,write=0x5000,wrapped=0x5100,cap=64";
+
+    /// A persistent `qemu-system:` spec builds a transport that, against a
+    /// mock monitor and gdb server on loopback, restores the snapshot once
+    /// for three clean inputs.
+    #[test]
+    fn a_persistent_qemu_system_spec_builds_a_transport_that_restores_once() {
+        let (spec, qmp_log, gdb_log) = persistent_qemu_mocks(Vec::new());
+        let plan = TransportPlan::parse(&spec, Some(PERSISTENT_MAP)).unwrap();
+        let transport = plan.into_transport(Some(Duration::from_secs(10))).unwrap();
+        let mut session = transport.arm().unwrap();
+        for input in [b"abc", b"def", b"ghi"] {
+            let outcome = session.run_input(input).unwrap();
+            assert_eq!(outcome.exit, ExitKind::Ok, "{outcome:?}");
+            assert_eq!(outcome.coverage_edges, [0x10, 0x11]);
+        }
+        let loadvms = qmp_log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.starts_with("hmp:loadvm"))
+            .count();
+        assert_eq!(loadvms, 1, "{:?}", qmp_log.lock().unwrap());
+        let steps = gdb_log.lock().unwrap().iter().filter(|p| *p == "s").count();
+        assert_eq!(steps, 2, "two continuations");
+    }
+
+    /// #346: a continuation that hangs before the loop is proven is run again
+    /// from the snapshot, where the input is clean and fast. The deadline
+    /// oracle judges that run, not the discarded hang plus the restore, so a
+    /// `--deadline` under the execution deadline makes no false finding.
+    #[test]
+    fn a_hung_continuation_rerun_from_the_snapshot_is_no_deadline_finding() {
+        let (spec, qmp_log, _gdb_log) = persistent_qemu_mocks(vec![
+            b"S05".to_vec(),
+            Vec::new(), // the continuation never comes back to done
+            b"S05".to_vec(),
+        ]);
+        let plan = TransportPlan::parse(&spec, Some(PERSISTENT_MAP)).unwrap();
+        let exec_deadline = Duration::from_millis(400);
+        let transport = plan.into_transport(Some(exec_deadline)).unwrap();
+        let work_dir = tmp_work_dir("persistent-deadline");
+        let mut config = config(
+            work_dir.to_path_buf(),
+            vec![b"a".to_vec(), b"b".to_vec()],
+            2,
+        );
+        config.spec = spec;
+        config.per_input_timeout = Some(exec_deadline);
+        config.deadline = Some(Duration::from_millis(150));
+
+        let summary = run_transport_campaign(transport.as_ref(), &config).unwrap();
+        assert_eq!(summary.executions, 2, "{summary:?}");
+        assert!(summary.findings.is_empty(), "{summary:?}");
+        assert_eq!(summary.crashes, 0, "{summary:?}");
+        let loadvms = qmp_log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.starts_with("hmp:loadvm"))
+            .count();
+        assert_eq!(
+            loadvms, 2,
+            "the hung continuation was run from the snapshot"
+        );
+    }
+
+    #[test]
+    fn replay_runs_a_persistent_spec_with_a_loadvm_per_input() {
+        let map_spec = "input=4096,input_cap=64,ring=16384,write=20480,wrapped=20736,cap=32";
+        let plan = TransportPlan::parse(
+            "qemu-system:qmp=h:1,gdb=h:2,done=0x1a8,reset=persistent",
+            Some(map_spec),
+        )
+        .unwrap()
+        .replay_from_baseline();
+        let TransportPlan::QemuSystem { reset, .. } = plan else {
+            panic!("expected QemuSystem, got {plan:?}");
+        };
+        assert_eq!(reset, FullSystemReset::Loadvm);
     }
 
     #[test]
@@ -3802,6 +4118,69 @@ mod tests {
         assert_eq!(profile["schema_version"], "bhf.transport-profile.v1");
         assert_eq!(profile["spec"], "agent:tcp:127.0.0.1:9000");
         assert_eq!(profile["backend"], "agent");
+
+        std::fs::remove_dir_all(&work_dir).ok();
+    }
+
+    #[test]
+    fn the_campaign_records_its_executions_per_sec_in_the_summary_and_each_transport_profile() {
+        let fault = Fault {
+            kind: FaultKind::MemoryProtection,
+            address: Some(0x2000_4000),
+            detail: String::new(),
+        };
+        let (transport, _received) = mock_agent_transport(vec![
+            ScriptedResponse::ok(vec![1]),
+            ScriptedResponse::ok(vec![1]),
+            ScriptedResponse::crash(vec![1], fault),
+        ]);
+        let work_dir = tmp_work_dir("throughput");
+        let mut config = config(
+            work_dir.to_path_buf(),
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+            3,
+        );
+        config.spec =
+            "qemu-system:qmp=127.0.0.1:1,gdb=127.0.0.1:2,done=0x1a8,reset=persistent".to_owned();
+
+        let summary = run_transport_campaign(transport.as_ref(), &config).unwrap();
+        assert_eq!(summary.executions, 3);
+        assert_eq!(summary.findings.len(), 1);
+        assert!(summary.executions_per_sec > 0.0, "{summary:?}");
+        let expected = summary.executions as f64 / summary.elapsed_secs;
+        assert!(
+            (summary.executions_per_sec - expected).abs() <= expected * 1e-9,
+            "{summary:?}"
+        );
+
+        let profile_path = work_dir
+            .join("results")
+            .join("findings")
+            .join(&summary.findings[0])
+            .join("transport_profile.json");
+        let profile: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&profile_path).unwrap()).unwrap();
+        let throughput = &profile["throughput"];
+        assert_eq!(throughput["executions"], 3, "{profile}");
+        // serde_json reads a float back to within an ulp.
+        let close = |field: &str, want: f64| {
+            let got = throughput[field].as_f64().unwrap_or(f64::NAN);
+            assert!((got - want).abs() <= want * 1e-12, "{field}: {profile}");
+        };
+        close("elapsed_secs", summary.elapsed_secs);
+        close("executions_per_sec", summary.executions_per_sec);
+        assert!(
+            profile["reset_mechanism"]
+                .as_str()
+                .is_some_and(|reset| reset.starts_with("guest persistent loop")),
+            "{profile}"
+        );
+        assert!(
+            profile["limitations"]
+                .as_str()
+                .is_some_and(|text| text.contains("replays it from the snapshot")),
+            "{profile}"
+        );
 
         std::fs::remove_dir_all(&work_dir).ok();
     }

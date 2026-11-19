@@ -31,6 +31,17 @@
   hidden `--campaign-seed-file` takes a directory for every file in it, so a
   campaign (`bhf fuzz --workers` too) hands its workers the shared queue and
   its seeds in a command line of fixed length.
+- `qemu-system:` takes `reset=persistent` (needs `done=`) (#346): between
+  clean inputs the guest continues its own input loop from the `done=`
+  breakpoint, with a `loadvm` only before the first input and after a crash,
+  hang or inconclusive run (about 4x the exec/s on the RV-3 image;
+  `reset=loadvm` stays the default). Until a continuation comes back to
+  `done=` with coverage, any other is run again from the snapshot; a `done`
+  that branches to itself, or a firmware that never proves its loop, is
+  refused. The transport summary gains `executions_per_sec` and each
+  `transport_profile.json` a `throughput` block (additive); `bhf replay`
+  still restores before every input, and the session lane refuses
+  `reset=persistent`.
 - `bhf fuzz --target-transport renode:monitor=HOST:PORT,gdb=HOST:PORT[,snapshot=PATH]`
   fuzzes firmware on a Renode board (#340): Renode's telnet monitor saves the
   baseline with `Save` and restores it with `Load` before each input, and gdb
