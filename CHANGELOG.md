@@ -2990,6 +2990,18 @@
   raised it rather than at the harness's call. `run.json` reports it with
   `provided_harness.origin` `atheris`; the record gains `dictionaries` and
   `dictionary_tokens` (omitted when empty).
+- `bhf auto` fuzzes the fuzzers a `bhf project import-ossfuzz` of the tree
+  registered in its work dir (#435): each one linked with bhf's driver is a
+  provided harness, staged from the import's `$OUT` with its unpacked seed
+  corpus, its merged dictionaries and its `.options` limits, and reported in
+  `run.json` with `provided_harness.origin` `ossfuzz-import` and the new
+  `provided_harness.options` (omitted when empty). A generated target in the
+  fuzzer's own source is not fuzzed again. A fresh run keeps the import's
+  `<work>/build/<name>` registrations instead of clearing them, and a run
+  over another tree no longer archives the import with the earlier run. The
+  import now builds with a `-fdebug-prefix-map` from its `$SRC` copy to the
+  tree, so findings name the project's files. The note on what discovery
+  skipped by default no longer counts the provided harnesses' files.
 - `bhf differential --metamorphic-transform` has a transform registry (#330):
   `append-newline`, `trailing-whitespace` (a space and a tab at the end of
   every line), `reorder-json-keys` (every JSON object's members in reverse

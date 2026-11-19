@@ -3436,8 +3436,14 @@ pub struct DefaultSkips {
 
 /// [`DefaultSkips`] for `root` under `filter`: only directories it skips by
 /// name (the default set, or `--exclude-dir`), not build or VCS directories or
-/// the work dir. A directory-entry walk, bounded like the other censuses.
-pub fn default_skips(root: &Path, filter: &DirFilter) -> DefaultSkips {
+/// the work dir, and not the `fuzzed` files (the harnesses a project ships,
+/// which the run fuzzes wherever they are). A directory-entry walk, bounded
+/// like the other censuses.
+pub fn default_skips(
+    root: &Path,
+    filter: &DirFilter,
+    fuzzed: &std::collections::HashSet<PathBuf>,
+) -> DefaultSkips {
     const BUDGET: usize = 200_000;
     let mut skips = DefaultSkips::default();
     let mut seen = 0usize;
@@ -3465,7 +3471,7 @@ pub fn default_skips(root: &Path, filter: &DirFilter) -> DefaultSkips {
                     .to_str()
                     .is_some_and(|name| filter.skips(name))
                 {
-                    let files = count_targetable_files(&path, BUDGET);
+                    let files = count_targetable_files(&path, BUDGET, fuzzed);
                     if files > 0 {
                         let relative = path.strip_prefix(root).unwrap_or(&path);
                         skips
@@ -3476,6 +3482,7 @@ pub fn default_skips(root: &Path, filter: &DirFilter) -> DefaultSkips {
             } else if file_type.is_file()
                 && has_targetable_extension_only(&path)
                 && is_test_or_tool_source_file(&path)
+                && !fuzzed.contains(&path)
             {
                 skips.files += 1;
             }
@@ -3485,8 +3492,13 @@ pub fn default_skips(root: &Path, filter: &DirFilter) -> DefaultSkips {
     skips
 }
 
-/// Targetable source files under `dir`, at most `limit`.
-fn count_targetable_files(dir: &Path, limit: usize) -> usize {
+/// Targetable source files under `dir` but the `fuzzed` ones, at most
+/// `limit`.
+fn count_targetable_files(
+    dir: &Path,
+    limit: usize,
+    fuzzed: &std::collections::HashSet<PathBuf>,
+) -> usize {
     let mut count = 0usize;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -3496,7 +3508,11 @@ fn count_targetable_files(dir: &Path, limit: usize) -> usize {
         for entry in entries.flatten() {
             match entry.file_type() {
                 Ok(t) if t.is_dir() => stack.push(entry.path()),
-                Ok(t) if t.is_file() && has_targetable_extension_only(&entry.path()) => {
+                Ok(t)
+                    if t.is_file()
+                        && has_targetable_extension_only(&entry.path())
+                        && !fuzzed.contains(&entry.path()) =>
+                {
                     count += 1;
                     if count >= limit {
                         return count;
@@ -5972,7 +5988,8 @@ mod tests {
         fs::create_dir_all(root.join(".git")).unwrap();
         fs::write(root.join(".git/x.c"), "int k(int x) { return x; }\n").unwrap();
 
-        let skips = default_skips(&root, &DirFilter::default());
+        let none = std::collections::HashSet::new();
+        let skips = default_skips(&root, &DirFilter::default(), &none);
         assert_eq!(
             skips.dirs,
             vec![
@@ -5984,10 +6001,31 @@ mod tests {
             "{skips:?}"
         );
         assert_eq!(skips.files, 1);
+        // The files the run fuzzes as the project's own harnesses are not
+        // skipped: a dir left with none is not named.
+        let fuzzed: std::collections::HashSet<PathBuf> = [
+            root.join("tools/lib.c"),
+            root.join("tests/extra.c"),
+            root.join("src/pngtest.c"),
+        ]
+        .into_iter()
+        .collect();
+        let skips = default_skips(&root, &DirFilter::default(), &fuzzed);
+        assert_eq!(
+            skips.dirs,
+            vec![
+                ("app".to_owned(), 1),
+                ("tests".to_owned(), 1),
+                ("vendor".to_owned(), 1),
+            ],
+            "{skips:?}"
+        );
+        assert_eq!(skips.files, 0);
         // --include-dir keeps one; --exclude-dir adds one.
         let kept = default_skips(
             &root,
             &DirFilter::new(&["latest".into()], &["tests".into()]),
+            &none,
         );
         let names: Vec<&str> = kept.dirs.iter().map(|(dir, _)| dir.as_str()).collect();
         assert_eq!(names, ["app", "latest", "tools", "vendor"]);

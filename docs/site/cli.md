@@ -2270,7 +2270,7 @@ bhf project import-ossfuzz oss-fuzz/projects/libfoo --src path/to/libfoo \
 | `$WORK` | `<work>/ossfuzz/work`, for intermediate files |
 | `$OUT` | `<work>/ossfuzz/out`, where the fuzzers go |
 | `$CC`, `$CXX` (`$CCC`) | clang and clang++ |
-| `$CFLAGS`, `$CXXFLAGS` | OSS-Fuzz's address build, `-O1 -fno-omit-frame-pointer -gline-tables-only -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION -fsanitize=address -fsanitize-address-use-after-scope`, with `-fsanitize-coverage=trace-pc-guard,trace-cmp` (the coverage bhf's driver reads) in place of `-fsanitize=fuzzer-no-link` |
+| `$CFLAGS`, `$CXXFLAGS` | OSS-Fuzz's address build, `-O1 -fno-omit-frame-pointer -gline-tables-only -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION -fsanitize=address -fsanitize-address-use-after-scope`, with `-fsanitize-coverage=trace-pc-guard,trace-cmp` (the coverage bhf's driver reads) in place of `-fsanitize=fuzzer-no-link`, and `-fdebug-prefix-map=$SRC/<name>=<source tree>`, so a crash stack names the tree's files rather than their copy (left out for a path with whitespace or, in the copy's, a `=`) |
 | `$LIB_FUZZING_ENGINE` | `<work>/ossfuzz/engine/libFuzzingEngine.a`: bhf's driver, the `main` and coverage runtime a generated harness links, with a `bhf_run_one` that calls the target's `LLVMFuzzerTestOneInput` |
 | `$SANITIZER`, `$FUZZING_ENGINE`, `$FUZZING_LANGUAGE`, `$ARCHITECTURE` | `address`, `libfuzzer`, `c++`, and the host's architecture |
 
@@ -2351,6 +2351,17 @@ fuzzer in `$OUT` comes with it:
 `bhf project run` on the manifest applies all three; `bhf fuzz` loads the
 dictionary, takes the options as the flags the listing prints, and takes
 each seed with `--seed-file`.
+
+**`bhf auto`.** A later `bhf auto` of the same tree with the same
+`--work-dir` fuzzes every imported fuzzer linked with bhf's driver as a
+[provided harness](auto.md#provided-harnesses), ahead of the targets it
+generates, with its seeds, dictionaries and options applied, and leaves the
+registrations under `<work>/build/` in place:
+
+```sh
+bhf project import-ossfuzz path/to/libfoo --work-dir bhf_work
+bhf auto path/to/libfoo --work-dir bhf_work
+```
 
 ## Out-of-Process Extensions
 

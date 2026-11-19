@@ -2237,7 +2237,7 @@ pub(crate) fn run_one_target_programmatic_with_runner(
     // large seed is never truncated). Unset (non-auto callers / tests) keeps the
     // historical defaults.
     let largest_seed = seeds.iter().map(Vec::len).max().unwrap_or(0);
-    let args = FuzzArgs {
+    let mut args = FuzzArgs {
         work_dir: work_dir.to_path_buf(),
         harness: harness_id.to_owned(),
         engine: FuzzEngine::Builtin,
@@ -2304,6 +2304,11 @@ pub(crate) fn run_one_target_programmatic_with_runner(
         collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
         extension: None,
     };
+    // A provided harness's own options (an imported OSS-Fuzz fuzzer's
+    // `.options`) set its limits in place of the run's.
+    if let Some(options) = crate::auto::provided::fuzz_options(work_dir, harness_id) {
+        options.apply(&mut args.max_len, &mut args.timeout, &mut args.rss_limit_mb);
+    }
     // #332: `bhf auto --workers-per-target N` runs each native pass as a
     // campaign of N workers that share their corpus as they run.
     if runner.is_none() {

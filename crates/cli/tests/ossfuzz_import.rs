@@ -302,6 +302,11 @@ fn the_imported_fuzzers_are_registered_and_bhf_fuzz_finds_the_planted_bug() {
              --rss-limit-mb 1024",
             work.display()
         ),
+        format!(
+            "bhf auto {} --work-dir {}",
+            project.canonicalize().unwrap().display(),
+            work.display()
+        ),
     ] {
         assert!(listing.contains(&command), "{command} in {listing}");
     }
@@ -538,6 +543,179 @@ fn the_seed_corpus_dictionaries_and_options_are_imported_and_applied() {
                 && fs::read(dir.join("testcase.bin")).unwrap() == fs::read(&regression).unwrap()
         });
     assert!(found, "no finding from the unpacked regression seed");
+}
+
+/// After the import, `bhf auto --work-dir <the same>` fuzzes the fuzzers it
+/// registered as provided harnesses, ahead of the targets it generates: each
+/// is a target at the source that defines it, staged from the import with
+/// its seeds, dictionaries and options, and `parse_record_fuzzer` finds the
+/// planted overflow. `run.json` marks both with their origin, and the run
+/// leaves the import's registrations for `bhf fuzz --harness`.
+#[test]
+fn bhf_auto_fuzzes_the_imported_fuzzers_with_their_seeds_and_dictionaries() {
+    if !have_fixture_tools() {
+        eprintln!("skipping: clang, zip or unzip not available");
+        return;
+    }
+    let root = TestDir::new("ossfuzz-auto");
+    let project = root.join("ossfuzz_project");
+    copy_tree(&fixture(), &project);
+    let project = project.canonicalize().unwrap();
+    let work = root.join("work");
+    assert_ok(&import(&project, &work, &sandbox_flags()));
+    let work = work.canonicalize().unwrap();
+    let _serial = support::fuzz_serial_guard();
+    // The two imported fuzzers rank first, so `--max-targets 2` is them.
+    let auto = bhf()
+        .args([
+            "auto",
+            "--per-target-time",
+            "15",
+            "--single-pass",
+            "--jobs",
+            "1",
+            "--max-targets",
+            "2",
+            "--work-dir",
+        ])
+        .arg(&work)
+        .arg(&project)
+        .output()
+        .unwrap();
+    let stderr = text(&auto.stderr);
+    assert!(auto.status.success(), "bhf auto failed: {stderr}");
+    assert!(
+        stderr.contains("provided harnesses: 2 the project ships (2 imported OSS-Fuzz fuzzer(s))"),
+        "{stderr}"
+    );
+    let run: serde_json::Value =
+        serde_json::from_slice(&fs::read(work.join("auto/run.json")).unwrap()).unwrap();
+    assert_eq!(run["summary"]["provided_harnesses"], 2, "{run:#}");
+    let targets = run["targets"].as_array().unwrap();
+    let target = |name: &str| {
+        targets
+            .iter()
+            .find(|target| target["name"] == name)
+            .unwrap_or_else(|| panic!("no target {name} in run.json: {run:#}"))
+    };
+    assert!(
+        targets
+            .iter()
+            .all(|target| target["name"] != "LLVMFuzzerTestOneInput"),
+        "an imported fuzzer is not fuzzed again as a generated driver target"
+    );
+    let out_dir = work.join("ossfuzz/out");
+    for (name, source) in [
+        ("parse_record_fuzzer", "fuzz/parse_record_fuzzer.cc"),
+        ("checksum_fuzzer", "fuzz/checksum_fuzzer.c"),
+    ] {
+        let target = target(name);
+        assert_eq!(
+            target["outcome"]["outcome"], "built_and_fuzzed",
+            "{target:#}"
+        );
+        let provided = &target["provided_harness"];
+        assert_eq!(provided["origin"], "ossfuzz-import", "{target:#}");
+        assert_eq!(provided["entry"], name);
+        assert_eq!(provided["source"], project.join(source).to_str().unwrap());
+    }
+
+    // parse_record_fuzzer: its unpacked corpus, its two dictionaries and its
+    // options, staged in its harness dir.
+    let parse = target("parse_record_fuzzer");
+    let provided = &parse["provided_harness"];
+    let seeds = work.join("ossfuzz/seeds/parse_record_fuzzer");
+    assert_eq!(provided["seeds"], 3, "{provided:#}");
+    assert_eq!(
+        provided["seed_sources"],
+        serde_json::json!([seeds.to_str().unwrap()])
+    );
+    assert_eq!(
+        provided["dictionaries"],
+        serde_json::json!([
+            out_dir.join("parse_record_fuzzer.dict"),
+            out_dir.join("record.dict")
+        ])
+    );
+    assert_eq!(provided["dictionary_tokens"], 3);
+    assert_eq!(
+        provided["options"],
+        serde_json::json!({ "max_len": 64, "timeout_secs": 5, "rss_limit_mb": 1024 })
+    );
+    let id = parse["harness_id"].as_str().unwrap();
+    let harness = work.join("harnesses").join(id);
+    assert_eq!(
+        fs::read(harness.join("main")).unwrap(),
+        fs::read(out_dir.join("parse_record_fuzzer")).unwrap()
+    );
+    assert_eq!(
+        fs::read_to_string(harness.join("dictionary.txt")).unwrap(),
+        "\"REC1\"\n\"\\x10\"\n\"\\xc5\\x9d\\x1c\\x81\"\n"
+    );
+    let mut staged: Vec<Vec<u8>> = fs::read_dir(harness.join("provided-seeds"))
+        .unwrap()
+        .map(|entry| fs::read(entry.unwrap().path()).unwrap())
+        .collect();
+    staged.sort();
+    let mut corpus: Vec<Vec<u8>> = listing(&seeds)
+        .iter()
+        .map(|seed| fs::read(seeds.join(seed)).unwrap())
+        .collect();
+    corpus.sort();
+    assert_eq!(staged, corpus);
+    let checksum = target("checksum_fuzzer");
+    assert_eq!(checksum["provided_harness"]["seeds"], 0);
+    assert!(checksum["provided_harness"].get("options").is_none());
+
+    // The planted overflow, found through the imported fuzzer.
+    let findings: serde_json::Value =
+        serde_json::from_slice(&fs::read(work.join("results/findings.json")).unwrap()).unwrap();
+    let found = findings["findings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|finding| {
+            finding["fuzz"]["harness_id"] == id
+                && finding["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("heap-buffer-overflow"))
+                && finding["location"]["function"] == "record_parse"
+        });
+    assert!(found, "the planted overflow was not found: {findings:#}");
+    // Located in the project's own file, not in the copy the import built.
+    let overflow = findings["findings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|finding| {
+            finding["fuzz"]["harness_id"] == id && finding["location"]["function"] == "record_parse"
+        })
+        .unwrap();
+    assert_eq!(overflow["location"]["file"], "src/record.c", "{overflow:#}");
+    assert!(
+        !overflow.to_string().contains("ossfuzz/src"),
+        "the finding names the import's $SRC copy: {overflow:#}"
+    );
+    // The fuzzer sources are fuzzed, so the note on what discovery skipped
+    // by default does not count them.
+    assert!(
+        !stderr.contains("fuzz/ ("),
+        "the fuzzers' dir is named as skipped: {stderr}"
+    );
+    let summary = fs::read_to_string(work.join("auto/summary.txt")).unwrap();
+    assert!(
+        summary.contains(&format!(
+            "{id} parse_record_fuzzer [ossfuzz-import]: built+fuzzed, 3 seed(s)"
+        )),
+        "{summary}"
+    );
+    // The import's registrations are still there for `bhf fuzz --harness`.
+    for name in ["checksum_fuzzer", "parse_record_fuzzer"] {
+        assert!(
+            work.join("build").join(name).join("main").is_file(),
+            "{name}"
+        );
+    }
 }
 
 /// A seed corpus is unpacked with the system `unzip`; without it the import

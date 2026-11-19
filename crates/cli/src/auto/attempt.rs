@@ -2444,6 +2444,34 @@ fn run_attempt(
     // Stays `None` for every non-force run and every other lane.
     let mut forced_synthetic_params: Option<String> = None;
 
+    // Step 0 (an imported OSS-Fuzz fuzzer, #435): the fuzzer `bhf project
+    // import-ossfuzz` built from the project's build.sh, linked with bhf's
+    // driver, is the harness. Stage it with the seeds, dictionary and options
+    // the import took for it; the build below passes it through, as it does a
+    // prebuilt lane's harness.
+    let imported = crate::auto::provided::imported_fuzzer(work_dir, candidate);
+    if let Some(fuzzer) = &imported {
+        progress.update(&ProgressUpdate::phase(Phase::Generate));
+        if let Err((reason, skip)) =
+            crate::auto::provided::stage_imported_fuzzer(fuzzer, candidate, &harness_dir)
+        {
+            let outcome = if skip {
+                Outcome::UnsupportedParams { reason }
+            } else {
+                Outcome::FailedBuild {
+                    repairs: Vec::new(),
+                    retries: 0,
+                    last_errors: build_classifier::classify(&reason),
+                }
+            };
+            return Ok(AttemptResult {
+                candidate: candidate.clone(),
+                outcome,
+                harness_dir,
+            });
+        }
+    }
+
     // Step 0 (Java, M2.1b/d): the native Java lane. Compile the target with javac,
     // generate + compile a bhf harness, and emit `harnesses/<id>/main` — a launcher
     // that runs the target in a persistent JVM under bhf's own coverage agent.
@@ -3029,6 +3057,7 @@ fn run_attempt(
     // pre-skip, foreign-strategy, harness-gen, and single-header steps and go
     // straight to the repair loop's build pass-through + shared fuzz cascade.
     let is_prebuilt = is_rust
+        || imported.is_some()
         || matches!(
             candidate.lang,
             crate::auto::candidate::Lang::Java
@@ -3617,10 +3646,13 @@ fn run_attempt(
                         candidate.harness_id
                     );
                 }
+                // An imported fuzzer was built by the project's build.sh: there is
+                // no bhf build recipe to persist for it.
                 if matches!(
                     candidate.lang,
                     crate::auto::candidate::Lang::C | crate::auto::candidate::Lang::Cpp
-                ) {
+                ) && imported.is_none()
+                {
                     let is_cpp = candidate.lang == crate::auto::candidate::Lang::Cpp;
                     // The standard the successful build used, as the build
                     // reported it: re-reading the dialect cache here could
@@ -6806,6 +6838,19 @@ fn try_build(
         .and_then(|n| n.to_str())
         .expect("harness dir name");
     match candidate.lang {
+        // An imported OSS-Fuzz fuzzer, staged in `run_attempt` Step 0, is built
+        // already: the pass-through reports Success iff its binary is there.
+        Lang::C | Lang::Cpp if crate::auto::provided::is_staged_import(dir) => {
+            if crate::auto::layout::harness_exe(dir, "main").is_file() {
+                BuildOutcome::Success
+            } else {
+                BuildOutcome::Failed {
+                    errors: build_classifier::classify(
+                        "imported fuzzer missing (Step 0 did not stage harnesses/<id>/main)",
+                    ),
+                }
+            }
+        }
         Lang::C | Lang::Cpp => try_build_c(
             work_dir,
             harness_id,

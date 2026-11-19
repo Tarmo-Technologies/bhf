@@ -75,7 +75,8 @@ Tools with the C++ workload (bhf finds it and its clang; no Developer shell
 needed) and GNU make; `--cc cl` builds the harnesses with cl.exe. A Visual
 Studio solution in the tree is imported for its include dirs and defines.
 Harnesses the project already ships (Go native fuzz tests, Atheris harnesses)
-are fuzzed first, from the seeds and dictionaries that come with them.
+are fuzzed first, from the seeds and dictionaries that come with them, and so
+are the fuzzers a `bhf project import-ossfuzz` registered in the work dir.
 Read results/INDEX.md for findings
 and auto/summary.txt for targets that built, fuzzed, or were skipped.
 Add --resume to the same command to continue a stopped run.";
@@ -1898,18 +1899,31 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         args.preprocess,
     )?;
     // The harnesses the project ships (Go native fuzz tests, Atheris
-    // harnesses) live where discovery of generated targets does not look;
-    // they go first.
-    crate::auto::provided::merge_into(
-        &mut candidates,
-        crate::auto::provided::discover(&path, &dir_filter),
-    );
-    if let Some(note) = crate::auto::provided::discovered_note(&candidates) {
+    // harnesses) live where discovery of generated targets does not look,
+    // and the fuzzers a `bhf project import-ossfuzz` registered in the work
+    // dir are built already; they go first.
+    let mut provided = crate::auto::provided::discover(&path, &dir_filter);
+    let (imported, import_notes) =
+        crate::auto::provided::discover_imported(&work, &path, &dir_filter);
+    for note in &import_notes {
         bhfeprintln!("{note}");
     }
-    if let Some(note) =
-        default_skips_note(&crate::auto::discovery::default_skips(&path, &dir_filter))
-    {
+    let imported_count = imported.len();
+    provided.extend(imported);
+    // The harness files the run fuzzes are not skipped, wherever they are.
+    let fuzzed: std::collections::HashSet<PathBuf> = provided
+        .iter()
+        .map(|candidate| candidate.source_path.clone())
+        .collect();
+    crate::auto::provided::merge_into(&mut candidates, provided);
+    if let Some(note) = crate::auto::provided::discovered_note(&candidates, imported_count) {
+        bhfeprintln!("{note}");
+    }
+    if let Some(note) = default_skips_note(&crate::auto::discovery::default_skips(
+        &path,
+        &dir_filter,
+        &fuzzed,
+    )) {
         bhfeprintln!("{note}");
     }
     if let Err(error) =

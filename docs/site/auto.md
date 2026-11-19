@@ -607,7 +607,9 @@ harnesses`. The walk for them skips the work dir, build output, VCS and other
 hidden directories, vendored dependencies (`vendor/`, `third_party/`, ...),
 `testdata/` and every `--exclude-dir`, and for Go fuzz tests a directory whose
 name starts with `_`, which the go tool ignores too; `--languages`,
-`--target` and the other filters apply to them as to any target.
+`--target` and the other filters apply to them as to any target. The note on
+what discovery skipped by default does not count their files, since the run
+fuzzes them.
 
 - **Go native fuzz tests.** A top-level `func FuzzXxx(f *testing.F)` in a
   `_test.go` file, the entry point `go test -fuzz` runs, is a target named
@@ -666,6 +668,29 @@ name starts with `_`, which the go tool ignores too; `--languages`,
   `harnesses/<id>/provided-seeds/` and start the fuzz passes. A harness file
   that cannot be imported, or that uses a part of the `atheris` API the
   stand-in lacks, is skipped with the reason.
+- **Imported OSS-Fuzz fuzzers.** When the work dir holds a
+  `bhf project import-ossfuzz` of the tree (or of a tree that holds it, or
+  that it holds; see [Importing an OSS-Fuzz
+  build](cli.md#importing-an-oss-fuzz-build)), each fuzzer it registered is a
+  target named after it, in the C or C++ file named after it that defines
+  `LLVMFuzzerTestOneInput` (`H-C` or `H-X` id, which names the
+  registration, so it is the same from run to run). Its binary, already
+  built by the project's `build.sh` with bhf's driver, is staged from
+  `<work>/ossfuzz/out/` as the harness, nothing is generated or rebuilt, and
+  it starts from its unpacked seed corpus, with the dictionaries the import
+  merged for it and the `max_len`, `timeout` and `rss_limit_mb` of its
+  `.options` in place of the run's `--max-len`, per-input timeout and memory
+  limit. A generated target in the same file, such as the passthrough
+  harness of its `LLVMFuzzerTestOneInput`, is the same fuzzer and is not
+  fuzzed again. A fuzzer the build linked with `-fsanitize=fuzzer` rather
+  than `$LIB_FUZZING_ENGINE` is skipped with the reason (`bhf project run`
+  runs it); an import of another tree is left out with a note. A fresh run
+  refreshes `<work>/build/` but keeps the import's registrations there, and
+  a run over another tree archives the earlier run but leaves the import
+  (`<work>/ossfuzz/` and those registrations) in place. The import builds
+  with a `-fdebug-prefix-map` from its `$SRC/<name>` copy to the tree, so a
+  finding is located in the tree's files; a fuzzer imported by an earlier
+  release names the copy until it is imported again.
 
 C and C++ harnesses are Makefile-based. Auto uses `clang` / `clang++` for the
 default coverage-guided sanitizer build unless `CC` / `CXX` are set. See
@@ -883,13 +908,16 @@ fuzz/oracle hit confirmed at the same source site (omitted when zero). See
 
 A target that is a harness the project ships ([Provided
 harnesses](#provided-harnesses)) carries `targets[].provided_harness`:
-`origin` (`go-fuzz-test` or `atheris`), `entry` (the fuzz test's name, or
-the function registered with `atheris.Setup`), `source` (the file that
-defines it), `seeds` (how many starting inputs came with it), `seed_sources`
-(its seed corpus directories), `dictionaries` and `dictionary_tokens` (the
-dictionaries that came with it, merged into its harness's `dictionary.txt`,
-and their token count; omitted when none did) and `notes` (what came with it
-that could not be used, and why). The top-level `summary.provided_harnesses`
+`origin` (`go-fuzz-test`, `atheris` or `ossfuzz-import`), `entry` (the
+fuzz test's name, the function registered with `atheris.Setup`, or the
+imported fuzzer's name), `source` (the file that defines it), `seeds` (how
+many starting inputs came with it), `seed_sources` (its seed corpus
+directories), `dictionaries` and `dictionary_tokens` (the dictionaries that
+came with it, merged into its harness's `dictionary.txt`, and their token
+count; omitted when none did), `options` (an imported fuzzer's `max_len`,
+`timeout_secs` and `rss_limit_mb`, which its fuzz passes use; omitted when
+it has none) and `notes` (what came with it that could not be used, and
+why). The top-level `summary.provided_harnesses`
 counts them (omitted when zero), and `run.md` tags each one's row
 `[provided harness: <origin>, N seed(s)]`.
 
@@ -989,7 +1017,9 @@ different tree with a work directory an earlier run used (the default
 included, to `<work>/archived/<UTC time>-<tree name>/` and prints
 `bhf auto: note: <work> held a run over <other tree>; moved it to ...` before
 it starts, so `results/` and the console report only the current tree.
-Nothing is deleted, and a run over the same tree keeps its findings.
+Nothing is deleted, and a run over the same tree keeps its findings. A
+`bhf project import-ossfuzz` in the work dir is not moved: it is the
+import's, not the earlier run's.
 
 The coverage-guided corpus is persisted to `corpus/<harness-id>/queue/`
 (content-hash-named, seeds included) at the end of each run (#401), so it

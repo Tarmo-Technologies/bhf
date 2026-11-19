@@ -163,6 +163,12 @@ fn auto_runs_an_atheris_harness_from_its_corpus_and_finds_its_planted_exception(
         "{key_error:#}"
     );
     assert_eq!(location["line"], 20, "{key_error:#}");
+    // The harness file is fuzzed, so the note on what discovery skipped by
+    // default does not count it.
+    assert!(
+        !stderr.contains("fuzz/ ("),
+        "the harness's dir is named as skipped: {stderr}"
+    );
 
     let summary = std::fs::read_to_string(work.join("auto/summary.txt")).unwrap();
     assert!(
