@@ -1251,6 +1251,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/bhf_runtrace_shim/tests/desocket.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/bhf_runtrace_shim/tests/determinism.rs",
       "license": "Apache-2.0"
     },
@@ -3112,6 +3116,10 @@
     },
     {
       "path": "crates/cli/tests/fuzz_crash_throughput.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/fuzz_desocket_server.rs",
       "license": "Apache-2.0"
     },
     {

@@ -1872,6 +1872,7 @@ fn replay_env(raw: &Value, emulated: bool) -> Vec<(String, String)> {
             }
         }
     }
+    env.extend(corpus::finding::recorded_shim_env(raw));
     env
 }
 

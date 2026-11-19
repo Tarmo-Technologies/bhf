@@ -62,6 +62,21 @@ pub const MANIFEST: &[ManifestEntry] = &[
         &[b"connect\0", b"getaddrinfo\0"],
         "log connect/getaddrinfo failures and substitute fake socket peers",
     ),
+    ManifestEntry::gated(
+        "desocket",
+        &[
+            b"bind\0",
+            b"listen\0",
+            b"accept\0",
+            b"accept4\0",
+            b"getsockname\0",
+            b"getpeername\0",
+            b"setsockopt\0",
+            b"bhf_shim_desocket_active\0",
+        ],
+        "BHF_DESOCKET",
+        "serve a TCP server's first accepted connection from the fuzz input, then end the run",
+    ),
     ManifestEntry::always_on(
         "fs",
         &[

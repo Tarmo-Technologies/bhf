@@ -126,6 +126,45 @@ impl RuntimeOracles {
     }
 }
 
+/// The runtrace shim's mode gates that change what a target does, so a
+/// replay must set them again: a desocketed server (#312) and the virtual
+/// clock (#342).
+pub const SHIM_MODE_GATES: &[&str] = &["BHF_DESOCKET", "BHF_FAKE_CLOCK"];
+
+/// The shim mode gates a child given `extra_env` on top of this process's
+/// environment runs with: each one set to `1`, when the shim is preloaded
+/// (without it a gate does nothing). A finding records them.
+pub fn shim_mode_gates(extra_env: &[(String, String)]) -> Vec<(String, String)> {
+    shim_mode_gates_with(extra_env, |key| std::env::var(key).ok())
+}
+
+fn shim_mode_gates_with(
+    extra_env: &[(String, String)],
+    inherited: impl Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    let value = |key: &str| {
+        extra_env
+            .iter()
+            .rev()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.clone())
+            .or_else(|| inherited(key))
+    };
+    let preloaded = value("LD_PRELOAD").is_some_and(|preload| {
+        preload.contains("bhf_runtrace")
+            || inherited("BHF_RUNTRACE_SHIM")
+                .is_some_and(|shim| !shim.is_empty() && preload.contains(&shim))
+    });
+    if !preloaded {
+        return Vec::new();
+    }
+    SHIM_MODE_GATES
+        .iter()
+        .filter(|gate| value(gate).as_deref() == Some("1"))
+        .map(|gate| ((*gate).to_owned(), "1".to_owned()))
+        .collect()
+}
+
 /// A stable dedup/replay signature for an oracle finding: the oracle rule, the
 /// dangerous API, and the subject value (the tainted path/command/address) it
 /// fired on. Replay re-runs the target under the oracles and matches this, rather
@@ -150,6 +189,51 @@ pub fn oracle_signature(hit: &OracleHit) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #312: the gates a campaign's children ran with, whether bhf's own
+    /// environment or the run's set them; nothing without the shim, and a
+    /// later `0` (the libFuzzer engine's real clock) wins.
+    #[test]
+    fn the_shim_mode_gates_a_child_runs_with_are_found() {
+        let pair = |key: &str, value: &str| (key.to_owned(), value.to_owned());
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                vars.iter()
+                    .find(|(name, _)| *name == key)
+                    .map(|(_, value)| (*value).to_owned())
+            }
+        };
+        let shim = pair("LD_PRELOAD", "/opt/bhf/libbhf_runtrace_shim.so");
+        assert_eq!(
+            shim_mode_gates_with(
+                std::slice::from_ref(&shim),
+                env(&[("BHF_DESOCKET", "1"), ("BHF_FAKE_CLOCK", "0")])
+            ),
+            [pair("BHF_DESOCKET", "1")]
+        );
+        assert_eq!(
+            shim_mode_gates_with(
+                &[shim.clone(), pair("BHF_FAKE_CLOCK", "1")],
+                env(&[("BHF_DESOCKET", "1")])
+            ),
+            [pair("BHF_DESOCKET", "1"), pair("BHF_FAKE_CLOCK", "1")]
+        );
+        assert!(shim_mode_gates_with(
+            &[shim.clone(), pair("BHF_FAKE_CLOCK", "0")],
+            env(&[("BHF_FAKE_CLOCK", "1")])
+        )
+        .is_empty());
+        // Without the shim a gate does nothing, so none is recorded.
+        assert!(shim_mode_gates_with(&[], env(&[("BHF_DESOCKET", "1")])).is_empty());
+        // A shim named by BHF_RUNTRACE_SHIM counts under any file name.
+        assert_eq!(
+            shim_mode_gates_with(
+                &[pair("LD_PRELOAD", "/x/shim.so")],
+                env(&[("BHF_RUNTRACE_SHIM", "/x/shim.so"), ("BHF_DESOCKET", "1")])
+            ),
+            [pair("BHF_DESOCKET", "1")]
+        );
+    }
 
     #[test]
     fn off_mode_is_always_inactive() {

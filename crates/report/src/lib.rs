@@ -2323,11 +2323,15 @@ fn ensure_repro_py(
     let asan_required_emulated = corpus::sanitizer_options::asan_required(leak, true);
     let ubsan_required = corpus::sanitizer_options::ubsan_required(false);
     let ubsan_required_emulated = corpus::sanitizer_options::ubsan_required(true);
-    let extra_env = raw
+    let mut extra_env = raw
         .pointer("/runtime_mode/env_injected")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    // The runtrace shim's mode gates the campaign ran with (#312).
+    for (key, value) in corpus::finding::recorded_shim_env(raw) {
+        extra_env.insert(key, Value::String(value));
+    }
 
     let mut header_lines = Vec::new();
     if let Some(explanation) = &actionability.explanation {
@@ -2667,6 +2671,9 @@ UBSAN_OPTIONS_REQUIRED_EMULATED = __UBSAN_EMULATED__
 EXTRA_ENV = __EXTRA_ENV__
 RUNNER = __RUNNER__
 RUNNER_FILE = "bhf_runner.json"
+# The runtrace shim's modes a finding can have run under (a desocketed server,
+# the virtual clock): they act only with the shim preloaded.
+SHIM_GATES = ("BHF_DESOCKET", "BHF_FAKE_CLOCK")
 
 
 def merged_options(inherited, required):
@@ -2885,6 +2892,25 @@ def resolve_harness(finding):
     sys.exit(2)
 
 
+def with_shim(env):
+    # A finding that ran under one of the shim's modes replays under the shim:
+    # BHF_RUNTRACE_SHIM names it, unless LD_PRELOAD already holds it.
+    gates = [key for key in SHIM_GATES if EXTRA_ENV.get(key) == "1"]
+    preload = env.get("LD_PRELOAD", "")
+    if not gates or "bhf_runtrace" in preload:
+        return env
+    shim = os.environ.get("BHF_RUNTRACE_SHIM", "")
+    if shim and os.path.isfile(shim):
+        env["LD_PRELOAD"] = shim + ":" + preload if preload else shim
+    else:
+        sys.stderr.write(
+            "note: this finding ran under the runtrace shim with %s=1; set "
+            "BHF_RUNTRACE_SHIM to libbhf_runtrace_shim.so to replay it that way\n"
+            % "=1, ".join(gates)
+        )
+    return env
+
+
 def main():
     finding = load_finding()
     harness = resolve_harness(finding)
@@ -2902,6 +2928,7 @@ def main():
     )
     for key, value in EXTRA_ENV.items():
         env.setdefault(key, value)
+    env = with_shim(env)
     env = with_runtime_path(env, harness)
     preexec = no_core_dumps if emulated and os.name == "posix" else None
 
@@ -4970,6 +4997,61 @@ mod tests {
             log,
             "the override ran the harness natively"
         );
+    }
+
+    /// #312: a finding that ran under one of the runtrace shim's modes
+    /// replays with the mode set and the shim (`BHF_RUNTRACE_SHIM`)
+    /// preloaded; without the shim the script says what it needs.
+    #[cfg(unix)]
+    #[test]
+    fn repro_py_replays_a_shim_mode_finding_under_the_shim() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(python) = python3() else {
+            eprintln!("skipping: python3 unavailable");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let harness_dir = tmp.path().join("work/harnesses/H-1");
+        std::fs::create_dir_all(&harness_dir).unwrap();
+        let harness = harness_dir.join("main");
+        std::fs::write(
+            &harness,
+            "#!/bin/sh\nprintf '%s|%s\\n' \"$BHF_DESOCKET\" \"$LD_PRELOAD\" > \"$(dirname \"$0\")/env.log\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&harness, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let shim = tmp.path().join("libbhf_runtrace_shim.so");
+        std::fs::write(&shim, b"").unwrap();
+        let finding = tmp.path().join("work/results/findings/F-1");
+        std::fs::create_dir_all(&finding).unwrap();
+        std::fs::write(finding.join("testcase.bin"), b"x").unwrap();
+        let raw = json!({
+            "id": "F-1", "harness_id": "H-1", "rule_id": "BHF-203",
+            "shim_env": {"BHF_DESOCKET": "1"},
+        });
+        std::fs::write(finding.join("finding.json"), raw.to_string()).unwrap();
+        let record =
+            actionability::backfill_actionability(actionability::RunMode::Reporting, &raw, None);
+        super::ensure_repro_py(&finding, &raw, &record).unwrap();
+        let replay = |shim: Option<&std::path::Path>| {
+            let mut command = std::process::Command::new(python);
+            command
+                .arg(finding.join("replay.py"))
+                .env_remove("BHF_DESOCKET")
+                .env_remove("LD_PRELOAD")
+                .env_remove("BHF_RUNTRACE_SHIM");
+            if let Some(shim) = shim {
+                command.env("BHF_RUNTRACE_SHIM", shim);
+            }
+            let out = command.output().unwrap();
+            let log = std::fs::read_to_string(harness_dir.join("env.log")).unwrap();
+            (String::from_utf8_lossy(&out.stderr).into_owned(), log)
+        };
+        let (_, log) = replay(Some(&shim));
+        assert_eq!(log, format!("1|{}\n", shim.display()));
+        let (stderr, log) = replay(None);
+        assert_eq!(log, "1|\n");
+        assert!(stderr.contains("set BHF_RUNTRACE_SHIM"), "{stderr}");
     }
 
     /// A harness the reproducer runs under an emulator gets

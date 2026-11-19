@@ -32,6 +32,18 @@
   libfuzzer` ignores the gate with a warning, since libFuzzer times its
   `-timeout` with the clock it would fake. `bhf auto --list-fakes` lists it
   as `clock`.
+- `BHF_DESOCKET=1` runs a TCP server's main loop on the fuzz input (#312):
+  under the runtrace shim, `bind` and `listen` succeed without the network,
+  the first `accept` returns a connection that delivers the input and then
+  end of file, and a later one ends the run once the server has closed that
+  connection (a non-blocking listener gets `EAGAIN` until then, so
+  thread-per-connection and event-loop servers handle it first). The C driver
+  then runs each framed input in a forked child, so a harness that calls
+  `serve(port)` fuzzes in the builtin engine's persistent fork-server.
+- A finding records the runtrace shim modes its campaign ran under
+  (`BHF_DESOCKET`, `BHF_FAKE_CLOCK`) in a new `shim_env` block, and replay,
+  minimize, env-capsule, the capsule's `verify-poc` and `replay.py` set them
+  again.
 
 ### Changed
 - The in-crate lane for private Rust targets (#83) is `bhf auto

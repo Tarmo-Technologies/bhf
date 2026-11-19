@@ -4685,6 +4685,7 @@ fn run_builtin_with_progress(
                 .map_err(|error| format!("serialize sandbox metadata: {error}"))?,
         )
         .with_mode(prepared.mode)
+        .with_shim_env(crate::runtime_oracles::shim_mode_gates(&prepared.extra_env))
         .with_line_maps_dir(&prepared.work_dir.join("src_instrumented")),
         &prepared.harness_path,
         &prepared.work_dir,
@@ -7068,6 +7069,7 @@ impl<'a> ExternalIngest<'a> {
                     .map_err(|error| format!("serialize sandbox metadata: {error}"))?,
             )
             .with_mode(prepared.mode)
+            .with_shim_env(crate::runtime_oracles::shim_mode_gates(&prepared.extra_env))
             .with_line_maps_dir(&prepared.work_dir.join("src_instrumented")),
             &fixture,
             &prepared.work_dir,

@@ -212,6 +212,7 @@ pub unsafe extern "C" fn bhf_shim_set_fuzz_input(data: *const u8, size: libc::si
         // testcase in a persistent process but starts from the seed in standalone
         // replay, violating the determinism contract.
         crate::hooks::determinism::reset_for_input(&[]);
+        crate::hooks::net::reset_for_input();
         // HDF-8: a fresh input begins a fresh schedule — clear the cooperative
         // scheduler's per-input registry/decision counter so a persistent-harness
         // iteration explores (and replays) the schedule of THIS input, not one left
@@ -231,6 +232,7 @@ pub unsafe extern "C" fn bhf_shim_set_fuzz_input(data: *const u8, size: libc::si
     // state from THIS input before target execution so a saved testcase replays
     // independently of the corpus prefix that happened to precede it.
     crate::hooks::determinism::reset_for_input(slice);
+    crate::hooks::net::reset_for_input();
     crate::hooks::sched::reset_for_input();
     let mut guard = match LIVE_INPUT.lock() {
         Ok(g) => g,
@@ -343,6 +345,22 @@ pub(crate) fn refresh_from_input_file() {
         }
         libc::syscall(libc::SYS_close, fd);
     }
+}
+
+/// Run `f` on the whole current input, the one the harness published else
+/// the shared memfd, without moving the read cursor; `None` when there is
+/// none. The desocket mode serves it as a connection's bytes (#312).
+pub fn with_current<R>(f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+    if let Ok(guard) = LIVE_INPUT.try_lock() {
+        if let Some(live) = guard.current() {
+            return Some(f(live));
+        }
+    }
+    let shared = load()?;
+    // SAFETY: the shared mapping is read-only and lives for the process.
+    Some(f(unsafe {
+        std::slice::from_raw_parts(shared.ptr, shared.len)
+    }))
 }
 
 pub fn read_into(out: &mut [u8]) -> usize {

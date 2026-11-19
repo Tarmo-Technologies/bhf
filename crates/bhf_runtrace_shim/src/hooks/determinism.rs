@@ -305,8 +305,9 @@ pub fn clock_enabled() -> bool {
 }
 
 /// Whether the first `environ` entry starting with `prefix` (`NAME=`) has
-/// the value `value`; `None` while `environ` is unset.
-unsafe fn environ_value_is(prefix: &[u8], value: &[u8]) -> Option<bool> {
+/// the value `value`; `None` while `environ` is unset. Calls nothing, so a
+/// hook may use it where `getenv` (the shim's own hook) is unsafe.
+pub(crate) unsafe fn environ_value_is(prefix: &[u8], value: &[u8]) -> Option<bool> {
     let mut entry = core::ptr::addr_of!(environ).read();
     if entry.is_null() {
         return None;

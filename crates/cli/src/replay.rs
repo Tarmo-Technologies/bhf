@@ -740,6 +740,9 @@ pub(crate) fn replay_env(
     }
     env.push(("BHF_RUNTRACE_MODE".to_owned(), pass.to_owned()));
     env.extend(env_injected);
+    // The shim's mode gates the campaign ran with (#312): a desocketed
+    // server replayed without its gate would bind a real port and wait.
+    env.extend(corpus::finding::recorded_shim_env(parsed));
     env
 }
 
