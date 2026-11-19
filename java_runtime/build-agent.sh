@@ -61,22 +61,32 @@ fetch_asm() {
     # Not the jar this script fetched: a partial or altered file.
     rm -f "$CACHE/$name"
   fi
-  url="https://repo1.maven.org/maven2/org/ow2/asm/${name%-"$ASM_VERSION".jar}/$ASM_VERSION/$name"
+  # Maven Central, then Google's mirror of it: Central's CDN has answered
+  # some networks with errors for an hour at a time. The pinned digest below
+  # holds the jar to the same bytes whichever one serves it.
+  path="org/ow2/asm/${name%-"$ASM_VERSION".jar}/$ASM_VERSION/$name"
   part="$CACHE/$name.part.$$"
-  if command -v curl >/dev/null 2>&1; then
-    # --retry-all-errors (curl 7.71) also retries an HTTP 429 or 503.
-    retry="--retry 6 --retry-delay 5"
-    if curl --help all 2>/dev/null | grep -q -- --retry-all-errors; then
-      retry="$retry --retry-all-errors"
-    fi
-    # shellcheck disable=SC2086
-    curl --proto '=https' -fsSL $retry "$url" -o "$part" || { rm -f "$part"; return 1; }
-  elif command -v wget >/dev/null 2>&1; then
-    wget -q --tries=6 --waitretry=5 "$url" -O "$part" || { rm -f "$part"; return 1; }
-  else
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
     echo "build-agent.sh: need curl or wget to fetch $name (or pre-stage it in \$ASM_JAR_DIR)" >&2
     return 1
   fi
+  fetched=""
+  for base in https://repo1.maven.org/maven2 https://maven-central.storage-download.googleapis.com/maven2; do
+    url="$base/$path"
+    if command -v curl >/dev/null 2>&1; then
+      # --retry-all-errors (curl 7.71) also retries an HTTP 429 or 503.
+      retry="--retry 6 --retry-delay 5"
+      if curl --help all 2>/dev/null | grep -q -- --retry-all-errors; then
+        retry="$retry --retry-all-errors"
+      fi
+      # shellcheck disable=SC2086
+      curl --proto '=https' -fsSL $retry "$url" -o "$part" && fetched=1 && break
+    else
+      wget -q --tries=6 --waitretry=5 "$url" -O "$part" && fetched=1 && break
+    fi
+    rm -f "$part"
+  done
+  [ -n "$fetched" ] || return 1
   got=$(sha256_of "$part")
   if [ "$got" != "$want" ]; then
     rm -f "$part"
