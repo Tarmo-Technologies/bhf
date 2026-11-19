@@ -3653,6 +3653,19 @@ fn run_attempt(
                             recorded_by: "auto",
                         },
                     );
+                    // #324: the SymCC lane of a native harness, when the run
+                    // asked for it.
+                    if cross_compiler.is_none() && cross_runner.is_none() {
+                        crate::symcc::build_lane(
+                            work_dir,
+                            &candidate.harness_id,
+                            &harness_dir,
+                            is_cpp,
+                            &extra_sources,
+                            &extra_includes,
+                            built_standard.as_deref(),
+                        );
+                    }
                     // #341: the device windows this build maps on this
                     // host, which the report's emulated-peripheral note
                     // names. A foreign build's probe would not run here.

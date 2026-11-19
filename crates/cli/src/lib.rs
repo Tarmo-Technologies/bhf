@@ -116,6 +116,7 @@ mod source_text;
 mod static_scan;
 mod stub;
 mod support_report;
+mod symcc;
 mod target_filter;
 mod terminal_text;
 /// Self-cleaning scratch directories for the tests (the integration tests

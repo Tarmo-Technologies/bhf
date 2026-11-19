@@ -73,6 +73,8 @@ impl Profile {
                 "bandit",
                 "semgrep",
                 "gnatcheck",
+                // #324: SymCC (GPL-3.0), the concolic lane of `auto --symcc`.
+                "symcc",
             ],
             Self::ResearchLab => &["*"],
         }
@@ -110,6 +112,19 @@ mod tests {
     #[test]
     fn strict_permissive_allows_no_probes() {
         assert!(Profile::StrictPermissive.allowed_probes().is_empty());
+    }
+
+    /// #324: SymCC (GPL-3.0) runs as a subprocess under external-tools and
+    /// research-lab only.
+    #[test]
+    fn only_the_external_tool_profiles_allow_symcc() {
+        assert!(!Profile::StrictPermissive
+            .allowed_subprocesses()
+            .contains(&"symcc"));
+        assert!(Profile::ExternalTools
+            .allowed_subprocesses()
+            .contains(&"symcc"));
+        assert_eq!(Profile::ResearchLab.allowed_subprocesses(), &["*"]);
     }
 
     #[test]

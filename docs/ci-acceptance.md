@@ -106,7 +106,8 @@ Cortex-M emulator toolchains (Lua 5.4, PHP with pcov, Ruby, Perl, JDK 21,
 Node 24 with esbuild, a nightly Rust, the SharpFuzz tool, GNAT 13 with
 GPRbuild, AFL++, GnuCOBOL 3, Wine with the MinGW-w64 cross compilers,
 qemu-user with the AArch64 cross compilers, `qemu-system-arm` with
-`gcc-arm-none-eabi`, gdb, lldb and LLVM)
+`gcc-arm-none-eabi`, gdb, lldb and LLVM, and SymCC, which
+`scripts/ci/install-symcc.sh` builds)
 and runs its tests with `BHF_REQUIRE_TOOLS=1`, under which a test's tool check
 (`support::require_tool`) fails the test when its tool is missing. A test that
 skips for another reason prints a skip line (one starting with `skip`, `skipping`, `skipped` or

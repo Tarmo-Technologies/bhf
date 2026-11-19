@@ -193,6 +193,9 @@ jobs:
             libunwind-dev \
             binutils-dev \
             libblocksruntime-dev \
+            clang-18 \
+            llvm-18-dev \
+            libz3-dev \
             clang-20 \
             libclang-rt-20-dev \
             cmake \
@@ -236,6 +239,20 @@ jobs:
 
       - name: Install honggfuzz
         run: bash scripts/ci/install-honggfuzz.sh >> "$GITHUB_PATH"
+
+      # `bhf auto --symcc` (#324, #331): no distribution packages SymCC; the
+      # script builds the pinned commit with LLVM 18 and Z3 once, and the
+      # cache keeps it.
+      - name: Cache the SymCC build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/opt/symcc
+          key: symcc-${{ runner.os }}-${{ hashFiles('scripts/ci/install-symcc.sh') }}
+
+      - name: Install SymCC
+        env:
+          LLVM_CONFIG: llvm-config-18
+        run: bash scripts/ci/install-symcc.sh >> "$GITHUB_PATH"
 
       # libc++ and libc++abi built with MemorySanitizer, which the C++ MSan
       # replay links (#323): the script the container image builds them with
@@ -323,7 +340,8 @@ jobs:
                       aarch64-linux-gnu-gcc aarch64-linux-gnu-g++ aarch64-linux-gnu-gnat \
                       arm-linux-gnueabihf-gcc qemu-arm lua5.4 php ruby perl java \
                       javac node esbuild qemu-system-arm qemu-img arm-none-eabi-gcc nm gdb \
-                      lldb llvm-symbolizer dotnet python2 honggfuzz hfuzz-clang clang-20; do
+                      lldb llvm-symbolizer dotnet python2 honggfuzz hfuzz-clang clang-20 \
+                      symcc sym++; do
             command -v "$tool" >/dev/null || { echo "missing $tool after install" >&2; exit 1; }
           done
           # The runner image's PHP ships the pcov module disabled; enable it for

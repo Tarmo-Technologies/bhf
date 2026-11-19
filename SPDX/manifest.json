@@ -2139,6 +2139,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/symcc.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/target_filter.rs",
       "license": "Apache-2.0"
     },
@@ -2840,6 +2844,10 @@
     },
     {
       "path": "crates/cli/tests/auto_static_scan.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_symcc.rs",
       "license": "Apache-2.0"
     },
     {

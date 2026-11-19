@@ -791,6 +791,19 @@ pub struct AutoArgs {
     #[arg(long = "external-tools")]
     pub external_tools: bool,
 
+    /// Also build a SymCC variant of each native C/C++ harness (`make symcc`:
+    /// `main_symcc`, compiled by SymCC's `symcc`/`sym++`), the concolic lane
+    /// that solves comparisons on values the input holds only after hashing or
+    /// modular arithmetic. SymCC is GPL-3.0 and runs only as a subprocess,
+    /// under a license profile that permits it: `BHF_PROFILE=external-tools`
+    /// or `research-lab`; without `BHF_PROFILE` this flag opts into
+    /// `external-tools`, and `strict-permissive` refuses it. Needs `symcc`
+    /// (C) and `sym++` (C++) on PATH, or SYMCC_CC/SYMCC_CXX naming them; a
+    /// harness whose SymCC build fails is fuzzed without it, and
+    /// `targets[].lanes.symcc` in run.json says why. `BHF_SYMCC=1` does the same.
+    #[arg(long = "symcc")]
+    pub symcc: bool,
+
     /// Force-fuzz mode: a SECOND phase over the targets the normal (unforced) run
     /// could not fuzz, so it can never lower the fuzzed count. Attempts a target
     /// even when a parameter type can't be driven or a type/symbol is undefined —
@@ -1478,6 +1491,11 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
             return Ok(EXIT_NO_CANDIDATES);
         }
         std::env::set_var("BHF_DEADLINE_MS", deadline.as_millis().to_string());
+    }
+    // #324: --symcc (or BHF_SYMCC=1) turns the SymCC lane on for every native
+    // C/C++ harness, when the license profile and the installed tools allow it.
+    if let Some(note) = crate::symcc::configure_run(args.symcc || crate::symcc::requested()) {
+        bhfeprintln!("bhf auto: {note}");
     }
     // --cxx-expected-exception reaches the C++ harnesses through their env.
     if !args.cxx_expected_exceptions.is_empty() {

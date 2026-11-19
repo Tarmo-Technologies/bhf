@@ -5,6 +5,12 @@
 ## Unreleased
 
 ### Added
+- `bhf auto --symcc` builds a SymCC variant of each native C/C++ harness
+  (#324): the generated Makefiles gain a `symcc` goal (`main_symcc`, built by
+  `SYMCC_CC`/`SYMCC_CXX`, default `symcc`/`sym++`), and run.json records it as
+  `targets[].lanes.symcc`. SymCC (GPL-3.0) runs only as a subprocess under a
+  license profile that permits it; `external-tools` now allows `symcc`, and
+  `strict-permissive` refuses the flag with a note.
 - `bhf fuzz --target-transport renode:monitor=HOST:PORT,gdb=HOST:PORT[,snapshot=PATH]`
   fuzzes firmware on a Renode board (#340): Renode's telnet monitor saves the
   baseline with `Save` and restores it with `Load` before each input, and gdb

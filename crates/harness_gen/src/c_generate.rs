@@ -6684,6 +6684,126 @@ mod tests {
         compiler
     }
 
+    /// #324: the generated Makefile has a `symcc` lane. Its `main_symcc` rule
+    /// compiles the harness for bhf's own driver with SymCC's compiler and no
+    /// sanitizer, links a driver object SymCC compiled, and `clean` removes
+    /// both.
+    #[test]
+    fn the_makefile_has_a_symcc_lane() {
+        let (_out_guard, out) = temp_dir("c_symcc_lane");
+        let result = generate_c_direct_harness(direct_args("parse_record", out)).unwrap();
+        let mk = fs::read_to_string(&result.makefile).unwrap();
+        let line = |prefix: &str| {
+            mk.lines()
+                .find(|line| line.starts_with(prefix))
+                .unwrap_or_else(|| panic!("no `{prefix}` line:\n{mk}"))
+                .to_owned()
+        };
+        assert_eq!(line("SYMCC_CC ?="), "SYMCC_CC ?= symcc");
+        assert_eq!(line("SYMCC_CFLAGS ?="), "SYMCC_CFLAGS ?= -O1 -g");
+        assert_eq!(line("symcc:"), "symcc: main_symcc$(EXEEXT)");
+        assert_eq!(
+            line("main_symcc$(EXEEXT):"),
+            "main_symcc$(EXEEXT): main.c $(BHF_SYMCC_DRIVER) bhf_lanes.stamp \
+             $(CONTEXT_SYMCC_OBJECTS) $(REPAIR_CONTEXT_SYMCC_OBJECTS)"
+        );
+        assert_eq!(
+            line("\t$(SYMCC_CC) $(SYMCC_CFLAGS)"),
+            "\t$(SYMCC_CC) $(SYMCC_CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) \
+             $(FEATURE_TEST_FLAGS) $(BHF_FUZZING_BUILD_MODE_FLAGS) $(COMPILE_DB_FLAGS) \
+             $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) \
+             $(BHF_TOOLCHAIN_C_CPPFLAGS) -DBHF_EXTERNAL_DRIVER -o $@ main.c \
+             /tmp/parse_record.c $(CONTEXT_SYMCC_OBJECTS) $(REPAIR_CONTEXT_SYMCC_OBJECTS) \
+             $(AUTO_EXTRA_SOURCES) $(BHF_SYMCC_DRIVER) $(BUILD_CONTEXT_LDFLAGS) \
+             $(call BHF_SECTION_LDFLAGS,$(SYMCC_CC)) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LIBS)"
+        );
+        assert_eq!(
+            line("BHF_SYMCC_DRIVER ="),
+            "BHF_SYMCC_DRIVER = $(call bhf_lane_driver,bhf_driver_symcc.o,$(SYMCC_CC))"
+        );
+        assert!(line(".PHONY: all").contains(" symcc "), "{mk}");
+        assert!(line("BHF_BINARIES =").ends_with(" main_symcc"), "{mk}");
+        let clean = line("\trm -f main$(EXEEXT)");
+        for file in [
+            "main_symcc$(EXEEXT)",
+            " main_symcc ",
+            " bhf_driver_symcc.o ",
+        ] {
+            assert!(clean.contains(file), "clean misses {file}: {clean}");
+        }
+        assert!(line("BHF_LANE_TOOLCHAIN_ID =").contains("$(SYMCC_CC)"));
+        assert!(line("BHF_LANE_TOOLCHAIN_ID =").contains("$(SYMCC_CFLAGS)"));
+        assert!(line("BHF_DRIVER_ID =").contains("$(SYMCC_CC)"));
+    }
+
+    /// #324: `make symcc` compiles bhf's driver and links `main_symcc` with
+    /// $(SYMCC_CC) alone: the harness and its target for the external driver,
+    /// without the sanitizers or the coverage `main` is built with.
+    #[cfg(unix)]
+    #[test]
+    fn make_symcc_builds_main_symcc_with_the_symcc_compiler() {
+        use std::os::unix::fs::PermissionsExt;
+        if !Command::new("make")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            eprintln!("skip: make unavailable");
+            return;
+        }
+        let (_out_guard, out) = temp_dir("c_make_symcc");
+        let mut args = direct_args("parse_record", out.clone());
+        args.c_runtime_include = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../c_runtime")
+            .canonicalize()
+            .expect("c_runtime dir");
+        generate_c_direct_harness(args).unwrap();
+        // Logs each call as one line of its arguments and writes its `-o`.
+        let compiler = out.join("symcc-stand-in");
+        fs::write(
+            &compiler,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$BHF_ARGV_LOG\"\nprev=\n\
+             for arg in \"$@\"; do [ \"$prev\" = -o ] && : > \"$arg\"; prev=$arg; done\n",
+        )
+        .unwrap();
+        fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
+        let log = out.join("argv.log");
+        let build = Command::new("make")
+            .arg("-C")
+            .arg(&out)
+            .arg("symcc")
+            .arg(format!("SYMCC_CC={}", compiler.display()))
+            .arg("CC=/nonexistent/cc")
+            .arg("BHF_CC_FAMILY=clang")
+            .env("BHF_ARGV_LOG", &log)
+            .output()
+            .expect("run make");
+        assert!(build.status.success(), "{build:?}");
+        assert!(out.join("main_symcc").is_file());
+        let calls: Vec<String> = fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(calls.len(), 2, "{calls:#?}");
+        assert!(
+            calls[0].contains("-c -o bhf_driver_symcc.o ") && calls[0].ends_with("bhf_driver.c"),
+            "{calls:#?}"
+        );
+        let link = &calls[1];
+        assert!(link.starts_with("-O1 -g "), "{link}");
+        for word in [
+            "-DBHF_EXTERNAL_DRIVER",
+            "-o main_symcc main.c /tmp/parse_record.c",
+            " bhf_driver_symcc.o",
+        ] {
+            assert!(link.contains(word), "{word} missing: {link}");
+        }
+        for word in ["-fsanitize", "trace-pc-guard", "bhf_driver.o"] {
+            assert!(!link.contains(word), "{word} in the SymCC link: {link}");
+        }
+    }
+
     /// The C dialect ladder, a repair round and the sanitizer lanes rerun
     /// `make` in one harness directory with a different `C_STD`, `CFLAGS` or
     /// `C_COMPAT_FLAGS`. The driver takes none of those, so it is compiled
