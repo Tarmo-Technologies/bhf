@@ -1492,6 +1492,7 @@ fn file_contains(path: &Path, needle: &[u8]) -> std::io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::test_support::TestDir;
 
     #[cfg(unix)]
