@@ -22,12 +22,15 @@ or missing license metadata.
 
 The `--profile` flag does not change that dependency-license list; it gates which
 external tools may run as subprocesses (they are never linked). `strict-permissive`
-(the default) permits none. `external-tools` permits eleven: the GPL Ada toolchain
+(the default) permits none. `external-tools` permits twelve: the GPL Ada toolchain
 (FSF GNAT, GPRbuild) and GNATcheck, plus AFL++ (Apache-2.0), the binary-analysis
 tools Rizin, Ghidra, and angr, the external static analyzers gosec, Bandit,
-and semgrep, and SymCC (GPL-3.0), the concolic lane of `bhf auto --symcc`.
-`research-lab` allows all probes. `bhf auto --symcc` honors an explicit
-`BHF_PROFILE`; without one the flag opts into `external-tools`, as
+and semgrep, SymCC (GPL-3.0), the concolic lane of `bhf auto --symcc`, and
+bhf's QEMU dirty-page plugin (`qemu_plugin`), which the `qemu-system:` lane's
+`reset=fast` has QEMU (GPL-2.0) load: bhf builds it from its own Apache-2.0
+source with the host C compiler and never links QEMU. `research-lab` allows
+all probes. `bhf auto --symcc` and `reset=fast` honor an explicit
+`BHF_PROFILE`; without one each opts into `external-tools`, as
 `--external-tools` does.
 
 Optional LLM support adds no proprietary model SDK to the linked core. BHF

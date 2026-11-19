@@ -166,6 +166,34 @@ pub struct TargetObservation {
     /// continuation that is run again from the snapshot reports that run,
     /// and this is its time (#346). `None`: the call's time is the run's.
     pub host_run_time: Option<std::time::Duration>,
+    /// How the session brought the target back to its baseline before this
+    /// run, and how long that took (#347). `None` when no reset ran: the first
+    /// run of a `reset=fast` session, a `reset=persistent` continuation, or a
+    /// backend that does not report its resets.
+    pub reset: Option<ResetObservation>,
+}
+
+/// One reset of a target to its baseline (#347).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResetObservation {
+    /// What restored the target.
+    pub kind: ResetKind,
+    /// The host time the reset took.
+    pub time: std::time::Duration,
+    /// Pages the reset handled: written back from their baseline by a
+    /// [`ResetKind::DirtyPages`] reset, or learned after a [`ResetKind::Full`]
+    /// one under `reset=fast` (0 under `reset=loadvm`).
+    pub pages: u64,
+}
+
+/// What a reset restored the target with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetKind {
+    /// The whole machine from its snapshot (`loadvm`).
+    Full,
+    /// A device reset and the RAM pages the run wrote, put back from their
+    /// baseline (`reset=fast`).
+    DirtyPages,
 }
 
 impl RunOutcome {

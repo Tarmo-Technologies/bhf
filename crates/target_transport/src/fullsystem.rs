@@ -69,6 +69,30 @@
 //! is refused at once, and three continuations that do not show they ran their
 //! input stop the session with an error.
 //!
+//! # The fast snapshot (`reset=fast`)
+//!
+//! [`FullSystemReset::Fast`] restores only what a run changed
+//! ([`crate::fast_snapshot`]):
+//!
+//! ```text
+//! arm():   as above, plus QMP system_reset before the savevm (the baseline is
+//!          the reset machine), GDB Qqemu.PhyMemMode:1, GDB g (the baseline's
+//!          registers), and on a Cortex-M core (the target description's
+//!          m-profile feature) HMP info mtree -f (RAM, bit-band windows, which
+//!          go into the log's header) and GDB p sp (the baseline's)
+//! run_input(input), but the first:
+//!          on a Cortex-M core, GDB p xpsr, and in handler mode p sp and p psp:
+//!              the exception frames still stacked are RAM the log missed
+//!          read and empty the QEMU plugin's dirty-page log, which must show
+//!              the plugin saw the last run when it reached a stop
+//!          GDB monitor system_reset, GDB g == the baseline's (else QMP
+//!              system_reset, which waits for RESET)
+//!          GDB M each dirty page's baseline back
+//!          (a dirty page with no baseline yet: QMP stop + loadvm, then GDB m
+//!          the page to learn it)
+//!          stage, GDB c, read, classify    (as above)
+//! ```
+//!
 //! # Bounding
 //!
 //! Every QMP read is bounded ([`QmpLimits`]): a message line is capped before it
@@ -95,11 +119,16 @@
 //! run itself is [`run_from_baseline`], shared with this module.
 
 use crate::error::{Result, TransportError};
+use crate::fast_snapshot::{
+    live_exception_frames, reset_reloaded_ranges, FastReset, FastSnapshot, FastSnapshotLimits,
+    GuestMemory, MProfileRegisters, MProfileStop, Machine, MemoryMap, PluginDirtyLog,
+};
 use crate::gdb::{ContStop, GdbClient, GdbMemoryMap};
-use crate::outcome::{ExitKind, Fault, FaultKind, RunOutcome};
+use crate::outcome::{ExitKind, Fault, FaultKind, ResetKind, ResetObservation, RunOutcome};
 use crate::transport::{TargetSession, TargetTransport};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// Persistent continuations between two QMP commands. QEMU reports each stop
@@ -142,29 +171,53 @@ impl Default for QmpLimits {
 pub struct QmpClient<C> {
     channel: C,
     limits: QmpLimits,
+    /// Bytes read from the channel and not yet consumed: a QMP message is
+    /// read a buffer at a time, not a byte per `read`.
+    buffer: Vec<u8>,
+    consumed: usize,
 }
+
+/// The most a [`QmpClient`] reads from its channel at once.
+const QMP_READ_CHUNK: usize = 4096;
 
 impl<C: Read + Write> QmpClient<C> {
     /// Wrap a channel with default [`QmpLimits`].
     pub fn new(channel: C) -> Self {
-        Self {
-            channel,
-            limits: QmpLimits::default(),
-        }
+        Self::with_limits(channel, QmpLimits::default())
     }
 
     /// Wrap a channel with explicit limits.
     pub fn with_limits(channel: C, limits: QmpLimits) -> Self {
-        Self { channel, limits }
+        Self {
+            channel,
+            limits,
+            buffer: Vec::new(),
+            consumed: 0,
+        }
     }
 
     /// Read one byte, distinguishing a clean EOF (`Ok(None)`) from a live byte.
     fn read_byte(&mut self) -> Result<Option<u8>> {
-        let mut buf = [0_u8; 1];
-        match self.channel.read(&mut buf)? {
-            0 => Ok(None),
-            _ => Ok(Some(buf[0])),
+        if self.consumed == self.buffer.len() {
+            self.buffer.resize(QMP_READ_CHUNK, 0);
+            self.consumed = 0;
+            let read = match self.channel.read(&mut self.buffer) {
+                Ok(read) => read,
+                Err(error) => {
+                    // Nothing was read: a caller that tries again must not be
+                    // served the empty buffer.
+                    self.buffer.clear();
+                    return Err(error.into());
+                }
+            };
+            self.buffer.truncate(read);
+            if read == 0 {
+                return Ok(None);
+            }
         }
+        let byte = self.buffer[self.consumed];
+        self.consumed += 1;
+        Ok(Some(byte))
     }
 
     /// Read one `\n`-terminated line, bounded by `max_message_bytes`, with the
@@ -244,6 +297,17 @@ impl<C: Read + Write> QmpClient<C> {
     /// (bounded by [`QmpLimits::max_events_before_response`]); an `error` object
     /// becomes a [`TransportError::TargetError`].
     pub fn execute(&mut self, command: &str, arguments: Option<Value>) -> Result<Value> {
+        self.exchange(command, arguments, None)
+    }
+
+    /// Execute `command` and read until both its response and, when
+    /// `awaited` names one, that event have arrived, in either order.
+    fn exchange(
+        &mut self,
+        command: &str,
+        arguments: Option<Value>,
+        awaited: Option<&str>,
+    ) -> Result<Value> {
         let mut request = json!({ "execute": command });
         if let Some(arguments) = arguments {
             request["arguments"] = arguments;
@@ -251,19 +315,23 @@ impl<C: Read + Write> QmpClient<C> {
         self.send(&request)?;
 
         let mut events_skipped = 0_usize;
+        let mut awaited = awaited;
+        let mut response: Option<Value> = None;
         loop {
             let message = self.read_message()?;
-            if message.get("event").is_some() {
-                events_skipped += 1;
-                if events_skipped > self.limits.max_events_before_response {
-                    return Err(TransportError::protocol(format!(
-                        "QMP emitted more than {} events without a response to {command:?}",
-                        self.limits.max_events_before_response
-                    )));
+            if let Some(event) = message.get("event") {
+                if awaited.is_some() && event.as_str() == awaited {
+                    awaited = None;
+                } else {
+                    events_skipped += 1;
+                    if events_skipped > self.limits.max_events_before_response {
+                        return Err(TransportError::protocol(format!(
+                            "QMP emitted more than {} events without a response to {command:?}",
+                            self.limits.max_events_before_response
+                        )));
+                    }
                 }
-                continue;
-            }
-            if let Some(error) = message.get("error") {
+            } else if let Some(error) = message.get("error") {
                 let desc = error
                     .get("desc")
                     .and_then(Value::as_str)
@@ -271,19 +339,33 @@ impl<C: Read + Write> QmpClient<C> {
                 return Err(TransportError::TargetError(format!(
                     "QMP command {command:?} failed: {desc}"
                 )));
+            } else if let Some(value) = message.get("return") {
+                response = Some(value.clone());
+            } else {
+                return Err(TransportError::protocol(format!(
+                    "QMP response to {command:?} has neither \"return\" nor \"error\": {message}"
+                )));
             }
-            if let Some(value) = message.get("return") {
-                return Ok(value.clone());
+            if awaited.is_none() {
+                if let Some(value) = response.take() {
+                    return Ok(value);
+                }
             }
-            return Err(TransportError::protocol(format!(
-                "QMP response to {command:?} has neither \"return\" nor \"error\": {message}"
-            )));
         }
     }
 
     /// `stop`: pause the vCPUs (idempotent; required for a coherent `loadvm`).
     pub fn stop(&mut self) -> Result<()> {
         self.execute("stop", None).map(|_| ())
+    }
+
+    /// `system_reset`: reset every CPU and device, keeping RAM (#347). QEMU
+    /// runs the reset from its main loop, so this waits for the `RESET` event
+    /// as well as the reply: a gdb packet sent after it meets the reset
+    /// machine.
+    pub fn system_reset(&mut self) -> Result<()> {
+        self.exchange("system_reset", None, Some("RESET"))
+            .map(|_| ())
     }
 
     /// `cont`: resume the vCPUs. Provided for callers that drive run control over
@@ -463,6 +545,9 @@ pub struct FullSystemTransport<FQ, FG> {
     snapshot_tag: String,
     harness_breakpoint: Option<(u64, u32)>,
     reset: FullSystemReset,
+    /// The QEMU plugin's dirty-page log, for [`FullSystemReset::Fast`].
+    dirty_log: Option<PathBuf>,
+    fast_limits: FastSnapshotLimits,
     run: RunSettings,
 }
 
@@ -500,6 +585,28 @@ pub enum FullSystemReset {
     /// [`GuestFaultStatus`] word: a fault that looks like a clean stop at `done`
     /// would be continued.
     Persistent,
+    /// The dirty-page fast snapshot ([`crate::fast_snapshot`], #347): before
+    /// every input but the first, a `system_reset` brings back the CPUs and
+    /// devices (a monitor command over the gdbstub, checked by the register
+    /// block it leaves, or QMP), and the RAM pages the last run wrote are
+    /// written back from their baseline over the gdbstub. QEMU must run the
+    /// dirty-page plugin ([`crate::fast_snapshot::DIRTY_PAGE_PLUGIN_SOURCE`]),
+    /// whose log [`FullSystemTransport::with_dirty_log`] names.
+    ///
+    /// The baseline is the machine as a reset leaves it: arm issues a
+    /// `system_reset` before the `savevm`. A page is learned the first time a
+    /// run writes it, from a `loadvm` (the full restore); a run that writes
+    /// only known pages, crash or hang included, needs none. RAM the plugin
+    /// cannot see written is not put back: a device's DMA, and on a Cortex-M
+    /// core an exception frame stacked and unstacked before the stop in a
+    /// page no store dirtied (the frames still stacked at the stop are put
+    /// back, see [`crate::fast_snapshot::live_exception_frames`], and so are
+    /// stores through a bit-band alias).
+    ///
+    /// The plugin logs guest-physical pages, so the session puts the gdbstub
+    /// in QEMU's physical-memory mode (`Qqemu.PhyMemMode:1`): the memory map's
+    /// addresses are physical, as they are on a core without an MMU.
+    Fast,
 }
 
 /// What one run from a restored baseline needs: where the input and the
@@ -553,8 +660,23 @@ impl<FQ, FG> FullSystemTransport<FQ, FG> {
             snapshot_tag,
             harness_breakpoint: None,
             reset: FullSystemReset::Loadvm,
+            dirty_log: None,
+            fast_limits: FastSnapshotLimits::default(),
             run: RunSettings::new(map, "qemu-system"),
         })
+    }
+
+    /// Name the dirty-page log the QEMU plugin writes, which
+    /// [`FullSystemReset::Fast`] reads (#347).
+    pub fn with_dirty_log(mut self, path: impl Into<PathBuf>) -> Self {
+        self.dirty_log = Some(path.into());
+        self
+    }
+
+    /// Bound what [`FullSystemReset::Fast`] keeps of the pages' baselines.
+    pub fn with_fast_snapshot_limits(mut self, limits: FastSnapshotLimits) -> Self {
+        self.fast_limits = limits;
+        self
     }
 
     /// Choose how the guest is brought back before each input (`reset=`).
@@ -653,7 +775,7 @@ where
         // A continuation steps the parked guest off its completion breakpoint,
         // so the persistent loop needs one.
         let persistent = match (self.reset, self.harness_breakpoint) {
-            (FullSystemReset::Loadvm, _) => None,
+            (FullSystemReset::Loadvm | FullSystemReset::Fast, _) => None,
             (FullSystemReset::Persistent, Some(done)) => Some(PersistentLoop::new(done)),
             (FullSystemReset::Persistent, None) => {
                 return Err(TransportError::protocol(
@@ -662,12 +784,29 @@ where
                 ))
             }
         };
+        // The fast snapshot reads the plugin's log.
+        if self.reset == FullSystemReset::Fast && self.dirty_log.is_none() {
+            return Err(TransportError::protocol(
+                "reset=fast needs the dirty-page log (dirty_log=PATH) that the QEMU plugin writes",
+            ));
+        }
 
         let mut qmp = QmpClient::new((self.connect_qmp)()?);
         qmp.connect()?;
+        // QEMU installs its plugins before it opens the monitor, so a log
+        // that is not there now will not be.
+        let dirty_log = match (self.reset, &self.dirty_log) {
+            (FullSystemReset::Fast, Some(path)) => Some(PluginDirtyLog::open(path)?),
+            _ => None,
+        };
 
         let mut gdb = GdbClient::new((self.connect_gdb)()?);
         gdb.attach()?;
+        // The plugin logs pages by physical address; the fast snapshot reads
+        // and writes them, and the session stages and reads, the same way.
+        if self.reset == FullSystemReset::Fast {
+            gdb.set_physical_memory_mode(true)?;
+        }
 
         // Plant the harness "done" breakpoint before the baseline snapshot so it
         // is in place for the very first iteration (QEMU keeps gdbstub
@@ -677,9 +816,59 @@ where
         }
 
         // Quiesce the vCPUs, then snapshot the clean baseline every iteration
-        // restores to.
+        // restores to. The fast snapshot's baseline is the machine as a reset
+        // leaves it, since a reset is how it brings back CPUs and devices.
         qmp.stop()?;
+        let (reloaded, stack, memory) = if self.reset == FullSystemReset::Fast {
+            qmp.system_reset()?;
+            // What the reset itself reloads needs no write from bhf.
+            let reloaded = reset_reloaded_ranges(&qmp.human_monitor_command("info roms")?);
+            // A Cortex-M core stacks exception frames without a store, and
+            // its bit-band aliases write RAM through a device: both need
+            // the RAM map.
+            match MProfileRegisters::from_target_description(&gdb.read_target_description()?) {
+                Some(registers) => {
+                    let memory =
+                        MemoryMap::from_info_mtree(&qmp.human_monitor_command("info mtree -f")?);
+                    if memory.ram.is_empty() {
+                        return Err(TransportError::protocol(
+                            "reset=fast: QEMU's memory map (info mtree -f) names no RAM, so the \
+                             exception frames a Cortex-M core stacks cannot be found; use \
+                             reset=loadvm",
+                        ));
+                    }
+                    let baseline_sp = register_value(&gdb.read_register(registers.sp)?);
+                    let stack = MProfileStack {
+                        registers,
+                        baseline_sp,
+                        ram: memory.ram.clone(),
+                    };
+                    (reloaded, Some(stack), memory)
+                }
+                None => (reloaded, None, MemoryMap::default()),
+            }
+        } else {
+            (Vec::new(), None, MemoryMap::default())
+        };
         qmp.savevm(&self.snapshot_tag)?;
+        let fast = match dirty_log {
+            Some(mut log) => {
+                log.set_bitband_windows(&memory.bitband)?;
+                Some(FastState {
+                    snapshot: FastSnapshot::new(log, self.fast_limits)?
+                        .with_reset_reloaded(reloaded),
+                    at_baseline: true,
+                    may_run: false,
+                    devices: DeviceReset {
+                        baseline_registers: gdb.read_registers()?,
+                        over_gdb: true,
+                    },
+                    since_qmp: 0,
+                    stack,
+                })
+            }
+            None => None,
+        };
 
         Ok(Box::new(FullSystemSession {
             qmp,
@@ -687,6 +876,7 @@ where
             snapshot_tag: self.snapshot_tag.clone(),
             run: self.run.clone(),
             persistent,
+            fast,
         }))
     }
 }
@@ -702,6 +892,216 @@ pub struct FullSystemSession<CQ, CG> {
     /// The guest's input loop under [`FullSystemReset::Persistent`]; `None`
     /// restores the snapshot before every input.
     persistent: Option<PersistentLoop>,
+    /// The dirty-page fast snapshot under [`FullSystemReset::Fast`].
+    fast: Option<FastState>,
+}
+
+/// What a [`FullSystemReset::Fast`] session keeps between inputs.
+struct FastState {
+    snapshot: FastSnapshot<PluginDirtyLog>,
+    /// Nothing ran since the baseline was taken.
+    at_baseline: bool,
+    /// The last run may have left the guest running: it hung, or failed part
+    /// way. A reset stops it first.
+    may_run: bool,
+    /// How the machine resets its devices, and checks that it did.
+    devices: DeviceReset,
+    /// Device resets since the monitor was last read ([`QMP_DRAIN_INTERVAL`]).
+    since_qmp: usize,
+    /// On a Cortex-M core, where its exception frames may lie.
+    stack: Option<MProfileStack>,
+}
+
+/// What a [`FullSystemReset::Fast`] session on a Cortex-M core needs to find
+/// the exception frames the core stacked without a store.
+#[derive(Debug)]
+struct MProfileStack {
+    registers: MProfileRegisters,
+    /// The stack pointer the baseline starts with.
+    baseline_sp: u64,
+    /// The machine's RAM, which bounds the frames.
+    ram: Vec<(u64, u64)>,
+}
+
+impl MProfileStack {
+    /// Where the core stopped: `xPSR`, and with an exception active the
+    /// stack pointer and the process stack pointer.
+    fn stop<CG: Read + Write>(&self, gdb: &mut GdbClient<CG>) -> Result<MProfileStop> {
+        let xpsr = register_value(&gdb.read_register(self.registers.xpsr)?) as u32;
+        let mut stop = MProfileStop {
+            sp: 0,
+            xpsr,
+            psp: None,
+        };
+        if stop.in_handler() {
+            stop.sp = register_value(&gdb.read_register(self.registers.sp)?);
+            stop.psp = match self.registers.psp {
+                Some(psp) => Some(register_value(&gdb.read_register(psp)?)),
+                None => None,
+            };
+        }
+        Ok(stop)
+    }
+}
+
+/// A register's value from the target's little-endian bytes.
+fn register_value(bytes: &[u8]) -> u64 {
+    let mut value = [0_u8; 8];
+    let len = bytes.len().min(8);
+    value[..len].copy_from_slice(&bytes[..len]);
+    u64::from_le_bytes(value)
+}
+
+/// How a [`FullSystemReset::Fast`] session resets the CPUs and devices.
+///
+/// `system_reset` as a monitor command over the gdbstub (`qRcmd`) costs one
+/// gdb round trip, where a QMP command costs more. QEMU runs the command when
+/// the packet arrives and the reset from its main loop before it reads the
+/// next packet, and the register block read after it shows the reset took:
+/// it is the baseline's. When the gdbstub takes no monitor command, or the
+/// registers do not show the reset, the session sends QMP `system_reset`
+/// from then on, which waits for QEMU's `RESET` event.
+#[derive(Debug)]
+struct DeviceReset {
+    /// The register block (`g`) right after arm's reset.
+    baseline_registers: Vec<u8>,
+    /// The gdbstub's monitor resets the machine.
+    over_gdb: bool,
+}
+
+impl FastState {
+    /// Run `input` from the baseline: reset the machine unless nothing ran
+    /// since arm took it, then stage, run and read.
+    fn run<CQ: Read + Write, CG: Read + Write + crate::gdb::ReadDeadline>(
+        &mut self,
+        session: &mut FullSystemSession<CQ, CG>,
+        input: &[u8],
+    ) -> Result<RunOutcome> {
+        let reset = if std::mem::replace(&mut self.at_baseline, false) {
+            None
+        } else {
+            Some(self.reset(session)?)
+        };
+        // The log does not see bhf's own writes: note them for the next reset.
+        let map = &session.run.map;
+        self.snapshot
+            .note_unlogged_write(map.input_address, session.staged_len(input));
+        if let Some(word) = session
+            .run
+            .input_contract
+            .as_ref()
+            .and_then(|contract| contract.length_word)
+        {
+            self.snapshot.note_unlogged_write(word, 4);
+        }
+        if let Some(region) = &session.run.cmplog {
+            self.snapshot.note_unlogged_write(region.address, 4);
+        }
+        self.may_run = true;
+        let mut outcome = run_from_baseline(&mut session.gdb, &session.run, input)?;
+        self.may_run = outcome.exit == ExitKind::Timeout;
+        // A guest that reached a stop ran code: the plugin must have seen it.
+        if outcome.exit != ExitKind::Timeout {
+            self.snapshot.note_guest_ran();
+        }
+        outcome.target.reset = reset;
+        Ok(outcome)
+    }
+
+    /// Bring the machine back to the baseline (see [`FastSnapshot::reset`]).
+    /// The gdbstub is in physical-memory mode (arm set it), so pages are
+    /// read and written by the physical address the plugin logs them at.
+    fn reset<CQ: Read + Write, CG: Read + Write>(
+        &mut self,
+        session: &mut FullSystemSession<CQ, CG>,
+    ) -> Result<ResetObservation> {
+        let started = Instant::now();
+        if std::mem::take(&mut self.may_run) {
+            session.qmp.stop()?;
+            self.since_qmp = 0;
+        }
+        // The guest's stops, resumes and resets are QMP events: read the
+        // monitor every so often so its backlog stays bounded.
+        if self.since_qmp >= QMP_DRAIN_INTERVAL {
+            session.qmp.execute("query-status", None)?;
+            self.since_qmp = 0;
+        }
+        // The frames a Cortex-M core stacked for the exceptions still active
+        // where the run stopped are RAM the log did not see written.
+        if let Some(stack) = &self.stack {
+            let stop = stack.stop(&mut session.gdb)?;
+            for (address, len) in live_exception_frames(stop, stack.baseline_sp, &stack.ram) {
+                self.snapshot.note_unlogged_write(address, len as usize);
+            }
+        }
+        let mut target = QemuTarget {
+            qmp: &mut session.qmp,
+            gdb: &mut session.gdb,
+            snapshot_tag: &session.snapshot_tag,
+            devices: &mut self.devices,
+        };
+        let reset = self.snapshot.reset(&mut target)?;
+        self.since_qmp = match reset {
+            FastReset::DirtyPages { .. } => self.since_qmp + 1,
+            // stop and loadvm read the monitor's backlog.
+            FastReset::Full { .. } => 0,
+        };
+        let (kind, pages) = match reset {
+            FastReset::DirtyPages { pages } => (ResetKind::DirtyPages, pages),
+            FastReset::Full { learned } => (ResetKind::Full, learned),
+        };
+        Ok(ResetObservation {
+            kind,
+            time: started.elapsed(),
+            pages,
+        })
+    }
+}
+
+/// The guest of a [`FullSystemReset::Fast`] session: its memory over the
+/// gdbstub (in physical-memory mode), its device reset over the gdbstub's
+/// monitor or QMP, its full restore over QMP.
+struct QemuTarget<'a, CQ, CG> {
+    qmp: &'a mut QmpClient<CQ>,
+    gdb: &'a mut GdbClient<CG>,
+    snapshot_tag: &'a str,
+    devices: &'a mut DeviceReset,
+}
+
+impl<CQ, CG: Read + Write> GuestMemory for QemuTarget<'_, CQ, CG> {
+    fn read(&mut self, address: u64, len: usize) -> Result<Vec<u8>> {
+        GuestMemory::read(self.gdb, address, len)
+    }
+
+    fn write(&mut self, address: u64, bytes: &[u8]) -> Result<()> {
+        GuestMemory::write(self.gdb, address, bytes)
+    }
+}
+
+impl<CQ: Read + Write, CG: Read + Write> Machine for QemuTarget<'_, CQ, CG> {
+    fn reset_devices(&mut self) -> Result<()> {
+        if self.devices.over_gdb {
+            if self.gdb.monitor("system_reset").is_ok()
+                && self.gdb.read_registers()? == self.devices.baseline_registers
+            {
+                return Ok(());
+            }
+            self.devices.over_gdb = false;
+        }
+        self.qmp.system_reset()?;
+        if self.gdb.read_registers()? != self.devices.baseline_registers {
+            return Err(TransportError::protocol(
+                "reset=fast: after a system_reset the registers differ from the baseline's, so \
+                 a reset does not bring this machine back to it; use reset=loadvm",
+            ));
+        }
+        Ok(())
+    }
+
+    fn restore_all(&mut self) -> Result<()> {
+        self.qmp.stop()?;
+        self.qmp.loadvm(self.snapshot_tag)
+    }
 }
 
 /// Continuations that failed to show the guest ran their input, before one
@@ -824,7 +1224,13 @@ impl PersistentLoop {
         session: &mut FullSystemSession<CQ, CG>,
         input: &[u8],
     ) -> Result<RunOutcome> {
+        let started = Instant::now();
         session.restore()?;
+        let reset = ResetObservation {
+            kind: ResetKind::Full,
+            time: started.elapsed(),
+            pages: 0,
+        };
         self.staging.restored();
         if self.lifted {
             let (address, kind) = self.done;
@@ -836,7 +1242,9 @@ impl PersistentLoop {
         let len = session.staged_len(input);
         self.staging
             .prepare(&mut session.gdb, session.run.map.input_address, len)?;
-        run_from_baseline(&mut session.gdb, &session.run, input)
+        let mut outcome = run_from_baseline(&mut session.gdb, &session.run, input)?;
+        outcome.target.reset = Some(reset);
+        Ok(outcome)
     }
 
     /// Continue the parked guest's input loop with `input`: step it off `done`,
@@ -972,10 +1380,23 @@ impl<CQ: Read + Write, CG: Read + Write + crate::gdb::ReadDeadline> TargetSessio
     for FullSystemSession<CQ, CG>
 {
     fn run_input(&mut self, input: &[u8]) -> Result<RunOutcome> {
-        // The loop state is taken out for the run so it can drive the session.
+        // The reset state is taken out for the run so it can drive the session.
+        if let Some(mut state) = self.fast.take() {
+            let outcome = state.run(self, input);
+            self.fast = Some(state);
+            return outcome;
+        }
         let Some(mut state) = self.persistent.take() else {
+            let started = Instant::now();
             self.restore()?;
-            return run_from_baseline(&mut self.gdb, &self.run, input);
+            let reset = ResetObservation {
+                kind: ResetKind::Full,
+                time: started.elapsed(),
+                pages: 0,
+            };
+            let mut outcome = run_from_baseline(&mut self.gdb, &self.run, input)?;
+            outcome.target.reset = Some(reset);
+            return Ok(outcome);
         };
         let outcome = state.run(self, input);
         self.persistent = Some(state);
@@ -1161,6 +1582,7 @@ mod tests {
     use super::*;
     use crate::gdb::StopReply;
     use crate::outcome::ExitKind;
+    use crate::outcome::ResetKind;
     use crate::testsupport::{
         duplex, encode_event_stream, simulate_ring, DuplexStream, MockGdbStub, MockQmpServer,
     };
@@ -1324,8 +1746,15 @@ mod tests {
     fn same_input_twice_is_deterministic() {
         let (transport, _qmp_log, _gdb_log) = wired_transport(&[3, 1, 4], b"S05".to_vec(), 64);
         let mut session = transport.arm().unwrap();
-        let first = session.run_input(b"same").unwrap();
-        let second = session.run_input(b"same").unwrap();
+        // The reset's own time differs from run to run; the run does not.
+        let run = |session: &mut Box<dyn TargetSession>| {
+            let mut outcome = session.run_input(b"same").unwrap();
+            let reset = outcome.target.reset.take().expect("a loadvm reset");
+            assert_eq!(reset.kind, crate::outcome::ResetKind::Full);
+            outcome
+        };
+        let first = run(&mut session);
+        let second = run(&mut session);
         assert_eq!(first, second, "snapshot reset makes runs reproducible");
         assert_eq!(first.coverage_edges, vec![3, 1, 4]);
     }
@@ -1903,9 +2332,40 @@ mod tests {
         FullSystemTransport<impl Fn() -> Result<DuplexStream>, impl Fn() -> Result<CG>>,
         Arc<Mutex<Vec<String>>>,
     ) {
+        scripted_transport_with_roms(gdb, reset, "")
+    }
+
+    /// [`scripted_transport`], with the monitor's `info roms` answering
+    /// `roms`.
+    #[allow(clippy::type_complexity)]
+    fn scripted_transport_with_roms<CG: Read + Write + Send + 'static>(
+        gdb: CG,
+        reset: FullSystemReset,
+        roms: &str,
+    ) -> (
+        FullSystemTransport<impl Fn() -> Result<DuplexStream>, impl Fn() -> Result<CG>>,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        scripted_transport_with_hmp(gdb, reset, &[("info roms", roms)])
+    }
+
+    /// [`scripted_transport`], with the monitor answering each HMP command
+    /// of `hmp` with its output.
+    #[allow(clippy::type_complexity)]
+    fn scripted_transport_with_hmp<CG: Read + Write + Send + 'static>(
+        gdb: CG,
+        reset: FullSystemReset,
+        hmp: &[(&str, &str)],
+    ) -> (
+        FullSystemTransport<impl Fn() -> Result<DuplexStream>, impl Fn() -> Result<CG>>,
+        Arc<Mutex<Vec<String>>>,
+    ) {
         let qmp_log = Arc::new(Mutex::new(Vec::<String>::new()));
         let (qmp_client_end, qmp_server_end) = duplex();
-        let server = MockQmpServer::new(qmp_server_end, Arc::clone(&qmp_log));
+        let server = hmp.iter().fold(
+            MockQmpServer::new(qmp_server_end, Arc::clone(&qmp_log)),
+            |server, (command, output)| server.with_hmp_output(command, output),
+        );
         thread::spawn(move || {
             let _ = server.serve();
         });
@@ -2460,6 +2920,692 @@ mod tests {
         }
         assert_eq!(count(&qmp_log, LOADVM), 1);
         assert_eq!(count(&qmp_log, "query-status"), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // reset=fast: a device reset plus the dirty pages, put back
+    // ------------------------------------------------------------------
+
+    const SYSTEM_RESET: &str = "system_reset";
+    /// `monitor system_reset` over the gdbstub (`qRcmd`, hex).
+    const MONITOR_RESET: &str = "qRcmd,73797374656d5f7265736574";
+
+    /// A gdbstub for a guest whose RAM is whole 256-byte pages: the staging
+    /// region at 0x1000, the ring at 0x4000, its write word at 0x5000 and
+    /// wrapped flag at 0x5100 (one region, so a read of both pages is one),
+    /// the fault word at [`STATUS`] and a stack page at 0x7f00. Each run
+    /// writes the ring words and a stack word, and the stub logs their pages
+    /// in `log`, as the QEMU plugin does.
+    fn fast_stub<C: Read + Write>(
+        channel: C,
+        gdb_log: Arc<Mutex<Vec<String>>>,
+        stops: Vec<Vec<u8>>,
+        log: crate::testsupport::DirtyLogFile,
+    ) -> MockGdbStub<C> {
+        let (image, write, wrapped) = scripted_ring(&[7], 64);
+        let mut ring = image;
+        ring.resize(256, 0);
+        let mut words = vec![0_u8; 512];
+        words[..4].copy_from_slice(&write.to_le_bytes());
+        words[0x100] = u8::from(wrapped);
+        MockGdbStub::new(channel, gdb_log)
+            .with_stop_sequence(stops)
+            .with_region(0x1000, vec![0; 256])
+            .with_region(0x4000, ring)
+            .with_region(0x5000, words)
+            .with_region(STATUS, vec![0; 256])
+            .with_region(0x7f00, vec![0x5a; 256])
+            .with_run_write(0x5000, write.to_le_bytes().to_vec())
+            .with_run_write(0x5100, vec![u8::from(wrapped)])
+            .with_run_write(0x7ff8, vec![0xa5; 8])
+            .with_dirty_log(log)
+    }
+
+    /// A `reset=fast` transport over [`fast_stub`] and a mock QMP monitor,
+    /// with its dirty-page log in `dir`.
+    #[allow(clippy::type_complexity)]
+    fn fast_transport(
+        dir: &tempfile::TempDir,
+        stops: Vec<Vec<u8>>,
+    ) -> (
+        FullSystemTransport<impl Fn() -> Result<DuplexStream>, impl Fn() -> Result<DuplexStream>>,
+        Arc<Mutex<Vec<String>>>,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        fast_transport_reloading(dir, stops, "")
+    }
+
+    /// [`fast_transport`], with QEMU's `info roms` answering `roms`.
+    #[allow(clippy::type_complexity)]
+    fn fast_transport_reloading(
+        dir: &tempfile::TempDir,
+        stops: Vec<Vec<u8>>,
+        roms: &str,
+    ) -> (
+        FullSystemTransport<impl Fn() -> Result<DuplexStream>, impl Fn() -> Result<DuplexStream>>,
+        Arc<Mutex<Vec<String>>>,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        let path = dir.path().join("dirty.log");
+        let log = crate::testsupport::DirtyLogFile::create(&path, 8, 64).unwrap();
+        let gdb_log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (client, stub_end) = duplex();
+        let stub = fast_stub(stub_end, Arc::clone(&gdb_log), stops, log);
+        thread::spawn(move || {
+            let _ = stub.serve();
+        });
+        let (transport, qmp_log) =
+            scripted_transport_with_roms(client, FullSystemReset::Fast, roms);
+        (transport.with_dirty_log(path), qmp_log, gdb_log)
+    }
+
+    #[test]
+    fn fast_reset_leaves_the_pages_qemus_reset_reloads_to_it() {
+        // The ring words' two pages lie in an image segment QEMU reloads on
+        // a reset: bhf neither learns nor writes them.
+        let dir = tempfile::tempdir().unwrap();
+        let roms = "addr=0000000000005000 size=0x000200 mem=ram name=\"fw.elf ELF program \
+                    header segment 1\"\r\n";
+        let (transport, qmp_log, gdb_log) = fast_transport_reloading(&dir, Vec::new(), roms);
+        let mut session = transport.arm().unwrap();
+        session.run_input(b"ab").unwrap();
+        let second = session.run_input(b"cd").unwrap();
+        assert_eq!(
+            second.target.reset.map(|r| (r.kind, r.pages)),
+            Some((ResetKind::Full, 2))
+        );
+        let mark = gdb_log.lock().unwrap().len();
+        let third = session.run_input(b"ef").unwrap();
+        assert_eq!(
+            third.target.reset.map(|r| (r.kind, r.pages)),
+            Some((ResetKind::DirtyPages, 2))
+        );
+        let writes: Vec<String> = since(&gdb_log, mark)
+            .into_iter()
+            .take_while(|p| !p.starts_with("M1000,2:"))
+            .map(|p| p.split(':').next().unwrap_or(&p).to_owned())
+            .collect();
+        assert_eq!(writes, [MONITOR_RESET, "g", "M1000,100", "M7f00,100"]);
+        assert_eq!(count(&qmp_log, LOADVM), 1);
+    }
+
+    /// The gdb packets sent since `from`.
+    fn since(log: &Arc<Mutex<Vec<String>>>, from: usize) -> Vec<String> {
+        log.lock().unwrap()[from..].to_vec()
+    }
+
+    #[test]
+    fn fast_reset_arms_from_a_device_reset_and_keeps_the_full_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (transport, qmp_log, gdb_log) = fast_transport(&dir, Vec::new());
+        let mut session = transport.arm().unwrap();
+        assert_eq!(
+            *qmp_log.lock().unwrap(),
+            [
+                "qmp_capabilities",
+                "stop",
+                SYSTEM_RESET,
+                "hmp:info roms",
+                "hmp:savevm bhf-baseline"
+            ],
+            "the baseline is the machine as a reset leaves it"
+        );
+        // Memory goes by physical address, as the plugin logs it, from arm on.
+        let gdb = gdb_log.lock().unwrap().clone();
+        assert_eq!(count(&gdb_log, "Qqemu.PhyMemMode:1"), 1, "{gdb:?}");
+        let attach = gdb.iter().position(|p| p == "?").expect("attach");
+        let physical = gdb.iter().position(|p| p == "Qqemu.PhyMemMode:1").unwrap();
+        assert!(attach < physical, "{gdb:?}");
+        session.run_input(b"a").unwrap();
+        session.run_input(b"b").unwrap();
+        assert_eq!(count(&gdb_log, "Qqemu.PhyMemMode:1"), 1);
+        assert_eq!(count(&gdb_log, "Qqemu.PhyMemMode:0"), 0);
+    }
+
+    #[test]
+    fn fast_reset_learns_a_page_from_a_loadvm_then_writes_back_only_dirty_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let (transport, qmp_log, gdb_log) = fast_transport(&dir, Vec::new());
+        let mut session = transport.arm().unwrap();
+
+        // The first input runs at the baseline arm took.
+        let first = session.run_input(b"ab").unwrap();
+        assert_eq!(first.exit, ExitKind::Ok);
+        assert_eq!(first.coverage_edges, vec![7]);
+        assert_eq!(
+            first.target.reset, None,
+            "arm left the guest at the baseline"
+        );
+        assert_eq!(count(&qmp_log, LOADVM), 0);
+
+        // The second: no page has a baseline yet, so a loadvm, then bhf reads
+        // the pages the run wrote (the ring words, the stack) and the one it
+        // wrote itself (the input), in physical-memory mode.
+        let mark = gdb_log.lock().unwrap().len();
+        let second = session.run_input(b"cd").unwrap();
+        assert_eq!(second.coverage_edges, vec![7]);
+        let reset = second.target.reset.expect("a reset ran");
+        assert_eq!(reset.kind, ResetKind::Full);
+        assert_eq!(reset.pages, 4, "four pages learned");
+        assert_eq!(count(&qmp_log, LOADVM), 1);
+        assert_eq!(count(&qmp_log, SYSTEM_RESET), 1, "arm's only");
+        let packets = since(&gdb_log, mark);
+        let learn: Vec<&String> = packets
+            .iter()
+            .take_while(|p| !p.starts_with("M1000,"))
+            .collect();
+        assert_eq!(
+            learn,
+            ["m1000,100", "m5000,200", "m7f00,100"],
+            "{packets:?}"
+        );
+
+        // The third: every page is known: a system_reset over the gdbstub,
+        // the registers read to see it took, and the dirty pages written
+        // back, the ring pages as one, before the input.
+        let mark = gdb_log.lock().unwrap().len();
+        let third = session.run_input(b"ef").unwrap();
+        assert_eq!(third.exit, ExitKind::Ok);
+        assert_eq!(third.coverage_edges, vec![7]);
+        let reset = third.target.reset.expect("a reset ran");
+        assert_eq!(reset.kind, ResetKind::DirtyPages);
+        assert_eq!(reset.pages, 4);
+        assert_eq!(
+            count(&qmp_log, LOADVM),
+            1,
+            "no loadvm once the pages are known"
+        );
+        assert_eq!(count(&qmp_log, SYSTEM_RESET), 1, "arm's only");
+        let packets = since(&gdb_log, mark);
+        let restore: Vec<String> = packets
+            .iter()
+            .take_while(|p| !p.starts_with("M1000,2:"))
+            .map(|p| p.split(':').next().unwrap_or(p).to_owned())
+            .collect();
+        assert_eq!(
+            restore,
+            [MONITOR_RESET, "g", "M1000,100", "M5000,200", "M7f00,100"],
+            "{packets:?}"
+        );
+        // The stack page is written back with the bytes bhf read for it when
+        // it learned it (the mock's loadvm leaves its memory as it is, so
+        // they include the first run's word).
+        let learned = format!("{}{}", "5a".repeat(248), "a5".repeat(8));
+        assert_eq!(packets[4], format!("M7f00,100:{learned}"));
+    }
+
+    #[test]
+    fn fast_reset_brings_a_faulted_guest_back_without_a_loadvm() {
+        let dir = tempfile::tempdir().unwrap();
+        // Clean, clean (learns the pages), a crash, then clean again.
+        let (transport, qmp_log, gdb_log) =
+            fast_transport(&dir, stops(&[b"S05", b"S05", b"S0b", b"S05"]));
+        let mut session = transport.arm().unwrap();
+        session.run_input(b"a").unwrap();
+        session.run_input(b"b").unwrap();
+        assert_eq!(count(&qmp_log, LOADVM), 1);
+
+        let crash = session.run_input(b"c").unwrap();
+        assert_eq!(crash.exit, ExitKind::Crash);
+        assert_eq!(
+            crash.target.reset.map(|r| r.kind),
+            Some(ResetKind::DirtyPages)
+        );
+        let after = session.run_input(b"d").unwrap();
+        assert_eq!(after.exit, ExitKind::Ok);
+        assert_eq!(
+            after.target.reset.map(|r| r.kind),
+            Some(ResetKind::DirtyPages)
+        );
+        assert_eq!(count(&qmp_log, LOADVM), 1, "the fault needs no loadvm");
+        assert_eq!(count(&gdb_log, MONITOR_RESET), 2);
+    }
+
+    #[test]
+    fn fast_reset_uses_qmp_when_the_gdbstub_takes_no_monitor_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dirty.log");
+        let log = crate::testsupport::DirtyLogFile::create(&path, 8, 64).unwrap();
+        let gdb_log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (client, stub_end) = duplex();
+        let stub = fast_stub(stub_end, Arc::clone(&gdb_log), Vec::new(), log).without_monitor();
+        thread::spawn(move || {
+            let _ = stub.serve();
+        });
+        let (transport, qmp_log) = scripted_transport(client, FullSystemReset::Fast);
+        let mut session = transport.with_dirty_log(path).arm().unwrap();
+        for input in [b"a", b"b", b"c", b"d"] {
+            assert_eq!(session.run_input(input).unwrap().exit, ExitKind::Ok);
+        }
+        // Asked once, refused, then QMP: arm's reset and two fast ones.
+        assert_eq!(count(&gdb_log, MONITOR_RESET), 1);
+        assert_eq!(count(&qmp_log, SYSTEM_RESET), 3);
+        assert_eq!(count(&qmp_log, LOADVM), 1);
+    }
+
+    #[test]
+    fn fast_reset_refuses_a_machine_whose_reset_does_not_bring_back_its_registers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dirty.log");
+        let log = crate::testsupport::DirtyLogFile::create(&path, 8, 64).unwrap();
+        let (client, stub_end) = duplex();
+        // Each run leaves other registers, and neither reset puts them back.
+        let stub = fast_stub(stub_end, Arc::new(Mutex::new(Vec::new())), Vec::new(), log)
+            .with_run_registers(vec![9, 9, 9, 9]);
+        thread::spawn(move || {
+            let _ = stub.serve();
+        });
+        let (transport, qmp_log) = scripted_transport(client, FullSystemReset::Fast);
+        let mut session = transport.with_dirty_log(path).arm().unwrap();
+        session.run_input(b"a").unwrap();
+        session.run_input(b"b").unwrap(); // a loadvm, which needs no check
+        let message = session.run_input(b"c").unwrap_err().to_string();
+        assert!(
+            message.contains("reset=fast") && message.contains("registers"),
+            "{message}"
+        );
+        assert_eq!(
+            count(&qmp_log, SYSTEM_RESET),
+            2,
+            "the QMP reset was tried too"
+        );
+    }
+
+    #[test]
+    fn fast_reset_reads_the_monitor_while_resets_go_over_the_gdbstub() {
+        // QEMU reports each stop, resume and reset of the guest as a QMP
+        // event; a periodic command keeps that backlog bounded.
+        let dir = tempfile::tempdir().unwrap();
+        let (transport, qmp_log, _gdb_log) = fast_transport(&dir, Vec::new());
+        let mut session = transport.arm().unwrap();
+        // The first input runs at the baseline and the second learns; the
+        // read comes before the reset that follows QMP_DRAIN_INTERVAL device
+        // resets.
+        for _ in 0..2 + QMP_DRAIN_INTERVAL {
+            assert_eq!(session.run_input(b"a").unwrap().exit, ExitKind::Ok);
+        }
+        assert_eq!(count(&qmp_log, "query-status"), 0);
+        session.run_input(b"a").unwrap();
+        assert_eq!(count(&qmp_log, "query-status"), 1);
+    }
+
+    // -- reset=fast on a Cortex-M core: exception frames and bit-band -------
+
+    /// A Cortex-M core's target description, as QEMU 8.2 serves it.
+    const M_TARGET: &str = r#"<?xml version="1.0"?><target><architecture>arm</architecture><xi:include href="arm-m-profile.xml"/><xi:include href="arm-m-system.xml"/></target>"#;
+    const M_CORE: &str = r#"<feature name="org.gnu.gdb.arm.m-profile"><reg name="r0" bitsize="32"/><reg name="r1" bitsize="32"/><reg name="r2" bitsize="32"/><reg name="r3" bitsize="32"/><reg name="r4" bitsize="32"/><reg name="r5" bitsize="32"/><reg name="r6" bitsize="32"/><reg name="r7" bitsize="32"/><reg name="r8" bitsize="32"/><reg name="r9" bitsize="32"/><reg name="r10" bitsize="32"/><reg name="r11" bitsize="32"/><reg name="r12" bitsize="32"/><reg name="sp" bitsize="32" type="data_ptr"/><reg name="lr" bitsize="32"/><reg name="pc" bitsize="32" type="code_ptr"/><reg name="xpsr" bitsize="32" regnum="25"/></feature>"#;
+    const M_SYSTEM: &str = r#"<feature name="org.gnu.gdb.arm.m-system"><reg name="msp" bitsize="32" regnum="26"/><reg name="psp" bitsize="32" regnum="27"/></feature>"#;
+    /// The mock Cortex-M's memory map: RAM over its whole low 64 KiB and at
+    /// 0x2000_0000, with QEMU's two bit-band windows.
+    const M_MTREE: &str = "FlatView #2\n AS \"cpu-memory-0\", root: armv7m-container\n  \
+        0000000000000000-000000000000ffff (prio 0, ram): ram\n  \
+        0000000020000000-00000000203fffff (prio 0, ram): sram\n  \
+        0000000022000000-0000000023ffffff (prio 0, i/o): bitband\n  \
+        0000000040000000-0000000040000fff (prio 0, i/o): uart\n  \
+        0000000042000000-0000000043ffffff (prio 0, i/o): bitband\n";
+    /// gdb's numbers for the core's sp, xPSR and PSP.
+    const SP: u32 = 13;
+    const XPSR: u32 = 25;
+    const PSP: u32 = 27;
+    /// xPSR in thread mode (the Thumb bit alone), and during a HardFault.
+    const THREAD: u32 = 0x0100_0000;
+    const HARD_FAULT: u32 = 0x0100_0003;
+
+    /// A `reset=fast` transport over a mock Cortex-M whose stops are
+    /// `stops`, `(xPSR, sp, PSP)` per `c`; its stack runs down from 0x8000
+    /// over two pages, 0x7e00 and 0x7f00, and each run stores into the upper
+    /// one only, as [`fast_stub`]'s do; 0x3000 is a task's stack.
+    #[allow(clippy::type_complexity)]
+    fn m_profile_transport(
+        dir: &tempfile::TempDir,
+        stops: Vec<(u32, u32, u32)>,
+        mtree: &str,
+    ) -> (
+        FullSystemTransport<impl Fn() -> Result<DuplexStream>, impl Fn() -> Result<DuplexStream>>,
+        Arc<Mutex<Vec<String>>>,
+        Arc<Mutex<Vec<String>>>,
+        crate::testsupport::DirtyLogFile,
+    ) {
+        let path = dir.path().join("dirty.log");
+        let log = crate::testsupport::DirtyLogFile::create(&path, 8, 64).unwrap();
+        let gdb_log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (client, stub_end) = duplex();
+        let (image, write, wrapped) = scripted_ring(&[7], 64);
+        let mut ring = image;
+        ring.resize(256, 0);
+        let mut words = vec![0_u8; 512];
+        words[..4].copy_from_slice(&write.to_le_bytes());
+        words[0x100] = u8::from(wrapped);
+        let stub = MockGdbStub::new(stub_end, Arc::clone(&gdb_log))
+            .with_region(0x1000, vec![0; 256])
+            .with_region(0x3000, vec![0x33; 256])
+            .with_region(0x4000, ring)
+            .with_region(0x5000, words)
+            .with_region(STATUS, vec![0; 256])
+            .with_region(0x7e00, vec![0x5a; 512])
+            .with_run_write(0x5000, write.to_le_bytes().to_vec())
+            .with_run_write(0x5100, vec![u8::from(wrapped)])
+            .with_run_write(0x7ff8, vec![0xa5; 8])
+            .with_dirty_log(log.clone())
+            .with_target_description(&[
+                ("target.xml", M_TARGET),
+                ("arm-m-profile.xml", M_CORE),
+                ("arm-m-system.xml", M_SYSTEM),
+            ])
+            .with_register(SP, 0x8000)
+            .with_register(XPSR, THREAD)
+            .with_register(PSP, 0)
+            .with_registers_per_c(
+                stops
+                    .into_iter()
+                    .map(|(xpsr, sp, psp)| vec![(XPSR, xpsr), (SP, sp), (PSP, psp)])
+                    .collect(),
+            );
+        thread::spawn(move || {
+            let _ = stub.serve();
+        });
+        let (transport, qmp_log) = scripted_transport_with_hmp(
+            client,
+            FullSystemReset::Fast,
+            &[("info roms", ""), ("info mtree -f", mtree)],
+        );
+        (transport.with_dirty_log(path), qmp_log, gdb_log, log)
+    }
+
+    #[test]
+    fn fast_reset_on_a_cortex_m_tells_the_plugin_its_sram_bitband_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let (transport, qmp_log, _gdb_log, log) = m_profile_transport(&dir, Vec::new(), M_MTREE);
+        let _session = transport.arm().unwrap();
+        assert!(
+            qmp_log
+                .lock()
+                .unwrap()
+                .contains(&"hmp:info mtree -f".to_owned()),
+            "the memory map is read at arm"
+        );
+        // The SRAM window aliases RAM; the peripheral one devices, which a
+        // reset restores.
+        assert_eq!(
+            log.bitband_windows().unwrap(),
+            vec![(0x2200_0000, 0x0200_0000, 0x2000_0000)]
+        );
+    }
+
+    #[test]
+    fn fast_reset_puts_back_the_frames_a_cortex_m_stacked_for_a_fault() {
+        let dir = tempfile::tempdir().unwrap();
+        // A clean run, then HardFaults that stop 0x180 below the stack's top,
+        // a task's frame at 0x3000.
+        let fault = (HARD_FAULT, 0x7e80, 0x3000);
+        let (transport, qmp_log, gdb_log, _log) = m_profile_transport(
+            &dir,
+            vec![(THREAD, 0x7ff0, 0), fault, fault, fault],
+            M_MTREE,
+        );
+        let mut session = transport.arm().unwrap();
+        session.run_input(b"a").unwrap();
+
+        // After a thread-mode stop no frame is live: only the logged pages
+        // are learned, and only xPSR is read.
+        let mark = gdb_log.lock().unwrap().len();
+        let second = session.run_input(b"b").unwrap();
+        assert_eq!(
+            second.target.reset.map(|r| (r.kind, r.pages)),
+            Some((ResetKind::Full, 4))
+        );
+        let packets = since(&gdb_log, mark);
+        assert_eq!(packets[0], "p19", "{packets:?}");
+        assert!(!packets.iter().any(|p| p == "pd"), "{packets:?}");
+
+        // After the fault: the stack from the stop's sp to the top, both its
+        // pages, and the task's frame, though no store wrote 0x7e00 or 0x3000.
+        let mark = gdb_log.lock().unwrap().len();
+        let third = session.run_input(b"c").unwrap();
+        assert_eq!(
+            third.target.reset.map(|r| (r.kind, r.pages)),
+            Some((ResetKind::Full, 2)),
+            "the frames' two new pages are learned"
+        );
+        let packets = since(&gdb_log, mark);
+        assert_eq!(packets[..3], ["p19", "pd", "p1b"], "{packets:?}");
+
+        let mark = gdb_log.lock().unwrap().len();
+        let fourth = session.run_input(b"d").unwrap();
+        assert_eq!(
+            fourth.target.reset.map(|r| (r.kind, r.pages)),
+            Some((ResetKind::DirtyPages, 6))
+        );
+        let restore: Vec<String> = since(&gdb_log, mark)
+            .into_iter()
+            .take_while(|p| !p.starts_with("M1000,1:"))
+            .map(|p| p.split(':').next().unwrap_or(&p).to_owned())
+            .collect();
+        assert_eq!(
+            restore,
+            [
+                "p19",
+                "pd",
+                "p1b",
+                MONITOR_RESET,
+                "g",
+                "M1000,100",
+                "M3000,100",
+                "M5000,200",
+                "M7e00,200"
+            ]
+        );
+        assert_eq!(count(&qmp_log, LOADVM), 2);
+    }
+
+    #[test]
+    fn fast_reset_on_a_cortex_m_needs_qemus_ram_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let (transport, _qmp_log, _gdb_log, _log) = m_profile_transport(&dir, Vec::new(), "");
+        let message = transport.arm().err().expect("no RAM map").to_string();
+        assert!(
+            message.contains("info mtree") && message.contains("reset=loadvm"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn fast_reset_refuses_a_log_no_plugin_in_this_qemu_writes() {
+        // QEMU runs without the plugin, and a well-formed log from another
+        // run sits at dirty_log=: the guest's stores go unrecorded, so bhf
+        // stops at the first reset after a run rather than carry state over.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dirty.log");
+        crate::testsupport::DirtyLogFile::create(&path, 8, 64).unwrap();
+        let gdb_log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (client, stub_end) = duplex();
+        let stub = MockGdbStub::new(stub_end, Arc::clone(&gdb_log))
+            .with_region(0x1000, vec![0; 256])
+            .with_region(STATUS, vec![0; 256]);
+        thread::spawn(move || {
+            let _ = stub.serve();
+        });
+        let (transport, _qmp_log) = scripted_transport(client, FullSystemReset::Fast);
+        let mut session = transport.with_dirty_log(path).arm().unwrap();
+        session.run_input(b"a").unwrap();
+        let message = session.run_input(b"b").unwrap_err().to_string();
+        assert!(
+            message.contains("no dirty-page plugin saw it run") && message.contains("-plugin"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn fast_reset_stops_a_hung_guest_before_it_resets_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dirty.log");
+        let log = crate::testsupport::DirtyLogFile::create(&path, 8, 64).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_nodelay(true).unwrap();
+            let stub = fast_stub(
+                stream,
+                Arc::new(Mutex::new(Vec::new())),
+                stops(&[b"S05", b"S05", b""]),
+                log,
+            );
+            let _ = stub.serve();
+        });
+        let client = std::net::TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let (transport, qmp_log) = scripted_transport(client, FullSystemReset::Fast);
+        let mut session = transport
+            .with_dirty_log(path)
+            .with_exec_deadline(Some(Duration::from_millis(300)))
+            .arm()
+            .unwrap();
+        session.run_input(b"a").unwrap();
+        session.run_input(b"b").unwrap();
+        let hang = session.run_input(b"c").unwrap();
+        assert_eq!(hang.exit, ExitKind::Timeout);
+        let stops_before = count(&qmp_log, "stop");
+        let after = session.run_input(b"d").unwrap();
+        assert_eq!(
+            after.target.reset.map(|r| r.kind),
+            Some(ResetKind::DirtyPages)
+        );
+        assert_eq!(
+            count(&qmp_log, "stop"),
+            stops_before + 1,
+            "the hung guest is stopped before its reset"
+        );
+    }
+
+    #[test]
+    fn fast_reset_needs_the_dirty_page_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let (transport, _qmp_log, _gdb_log) = fast_transport(&dir, Vec::new());
+        let error = transport
+            .with_dirty_log(dir.path().join("absent.log"))
+            .arm()
+            .err()
+            .expect("no log, no fast reset");
+        let message = error.to_string();
+        assert!(message.contains("-plugin"), "{message}");
+
+        let (transport, _qmp_log, _gdb_log) =
+            duplex_transport(Vec::new(), vec![0; 64], FullSystemReset::Fast);
+        let message = transport.arm().err().expect("no log").to_string();
+        assert!(
+            message.contains("reset=fast") && message.contains("log"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_loadvm_reset_reports_what_it_took() {
+        let (transport, _qmp_log, _gdb_log) = wired_transport(&[7], b"S05".to_vec(), 64);
+        let mut session = transport.arm().unwrap();
+        let reset = session
+            .run_input(b"a")
+            .unwrap()
+            .target
+            .reset
+            .expect("a reset");
+        assert_eq!(reset.kind, ResetKind::Full);
+        assert_eq!(reset.pages, 0);
+    }
+
+    /// A channel whose reads come from `reads` in turn, an `Err` failing
+    /// that read; what is written to it is dropped.
+    struct ScriptedReads {
+        reads: std::collections::VecDeque<std::io::Result<Vec<u8>>>,
+    }
+
+    impl Read for ScriptedReads {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.reads.pop_front() {
+                Some(Ok(bytes)) => {
+                    assert!(bytes.len() <= buf.len(), "one read fits the buffer");
+                    buf[..bytes.len()].copy_from_slice(&bytes);
+                    Ok(bytes.len())
+                }
+                Some(Err(error)) => Err(error),
+                None => Ok(0),
+            }
+        }
+    }
+
+    impl Write for ScriptedReads {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failed_qmp_read_leaves_the_next_reply_intact() {
+        // A read that times out (the socket's io_timeout) or is interrupted
+        // must not leave the client serving stale buffer bytes: a caller
+        // that tries again reads the reply as QEMU sent it.
+        let reads = [
+            Ok(br#"{"QMP":{}}"#.to_vec()),
+            Ok(b"\n".to_vec()),
+            Ok(b"{\"return\":{}}\n".to_vec()),
+            Err(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+            Ok(b"{\"return\":{\"status\":\"paused\"}}\n".to_vec()),
+        ];
+        let mut qmp = QmpClient::new(ScriptedReads {
+            reads: reads.into_iter().collect(),
+        });
+        qmp.connect().unwrap();
+        qmp.execute("query-status", None)
+            .expect_err("the read timed out");
+        let status = qmp.execute("query-status", None).unwrap();
+        assert_eq!(status["status"], "paused");
+    }
+
+    #[test]
+    fn qmp_system_reset_waits_for_the_reset_event_in_either_order() {
+        // QEMU 8.2 sends the RESET event before the reply; a reply first and
+        // an event that comes later is waited for too.
+        for event_first in [true, false] {
+            let (client, mut server) = duplex();
+            let monitor = thread::spawn(move || {
+                let mut line = |text: &str| {
+                    server.write_all(text.as_bytes()).unwrap();
+                    server.write_all(b"\n").unwrap();
+                };
+                line(r#"{"QMP":{}}"#);
+                line(r#"{"return":{}}"#);
+                if event_first {
+                    line(r#"{"event":"RESET"}"#);
+                    line(r#"{"return":{}}"#);
+                } else {
+                    line(r#"{"return":{}}"#);
+                    thread::sleep(Duration::from_millis(150));
+                    line(r#"{"event":"RESET"}"#);
+                }
+                line(r#"{"return":{"status":"paused"}}"#);
+                server
+            });
+            let mut qmp = QmpClient::new(client);
+            qmp.connect().unwrap();
+            let started = Instant::now();
+            qmp.system_reset().unwrap();
+            if !event_first {
+                assert!(
+                    started.elapsed() >= Duration::from_millis(150),
+                    "system_reset returned before the RESET event"
+                );
+            }
+            // The next command's reply is not mistaken for the reset's.
+            let status = qmp.execute("query-status", None).unwrap();
+            assert_eq!(status["status"], "paused");
+            drop(monitor.join().unwrap());
+        }
     }
 
     #[test]

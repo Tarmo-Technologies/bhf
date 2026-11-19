@@ -579,10 +579,12 @@ pub struct FuzzArgs {
     /// `agent:tcp:HOST:PORT`, `agent:serial:/dev/ttyX[,baud=N]` (on-target agent),
     /// `gdb:HOST:PORT` (debug-probe/emulator gdbstub; needs
     /// `--transport-coverage-map`), and
-    /// `qemu-system:qmp=HOST:PORT,gdb=HOST:PORT[,snapshot=TAG][,reset=loadvm|persistent]`
+    /// `qemu-system:qmp=HOST:PORT,gdb=HOST:PORT[,snapshot=TAG][,reset=loadvm|persistent|fast]`
     /// (full-system; needs `--transport-coverage-map`; `reset=persistent`
     /// continues a firmware's own input loop and restores only after a
-    /// crash, hang or inconclusive run, and needs `done=`), and
+    /// crash, hang or inconclusive run, and needs `done=`; `reset=fast`
+    /// resets the machine and writes back the RAM pages the run wrote, which
+    /// bhf's QEMU plugin logs, and needs `dirty_log=PATH`), and
     /// `renode:monitor=HOST:PORT,gdb=HOST:PORT[,snapshot=PATH]` (a Renode
     /// board: its telnet monitor saves and loads the baseline; needs
     /// `--transport-coverage-map`). Live agent/gdb/qemu/renode backends are

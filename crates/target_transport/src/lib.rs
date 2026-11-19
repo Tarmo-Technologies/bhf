@@ -27,6 +27,9 @@
 //!   backend over `qemu-system-*`: a [`fullsystem::QmpClient`] drives the
 //!   snapshot lifecycle (`qmp_capabilities`, `stop`, `savevm`/`loadvm`) while
 //!   the [`gdb::GdbClient`] delivers input, runs, and reads the coverage ring.
+//!   [`fast_snapshot`] is its dirty-page fast snapshot (`reset=fast`): a
+//!   device reset plus the RAM pages a QEMU TCG plugin logged the guest
+//!   writing, put back from their baseline, in place of a `loadvm`.
 //! * [`renode::RenodeTransport`] — the same full-system lane over a Renode
 //!   board: a [`renode::RenodeMonitor`] (Renode's telnet monitor) saves and
 //!   loads the baseline with `Save`/`Load`, and gdb runs each input.
@@ -54,6 +57,7 @@ pub mod cmplog;
 pub mod coverage;
 pub mod cycles;
 pub mod error;
+pub mod fast_snapshot;
 pub mod fullsystem;
 pub mod gdb;
 pub mod outcome;
@@ -69,6 +73,10 @@ pub use agent::{AgentLimits, AgentSession, AgentTransport};
 pub use cmplog::{CmpLogRegion, Comparison};
 pub use coverage::{edges_from_events, MemoryBufferReader, SemihostingReader};
 pub use error::{Result, TransportError};
+pub use fast_snapshot::{
+    DirtyLog, DirtyPageSnapshot, DirtyPages, FastSnapshot, FastSnapshotLimits, GuestMemory,
+    PluginDirtyLog,
+};
 pub use fullsystem::{
     FullSystemReset, FullSystemSession, FullSystemTransport, GuestFaultStatus, QmpClient, QmpLimits,
 };
@@ -76,7 +84,9 @@ pub use gdb::{
     read_coverage_ring, stage_input, GdbClient, GdbConnection, GdbMemoryMap, GdbRemoteTransport,
     GdbSession, InputContract, ResetMode, StopReply,
 };
-pub use outcome::{ExitKind, Fault, FaultKind, RunOutcome, TargetObservation};
+pub use outcome::{
+    ExitKind, Fault, FaultKind, ResetKind, ResetObservation, RunOutcome, TargetObservation,
+};
 pub use renode::{RenodeLimits, RenodeMonitor, RenodeSession, RenodeTransport};
 pub use transport::{TargetSession, TargetTransport};
 

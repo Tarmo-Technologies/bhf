@@ -5203,6 +5203,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/target_transport/qemu_plugin/bhf_qemu_dirty_pages.c",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/target_transport/src/agent.rs",
       "license": "Apache-2.0"
     },
@@ -5220,6 +5224,10 @@
     },
     {
       "path": "crates/target_transport/src/error.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/target_transport/src/fast_snapshot.rs",
       "license": "Apache-2.0"
     },
     {
@@ -5856,6 +5864,10 @@
     },
     {
       "path": "docs/validation/2026-11-18-zephyr-agent.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/validation/2026-11-19-fullsystem-fast-snapshot.md",
       "license": "Apache-2.0"
     },
     {

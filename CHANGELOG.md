@@ -65,6 +65,26 @@
   `transport_profile.json` a `throughput` block (additive); `bhf replay`
   still restores before every input, and the session lane refuses
   `reset=persistent`.
+- `qemu-system:` takes `reset=fast,dirty_log=PATH`, a dirty-page fast
+  snapshot (#347): before each input a `system_reset` (a gdbstub monitor
+  command checked by the registers it leaves, else QMP) brings back the CPUs
+  and devices, and bhf writes back only the RAM pages the last run wrote,
+  which its QEMU TCG plugin (`crates/target_transport/qemu_plugin/`, loaded with
+  `-plugin`) logs, so a crash or hang needs no `loadvm`. A page is learned
+  from one `loadvm` the first time a run writes it; the baseline is the
+  machine as a reset leaves it, and memory goes by physical address. The
+  plugin runs inside QEMU (GPL-2.0), so `external-tools` now allows the
+  `qemu_plugin` subprocess id and `strict-permissive` refuses `reset=fast`;
+  a run with no log builds the plugin under `<work>/qemu-plugin/` and says
+  how to load it. On a Cortex-M core the plugin logs a bit-band alias store
+  as the RAM word it writes, and bhf restores the exception frames still
+  stacked at the stop; a frame stacked and unstacked before the stop in a
+  page no store wrote, and a device's DMA, are not restored (listed in
+  `transport_profile.json`'s `limitations`). A log no plugin in that QEMU
+  writes, or one a second session empties, stops the run, and `--workers`
+  specs that share a `dirty_log=` are refused. `TargetObservation` gains
+  `reset` (kind, time, pages; additive), `bhf replay` restores with `loadvm`,
+  and the session lane refuses `reset=fast`.
 - `bhf fuzz --target-transport renode:monitor=HOST:PORT,gdb=HOST:PORT[,snapshot=PATH]`
   fuzzes firmware on a Renode board (#340): Renode's telnet monitor saves the
   baseline with `Save` and restores it with `Load` before each input, and gdb

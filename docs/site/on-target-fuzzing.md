@@ -304,7 +304,8 @@ The flagship path: boot a `qemu-system-*` guest, attach QMP + gdb, take a
 `savevm` baseline, then per input `loadvm`-reset → write input → run → read the
 coverage ring. Deterministic and reset-clean; `reset=persistent` trades the
 `loadvm` per input for the firmware's own input loop (see
-[Persistent loop](#persistent-loop)). The CLI parses **TCP** `HOST:PORT`
+[Persistent loop](#persistent-loop)), and `reset=fast` for a machine reset
+plus the RAM pages the run wrote (see [Fast snapshot](#fast-snapshot)). The CLI parses **TCP** `HOST:PORT`
 endpoints for both `qmp=` and `gdb=` (there is no Unix-socket form), so expose
 QMP over TCP.
 
@@ -427,6 +428,108 @@ bhf fuzz bhf_work --harness H-C0001 \
   --target-transport "qemu-system:qmp=127.0.0.1:4444,gdb=127.0.0.1:3333,done=0x1a8,fault=0x20000100,reset=persistent" \
   --transport-coverage-map input=0x2000020c,input_cap=64,ring=0x20000004,write=0x20000204,wrapped=0x20000208,cap=512
 ```
+
+#### Fast snapshot
+
+`reset=fast,dirty_log=PATH` restores only what a run changed. Before each
+input but the first, BHF resets the machine with `system_reset`, which brings
+back every CPU and device (a HardFault's exception state included) and keeps
+RAM, then writes back over gdb the RAM pages the last run wrote, from their
+baseline. A crash or a hang needs no `loadvm`. The RAM the plugin cannot see
+written is the exception: see **What is not restored** below.
+
+BHF sends `system_reset` as a monitor command over the gdbstub (`qRcmd`, one
+round trip) and reads the register block after it, which must be the
+baseline's. A gdbstub that takes no monitor command, or registers that do
+not show the reset, switch the session to QMP `system_reset`, which waits for
+QEMU's `RESET` event; registers that still differ stop the run with an
+error, since a reset does not bring that machine back to its baseline. BHF
+reads the monitor every 128 resets so QEMU's QMP event backlog stays bounded.
+
+The pages come from bhf's QEMU TCG plugin, which logs the guest-physical
+page of every guest store to RAM in the file `dirty_log=` names. Load it into
+each emulator; with `--workers`, give each worker's QEMU a log of its own
+(`dirty_log=/tmp/bhf-dirty-{worker}.log`, and `log=` to match): specs that
+name one log are refused with exit 2.
+
+```sh
+# bhf_qemu_dirty_pages.c ships in bhf (crates/target_transport/qemu_plugin/); a run with
+# reset=fast and no log builds it under <work>/qemu-plugin/ and prints the line.
+cc -shared -fPIC -O2 -o libbhf_qemu_dirty_pages.so bhf_qemu_dirty_pages.c -lpthread
+
+qemu-system-arm -M mps2-an385 -kernel harness.elf -S \
+  -gdb tcp::3333 -qmp tcp:127.0.0.1:4444,server,nowait \
+  -drive if=none,file=scratch.qcow2,format=qcow2,id=sc0 \
+  -plugin ./libbhf_qemu_dirty_pages.so,log=/tmp/bhf-dirty.log &
+
+bhf fuzz bhf_work --harness H-C0001 \
+  --target-transport "qemu-system:qmp=127.0.0.1:4444,gdb=127.0.0.1:3333,done=0x1a8,fault=0x20000100,reset=fast,dirty_log=/tmp/bhf-dirty.log" \
+  --transport-coverage-map input=0x2000020c,input_cap=64,ring=0x20000004,write=0x20000204,wrapped=0x20000208,cap=512
+```
+
+- **The baseline** is the machine as a reset leaves it: arming sends
+  `system_reset` before the `savevm`, so the guest starts each input from its
+  reset vector, as it does from a fresh `-S` boot.
+- **Learning.** BHF learns a page's baseline the first time a run writes it:
+  that reset is a `loadvm`, after which BHF reads the page from the restored
+  guest. Once the pages a target writes are known, every reset is fast. The
+  pages QEMU's reset reloads by itself (each image segment it loaded into
+  RAM, from `info roms`) are neither learned nor written. Baselines are
+  capped at 64 MiB; a run that writes a page past the cap, a store whose
+  physical address QEMU does not report, a full log (65,536 pages by default,
+  `capacity=` on the plugin) and the reset after one that failed part way
+  all restore with `loadvm`.
+- **Addresses are physical.** The plugin logs physical pages, so the session
+  puts the gdbstub in QEMU's physical-memory mode (`Qqemu.PhyMemMode:1`); the
+  coverage map's addresses are physical, as they are on a core without an
+  MMU.
+- **Cortex-M cores.** When the gdbstub's target description is M-profile,
+  BHF reads QEMU's memory map (`info mtree -f`) at arm. A store through a
+  bit-band alias reaches RAM through QEMU's bit-band device, out of the
+  plugin's sight, so the plugin logs it as the RAM word it writes, for the
+  windows whose aliased memory is RAM. The core stacks an exception frame
+  without a store, so before each reset BHF reads `xPSR`, and while an
+  exception is active (a fault, or an interrupt the stop came in) the stack
+  pointer and `PSP`: it restores the stack from the stop's stack pointer up to
+  the baseline's (or the 4 KiB above it when the firmware moved the stack
+  more than 64 KiB away), and the frame at `PSP`.
+- **What is not restored**: RAM written by something other than a guest
+  store and that BHF does not know of: a device's DMA, and on a Cortex-M core
+  the frame of an exception taken and returned before the stop (an
+  interrupt), in a page no store dirtied. On other cores, the plugin does not
+  see what QEMU writes for the CPU outside an instruction's own stores, such
+  as an x86 interrupt's stack frame. Device state a reset does not clear (a
+  flash part's contents) is not restored either. When the firmware's
+  behaviour depends on any of these, use `reset=loadvm`.
+- **The log is checked.** After a run that reached a stop, the log must show
+  that the plugin saw the guest run in its current epoch, and its epoch must
+  be the one BHF left it in: a log no plugin in this QEMU writes (one left by
+  an earlier run), or one a second session empties, stops the run with an
+  error rather than carry state from one input to the next.
+- **Pages**: 256 bytes by default; `page_bits=N` on the plugin (6 to 16) sets
+  2^N.
+- **License profile.** The plugin runs inside QEMU (GPL-2.0), so `reset=fast`
+  runs under a profile that allows the `qemu_plugin` subprocess id:
+  `external-tools` (which asking for `reset=fast` opts into when
+  `BHF_PROFILE` is unset) or `research-lab`. `BHF_PROFILE=strict-permissive`
+  refuses it with exit 2.
+- **Host.** The plugin shares its log with bhf through POSIX `mmap`, so bhf
+  builds it on a Linux or macOS host only. On Windows use `reset=loadvm` or
+  `reset=persistent`.
+- **QEMU versions.** The plugin declares plugin API version 1, which QEMU 8.x
+  takes. For a QEMU that wants another, build it with
+  `-DBHF_QEMU_PLUGIN_VERSION=N` (or set `BHF_QEMU_PLUGIN_VERSION=N` for the
+  build `bhf fuzz` does); the calls it makes are the same in every version.
+- `bhf replay` and its minimization restore with `loadvm`, so a replay needs
+  no plugin. A finding's `transport_profile.json` names the fast snapshot in
+  `reset_mechanism` and what it does not restore in `limitations`, and each
+  `RunOutcome` reports the reset it followed (`kind`, `time`, `pages`). The
+  session lane (`--session-transport transport:qemu-system:...`) does not
+  take `reset=fast`, since its replay would rebuild the same transport.
+- On the RV-3 mps2-an385 image under QEMU 8.2.2, the fast snapshot's mean
+  reset took about a tenth or less of a `loadvm`'s, with the planted fault
+  among the inputs, in
+  `docs/validation/2026-11-19-fullsystem-fast-snapshot.md`.
 
 #### Renode boards
 
@@ -584,7 +687,7 @@ the backend's stdout, which the agent does not have: a profile over the
 agent captures nothing from replies and its oracles are the faults. The
 `gdb` and `qemu-system` backends take `--transport-coverage-map` here as
 they do for `--target-transport`; `qemu-system` does not take
-`reset=persistent` here. `--session-reset reconnect` (the default)
+`reset=persistent` or `reset=fast` here. `--session-reset reconnect` (the default)
 arms a fresh target session for each protocol session; `none` keeps one
 armed for the campaign.
 
@@ -809,11 +912,15 @@ gcc-arm-none-eabi libnewlib-dev libnewlib-arm-none-eabi gcc-arm-linux-gnueabihf 
 RV-1 through RV-3 were validated on QEMU in September 2026 (see
 `docs/validation/2026-09-27-hil-emu-live-qemu.md`). RV-4 passed locally on
 October 4, 2026; hosted HIL-emu workflow evidence remains pending. The script
-also runs the ignored RV-3 benchmark, which measures `reset=persistent`
-against a `loadvm` per input in one test and needs 3x
-(`docs/validation/2026-11-19-fullsystem-persistent-loop.md`), on the nightly
-schedule, a manual dispatch or a local run; a pull request or a push skips
-it.
+also runs the ignored RV-3 benchmarks, on the nightly schedule, a manual
+dispatch or a local run (a pull request or a push skips them), one after the
+other: one measures `reset=persistent` against a `loadvm` per input in one
+test and needs 3x the runs
+(`docs/validation/2026-11-19-fullsystem-persistent-loop.md`), the other
+`reset=fast` against a `loadvm`, with the planted fault among the inputs, and
+needs a mean reset at most a tenth of a `loadvm`'s
+(`docs/validation/2026-11-19-fullsystem-fast-snapshot.md`). The script needs
+the host `cc` for the fast snapshot's QEMU plugin.
 
 ---
 

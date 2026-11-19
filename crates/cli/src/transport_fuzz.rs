@@ -37,9 +37,10 @@
 //! * `agent:serial:PATH[,baud=N]` — [`AgentTransport`] over a serial device,
 //!   opened raw with reads bounded by `--timeout`.
 //! * `gdb:HOST:PORT`         — [`GdbRemoteTransport`]; needs `--transport-coverage-map`.
-//! * `qemu-system:qmp=HOST:PORT,gdb=HOST:PORT[,snapshot=TAG][,reset=loadvm|persistent]` —
-//!   [`FullSystemTransport`]; needs `--transport-coverage-map`, and `reset=persistent`
-//!   needs `done=`.
+//! * `qemu-system:qmp=HOST:PORT,gdb=HOST:PORT[,snapshot=TAG][,reset=loadvm|persistent|fast]`
+//!   — [`FullSystemTransport`]; needs `--transport-coverage-map`, `reset=persistent`
+//!   needs `done=`, and `reset=fast` needs `dirty_log=PATH`, the log of the QEMU
+//!   dirty-page plugin (#347).
 //! * `renode:monitor=HOST:PORT,gdb=HOST:PORT[,snapshot=PATH]` — [`RenodeTransport`]
 //!   over Renode's telnet monitor; needs `--transport-coverage-map`.
 //!
@@ -219,6 +220,9 @@ pub(crate) enum TransportPlan {
         snapshot_tag: String,
         /// How the guest is brought back before each input (`reset=`).
         reset: FullSystemReset,
+        /// The QEMU dirty-page plugin's log `reset=fast` reads (`dirty_log=`,
+        /// #347).
+        dirty_log: Option<PathBuf>,
         /// Completion breakpoint `(address, RSP kind)` planted at arm so a
         /// self-HardFaulting Cortex-M target halts back to the debugger instead
         /// of running `c` unbounded (#71). `None` for targets that trap on their
@@ -339,6 +343,13 @@ pub(crate) enum TransportSpecError {
 
     #[error("coverage ring capacity {cap} is not representable as a host-sized length")]
     CapTooLarge { cap: u64 },
+
+    /// The license profile does not allow what the spec asks for (#347).
+    #[error("{backend}: {reason}")]
+    NotAllowed {
+        backend: &'static str,
+        reason: String,
+    },
 
     /// A transport constructor rejected the spec (e.g. an unsafe snapshot tag).
     #[error(transparent)]
@@ -559,6 +570,7 @@ impl TransportPlan {
                 input,
                 snapshot_tag,
                 reset,
+                dirty_log,
                 harness_done,
                 fault_status,
                 firmware: _,
@@ -568,6 +580,17 @@ impl TransportPlan {
                 semihosting,
                 notes: _,
             } => {
+                // reset=fast runs bhf's plugin inside QEMU: a license profile
+                // must allow it (#347).
+                if reset == FullSystemReset::Fast {
+                    crate::auto::external_tools::qemu_plugin_gate(
+                        crate::auto::external_tools::qemu_plugin_profile(),
+                    )
+                    .map_err(|reason| TransportSpecError::NotAllowed {
+                        backend: "qemu-system",
+                        reason,
+                    })?;
+                }
                 let mut transport = FullSystemTransport::new(
                     move || connect_tcp_bounded(&qmp_host, qmp_port, io_timeout),
                     move || connect_tcp_bounded(&gdb_host, gdb_port, io_timeout),
@@ -580,6 +603,9 @@ impl TransportPlan {
                 .with_task_id(task_id)
                 .with_cmplog(cmplog)
                 .with_semihosting_coverage(semihosting);
+                if let Some(log) = dirty_log {
+                    transport = transport.with_dirty_log(log);
+                }
                 // Wire the completion contract (#71) and the firmware
                 // fault-status channel (#72) the parser captured, so the guide's
                 // `bhf fuzz --target-transport qemu-system:...` command plants
@@ -642,12 +668,35 @@ impl TransportPlan {
     /// The plan `bhf replay` rebuilds a finding's target from: a persistent
     /// `qemu-system:` spec restores the snapshot before every input instead,
     /// so each replay and minimization run starts from the snapshot rather
-    /// than from whatever the run before it left.
+    /// than from whatever the run before it left. A `reset=fast` spec does
+    /// too, so a replay needs no dirty-page plugin in QEMU (#347).
     pub(crate) fn replay_from_baseline(mut self) -> Self {
-        if let Self::QemuSystem { reset, .. } = &mut self {
+        if let Self::QemuSystem {
+            reset, dirty_log, ..
+        } = &mut self
+        {
             *reset = FullSystemReset::Loadvm;
+            *dirty_log = None;
         }
         self
+    }
+
+    /// Whether the plan resets with the dirty-page fast snapshot
+    /// (`qemu-system:...,reset=fast`, #347).
+    pub(crate) fn resets_fast(&self) -> bool {
+        self.dirty_log().is_some()
+    }
+
+    /// The dirty-page log a `reset=fast` spec reads (`dirty_log=`, #347).
+    pub(crate) fn dirty_log(&self) -> Option<&Path> {
+        match self {
+            Self::QemuSystem {
+                reset: FullSystemReset::Fast,
+                dirty_log,
+                ..
+            } => dirty_log.as_deref(),
+            _ => None,
+        }
     }
 
     /// Whether the plan continues the guest's own input loop between clean
@@ -771,9 +820,10 @@ fn parse_qemu_system(
     let reset = match parsed.reset.as_deref() {
         None | Some("loadvm") => FullSystemReset::Loadvm,
         Some("persistent") => FullSystemReset::Persistent,
+        Some("fast") => FullSystemReset::Fast,
         Some(other) => {
             return Err(malformed(format!(
-                "reset={other:?}: expected loadvm or persistent"
+                "reset={other:?}: expected loadvm, persistent or fast"
             )))
         }
     };
@@ -784,6 +834,22 @@ fn parse_qemu_system(
                 .to_owned(),
         ));
     }
+    match (reset, &parsed.dirty_log) {
+        (FullSystemReset::Fast, None) => {
+            return Err(malformed(
+                "reset=fast needs dirty_log=PATH: the log the QEMU dirty-page plugin writes \
+                 (-plugin libbhf_qemu_dirty_pages.so,log=PATH)"
+                    .to_owned(),
+            ))
+        }
+        (FullSystemReset::Loadvm | FullSystemReset::Persistent, Some(_)) => {
+            return Err(malformed(
+                "dirty_log= is the dirty-page log reset=fast reads; give reset=fast with it"
+                    .to_owned(),
+            ))
+        }
+        _ => {}
+    }
     Ok(TransportPlan::QemuSystem {
         qmp_host: parsed.control.0,
         qmp_port: parsed.control.1,
@@ -793,6 +859,7 @@ fn parse_qemu_system(
         input,
         snapshot_tag: parsed.snapshot,
         reset,
+        dirty_log: parsed.dirty_log,
         harness_done: parsed.harness_done,
         fault_status: parsed.fault_status,
         firmware: parsed.firmware,
@@ -817,6 +884,8 @@ struct SnapshotSpec {
     task_id: Option<u64>,
     /// `reset=`, which only `qemu-system:` takes.
     reset: Option<String>,
+    /// `dirty_log=`, which only `qemu-system:` takes (#347).
+    dirty_log: Option<PathBuf>,
     notes: Vec<String>,
 }
 
@@ -837,6 +906,7 @@ impl SnapshotSpec {
         let mut cycles = CycleKeys::default();
         let mut task_id: Option<u64> = None;
         let mut reset: Option<String> = None;
+        let mut dirty_log: Option<PathBuf> = None;
         let takes_reset = backend == "qemu-system";
 
         let malformed = |reason: String| TransportSpecError::Malformed {
@@ -863,6 +933,7 @@ impl SnapshotSpec {
                 "firmware" => firmware = Some(PathBuf::from(value)),
                 "task_id" => task_id = Some(parse_int("task_id", value)?),
                 "reset" if takes_reset => reset = Some(value.to_owned()),
+                "dirty_log" if takes_reset => dirty_log = Some(PathBuf::from(value)),
                 key if cycles.take(key, value)? => {}
                 key if contract.take(key, value)? => {}
                 other => {
@@ -870,7 +941,11 @@ impl SnapshotSpec {
                         "unknown key {other:?}; allowed: {control_key}, gdb, snapshot, done, \
                          done_kind, fault, fault_width, fault_clear, firmware, cycles, cpu_hz, \
                          task_id{}",
-                        if takes_reset { ", reset" } else { "" }
+                        if takes_reset {
+                            ", reset, dirty_log"
+                        } else {
+                            ""
+                        }
                     )))
                 }
             }
@@ -890,6 +965,7 @@ impl SnapshotSpec {
             cycles: cycles.counter(backend, spec)?,
             task_id,
             reset,
+            dirty_log,
             notes,
         })
     }
@@ -1900,15 +1976,20 @@ fn run_worker(
 const TRANSPORT_PROFILE_SCHEMA: &str = "bhf.transport-profile.v1";
 pub(crate) const TRANSPORT_PROFILE_FILE: &str = "transport_profile.json";
 
-/// Whether a `qemu-system:` spec continues the guest's own input loop
-/// between clean inputs (`reset=persistent`).
-fn resets_persistently(spec: &str) -> bool {
+/// Whether a `qemu-system:` spec names `reset=<mode>`.
+fn qemu_system_resets_with(spec: &str, mode: &str) -> bool {
     let spec = spec.trim();
     spec.starts_with("qemu-system:")
         && spec.split(',').any(|part| {
             part.split_once('=')
-                .is_some_and(|(key, value)| key.trim() == "reset" && value.trim() == "persistent")
+                .is_some_and(|(key, value)| key.trim() == "reset" && value.trim() == mode)
         })
+}
+
+/// Whether a `qemu-system:` spec continues the guest's own input loop
+/// between clean inputs (`reset=persistent`).
+fn resets_persistently(spec: &str) -> bool {
+    qemu_system_resets_with(spec, "persistent")
 }
 
 /// The backend and reset mechanism a spec implies, for the replay profile.
@@ -1923,6 +2004,12 @@ fn backend_and_reset(spec: &str) -> (&'static str, &'static str) {
             "qemu-system",
             "guest persistent loop; qmp loadvm before the first input and after a crash, hang \
              or inconclusive run",
+        )
+    } else if qemu_system_resets_with(spec, "fast") {
+        (
+            "qemu-system",
+            "dirty-page fast snapshot: system_reset and the RAM pages the last run wrote put \
+             back over gdb; qmp loadvm while a written page has no baseline yet",
         )
     } else if spec.starts_with("qemu-system:") {
         ("qemu-system", "qmp savevm/loadvm snapshot")
@@ -1971,6 +2058,15 @@ fn persist_transport_profile(
         limitations.push(
             "reset=persistent: guest state carries over between clean inputs, so a finding \
              may depend on the inputs before it; bhf replay replays it from the snapshot",
+        );
+    }
+    if qemu_system_resets_with(spec, "fast") {
+        limitations.push(
+            "reset=fast: devices come back by a machine reset, and RAM written out of the \
+             dirty-page log's sight is not put back: a device's DMA, and on a Cortex-M core the \
+             frame of an exception taken and returned before the stop where no store dirtied its \
+             page (frames still stacked at the stop and bit-band stores are put back); bhf replay \
+             restores with loadvm",
         );
     }
     // Persist the timing contract so `bhf replay` can reproduce a timing finding:
@@ -2418,6 +2514,21 @@ fn run_inner(mut args: FuzzArgs) -> Result<TransportFuzzSummary, i32> {
         );
     }
 
+    // Each worker's QEMU writes its own dirty-page log (#347).
+    refuse_shared_dirty_logs(&plans).map_err(|error| {
+        crate::bhfeprintln!("bhf fuzz --target-transport: {error}");
+        2
+    })?;
+    // reset=fast reads the log QEMU's dirty-page plugin writes: without one,
+    // build the plugin and say how to start QEMU with it (#347).
+    for plan in &plans {
+        let profile = crate::auto::external_tools::qemu_plugin_profile();
+        fast_snapshot_preflight(plan, &args.work_dir, profile).map_err(|error| {
+            crate::bhfeprintln!("bhf fuzz --target-transport: {error}");
+            2
+        })?;
+    }
+
     let fail = |error: String| {
         crate::bhfeprintln!("bhf fuzz --target-transport: {error}");
         3
@@ -2488,6 +2599,77 @@ fn run_inner(mut args: FuzzArgs) -> Result<TransportFuzzSummary, i32> {
         );
     }
     Ok(summary)
+}
+
+/// Refuse `--workers` plans that name one dirty-page log (#347): two plugins
+/// writing one file, and two sessions emptying it, would each take the
+/// other's pages, so a guest's writes would go unrestored.
+fn refuse_shared_dirty_logs(plans: &[TransportPlan]) -> Result<(), String> {
+    let mut seen: Vec<(PathBuf, usize)> = Vec::new();
+    for (worker, plan) in plans.iter().enumerate() {
+        let Some(log) = plan.dirty_log() else {
+            continue;
+        };
+        let key = comparable_path(log);
+        if let Some((_, first)) = seen.iter().find(|(path, _)| *path == key) {
+            return Err(format!(
+                "workers {first} and {worker} both name the dirty-page log {}: each worker's \
+                 qemu-system needs a log of its own; put {{worker}} in dirty_log= \
+                 (dirty_log=/tmp/bhf-dirty-{{worker}}.log)",
+                log.display()
+            ));
+        }
+        seen.push((key, worker));
+    }
+    Ok(())
+}
+
+/// `path` in a form two spellings of one file share: canonical when it
+/// exists, else its directory's canonical form and its name, else absolute.
+fn comparable_path(path: &Path) -> PathBuf {
+    if let Ok(path) = std::fs::canonicalize(path) {
+        return path;
+    }
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        if let Ok(parent) = std::fs::canonicalize(parent) {
+            return parent.join(name);
+        }
+    }
+    std::path::absolute(path).unwrap_or_else(|_| path.to_owned())
+}
+
+/// Check a `reset=fast` plan before anything connects (#347): the license
+/// profile must allow bhf's plugin inside QEMU, and QEMU must be running it.
+/// When the dirty-page log is not there, build the plugin under
+/// `<work_dir>/qemu-plugin/` and say how to start QEMU with it.
+fn fast_snapshot_preflight(
+    plan: &TransportPlan,
+    work_dir: &Path,
+    profile: config::Profile,
+) -> Result<(), String> {
+    let Some(log) = plan.dirty_log() else {
+        return Ok(());
+    };
+    crate::auto::external_tools::qemu_plugin_gate(profile)?;
+    let Err(error) = target_transport::PluginDirtyLog::open(log) else {
+        return Ok(());
+    };
+    let out_dir = work_dir.join("qemu-plugin");
+    match crate::auto::external_tools::build_qemu_dirty_page_plugin(&out_dir) {
+        Ok(library) => Err(format!(
+            "{error}. bhf built the plugin at {}: start qemu-system with -plugin {},log={} \
+             and run again",
+            library.display(),
+            library.display(),
+            log.display()
+        )),
+        Err(build) => Err(format!("{error}. bhf could not build the plugin: {build}")),
+    }
 }
 
 /// Load seeds from `--seed-input` / `--seed-file`, bounding each to
@@ -2828,6 +3010,7 @@ mod tests {
                 harness_done,
                 fault_status,
                 reset,
+                dirty_log,
                 firmware: _,
                 cycles: _,
                 task_id: _,
@@ -2841,6 +3024,7 @@ mod tests {
                     FullSystemReset::Loadvm,
                     "a loadvm per input by default"
                 );
+                assert_eq!(dirty_log, None);
                 assert_eq!(input.capacity, 64);
                 assert_eq!(qmp_host, "127.0.0.1");
                 assert_eq!(qmp_port, 4444);
@@ -3095,8 +3279,11 @@ mod tests {
         // The guest parks at the completion breakpoint between inputs.
         let error = reset_of("qemu-system:qmp=h:1,gdb=h:2,reset=persistent").unwrap_err();
         assert!(error.contains("reset=persistent needs done="), "{error}");
-        let error = reset_of("qemu-system:qmp=h:1,gdb=h:2,done=0x1a8,reset=fast").unwrap_err();
-        assert!(error.contains("expected loadvm or persistent"), "{error}");
+        let error = reset_of("qemu-system:qmp=h:1,gdb=h:2,done=0x1a8,reset=quick").unwrap_err();
+        assert!(
+            error.contains("expected loadvm, persistent or fast"),
+            "{error}"
+        );
         // Renode's Load is the only reset it has.
         let error = TransportPlan::parse(
             "renode:monitor=h:1,gdb=h:2,done=0x1a8,reset=persistent",
@@ -3116,6 +3303,274 @@ mod tests {
         assert_eq!(
             backend_and_reset("qemu-system:qmp=h:1,gdb=h:2,reset=loadvm"),
             ("qemu-system", "qmp savevm/loadvm snapshot")
+        );
+    }
+
+    /// #347: `reset=fast` takes the dirty-page log the QEMU plugin writes,
+    /// and only it does.
+    #[test]
+    fn the_qemu_system_spec_takes_a_fast_reset_with_its_dirty_page_log() {
+        let map_spec = "input=4096,input_cap=64,ring=16384,write=20480,wrapped=20736,cap=32";
+        let parse = |spec: &str| TransportPlan::parse(spec, Some(map_spec));
+        let plan =
+            parse("qemu-system:qmp=h:1,gdb=h:2,reset=fast,dirty_log=/run/dirty.log").unwrap();
+        let TransportPlan::QemuSystem {
+            reset, dirty_log, ..
+        } = &plan
+        else {
+            panic!("expected QemuSystem, got {plan:?}");
+        };
+        assert_eq!(*reset, FullSystemReset::Fast);
+        assert_eq!(dirty_log.as_deref(), Some(Path::new("/run/dirty.log")));
+        assert_eq!(plan.dirty_log(), Some(Path::new("/run/dirty.log")));
+
+        let error = parse("qemu-system:qmp=h:1,gdb=h:2,reset=fast")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reset=fast needs dirty_log=PATH"), "{error}");
+        let error = parse("qemu-system:qmp=h:1,gdb=h:2,dirty_log=/run/dirty.log")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("give reset=fast with it"), "{error}");
+        // Renode keeps its own Load.
+        let error = TransportPlan::parse(
+            "renode:monitor=h:1,gdb=h:2,dirty_log=/run/dirty.log",
+            Some(RENODE_MAP),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("unknown key \"dirty_log\""), "{error}");
+
+        let (backend, reset) =
+            backend_and_reset("qemu-system:qmp=h:1,gdb=h:2,reset=fast,dirty_log=/run/d.log");
+        assert_eq!(backend, "qemu-system");
+        assert!(reset.starts_with("dirty-page fast snapshot"), "{reset}");
+
+        // A replay restores with loadvm, so it needs no plugin in QEMU.
+        let replay = plan.replay_from_baseline();
+        let TransportPlan::QemuSystem {
+            reset, dirty_log, ..
+        } = &replay
+        else {
+            panic!("expected QemuSystem, got {replay:?}");
+        };
+        assert_eq!((*reset, dirty_log), (FullSystemReset::Loadvm, &None));
+        assert_eq!(replay.dirty_log(), None);
+    }
+
+    /// #347: before anything connects, a `reset=fast` run with no plugin log
+    /// gets the plugin built and the `-plugin` argument to start QEMU with; a
+    /// profile that does not allow the plugin is refused first.
+    #[test]
+    fn a_fast_reset_without_the_plugins_log_builds_the_plugin_and_says_how_to_load_it() {
+        let work = crate::test_support::TestDir::new("fast-preflight");
+        let log = work.join("dirty.log");
+        let map_spec = "input=4096,input_cap=64,ring=16384,write=20480,wrapped=20736,cap=32";
+        let plan = TransportPlan::parse(
+            &format!(
+                "qemu-system:qmp=h:1,gdb=h:2,reset=fast,dirty_log={}",
+                log.display()
+            ),
+            Some(map_spec),
+        )
+        .unwrap();
+
+        let refused =
+            fast_snapshot_preflight(&plan, &work, config::Profile::StrictPermissive).unwrap_err();
+        assert!(refused.contains("strict-permissive"), "{refused}");
+        assert!(
+            !work.join("qemu-plugin").exists(),
+            "nothing is built when refused"
+        );
+
+        let message =
+            fast_snapshot_preflight(&plan, &work, config::Profile::ExternalTools).unwrap_err();
+        let library = work.join("qemu-plugin").join("libbhf_qemu_dirty_pages.so");
+        if cfg!(unix) && which::which("cc").is_ok() && std::env::var_os("CC").is_none() {
+            assert!(library.is_file(), "{message}");
+            assert!(
+                message.contains(&format!(
+                    "-plugin {},log={}",
+                    library.display(),
+                    log.display()
+                )),
+                "{message}"
+            );
+        } else {
+            assert!(message.contains("dirty-page log"), "{message}");
+        }
+        if !cfg!(unix) {
+            assert!(message.contains("Linux or macOS host only"), "{message}");
+            assert!(!library.exists(), "{message}");
+        }
+
+        // With the plugin's log there, the run goes on.
+        target_transport::testsupport::DirtyLogFile::create(&log, 8, 16).unwrap();
+        assert_eq!(
+            fast_snapshot_preflight(&plan, &work, config::Profile::ExternalTools),
+            Ok(())
+        );
+        // A plan that is not reset=fast has nothing to check.
+        let loadvm = TransportPlan::parse("qemu-system:qmp=h:1,gdb=h:2", Some(map_spec)).unwrap();
+        assert_eq!(
+            fast_snapshot_preflight(&loadvm, &work, config::Profile::StrictPermissive),
+            Ok(())
+        );
+    }
+
+    /// #347: `--workers` specs that resolve to one dirty-page log are
+    /// refused, however the path is spelled; a log per worker is not.
+    #[test]
+    fn workers_that_would_share_a_dirty_page_log_are_refused() {
+        let dir = crate::test_support::TestDir::new("fast-workers");
+        let map_spec = "input=4096,input_cap=64,ring=16384,write=20480,wrapped=20736,cap=32";
+        let plans = |template: &str| {
+            (0..2)
+                .map(|worker| {
+                    TransportPlan::parse(&resolve_worker_spec(template, worker), Some(map_spec))
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        let shared = format!(
+            "qemu-system:qmp=127.0.0.1:{{4444+worker}},gdb=127.0.0.1:{{3333+worker}},reset=fast,\
+             dirty_log={}",
+            dir.join("dirty.log").display()
+        );
+        let error = refuse_shared_dirty_logs(&plans(&shared)).unwrap_err();
+        assert!(
+            error.contains("workers 0 and 1") && error.contains("{worker}"),
+            "{error}"
+        );
+
+        // One file under two spellings, there or not yet.
+        for exists in [false, true] {
+            if exists {
+                std::fs::write(dir.join("dirty.log"), b"").unwrap();
+            }
+            let spelled = [
+                dir.join("dirty.log"),
+                dir.join(".").join("sub").join("..").join("dirty.log"),
+            ];
+            std::fs::create_dir_all(dir.join("sub")).unwrap();
+            let two: Vec<TransportPlan> = spelled
+                .iter()
+                .enumerate()
+                .map(|(worker, log)| {
+                    TransportPlan::parse(
+                        &format!(
+                            "qemu-system:qmp=127.0.0.1:{},gdb=127.0.0.1:{},reset=fast,dirty_log={}",
+                            4444 + worker,
+                            3333 + worker,
+                            log.display()
+                        ),
+                        Some(map_spec),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            assert!(
+                refuse_shared_dirty_logs(&two).is_err(),
+                "exists={exists}: {spelled:?}"
+            );
+        }
+
+        let own = format!(
+            "qemu-system:qmp=127.0.0.1:{{4444+worker}},gdb=127.0.0.1:{{3333+worker}},reset=fast,\
+             dirty_log={}",
+            dir.join("dirty-{worker}.log").display()
+        );
+        assert_eq!(refuse_shared_dirty_logs(&plans(&own)), Ok(()));
+        // Plans without a fast reset have no log to share.
+        let loadvm = "qemu-system:qmp=127.0.0.1:{4444+worker},gdb=127.0.0.1:{3333+worker}";
+        assert_eq!(refuse_shared_dirty_logs(&plans(loadvm)), Ok(()));
+    }
+
+    /// #347: a `reset=fast` spec builds a transport that, against a mock
+    /// monitor and gdb server whose guest logs its stores, learns the pages
+    /// with one loadvm and then resets with system_reset alone.
+    #[test]
+    fn a_fast_qemu_system_spec_builds_a_transport_that_resets_without_a_loadvm() {
+        use std::net::TcpListener;
+        use target_transport::testsupport::{
+            encode_event_stream, simulate_ring, DirtyLogFile, MockGdbStub, MockQmpServer,
+        };
+        let work = crate::test_support::TestDir::new("fast-transport");
+        let log_path = work.join("dirty.log");
+        let log = DirtyLogFile::create(&log_path, 8, 64).unwrap();
+        let qmp_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let gdb_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let qmp_port = qmp_listener.local_addr().unwrap().port();
+        let gdb_port = gdb_listener.local_addr().unwrap().port();
+        let qmp_log = Arc::new(Mutex::new(Vec::new()));
+        let gdb_log = Arc::new(Mutex::new(Vec::new()));
+        {
+            let qmp_log = Arc::clone(&qmp_log);
+            thread::spawn(move || {
+                let (stream, _) = qmp_listener.accept().unwrap();
+                let _ = MockQmpServer::new(stream, qmp_log).serve();
+            });
+        }
+        {
+            let gdb_log = Arc::clone(&gdb_log);
+            thread::spawn(move || {
+                let (stream, _) = gdb_listener.accept().unwrap();
+                stream.set_nodelay(true).unwrap();
+                let events: Vec<event_log::Event> = [0x10, 0x11]
+                    .into_iter()
+                    .map(|id| event_log::Event::Crumb { id })
+                    .collect();
+                let (image, write, wrapped) = simulate_ring(&encode_event_stream(&events), 64);
+                let mut words = vec![0_u8; 512];
+                words[..4].copy_from_slice(&write.to_le_bytes());
+                words[0x100] = u8::from(wrapped);
+                let mut ring = image;
+                ring.resize(256, 0);
+                let _ = MockGdbStub::new(stream, gdb_log)
+                    .with_region(0x1000, vec![0; 256])
+                    .with_region(0x4000, ring)
+                    .with_region(0x5000, words)
+                    .with_run_write(0x5000, write.to_le_bytes().to_vec())
+                    .with_run_write(0x5100, vec![u8::from(wrapped)])
+                    .with_dirty_log(log)
+                    .serve();
+            });
+        }
+        let spec = format!(
+            "qemu-system:qmp=127.0.0.1:{qmp_port},gdb=127.0.0.1:{gdb_port},reset=fast,\
+             dirty_log={}",
+            log_path.display()
+        );
+        let plan = TransportPlan::parse(&spec, Some(PERSISTENT_MAP)).unwrap();
+        let transport = plan.into_transport(Some(Duration::from_secs(10))).unwrap();
+        let mut session = transport.arm().unwrap();
+        for input in [b"abc", b"def", b"ghi"] {
+            let outcome = session.run_input(input).unwrap();
+            assert_eq!(outcome.exit, ExitKind::Ok, "{outcome:?}");
+            assert_eq!(outcome.coverage_edges, [0x10, 0x11]);
+        }
+        let count = |entry: &str| {
+            qmp_log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|line| line.as_str() == entry)
+                .count()
+        };
+        assert_eq!(
+            count("hmp:loadvm bhf-baseline"),
+            1,
+            "{:?}",
+            qmp_log.lock().unwrap()
+        );
+        assert_eq!(count("system_reset"), 1, "arm's: the fast ones go over gdb");
+        let gdb = gdb_log.lock().unwrap();
+        assert!(gdb.iter().any(|packet| packet == "Qqemu.PhyMemMode:1"));
+        // `monitor system_reset` before the third input.
+        let monitor_reset = "qRcmd,73797374656d5f7265736574";
+        assert_eq!(
+            gdb.iter().filter(|packet| *packet == monitor_reset).count(),
+            1
         );
     }
 
