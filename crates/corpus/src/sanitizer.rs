@@ -995,7 +995,16 @@ fn parse_python_finding(stderr: &str) -> Option<SanitizerReport> {
 
 /// Parse CPython traceback frames (`  File "x.py", line N, in func`), skipping the
 /// bhf driver/harness/coverage frames so the top frame is the target's code.
+/// The frames of a file the driver names as glue (`== bhf python glue: <file>`,
+/// a harness the project wrote) are skipped too, unless every other frame
+/// is: the exception was then raised in the harness itself.
 fn parse_python_stack_frames(stderr: &str) -> Vec<StackFrame> {
+    const GLUE: &str = "== bhf python glue: ";
+    let glue: Vec<&str> = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix(GLUE))
+        .map(str::trim_end)
+        .collect();
     let mut frames = Vec::new();
     for raw in stderr.lines() {
         let line = raw.trim();
@@ -1029,6 +1038,10 @@ fn parse_python_stack_frames(stderr: &str) -> Vec<StackFrame> {
             file: Some(file.to_owned()),
             line: line_no,
         });
+    }
+    let is_glue = |frame: &StackFrame| frame.file.as_deref().is_some_and(|f| glue.contains(&f));
+    if frames.iter().any(|frame| !is_glue(frame)) {
+        frames.retain(|frame| !is_glue(frame));
     }
     frames
 }
@@ -2534,6 +2547,47 @@ java.lang.ArrayIndexOutOfBoundsException: Index 8 out of bounds for length 1
         assert_eq!(r.stack[0].function, "parse_record");
         assert_eq!(r.stack[0].file.as_deref(), Some("/proj/recordparser.py"));
         assert_eq!(r.stack[0].line, Some(18));
+    }
+
+    /// A harness the project wrote (an Atheris harness) only hands the input
+    /// on: the driver names its file as glue, and the stack starts at the
+    /// first frame past it, unless the exception was raised in the harness
+    /// itself.
+    #[test]
+    fn python_finding_skips_the_frames_of_a_file_the_driver_names_as_glue() {
+        let through = "== bhf python finding: KeyError: 2\n\
+                       == bhf python glue: /proj/fuzz/fuzz_widget.py\n\
+                       Traceback (most recent call last):\n\
+                       \x20 File \"/w/bhf_driver.py\", line 99, in _run_input\n\
+                       \x20 File \"/w/bhfgen/harness.py\", line 30, in bhf_run_one\n\
+                       \x20 File \"/proj/fuzz/fuzz_widget.py\", line 7, in TestOneInput\n\
+                       \x20 File \"/proj/widget/__init__.py\", line 5, in parse_record\n\
+                       KeyError: 2\n";
+        let r = parse_sanitizer_report(through).expect("python finding");
+        let frames: Vec<(&str, Option<&str>, Option<u32>)> = r
+            .stack
+            .iter()
+            .map(|f| (f.function.as_str(), f.file.as_deref(), f.line))
+            .collect();
+        assert_eq!(
+            frames,
+            [("parse_record", Some("/proj/widget/__init__.py"), Some(5))]
+        );
+        // Raised in the harness itself: its frame is where the bug is.
+        let own = "== bhf python finding: AssertionError: \n\
+                   == bhf python glue: /proj/fuzz/fuzz_widget.py\n\
+                   Traceback (most recent call last):\n\
+                   \x20 File \"/w/bhfgen/harness.py\", line 30, in bhf_run_one\n\
+                   \x20 File \"/proj/fuzz/fuzz_widget.py\", line 9, in TestOneInput\n\
+                   AssertionError\n";
+        let r = parse_sanitizer_report(own).expect("python finding");
+        assert_eq!(r.stack.len(), 1, "{:?}", r.stack);
+        assert_eq!(r.stack[0].function, "TestOneInput");
+        assert_eq!(r.stack[0].line, Some(9));
+        // No glue named: the frame is the target's, as before.
+        let unnamed = through.replace("== bhf python glue: /proj/fuzz/fuzz_widget.py\n", "");
+        let r = parse_sanitizer_report(&unnamed).expect("python finding");
+        assert_eq!(r.stack[0].function, "TestOneInput");
     }
 
     #[test]

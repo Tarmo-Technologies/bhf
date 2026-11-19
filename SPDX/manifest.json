@@ -2275,6 +2275,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_atheris_harness.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_attempt.rs",
       "license": "Apache-2.0"
     },

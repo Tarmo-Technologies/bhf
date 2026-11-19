@@ -461,8 +461,8 @@ struct TargetEntry<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     collector: Option<serde_json::Value>,
     /// Set when the target is a harness the project ships rather than one bhf
-    /// generated (a Go native fuzz test): its origin, entry point and the seeds
-    /// it came with. Omitted for a generated target.
+    /// generated (a Go native fuzz test, an Atheris harness): its origin, entry
+    /// point and the seeds it came with. Omitted for a generated target.
     #[serde(skip_serializing_if = "Option::is_none")]
     provided_harness: Option<crate::auto::provided::ProvidedRecord>,
 }

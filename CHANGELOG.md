@@ -2981,6 +2981,15 @@
   provided harnesses rank ahead of generated targets; `run.json` marks each
   with `targets[].provided_harness` and counts them in
   `summary.provided_harnesses` (both new, omitted otherwise).
+- `bhf auto` runs the Atheris harnesses a Python project ships (#337): the
+  function a file registers with `atheris.Setup` is a target, run under
+  bhf's Python driver with a stand-in `atheris` module (Atheris need not be
+  installed) whose `FuzzedDataProvider` decodes values from the input, and
+  started from its seed corpus with its `<stem>.dict`. As under Atheris,
+  every exception it lets escape is a finding, located in the code that
+  raised it rather than at the harness's call. `run.json` reports it with
+  `provided_harness.origin` `atheris`; the record gains `dictionaries` and
+  `dictionary_tokens` (omitted when empty).
 - `bhf differential --metamorphic-transform` has a transform registry (#330):
   `append-newline`, `trailing-whitespace` (a space and a tab at the end of
   every line), `reorder-json-keys` (every JSON object's members in reverse

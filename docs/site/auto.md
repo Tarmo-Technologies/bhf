@@ -639,6 +639,33 @@ name starts with `_`, which the go tool ignores too; `--languages`,
   a failure the fuzz target reports through its `*testing.T` (`t.Error`,
   `t.Fatal`), as it is to `go test`; `t.Skip` skips the input. A fuzz test
   that fails or skips before reaching `f.Fuzz` is skipped with the reason.
+- **Atheris harnesses.** The function a Python file registers with
+  `atheris.Setup(sys.argv, TestOneInput)` (however it imports `atheris` or
+  `Setup`, positionally or as `test_one_input=`), a module-level `def`, is a
+  target named after it (`H-P` id); the file's other functions are harness
+  glue, not targets. Atheris runs a harness under libFuzzer, so bhf runs it
+  under its own Python driver instead, and Atheris need not be installed:
+  the harness dir holds a stand-in `atheris` module, ahead of an installed
+  one, whose `Setup` and `Fuzz` only record and return when bhf imports the
+  harness file (its `if __name__ == "__main__":` block does not run), whose
+  `instrument_imports`, `instrument_func` and `instrument_all` change
+  nothing (bhf's tracer measures line-edge coverage over the whole tree),
+  and whose `FuzzedDataProvider` decodes `Consume*` values from the front of
+  the input: text as Atheris does, a first byte choosing ASCII, UTF-16 or
+  UTF-32, and integers as little-endian two's complement. The harness file
+  runs with the tree and its `src/` on the module path, as an installed
+  project would be. As under Atheris, every exception the function lets
+  escape is a finding, a `ValueError` or the library's own exception class
+  included (a generated Python harness takes those for input rejections);
+  `SystemExit` and `KeyboardInterrupt` are not. A finding's stack starts
+  past the harness file's frames, so it is located in the code that raised
+  it, unless the harness raised it itself. The `<stem>.dict` beside the
+  harness joins its dictionary, and the files of its seed corpus
+  (`<stem>_seed_corpus/`, `<stem>_corpus/`, `corpus/<stem>/` or
+  `seeds/<stem>/` beside it) are copied as they are to
+  `harnesses/<id>/provided-seeds/` and start the fuzz passes. A harness file
+  that cannot be imported, or that uses a part of the `atheris` API the
+  stand-in lacks, is skipped with the reason.
 
 C and C++ harnesses are Makefile-based. Auto uses `clang` / `clang++` for the
 default coverage-guided sanitizer build unless `CC` / `CXX` are set. See
@@ -856,9 +883,12 @@ fuzz/oracle hit confirmed at the same source site (omitted when zero). See
 
 A target that is a harness the project ships ([Provided
 harnesses](#provided-harnesses)) carries `targets[].provided_harness`:
-`origin` (`go-fuzz-test`), `entry` (the fuzz test's name), `source` (the file
-that defines it), `seeds` (how many starting inputs came with it),
-`seed_sources` (its seed corpus directory) and `notes` (seeds it came with
+`origin` (`go-fuzz-test` or `atheris`), `entry` (the fuzz test's name, or
+the function registered with `atheris.Setup`), `source` (the file that
+defines it), `seeds` (how many starting inputs came with it), `seed_sources`
+(its seed corpus directories), `dictionaries` and `dictionary_tokens` (the
+dictionaries that came with it, merged into its harness's `dictionary.txt`,
+and their token count; omitted when none did) and `notes` (what came with it
 that could not be used, and why). The top-level `summary.provided_harnesses`
 counts them (omitted when zero), and `run.md` tags each one's row
 `[provided harness: <origin>, N seed(s)]`.

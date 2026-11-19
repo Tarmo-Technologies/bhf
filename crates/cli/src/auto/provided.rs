@@ -10,7 +10,11 @@
 //!
 //! - a Go native fuzz test (`func FuzzXxx(f *testing.F)` in a `_test.go` file),
 //!   built by [`crate::auto::go_build`] against a stand-in for the `testing`
-//!   package, with its `f.Add` seeds and its `testdata/fuzz/<Name>` corpus.
+//!   package, with its `f.Add` seeds and its `testdata/fuzz/<Name>` corpus;
+//! - an Atheris harness (the function a Python file registers with
+//!   `atheris.Setup`, `TestOneInput` by convention), run by
+//!   [`crate::auto::python_build`] with a stand-in for `atheris`, with the
+//!   `<name>.dict` beside it; every exception it lets escape is a finding.
 //!
 //! The build of each kind leaves [`RECORD_FILE`] in the harness dir, which
 //! `run.json` reports as the target's `provided_harness`, and the starting
@@ -46,12 +50,15 @@ const WALK_BUDGET: usize = 200_000;
 pub(crate) enum Origin {
     /// A Go native fuzz test (`func FuzzXxx(f *testing.F)`).
     GoFuzzTest,
+    /// An Atheris harness (`atheris.Setup(sys.argv, TestOneInput)`).
+    Atheris,
 }
 
 impl Origin {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Origin::GoFuzzTest => "go-fuzz-test",
+            Origin::Atheris => "atheris",
         }
     }
 
@@ -59,6 +66,7 @@ impl Origin {
     fn describe(self) -> &'static str {
         match self {
             Origin::GoFuzzTest => "Go native fuzz test",
+            Origin::Atheris => "Atheris harness",
         }
     }
 }
@@ -67,7 +75,8 @@ impl Origin {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ProvidedRecord {
     pub origin: Origin,
-    /// The entry point: the fuzz test's name.
+    /// The entry point: the fuzz test's name, or the function registered
+    /// with `atheris.Setup`.
     pub entry: String,
     /// The file that defines it.
     pub source: PathBuf,
@@ -77,9 +86,36 @@ pub(crate) struct ProvidedRecord {
     /// Where they came from (the `f.Add` calls are counted, not named).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub seed_sources: Vec<PathBuf>,
-    /// Starting inputs it came with that could not be used, and why.
+    /// The dictionaries that came with it, merged into its harness's
+    /// `dictionary.txt`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dictionaries: Vec<PathBuf>,
+    /// How many tokens they hold.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub dictionary_tokens: usize,
+    /// What came with it that could not be used, and why.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+impl ProvidedRecord {
+    /// A record of `origin`'s `entry` in `source`, with nothing that came with it.
+    pub(crate) fn new(origin: Origin, entry: &str, source: &Path) -> Self {
+        Self {
+            origin,
+            entry: entry.to_owned(),
+            source: source.to_path_buf(),
+            seeds: 0,
+            seed_sources: Vec::new(),
+            dictionaries: Vec::new(),
+            dictionary_tokens: 0,
+            notes: Vec::new(),
+        }
+    }
 }
 
 /// Record `record` in `harness_dir`.
@@ -140,6 +176,78 @@ pub(crate) fn load_seeds(harness_dir: &Path) -> Vec<Vec<u8>> {
     seeds
 }
 
+/// Copy the starting inputs in `sources` into `harness_dir`'s [`SEEDS_DIR`],
+/// as they are: each regular file of a source directory (walked in name
+/// order, its subdirectories included) or a source file, within the bounds
+/// [`load_seeds`] reads them in. A symlink is not followed, since it could
+/// name a file outside the corpus. Returns how many files were copied and
+/// how many were left out.
+pub(crate) fn copy_seed_files(
+    harness_dir: &Path,
+    sources: &[PathBuf],
+) -> std::io::Result<(usize, usize)> {
+    fn collect(path: &Path, depth: usize, files: &mut Vec<PathBuf>, budget: &mut usize) {
+        let Ok(meta) = std::fs::symlink_metadata(path) else {
+            return;
+        };
+        if meta.is_file() {
+            files.push(path.to_path_buf());
+        } else if meta.is_dir() && depth < 16 {
+            let Ok(entries) = std::fs::read_dir(path) else {
+                return;
+            };
+            let mut entries: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+            entries.sort();
+            for entry in entries {
+                if *budget == 0 {
+                    return;
+                }
+                *budget -= 1;
+                collect(&entry, depth + 1, files, budget);
+            }
+        } else {
+            files.push(path.to_path_buf());
+        }
+    }
+    let mut files = Vec::new();
+    let mut budget = WALK_BUDGET;
+    for source in sources {
+        collect(source, 0, &mut files, &mut budget);
+    }
+    let dest = harness_dir.join(SEEDS_DIR);
+    std::fs::create_dir_all(&dest)?;
+    let (mut copied, mut skipped, mut total) = (0usize, 0usize, 0u64);
+    for file in files {
+        let fits = std::fs::symlink_metadata(&file).is_ok_and(|meta| {
+            meta.is_file()
+                && copied < MAX_SEEDS
+                && meta.len() <= MAX_SEED_BYTES
+                && total + meta.len() <= MAX_SEEDS_TOTAL_BYTES
+        });
+        if !fits {
+            skipped += 1;
+            continue;
+        }
+        let name: String = file
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_default()
+            .chars()
+            .take(64)
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        total += std::fs::copy(&file, dest.join(format!("seed-{copied:04}-{name}")))?;
+        copied += 1;
+    }
+    Ok((copied, skipped))
+}
+
 /// Whether `candidate` is a Go native fuzz test. Discovery never takes a
 /// generated target from a `_test.go` file, so a Go candidate from one is a
 /// fuzz test [`discover`] found.
@@ -152,9 +260,28 @@ pub(crate) fn is_go_fuzz_test(candidate: &Candidate) -> bool {
             .is_some_and(|name| name.ends_with("_test.go"))
 }
 
+/// The Atheris entry point `candidate` is, when its file registers it with
+/// `atheris.Setup`.
+pub(crate) fn atheris_entry(candidate: &Candidate) -> Option<python_parser::AtherisEntry> {
+    if candidate.lang != Lang::Python {
+        return None;
+    }
+    let source = crate::source_text::read_source_text(&candidate.source_path).ok()?;
+    if !source.contains("atheris") {
+        return None;
+    }
+    python_parser::find_atheris_entry_points(&source)
+        .ok()?
+        .into_iter()
+        .find(|entry| entry.callback == candidate.name)
+}
+
 /// Where `candidate` came from, when it is a provided harness.
 pub(crate) fn origin(candidate: &Candidate) -> Option<Origin> {
-    is_go_fuzz_test(candidate).then_some(Origin::GoFuzzTest)
+    if is_go_fuzz_test(candidate) {
+        return Some(Origin::GoFuzzTest);
+    }
+    atheris_entry(candidate).map(|_| Origin::Atheris)
 }
 
 /// What `run.json` reports for `candidate`: the record its build left, or,
@@ -164,19 +291,42 @@ pub(crate) fn target_record(candidate: &Candidate, harness_dir: &Path) -> Option
     Some(
         read_record(harness_dir)
             .filter(|record| record.origin == origin)
-            .unwrap_or_else(|| ProvidedRecord {
-                origin,
-                entry: candidate.name.clone(),
-                source: candidate.source_path.clone(),
-                seeds: 0,
-                seed_sources: Vec::new(),
-                notes: Vec::new(),
+            .unwrap_or_else(|| {
+                ProvidedRecord::new(origin, &candidate.name, &candidate.source_path)
             }),
     )
 }
 
+/// Merge the dictionaries that came with a provided harness, in order, into
+/// its harness's `dictionary.txt` (after the tokens bhf mined, each token
+/// once), and return how many tokens they hold.
+pub(crate) fn append_dictionaries(
+    harness_dir: &Path,
+    dictionaries: &[PathBuf],
+) -> Result<usize, String> {
+    if dictionaries.is_empty() {
+        return Ok(0);
+    }
+    let merged =
+        project_profile::merge_dictionaries(dictionaries).map_err(|error| error.to_string())?;
+    let path = harness_dir.join("dictionary.txt");
+    let mut contents = std::fs::read_to_string(&path).unwrap_or_default();
+    for line in merged.to_afl_format().lines() {
+        if !contents.lines().any(|existing| existing.trim() == line) {
+            if !contents.is_empty() && !contents.ends_with('\n') {
+                contents.push('\n');
+            }
+            contents.push_str(line);
+            contents.push('\n');
+        }
+    }
+    std::fs::write(&path, contents)
+        .map_err(|error| format!("write {}: {error}", path.display()))?;
+    Ok(merged.tokens.len())
+}
+
 /// The provided harnesses under `root` (a directory, or one file): every Go
-/// native fuzz test. The walk looks in test and fuzz directories, which
+/// native fuzz test and Atheris harness. The walk looks in test and fuzz directories, which
 /// discovery of generated targets skips, but not in the work dir, build output,
 /// a vendored dependency, `testdata/` or a directory `--exclude-dir` names,
 /// nor for Go in a directory whose name starts with `_`, which the go tool
@@ -227,6 +377,29 @@ fn visit_file(path: &Path, go_builds: bool, out: &mut Vec<Candidate>) {
     };
     if go_builds && name.ends_with("_test.go") {
         go_fuzz_tests(path, out);
+    } else if name.ends_with(".py") {
+        atheris_harnesses(path, out);
+    }
+}
+
+fn atheris_harnesses(path: &Path, out: &mut Vec<Candidate>) {
+    let Ok(source) = crate::source_text::read_source_text(path) else {
+        return;
+    };
+    if !source.contains("atheris") {
+        return;
+    }
+    let Ok(entries) = python_parser::find_atheris_entry_points(&source) else {
+        return;
+    };
+    for entry in entries {
+        out.push(provided_candidate(
+            "H-P",
+            Lang::Python,
+            path,
+            entry.line,
+            entry.callback,
+        ));
     }
 }
 
@@ -270,13 +443,16 @@ fn provided_candidate(prefix: &str, lang: Lang, path: &Path, line: u32, name: St
 }
 
 /// Put the `provided` harnesses ahead of the discovered `candidates`, each
-/// once, and drop a discovered candidate that is one of them.
+/// once, and drop a discovered candidate that is one of them or is defined
+/// in a provided harness's file: that file is harness glue, not library code.
 pub fn merge_into(candidates: &mut Vec<Candidate>, provided: Vec<Candidate>) {
     if provided.is_empty() {
         return;
     }
     let ids: std::collections::HashSet<String> =
         provided.iter().map(|c| c.harness_id.clone()).collect();
+    let files: std::collections::HashSet<PathBuf> =
+        provided.iter().map(|c| c.source_path.clone()).collect();
     let mut merged = Vec::with_capacity(candidates.len() + provided.len());
     let mut taken = std::collections::HashSet::new();
     for candidate in provided {
@@ -284,11 +460,9 @@ pub fn merge_into(candidates: &mut Vec<Candidate>, provided: Vec<Candidate>) {
             merged.push(candidate);
         }
     }
-    merged.extend(
-        std::mem::take(candidates)
-            .into_iter()
-            .filter(|candidate| !ids.contains(&candidate.harness_id)),
-    );
+    merged.extend(std::mem::take(candidates).into_iter().filter(|candidate| {
+        !ids.contains(&candidate.harness_id) && !files.contains(&candidate.source_path)
+    }));
     *candidates = merged;
 }
 
@@ -407,6 +581,110 @@ mod tests {
         // `--exclude-dir fuzz` keeps it out.
         let excluded = discover(&root, &DirFilter::new(&["fuzz".to_owned()], &[]));
         assert_eq!(excluded.len(), 1, "{excluded:?}");
+    }
+
+    const ATHERIS_HARNESS: &str = "import sys\nimport atheris\n\n\
+        def TestOneInput(data):\n    pass\n\n\
+        def helper(data):\n    return data\n\n\
+        if __name__ == \"__main__\":\n    atheris.Setup(sys.argv, TestOneInput)\n    atheris.Fuzz()\n";
+
+    #[test]
+    fn atheris_harnesses_are_found_in_fuzz_dirs_and_their_files_are_not_targets() {
+        let root = crate::test_support::TestDir::new("provided-atheris");
+        write(&root.join("fuzz/fuzz_widget.py"), ATHERIS_HARNESS);
+        // An `_`-prefixed package is still Python's, but `testdata/` is not
+        // the project's own code.
+        write(&root.join("_fuzzers/fuzz_more.py"), ATHERIS_HARNESS);
+        write(&root.join("tests/testdata/fuzz_sample.py"), ATHERIS_HARNESS);
+        write(
+            &root.join("widget/__init__.py"),
+            "def parse_record(data):\n    return data\n",
+        );
+        let mut found = discover(&root, &DirFilter::default());
+        let files: Vec<PathBuf> = found
+            .iter()
+            .map(|c| c.source_path.strip_prefix(&*root).unwrap().to_path_buf())
+            .collect();
+        assert_eq!(
+            files,
+            [
+                Path::new("_fuzzers/fuzz_more.py"),
+                Path::new("fuzz/fuzz_widget.py")
+            ]
+        );
+        found.remove(0);
+        let harness = &found[0];
+        assert_eq!(
+            (harness.name.as_str(), harness.line, harness.lang),
+            ("TestOneInput", 4, Lang::Python)
+        );
+        assert!(harness.harness_id.starts_with("H-P"));
+        assert_eq!(origin(harness), Some(Origin::Atheris));
+        let entry = atheris_entry(harness).expect("an Atheris entry point");
+        assert_eq!(entry.callback, "TestOneInput");
+        // The harness file's other functions are glue, not targets.
+        let mut glue = harness.clone();
+        glue.harness_id = "H-P0007-00000000".to_owned();
+        glue.name = "helper".to_owned();
+        assert!(origin(&glue).is_none());
+        let mut candidates = vec![glue, candidate("H-P1", "parse_record")];
+        merge_into(&mut candidates, found);
+        let names: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["TestOneInput", "parse_record"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seed_corpus_files_are_copied_as_they_are_but_not_through_a_symlink() {
+        let dir = crate::test_support::TestDir::new("provided-copy-seeds");
+        write(&dir.join("corpus/b record"), "second");
+        write(&dir.join("corpus/a/nested"), "first");
+        write(&dir.join("one.bin"), "third");
+        write(&dir.join("outside"), "host file");
+        std::os::unix::fs::symlink(dir.join("outside"), dir.join("corpus/link")).unwrap();
+        std::fs::write(
+            dir.join("corpus/c-too-large"),
+            vec![0u8; MAX_SEED_BYTES as usize + 1],
+        )
+        .unwrap();
+        let harness = dir.join("harness");
+        let counts = copy_seed_files(&harness, &[dir.join("corpus"), dir.join("one.bin")]).unwrap();
+        assert_eq!(
+            counts,
+            (3, 2),
+            "the symlink and the oversized file are left out"
+        );
+        let mut names: Vec<String> = std::fs::read_dir(harness.join(SEEDS_DIR))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "seed-0000-nested",
+                "seed-0001-b_record",
+                "seed-0002-one.bin"
+            ]
+        );
+        assert_eq!(
+            load_seeds(&harness),
+            [b"first".to_vec(), b"second".to_vec(), b"third".to_vec()]
+        );
+    }
+
+    #[test]
+    fn a_provided_harnesss_dictionaries_join_the_mined_tokens_once() {
+        let dir = crate::test_support::TestDir::new("provided-dict");
+        write(&dir.join("dictionary.txt"), "# mined\n\"BHF\"\n");
+        write(&dir.join("widget.dict"), "magic=\"BHF\"\nkind=\"\\x07\"\n");
+        let tokens = append_dictionaries(&dir, &[dir.join("widget.dict")]).unwrap();
+        assert_eq!(tokens, 2);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("dictionary.txt")).unwrap(),
+            "# mined\n\"BHF\"\n\"\\x07\"\n"
+        );
+        assert_eq!(append_dictionaries(&dir, &[]).unwrap(), 0);
     }
 
     fn candidate(id: &str, name: &str) -> Candidate {

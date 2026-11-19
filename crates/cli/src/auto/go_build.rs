@@ -2478,18 +2478,18 @@ fn probe_fuzz_test(
              of the fuzz target's argument types"
         ));
     }
-    crate::auto::provided::write_record(
-        auto_dir,
-        &crate::auto::provided::ProvidedRecord {
-            origin: crate::auto::provided::Origin::GoFuzzTest,
-            entry: test.name.clone(),
-            source: candidate.source_path.clone(),
-            seeds: written,
-            seed_sources: corpus.is_dir().then_some(corpus).into_iter().collect(),
-            notes,
-        },
-    )
-    .map_err(|e| (format!("record the provided harness: {e}"), false))
+    let record = crate::auto::provided::ProvidedRecord {
+        seeds: written,
+        seed_sources: corpus.is_dir().then_some(corpus).into_iter().collect(),
+        notes,
+        ..crate::auto::provided::ProvidedRecord::new(
+            crate::auto::provided::Origin::GoFuzzTest,
+            &test.name,
+            &candidate.source_path,
+        )
+    };
+    crate::auto::provided::write_record(auto_dir, &record)
+        .map_err(|e| (format!("record the provided harness: {e}"), false))
 }
 
 /// The harness `main` of a native fuzz test: it runs the fuzz test `name`
