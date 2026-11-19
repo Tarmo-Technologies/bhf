@@ -4,12 +4,15 @@
 //! source and no instrumentation, in the rehosting emulator (`crates/rehost`),
 //! and replay what it finds.
 //!
-//! Each input is written into a fixed buffer in the firmware's memory, the
-//! core starts from the reset vector, and the basic blocks it enters fill an
-//! edge map that steers the builtin engine's mutator and power schedule. A
-//! run that faults (an invalid memory access, a bad PC, or a HardFault) is a
-//! finding; `bhf replay` runs its testcase through the same machine again and
-//! matches the fault signature.
+//! Each input is written into a fixed buffer in the firmware's memory, or
+//! read by its peripheral reads through MMIO models (passthrough, which takes
+//! the read's bytes from the input, and constant), or both; the core starts
+//! from the reset vector, and the basic blocks it enters fill an edge map
+//! that steers the builtin engine's mutator and power schedule. A run that
+//! faults (an invalid memory access, a bad PC, or a HardFault) is a finding
+//! that records the machine setup, its MMIO models included; `bhf replay`
+//! runs its testcase through the same machine again and matches the fault
+//! signature.
 
 use anyhow::{anyhow, Context};
 use fuzz_engine_builtin::{
@@ -17,8 +20,8 @@ use fuzz_engine_builtin::{
     ScheduleFeedback,
 };
 use rehost::{
-    CoverageMap, Execution, Fault, Image, InputBuffer, Machine, MachineConfig, MemoryRange, Stop,
-    DEFAULT_MAX_INSTRUCTIONS,
+    CoverageMap, Execution, Fault, Image, InputBuffer, Machine, MachineConfig, MemoryRange,
+    MmioConfig, MmioDefault, MmioModel, MmioModelKind, Stop, DEFAULT_MAX_INSTRUCTIONS,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -68,25 +71,37 @@ pub struct BinaryRehostArgs {
 
     /// Where each input is written: an address (hex, `0x` optional, as `nm`
     /// prints it) or an ELF symbol, such as the buffer the firmware's receive
-    /// routine fills. A name the symbol table holds is that symbol.
+    /// routine fills. A name the symbol table holds is that symbol. Without
+    /// it, the input reaches the firmware through its peripheral reads
+    /// (see `--mmio`).
     #[arg(long = "input-buffer", value_name = "ADDR|SYMBOL")]
-    pub input_buffer: String,
+    pub input_buffer: Option<String>,
 
-    /// Bytes the input buffer holds; a longer input is cut to this.
-    /// Default: the symbol's size.
-    #[arg(long = "input-size", value_name = "BYTES")]
+    /// Bytes the input buffer holds; a longer input is cut to this, and
+    /// peripheral reads that take input take the bytes after it (the buffer
+    /// then takes at most the input's first 4096 bytes). Default: the
+    /// symbol's size.
+    #[arg(long = "input-size", value_name = "BYTES", requires = "input_buffer")]
     pub input_size: Option<u32>,
 
     /// Where the input's length is written, as a little-endian 32-bit word:
     /// an address (hex) or an ELF symbol.
-    #[arg(long = "input-length", value_name = "ADDR|SYMBOL")]
+    #[arg(
+        long = "input-length",
+        value_name = "ADDR|SYMBOL",
+        requires = "input_buffer"
+    )]
     pub input_length: Option<String>,
 
     /// Write the input when the core first reaches this address (hex) or
     /// function, e.g. `main`, so the start-up code's `.bss` clearing does not
     /// wipe it. Default: at reset. The run JSON's `input_not_delivered`
     /// counts the runs that never reached it.
-    #[arg(long = "inject-at", value_name = "ADDR|SYMBOL")]
+    #[arg(
+        long = "inject-at",
+        value_name = "ADDR|SYMBOL",
+        requires = "input_buffer"
+    )]
     pub inject_at: Option<String>,
 
     /// End a run cleanly when the core reaches this address (hex) or
@@ -98,6 +113,31 @@ pub struct BinaryRehostArgs {
     /// The most instructions one run executes.
     #[arg(long = "max-instructions", default_value_t = DEFAULT_MAX_INSTRUCTIONS)]
     pub max_instructions: u64,
+
+    /// A model for a peripheral register's reads: `ADDR[@PC]=MODEL`, where
+    /// ADDR is the register (hex or an ELF symbol), PC limits the model to
+    /// the instruction there (hex or a function), and MODEL is `passthrough`
+    /// (each read takes its bytes from the input) or `constant:VALUE` (hex).
+    /// A model for one instruction wins over one for the register.
+    /// Repeatable. Peripheral reads take the input in order (after the
+    /// bytes `--input-buffer` holds), and a run whose reads want more input
+    /// than it has stops as `input_exhausted`.
+    #[arg(long = "mmio", value_name = "ADDR[@PC]=MODEL")]
+    pub mmio: Vec<String>,
+
+    /// Peripheral models from a JSON file: the `mmio` object a run JSON's
+    /// `setup` or a finding's `rehost.setup` records, or either whole
+    /// document. `--mmio` models are added to them. A file with no
+    /// `default` leaves the default to `--mmio-default`'s rule.
+    #[arg(long = "mmio-models", value_name = "FILE")]
+    pub mmio_models: Option<PathBuf>,
+
+    /// What a peripheral register no model names reads as: `zero`, or
+    /// `passthrough` (its bytes from the input). Default: `passthrough`
+    /// without `--input-buffer`, `zero` with it (or what `--mmio-models`
+    /// records).
+    #[arg(long = "mmio-default", value_enum, value_name = "MODEL")]
+    pub mmio_default: Option<MmioDefaultArg>,
 
     /// Runs in the campaign: the seeds, then mutations of the inputs that
     /// reached new edges.
@@ -120,6 +160,22 @@ pub struct BinaryRehostArgs {
     /// Seed of the mutation, so a campaign repeats exactly.
     #[arg(long = "rng-seed", default_value_t = 0)]
     pub rng_seed: u64,
+}
+
+/// `--mmio-default`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum MmioDefaultArg {
+    Zero,
+    Passthrough,
+}
+
+impl From<MmioDefaultArg> for MmioDefault {
+    fn from(value: MmioDefaultArg) -> Self {
+        match value {
+            MmioDefaultArg::Zero => Self::Zero,
+            MmioDefaultArg::Passthrough => Self::Passthrough,
+        }
+    }
 }
 
 fn parse_address(value: &str) -> Result<u32, String> {
@@ -210,6 +266,162 @@ fn resolve(image: &Image, what: &str, value: &str) -> anyhow::Result<(u32, Optio
     }
 }
 
+/// A code address may carry the Thumb bit, as a vector-table entry or a
+/// function pointer does; the instruction is at the even address.
+fn resolve_code(image: &Image, what: &str, value: &str) -> anyhow::Result<u32> {
+    resolve(image, what, value).map(|(address, _)| address & !1)
+}
+
+/// A `--mmio` model: `ADDR[@PC]=MODEL`.
+fn parse_mmio_model(image: &Image, spec: &str) -> anyhow::Result<MmioModel> {
+    let shape = || anyhow!("--mmio {spec:?} is not ADDR[@PC]=MODEL (e.g. 0x40011004=passthrough)");
+    let (site, model) = spec.split_once('=').ok_or_else(shape)?;
+    let (register, pc) = match site.split_once('@') {
+        Some((register, pc)) => (register, Some(pc)),
+        None => (site, None),
+    };
+    if register.trim().is_empty() {
+        return Err(shape());
+    }
+    let (address, _) = resolve(image, "--mmio", register)?;
+    let pc = pc.map(|pc| resolve_code(image, "--mmio", pc)).transpose()?;
+    let model = model.trim();
+    let kind = match model.split_once(':') {
+        None if model == "passthrough" => MmioModelKind::Passthrough,
+        Some(("constant", value)) => MmioModelKind::Constant {
+            value: hex_number(value)
+                .ok_or_else(|| anyhow!("--mmio {spec:?}: {value:?} is not a hex value"))?,
+        },
+        None if model == "constant" => {
+            return Err(anyhow!(
+                "--mmio {spec:?}: a constant model is constant:VALUE"
+            ))
+        }
+        _ => {
+            return Err(anyhow!(
+                "--mmio {spec:?}: {model:?} is not a model (passthrough or constant:VALUE)"
+            ))
+        }
+    };
+    Ok(MmioModel { address, pc, kind })
+}
+
+fn mmio_to_json(mmio: &MmioConfig) -> Value {
+    json!({
+        "default": mmio.default.as_str(),
+        "models": mmio.models.iter().map(|model| {
+            let mut entry = json!({
+                "address": hex(model.address),
+                "pc": model.pc.map(hex),
+                "model": model.kind.as_str(),
+            });
+            if let MmioModelKind::Constant { value } = model.kind {
+                entry["value"] = json!(hex(value));
+            }
+            entry
+        }).collect::<Vec<_>>(),
+    })
+}
+
+/// The peripheral default an `mmio` object records, or `None` when it
+/// records none.
+fn mmio_default_from_json(value: &Value, field: &str) -> Result<Option<MmioDefault>, String> {
+    match value.get("default").unwrap_or(&Value::Null) {
+        Value::Null => Ok(None),
+        Value::String(name) if name == "zero" => Ok(Some(MmioDefault::Zero)),
+        Value::String(name) if name == "passthrough" => Ok(Some(MmioDefault::Passthrough)),
+        other => Err(format!(
+            "{field}.default {other} is not zero or passthrough"
+        )),
+    }
+}
+
+/// The MMIO models a setup records under `field`; a setup recorded before
+/// they existed has none, and reads every peripheral register as zero.
+fn mmio_from_json(value: &Value, field: &str) -> Result<MmioConfig, String> {
+    let Some(mmio) = value.as_object() else {
+        return match value {
+            Value::Null => Ok(MmioConfig::default()),
+            other => Err(format!("{field} is {other}, not an object")),
+        };
+    };
+    let hex_field = |entry: &Value, name: &str| -> Result<Option<u32>, String> {
+        match &entry[name] {
+            Value::Null => Ok(None),
+            Value::String(text) => hex_number(text)
+                .map(Some)
+                .ok_or_else(|| format!("{field}.models[].{name} {text:?} is not hex")),
+            other => Err(format!("{field}.models[].{name} is {other}, not hex")),
+        }
+    };
+    let default = mmio_default_from_json(value, field)?.unwrap_or(MmioDefault::Zero);
+    let models = mmio
+        .get("models")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .map(|entry| {
+            let address = hex_field(entry, "address")?
+                .ok_or_else(|| format!("{field}.models[].address is missing"))?;
+            let kind = match entry["model"].as_str() {
+                Some("passthrough") => MmioModelKind::Passthrough,
+                Some("constant") => MmioModelKind::Constant {
+                    value: hex_field(entry, "value")?
+                        .ok_or_else(|| format!("{field}.models[].value is missing"))?,
+                },
+                other => {
+                    return Err(format!(
+                        "{field}.models[].model {} is not passthrough or constant",
+                        other
+                            .map_or_else(|| entry["model"].to_string(), |name| format!("{name:?}"))
+                    ))
+                }
+            };
+            Ok(MmioModel {
+                address,
+                pc: hex_field(entry, "pc")?,
+                kind,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(MmioConfig { models, default })
+}
+
+/// What a `--mmio-models` file gives.
+struct ModelsFile {
+    models: Vec<MmioModel>,
+    /// The default it records; a file that names none leaves the default to
+    /// the usual rule (`passthrough` without an input buffer).
+    default: Option<MmioDefault>,
+}
+
+/// The MMIO models of a `--mmio-models` file: the `mmio` object itself, or
+/// a run JSON or finding that records one in its setup.
+fn load_mmio_models(path: &Path) -> anyhow::Result<ModelsFile> {
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let document: Value =
+        serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+    let mmio = if document.get("models").is_some() {
+        &document
+    } else if document["rehost"]["setup"]["mmio"].is_object() {
+        &document["rehost"]["setup"]["mmio"]
+    } else if document["setup"]["mmio"].is_object() {
+        &document["setup"]["mmio"]
+    } else {
+        return Err(anyhow!(
+            "{} holds no MMIO models: give the mmio object a run JSON's setup or a finding's \
+             rehost.setup records, or either document",
+            path.display()
+        ));
+    };
+    let named = |error: String| anyhow!("{}: {error}", path.display());
+    Ok(ModelsFile {
+        models: mmio_from_json(mmio, "mmio").map_err(named)?.models,
+        default: mmio_default_from_json(mmio, "mmio").map_err(named)?,
+    })
+}
+
 /// How an image is mapped and run: everything a replay needs to run a
 /// finding's testcase the way the campaign did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,41 +430,50 @@ struct Setup {
     base: Option<u32>,
     vector_table: Option<u32>,
     ram: Vec<MemoryRange>,
-    input: InputBuffer,
+    input: Option<InputBuffer>,
     exit_at: Vec<u32>,
     max_instructions: u64,
+    mmio: MmioConfig,
 }
 
 impl Setup {
     fn from_args(args: &BinaryRehostArgs, image: &Image) -> anyhow::Result<Self> {
-        let (address, symbol_size) = resolve(image, "--input-buffer", &args.input_buffer)?;
-        let capacity = match (args.input_size, symbol_size) {
-            (Some(size), _) | (None, Some(size)) => size,
-            (None, None) => {
-                return Err(anyhow!(
-                    "--input-size is needed: --input-buffer {:?} names no sized symbol",
-                    args.input_buffer
-                ))
-            }
-        };
-        let length_word = args
-            .input_length
+        let input = args
+            .input_buffer
             .as_deref()
-            .map(|value| resolve(image, "--input-length", value).map(|(address, _)| address))
-            .transpose()?;
-        // A code address may carry the Thumb bit, as a vector-table entry
-        // or a function pointer does; the instruction is at the even address.
-        let code = |what: &str, value: &str| resolve(image, what, value).map(|(at, _)| at & !1);
-        let inject_at = args
-            .inject_at
-            .as_deref()
-            .map(|value| code("--inject-at", value))
+            .map(|buffer| input_buffer(args, image, buffer))
             .transpose()?;
         let exit_at = args
             .exit_at
             .iter()
-            .map(|value| code("--exit-at", value))
+            .map(|value| resolve_code(image, "--exit-at", value))
             .collect::<anyhow::Result<Vec<_>>>()?;
+        let file = args
+            .mmio_models
+            .as_deref()
+            .map(load_mmio_models)
+            .transpose()?;
+        let recorded_default = file.as_ref().and_then(|file| file.default);
+        let mut mmio = MmioConfig {
+            models: file.map(|file| file.models).unwrap_or_default(),
+            default: MmioDefault::Zero,
+        };
+        for spec in &args.mmio {
+            mmio.models.push(parse_mmio_model(image, spec)?);
+        }
+        // Without a buffer, peripheral reads are how the input arrives.
+        mmio.default = match (args.mmio_default, recorded_default) {
+            (Some(named), _) => named.into(),
+            (None, Some(recorded)) => recorded,
+            (None, None) if input.is_none() => MmioDefault::Passthrough,
+            (None, None) => MmioDefault::Zero,
+        };
+        if input.is_none() && !mmio.takes_input() {
+            return Err(anyhow!(
+                "no input reaches the firmware: give --input-buffer, or let peripheral reads take \
+                 the input (--mmio-default passthrough, or an --mmio ADDR=passthrough model)"
+            ));
+        }
         let image_path = fs::canonicalize(&args.image).unwrap_or_else(|_| args.image.clone());
         Ok(Self {
             image: image_path,
@@ -263,29 +484,65 @@ impl Setup {
             } else {
                 args.ram.clone()
             },
-            input: InputBuffer {
-                address,
-                capacity,
-                length_word,
-                inject_at,
-            },
+            input,
             exit_at,
             max_instructions: args.max_instructions,
+            mmio,
         })
     }
 
+    fn config(&self) -> MachineConfig {
+        MachineConfig {
+            ram: self.ram.clone(),
+            vector_table: self.vector_table,
+            input: self.input.map(|input| InputBuffer {
+                capacity: self.buffer_share(),
+                ..input
+            }),
+            exit_at: self.exit_at.clone(),
+            max_instructions: self.max_instructions,
+            mmio: self.mmio.clone(),
+        }
+    }
+
     fn machine(&self, image: &Image) -> anyhow::Result<Machine> {
-        Machine::new(
-            image,
-            MachineConfig {
-                ram: self.ram.clone(),
-                vector_table: self.vector_table,
-                input: Some(self.input),
-                exit_at: self.exit_at.clone(),
-                max_instructions: self.max_instructions,
-            },
-        )
-        .map_err(|error| anyhow!("{}: {error}", self.image.display()))
+        Machine::new(image, self.config())
+            .map_err(|error| anyhow!("{}: {error}", self.image.display()))
+    }
+
+    /// The bytes of each input the buffer takes: its capacity, or, when
+    /// peripheral reads take input as well, at most [`MAX_INPUT_LEN`], so
+    /// that the bytes after it reach the peripheral reads in an input the
+    /// mutator can make.
+    fn buffer_share(&self) -> u32 {
+        self.input.map_or(0, |input| {
+            if self.mmio.takes_input() {
+                input.capacity.min(MAX_INPUT_LEN)
+            } else {
+                input.capacity
+            }
+        })
+    }
+
+    /// The longest input a run can use: the buffer's bytes, then what the
+    /// peripheral reads take.
+    fn max_input_len(&self) -> usize {
+        let buffer = self.buffer_share().min(MAX_INPUT_LEN);
+        let peripherals = if self.mmio.takes_input() {
+            MAX_INPUT_LEN
+        } else {
+            0
+        };
+        (buffer + peripherals).max(1) as usize
+    }
+
+    /// How the input reaches the firmware, as a finding's `input.mode`.
+    fn input_mode(&self) -> &'static str {
+        match (self.input.is_some(), self.mmio.takes_input()) {
+            (true, false) => "rehost-buffer",
+            (false, _) => "rehost-mmio",
+            (true, true) => "rehost-buffer+mmio",
+        }
     }
 
     fn to_json(&self) -> Value {
@@ -297,14 +554,15 @@ impl Setup {
                 "base": hex(range.base),
                 "size": hex(range.size),
             })).collect::<Vec<_>>(),
-            "input": {
-                "address": hex(self.input.address),
-                "capacity": self.input.capacity,
-                "length_word": self.input.length_word.map(hex),
-                "inject_at": self.input.inject_at.map(hex),
-            },
+            "input": self.input.map(|input| json!({
+                "address": hex(input.address),
+                "capacity": input.capacity,
+                "length_word": input.length_word.map(hex),
+                "inject_at": input.inject_at.map(hex),
+            })),
             "exit_at": self.exit_at.iter().copied().map(hex).collect::<Vec<_>>(),
             "max_instructions": self.max_instructions,
+            "mmio": mmio_to_json(&self.mmio),
         })
     }
 
@@ -337,11 +595,18 @@ impl Setup {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let input = &value["input"];
-        let capacity = input["capacity"]
-            .as_u64()
-            .and_then(|capacity| u32::try_from(capacity).ok())
-            .ok_or("rehost.setup.input.capacity is missing")?;
+        let input = match &value["input"] {
+            Value::Null => None,
+            input => Some(InputBuffer {
+                address: required(&input["address"], "input.address")?,
+                capacity: input["capacity"]
+                    .as_u64()
+                    .and_then(|capacity| u32::try_from(capacity).ok())
+                    .ok_or("rehost.setup.input.capacity is missing")?,
+                length_word: address(&input["length_word"], "input.length_word")?,
+                inject_at: address(&input["inject_at"], "input.inject_at")?,
+            }),
+        };
         let exit_at = value
             .get("exit_at")
             .and_then(Value::as_array)
@@ -358,30 +623,86 @@ impl Setup {
             base: address(&value["base"], "base")?,
             vector_table: address(&value["vector_table"], "vector_table")?,
             ram,
-            input: InputBuffer {
-                address: required(&input["address"], "input.address")?,
-                capacity,
-                length_word: address(&input["length_word"], "input.length_word")?,
-                inject_at: address(&input["inject_at"], "input.inject_at")?,
-            },
+            input,
             exit_at,
             max_instructions: value["max_instructions"]
                 .as_u64()
                 .ok_or("rehost.setup.max_instructions is missing")?,
+            mmio: mmio_from_json(&value["mmio"], "rehost.setup.mmio")?,
         })
     }
 }
 
+/// The input buffer `--input-buffer` names, with its size, length word and
+/// injection address.
+fn input_buffer(
+    args: &BinaryRehostArgs,
+    image: &Image,
+    buffer: &str,
+) -> anyhow::Result<InputBuffer> {
+    let (address, symbol_size) = resolve(image, "--input-buffer", buffer)?;
+    let capacity = match (args.input_size, symbol_size) {
+        (Some(size), _) | (None, Some(size)) => size,
+        (None, None) => {
+            return Err(anyhow!(
+                "--input-size is needed: --input-buffer {buffer:?} names no sized symbol"
+            ))
+        }
+    };
+    let length_word = args
+        .input_length
+        .as_deref()
+        .map(|value| resolve(image, "--input-length", value).map(|(address, _)| address))
+        .transpose()?;
+    let inject_at = args
+        .inject_at
+        .as_deref()
+        .map(|value| resolve_code(image, "--inject-at", value))
+        .transpose()?;
+    Ok(InputBuffer {
+        address,
+        capacity,
+        length_word,
+        inject_at,
+    })
+}
+
 /// What a rehosted run does and does not model, recorded with every run and
 /// finding so a result is never read as more than it is.
-fn fidelity() -> Value {
+fn fidelity(mmio: &MmioConfig) -> Value {
     json!({
         "execution": "rehosted",
         "cpu": "ARMv7-M Thumb-2 integer core (Cortex-M3/M4), interpreted",
-        "peripherals": "not modelled: peripheral registers read as zero and drop writes",
+        "peripherals": describe_peripherals(mmio),
         "interrupts": "not modelled",
         "floating_point": "not modelled",
     })
+}
+
+fn describe_peripherals(mmio: &MmioConfig) -> String {
+    if mmio.models.is_empty() && mmio.default == MmioDefault::Zero {
+        return "not modelled: peripheral registers read as zero and drop writes".to_owned();
+    }
+    let mut kinds: Vec<&str> = mmio
+        .models
+        .iter()
+        .map(|model| model.kind.as_str())
+        .collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    let models = match mmio.models.len() {
+        0 => "no register models".to_owned(),
+        1 => format!("1 register model ({})", kinds.join(", ")),
+        count => format!("{count} register models ({})", kinds.join(", ")),
+    };
+    let others = match mmio.default {
+        MmioDefault::Zero => "read as zero",
+        MmioDefault::Passthrough => "take their bytes from the input",
+    };
+    format!(
+        "modelled reads: {models}; other peripheral registers {others}; writes are dropped; no \
+         peripheral behaviour beyond what its reads return"
+    )
 }
 
 fn fault_json(fault: &Fault) -> Value {
@@ -419,6 +740,11 @@ fn describe_stop(stop: &Stop) -> String {
             "met an instruction the emulator does not implement ({what}, {encoding:#x}) at pc {}",
             hex(*pc)
         ),
+        Stop::InputExhausted { pc, address } => format!(
+            "ran out of input at a read of the peripheral register {} at pc {}",
+            hex(*address),
+            hex(*pc)
+        ),
         Stop::Fault(fault) => format!("faulted: {}", fault.message()),
     }
 }
@@ -452,9 +778,11 @@ fn render_finding(
             "format": target.format,
         },
         "input": {
-            "mode": "rehost-buffer",
+            "mode": target.setup.input_mode(),
             "bytes": input.len(),
             "delivered": run.input_delivered,
+            "mmio_reads": run.mmio_reads,
+            "mmio_bytes": run.mmio_input,
             "testcase": "testcase.bin",
         },
         "crash": {
@@ -468,7 +796,7 @@ fn render_finding(
             "fault": fault_json(fault),
             "instructions": run.instructions,
             "blocks": run.blocks,
-            "fidelity": fidelity(),
+            "fidelity": fidelity(&target.setup.mmio),
         },
         "paths": {
             "testcase": "testcase.bin",
@@ -511,6 +839,8 @@ struct Campaign<'a> {
     repeated_faults: usize,
     /// Runs that never reached `--inject-at`, so ran without their input.
     input_not_delivered: usize,
+    /// Peripheral registers the runs read.
+    mmio_reads: u64,
     /// How the first of them ended.
     first_undelivered: Option<String>,
 }
@@ -521,8 +851,9 @@ impl Campaign<'_> {
     fn execute(&mut self, input: &[u8], seed: bool) -> anyhow::Result<()> {
         let run = self.machine.run(input);
         self.executions += 1;
+        self.mmio_reads += run.mmio_reads;
         *self.stops.entry(run.stop.as_str()).or_default() += 1;
-        if run.input_delivered.is_none() {
+        if self.target.setup.input.is_some() && run.input_delivered.is_none() {
             self.input_not_delivered += 1;
             self.first_undelivered
                 .get_or_insert_with(|| describe_stop(&run.stop));
@@ -646,6 +977,7 @@ fn run_inner(args: &BinaryRehostArgs) -> anyhow::Result<Value> {
         findings: Vec::new(),
         repeated_faults: 0,
         input_not_delivered: 0,
+        mmio_reads: 0,
         first_undelivered: None,
     };
     let started = Instant::now();
@@ -664,7 +996,7 @@ fn run_inner(args: &BinaryRehostArgs) -> anyhow::Result<Value> {
     // A run is the same for every input until the input is written, so when
     // no seed reaches `--inject-at`, no run will.
     if seeds_run > 0 && campaign.input_not_delivered == seeds_run {
-        if let Some(address) = setup.input.inject_at {
+        if let Some(address) = setup.input.and_then(|input| input.inject_at) {
             bhfeprintln!(
                 "bhf binary rehost: warning: no seed run reached --inject-at {}, so no input was \
                  written into the firmware and every run ignores its input (the first run {}); \
@@ -675,7 +1007,7 @@ fn run_inner(args: &BinaryRehostArgs) -> anyhow::Result<Value> {
         }
     }
     let mutator = MutatorSuite::new(MutatorConfig {
-        max_len: setup.input.capacity.clamp(1, MAX_INPUT_LEN) as usize,
+        max_len: setup.max_input_len(),
         ..MutatorConfig::default()
     });
     let dictionary = Dictionary::from_tokens(Vec::<Vec<u8>>::new());
@@ -702,7 +1034,7 @@ fn run_inner(args: &BinaryRehostArgs) -> anyhow::Result<Value> {
         "sha256": campaign.target.sha256,
         "engine": "rehost",
         "setup": setup.to_json(),
-        "fidelity": fidelity(),
+        "fidelity": fidelity(&setup.mmio),
         "seeds_run": seeds_run,
         "executions": campaign.executions,
         "corpus_new": campaign.corpus_new,
@@ -712,6 +1044,7 @@ fn run_inner(args: &BinaryRehostArgs) -> anyhow::Result<Value> {
         "findings": campaign.findings,
         "repeated_faults": campaign.repeated_faults,
         "input_not_delivered": campaign.input_not_delivered,
+        "mmio_reads": campaign.mmio_reads,
         "elapsed_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
     }))
 }
@@ -750,7 +1083,7 @@ pub(crate) fn replay_rehost_outcome(
         fs::read(&testcase).map_err(|error| format!("read {}: {error}", testcase.display()))?;
     let mut machine = Setup {
         image: image_path.clone(),
-        ..setup
+        ..setup.clone()
     }
     .machine(&loaded)
     .map_err(|error| format!("{error:#}"))?;
@@ -775,6 +1108,28 @@ pub(crate) fn replay_rehost_outcome(
         });
     }
     let outcome = describe_stop(&run.stop);
+    let mut details = vec![
+        crate::replay::Detail::new("outcome", outcome.clone()),
+        crate::replay::Detail::new(
+            "executed",
+            format!("{} instructions, {} blocks", run.instructions, run.blocks),
+        ),
+    ];
+    if run.mmio_reads > 0 {
+        details.push(crate::replay::Detail::new(
+            "peripheral reads",
+            format!(
+                "{} reads, {} input bytes ({} register models; others {})",
+                run.mmio_reads,
+                run.mmio_input,
+                setup.mmio.models.len(),
+                match setup.mmio.default {
+                    MmioDefault::Zero => "read as zero",
+                    MmioDefault::Passthrough => "take the input",
+                }
+            ),
+        ));
+    }
     Ok(crate::replay::LaneReplay {
         lane: "rehost",
         matched,
@@ -786,13 +1141,7 @@ pub(crate) fn replay_rehost_outcome(
         },
         compared: format!("fault {recorded}"),
         differences,
-        details: vec![
-            crate::replay::Detail::new("outcome", outcome.clone()),
-            crate::replay::Detail::new(
-                "executed",
-                format!("{} instructions, {} blocks", run.instructions, run.blocks),
-            ),
-        ],
+        details,
         exit: Some(crate::replay::ExitSummary::described(
             None,
             None,
@@ -824,18 +1173,50 @@ mod tests {
             base: None,
             vector_table: None,
             ram: Vec::new(),
-            input_buffer: "rx_buf".to_owned(),
+            input_buffer: Some("rx_buf".to_owned()),
             input_size: None,
             input_length: Some("rx_len".to_owned()),
             inject_at: Some("main".to_owned()),
             exit_at: Vec::new(),
             max_instructions: DEFAULT_MAX_INSTRUCTIONS,
+            mmio: Vec::new(),
+            mmio_models: None,
+            mmio_default: None,
             iterations: 1,
             time: None,
             seed_inputs: Vec::new(),
             seed_files: Vec::new(),
             rng_seed: 0,
         }
+    }
+
+    /// The peripheral fixture (`mmio.c`): its ID register at 0x40013000
+    /// must read 0x4c31a5c3, and its data register at 0x40013004 gives the
+    /// record's length and then the record.
+    const PERIPH_ID: u32 = 0x4001_3000;
+    const PERIPH_DATA: u32 = 0x4001_3004;
+
+    /// `mmio.elf` with no input buffer: its data register takes the input.
+    fn mmio_args(work: &Path) -> BinaryRehostArgs {
+        let mut args = args(fixture("mmio.elf"), work);
+        args.input_buffer = None;
+        args.input_length = None;
+        args.inject_at = None;
+        args.mmio = vec!["0x40013000=constant:0x4c31a5c3".to_owned()];
+        args
+    }
+
+    /// The length byte, then a "FUZZW" record that stores `value` at
+    /// `offset` in the fixture's table.
+    fn store_record(dir: &Path, offset: u32, value: u8) -> PathBuf {
+        let mut record = b"FUZZW".to_vec();
+        record.extend_from_slice(&offset.to_le_bytes());
+        record.push(value);
+        let mut bytes = vec![record.len() as u8];
+        bytes.extend_from_slice(&record);
+        let path = dir.join(format!("seed-store-{offset:08x}"));
+        fs::write(&path, bytes).unwrap();
+        path
     }
 
     fn write_record(dir: &Path, command: u8, operand: u32) -> PathBuf {
@@ -914,11 +1295,18 @@ mod tests {
         let work = TestDir::new("rehost-size");
         let (image, _) = load_image(&fixture("faults.elf"), None).unwrap();
         let mut args = args(fixture("faults.elf"), &work);
-        args.input_buffer = "0x20000000".to_owned();
+        args.input_buffer = Some("0x20000000".to_owned());
         let error = Setup::from_args(&args, &image).unwrap_err();
         assert!(error.to_string().contains("--input-size"), "{error}");
         args.input_size = Some(16);
-        assert_eq!(Setup::from_args(&args, &image).unwrap().input.capacity, 16);
+        assert_eq!(
+            Setup::from_args(&args, &image)
+                .unwrap()
+                .input
+                .unwrap()
+                .capacity,
+            16
+        );
     }
 
     #[test]
@@ -930,7 +1318,7 @@ mod tests {
         args.inject_at = Some(format!("{:#x}", main | 1));
         args.exit_at = vec![format!("{:#x}", main | 1)];
         let setup = Setup::from_args(&args, &image).unwrap();
-        assert_eq!(setup.input.inject_at, Some(main));
+        assert_eq!(setup.input.unwrap().inject_at, Some(main));
         assert_eq!(setup.exit_at, vec![main]);
         assert!(setup.machine(&image).is_ok());
     }
@@ -946,11 +1334,294 @@ mod tests {
             base: 0x2000_0000,
             size: 0x4000,
         }];
+        args.mmio = vec![
+            "0x40011000=constant:0x20".to_owned(),
+            "0x40011004@main=passthrough".to_owned(),
+        ];
         let setup = Setup::from_args(&args, &image).unwrap();
+        assert_eq!(setup.mmio.models.len(), 2);
         assert_eq!(Setup::from_json(&setup.to_json()), Ok(setup.clone()));
         let mut broken = setup.to_json();
         broken["input"]["address"] = json!("rx_buf");
         assert!(Setup::from_json(&broken).is_err());
+        let mut broken = setup.to_json();
+        broken["mmio"]["models"][0]["model"] = json!("mystery");
+        let error = Setup::from_json(&broken).unwrap_err();
+        assert!(error.contains("mystery"), "{error}");
+        let mut broken = setup.to_json();
+        broken["mmio"]["default"] = json!(1);
+        let error = Setup::from_json(&broken).unwrap_err();
+        assert!(error.contains("rehost.setup.mmio.default 1"), "{error}");
+        // A setup with no input buffer, whose peripheral reads take the input.
+        let (image, _) = load_image(&fixture("mmio.elf"), None).unwrap();
+        let setup = Setup::from_args(&mmio_args(&work), &image).unwrap();
+        assert_eq!(setup.input, None);
+        assert_eq!(setup.to_json()["input"], Value::Null);
+        assert_eq!(setup.to_json()["mmio"]["default"], "passthrough");
+        assert_eq!(Setup::from_json(&setup.to_json()), Ok(setup));
+    }
+
+    #[test]
+    fn a_setup_recorded_before_mmio_models_reads_peripherals_as_zero() {
+        let work = TestDir::new("rehost-setup-old");
+        let (image, _) = load_image(&fixture("faults.elf"), None).unwrap();
+        let setup = Setup::from_args(&args(fixture("faults.elf"), &work), &image).unwrap();
+        let mut old = setup.to_json();
+        old.as_object_mut().unwrap().remove("mmio");
+        let read = Setup::from_json(&old).unwrap();
+        assert_eq!(read.mmio, MmioConfig::default());
+        assert_eq!(read, setup);
+    }
+
+    #[test]
+    fn mmio_models_parse_from_their_flags_and_bad_ones_are_named() {
+        let (image, _) = load_image(&fixture("mmio.elf"), None).unwrap();
+        let main = image.symbol("main").unwrap().address;
+        let model = |spec: &str| parse_mmio_model(&image, spec);
+        assert_eq!(
+            model("0x40013000=constant:0x4c31a5c3").unwrap(),
+            MmioModel {
+                address: PERIPH_ID,
+                pc: None,
+                kind: MmioModelKind::Constant { value: 0x4c31_a5c3 },
+            }
+        );
+        // Hex, `0x` optional, as for every address; the instruction may be
+        // a symbol and may carry the Thumb bit.
+        assert_eq!(
+            model("40013004@08000113=passthrough").unwrap(),
+            MmioModel {
+                address: PERIPH_DATA,
+                pc: Some(0x0800_0112),
+                kind: MmioModelKind::Passthrough,
+            }
+        );
+        assert_eq!(model("0x40013004@main=constant:10").unwrap().pc, Some(main));
+        assert_eq!(
+            model("0x40013004=constant:10").unwrap().kind,
+            MmioModelKind::Constant { value: 0x10 }
+        );
+        for (bad, says) in [
+            ("0x40013000", "ADDR[@PC]=MODEL"),
+            ("0x40013000=", "passthrough"),
+            ("=passthrough", "ADDR[@PC]=MODEL"),
+            ("0x40013000=constant", "constant:VALUE"),
+            ("0x40013000=constant:zz", "\"zz\""),
+            ("0x40013000=mystery", "\"mystery\""),
+            (
+                "0x40013000@no_such_function=passthrough",
+                "no_such_function",
+            ),
+        ] {
+            let error = model(bad).unwrap_err().to_string();
+            assert!(error.contains(says), "{bad:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn the_peripheral_default_follows_the_input_buffer_unless_named() {
+        let work = TestDir::new("rehost-mmio-default");
+        let (image, _) = load_image(&fixture("mmio.elf"), None).unwrap();
+        let mut args = mmio_args(&work);
+        assert_eq!(
+            Setup::from_args(&args, &image).unwrap().mmio.default,
+            MmioDefault::Passthrough,
+            "with no buffer, peripheral reads are how the input arrives"
+        );
+        args.input_buffer = Some("record".to_owned());
+        assert_eq!(
+            Setup::from_args(&args, &image).unwrap().mmio.default,
+            MmioDefault::Zero,
+            "with a buffer, unmodelled registers read as zero as before"
+        );
+        args.mmio_default = Some(MmioDefaultArg::Passthrough);
+        assert_eq!(
+            Setup::from_args(&args, &image).unwrap().mmio.default,
+            MmioDefault::Passthrough
+        );
+    }
+
+    #[test]
+    fn a_setup_no_input_reaches_is_refused() {
+        let work = TestDir::new("rehost-no-input");
+        let (image, _) = load_image(&fixture("mmio.elf"), None).unwrap();
+        let mut args = mmio_args(&work);
+        args.mmio_default = Some(MmioDefaultArg::Zero);
+        let error = Setup::from_args(&args, &image).unwrap_err().to_string();
+        assert!(error.contains("no input reaches the firmware"), "{error}");
+        // An input-fed model for the data register is enough.
+        args.mmio.push(format!("{PERIPH_DATA:#x}=passthrough"));
+        assert!(Setup::from_args(&args, &image).is_ok());
+    }
+
+    #[test]
+    fn mmio_models_load_from_a_file_or_a_recorded_setup() {
+        let work = TestDir::new("rehost-mmio-file");
+        let (image, _) = load_image(&fixture("mmio.elf"), None).unwrap();
+        let mut given = mmio_args(&work);
+        given.mmio.push("0x40013004@main=constant:3".to_owned());
+        let setup = Setup::from_args(&given, &image).unwrap();
+        let mut args = mmio_args(&work);
+        args.mmio.clear();
+        // The models alone, a run JSON's setup and a finding's all load.
+        let documents = [
+            setup.to_json()["mmio"].clone(),
+            json!({"schema_version": RUN_SCHEMA, "setup": setup.to_json()}),
+            json!({"kind": FINDING_KIND, "rehost": {"setup": setup.to_json()}}),
+        ];
+        for (index, document) in documents.iter().enumerate() {
+            let path = work.join(format!("models-{index}.json"));
+            fs::write(&path, document.to_string()).unwrap();
+            args.mmio_models = Some(path);
+            assert_eq!(
+                Setup::from_args(&args, &image).unwrap().mmio,
+                setup.mmio,
+                "{document:#}"
+            );
+        }
+        // A flag adds to the file's models.
+        args.mmio = vec![format!("{PERIPH_DATA:#x}@0x08000128=passthrough")];
+        assert_eq!(
+            Setup::from_args(&args, &image).unwrap().mmio.models.len(),
+            3
+        );
+        let path = work.join("not-models.json");
+        fs::write(&path, "{\"schema_version\": 1}").unwrap();
+        args.mmio_models = Some(path);
+        let error = Setup::from_args(&args, &image).unwrap_err().to_string();
+        assert!(error.contains("not-models.json"), "{error}");
+    }
+
+    #[test]
+    fn a_models_file_with_no_default_leaves_it_to_the_input_buffer_rule() {
+        let work = TestDir::new("rehost-mmio-file-default");
+        let (image, _) = load_image(&fixture("mmio.elf"), None).unwrap();
+        let id = json!({"address": "0x40013000", "model": "constant", "value": "0x4c31a5c3"});
+        let path = work.join("models.json");
+        fs::write(&path, json!({"models": [id]}).to_string()).unwrap();
+        let mut args = mmio_args(&work);
+        args.mmio.clear();
+        args.mmio_models = Some(path.clone());
+        let setup = Setup::from_args(&args, &image).unwrap();
+        assert_eq!(setup.mmio.default, MmioDefault::Passthrough, "no buffer");
+        assert_eq!(setup.mmio.models.len(), 1);
+        args.input_buffer = Some("record".to_owned());
+        assert_eq!(
+            Setup::from_args(&args, &image).unwrap().mmio.default,
+            MmioDefault::Zero,
+            "a buffer"
+        );
+        // A default the file does record is kept.
+        args.input_buffer = None;
+        fs::write(
+            &path,
+            json!({"default": "zero", "models": [id]}).to_string(),
+        )
+        .unwrap();
+        let error = Setup::from_args(&args, &image).unwrap_err().to_string();
+        assert!(error.contains("no input reaches the firmware"), "{error}");
+    }
+
+    #[test]
+    fn a_large_buffer_leaves_peripheral_reads_the_rest_of_an_input_the_mutator_makes() {
+        let work = TestDir::new("rehost-large-buffer");
+        let (image, _) = load_image(&fixture("mmio.elf"), None).unwrap();
+        let mut args = mmio_args(&work);
+        args.input_buffer = Some("0x20008000".to_owned());
+        args.input_size = Some(8192);
+        args.mmio_default = Some(MmioDefaultArg::Passthrough);
+        let setup = Setup::from_args(&args, &image).unwrap();
+        assert_eq!(setup.max_input_len(), 8192);
+        assert_eq!(setup.config().input.unwrap().capacity, 4096);
+        // The buffer's share, then a record with a wild offset for the data
+        // register: no longer than the mutator's inputs.
+        let mut input = vec![0x55; 4096];
+        input.extend_from_slice(&fs::read(store_record(&work, 0x4000_0000, 0x5a)).unwrap());
+        assert!(input.len() <= setup.max_input_len());
+        let run = setup.machine(&image).unwrap().run(&input);
+        assert_eq!(run.input_delivered, Some(4096));
+        assert!(matches!(run.stop, Stop::Fault(_)), "{:?}", run.stop);
+        assert_eq!(run.mmio_input, 11, "the whole record");
+        // The campaign and the replay of its finding split it the same way.
+        let seed = work.join("seed-large");
+        fs::write(&seed, &input).unwrap();
+        args.seed_files = vec![seed];
+        let summary = run_inner(&args).unwrap();
+        assert_eq!(summary["stops"]["fault"], 1, "{summary:#}");
+        assert_eq!(summary["setup"]["input"]["capacity"], 8192);
+        let id = summary["findings"][0].as_str().unwrap().to_owned();
+        let dir = corpus::layout::findings_dir(&work).join(&id);
+        let replay = replay_rehost_outcome(&dir, None).unwrap();
+        assert!(replay.matched, "{:?}", replay.differences);
+        // With no peripheral input the buffer keeps its whole capacity.
+        args.mmio_default = Some(MmioDefaultArg::Zero);
+        let setup = Setup::from_args(&args, &image).unwrap();
+        assert_eq!(setup.config().input.unwrap().capacity, 8192);
+        assert_eq!(setup.max_input_len(), 4096);
+    }
+
+    #[test]
+    fn a_fault_behind_a_peripheral_is_a_finding_that_replays_with_its_models() {
+        let work = TestDir::new("rehost-mmio-campaign");
+        let mut args = mmio_args(&work);
+        args.seed_files = vec![store_record(&work, 0x4000_0000, 0x5a)];
+        let summary = run_inner(&args).unwrap();
+        assert_eq!(summary["stops"]["fault"], 1, "{summary:#}");
+        assert_eq!(
+            summary["input_not_delivered"], 0,
+            "no buffer, nothing to miss"
+        );
+        assert!(summary["mmio_reads"].as_u64().unwrap() > 10, "{summary:#}");
+        let id = summary["findings"][0].as_str().unwrap().to_owned();
+        let dir = corpus::layout::findings_dir(&work).join(&id);
+        let finding: Value =
+            serde_json::from_slice(&fs::read(dir.join("finding.json")).unwrap()).unwrap();
+        assert_eq!(finding["rehost"]["fault"]["kind"], "write_unmapped");
+        assert_eq!(finding["input"]["mode"], "rehost-mmio");
+        assert_eq!(finding["input"]["mmio_bytes"], 11);
+        let mmio = &finding["rehost"]["setup"]["mmio"];
+        assert_eq!(mmio["default"], "passthrough");
+        assert_eq!(
+            mmio["models"],
+            json!([{"address": "0x40013000", "pc": null, "model": "constant", "value": "0x4c31a5c3"}])
+        );
+        let peripherals = finding["rehost"]["fidelity"]["peripherals"]
+            .as_str()
+            .unwrap();
+        assert!(peripherals.contains("1 register model"), "{peripherals}");
+        assert!(peripherals.contains("from the input"), "{peripherals}");
+        let replay = replay_rehost_outcome(&dir, None).unwrap();
+        assert!(replay.matched, "{:?}", replay.differences);
+        // The recorded models are what the replay runs: without them the ID
+        // register reads as the input's first bytes and the firmware sleeps.
+        let mut stripped = finding.clone();
+        stripped["rehost"]["setup"]["mmio"]["models"] = json!([]);
+        fs::write(dir.join("finding.json"), stripped.to_string()).unwrap();
+        let replay = replay_rehost_outcome(&dir, None).unwrap();
+        assert!(!replay.matched);
+        assert!(
+            replay.differences[0].contains("went idle"),
+            "{:?}",
+            replay.differences
+        );
+    }
+
+    #[test]
+    fn a_run_that_reads_past_its_input_is_a_clean_stop() {
+        let work = TestDir::new("rehost-mmio-exhausted");
+        let mut args = mmio_args(&work);
+        // A length of 10 and no record.
+        args.seed_inputs = vec!["\n".to_owned()];
+        let summary = run_inner(&args).unwrap();
+        assert_eq!(summary["stops"]["input_exhausted"], 1, "{summary:#}");
+        assert_eq!(summary["findings"], json!([]));
+        assert_eq!(
+            describe_stop(&Stop::InputExhausted {
+                pc: 0x0800_0128,
+                address: PERIPH_DATA
+            }),
+            "ran out of input at a read of the peripheral register 0x40013004 at pc 0x08000128"
+        );
     }
 
     #[test]

@@ -523,13 +523,16 @@ bhf binary fuzz ./parser --engine afl-qemu --input-mode file \
 `bhf binary rehost <IMAGE>` fuzzes an unmodified Cortex-M firmware image (an
 ELF, or a raw image with `--base`) in bhf's own emulator: each input is
 written into a fixed buffer (`--input-buffer`, an address or ELF symbol,
-with `--input-size`, `--input-length` and `--inject-at`), the core starts
-from the reset vector, and basic-block edge coverage steers the mutation.
-Addresses are hex, `0x` optional, as `nm` prints them. An invalid memory
-access, a bad PC or a HardFault is a `kind: rehost_fault` finding, which
-`bhf replay` reproduces through the recorded machine setup. Peripherals and
-interrupts are not modelled; see [On-target fuzzing §9](on-target-fuzzing.md)
-for the flags and the fidelity.
+with `--input-size`, `--input-length` and `--inject-at`), read by the
+firmware's peripheral reads through MMIO models (`--mmio ADDR[@PC]=MODEL`,
+`passthrough` from the input or `constant:VALUE`; `--mmio-models FILE`;
+`--mmio-default zero|passthrough`), or both; the core starts from the reset
+vector, and basic-block edge coverage steers the mutation. Addresses are
+hex, `0x` optional, as `nm` prints them. An invalid memory access, a bad PC
+or a HardFault is a `kind: rehost_fault` finding, which `bhf replay`
+reproduces through the recorded machine setup and MMIO models. Interrupts
+are not modelled; see [On-target fuzzing §9](on-target-fuzzing.md) for the
+flags and the fidelity.
 
 `--runtime-oracles auto|on|off` (on `bhf fuzz` and `bhf binary fuzz`) loads the
 runtrace sink oracles via the `LD_PRELOAD` shim so a **clean-exit** semantic

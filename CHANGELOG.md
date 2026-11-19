@@ -2992,6 +2992,25 @@
   `binary rehost` (a value added to the `bhf.findings.v1` schema's
   `producer` enum) and the reproduce command `bhf replay findings/<id>`;
   they get no `replay.py`.
+- `bhf binary rehost` serves the firmware's peripheral reads from MMIO models
+  (#352): `--mmio ADDR[@PC]=MODEL` names a `passthrough` model (the read's
+  bytes come from the input) or a `constant:VALUE` model for a register, or
+  for one instruction's reads of it; `--mmio-models FILE` loads models a run
+  JSON or finding records; `--mmio-default zero|passthrough` sets what an
+  unmodelled register reads as (`passthrough` without `--input-buffer`,
+  which is now optional, and `zero` with it, as before; a models file that
+  records no `default` leaves it to that rule). Peripheral reads take the
+  input after the buffer's bytes (the buffer then takes at most the first
+  4096); a run that wants more stops as `input_exhausted`. A model for an
+  address `--ram` or an image segment maps is refused, since memory would
+  answer its reads. The setup in the run JSON and in each finding
+  (`rehost.setup.mmio`, absent in older findings, which replay as before)
+  records the models, so `bhf replay` runs the same models again; `input`
+  may now be null, a finding's `input` block gains `mmio_reads` and
+  `mmio_bytes` and modes `rehost-mmio` and `rehost-buffer+mmio`, and the run
+  JSON gains `mmio_reads`, all additive to `bhf.binary_rehost.run.v1` and
+  `bhf.rehost.v1`. The `rehost` crate gains `MmioConfig` and a recorded
+  trace of a run's peripheral reads (`Machine::trace_mmio`).
 - `bhf auto` fuzzes the Go native fuzz tests a project ships (#336): each
   `func FuzzXxx(f *testing.F)` in a `_test.go` file is a target, built
   against a stand-in for `testing` whose `f.Fuzz` hands bhf's inputs to the

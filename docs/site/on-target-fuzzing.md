@@ -61,7 +61,7 @@ binary release.
 | An on-device agent (TCP/serial) | **On-target agent** | Real device; coverage over the agent protocol | ⛔ unproven: the host side ships; no target-side agent does yet ([#289](https://github.com/Tarmo-Technologies/bhf/issues/289)), so you write one to the frame format in §3c |
 | A physical board | **HIL** (hardware-in-the-loop) | Silicon | ⛔ unproven (`BHF_HIL_GDB`) |
 | A Linux driver's source, and syzkaller | **syzkaller descriptions and crash import** (`bhf kernel syzlang`, `bhf kernel import`, §10) | syzkaller runs the kernel and its KCOV coverage; bhf describes the driver's ioctls and triages the crashes | ✅ snapshot of the widget fixture's description, and the import of a crash directory in syz-manager's layout; ⛔ syz-sysgen acceptance and a fresh syz-manager workdir gated (need syzkaller) |
-| Only a firmware image (ELF or flash dump), no source | **Rehosting** (`bhf binary rehost`, §9) | bhf's own Cortex-M interpreter: the real instructions, no peripherals or interrupts | ✅ fixture images in `crates/rehost/tests/fixtures/`: edge coverage that grows with the input, invalid-access, bad-PC and HardFault findings, `bhf replay` MATCH |
+| Only a firmware image (ELF or flash dump), no source | **Rehosting** (`bhf binary rehost`, §9) | bhf's own Cortex-M interpreter: the real instructions; peripheral reads from per-register models (input-fed or constant), no interrupts | ✅ fixture images in `crates/rehost/tests/fixtures/`: edge coverage that grows with the input, invalid-access, bad-PC and HardFault findings, a parser fed through a peripheral data register, `bhf replay` MATCH |
 
 ---
 
@@ -825,12 +825,13 @@ dump, `bhf binary rehost` runs it unmodified in bhf's own emulator (the
 source, toolchain, harness or instrumentation is involved.
 
 For each input the emulator resets the core the way the hardware does: the
-stack pointer and the reset vector come from the vector table. The input is
-written into a fixed buffer in the firmware's memory, the receive buffer its
-parser reads, with an optional length word. Execution runs until the core
-goes idle (`WFI`, `WFE`, a branch to itself), reaches an `--exit-at`
-address, exits through semihosting, requests a system reset, faults, or uses
-`--max-instructions`. Every basic block the core enters is counted in a
+stack pointer and the reset vector come from the vector table. The input
+reaches the firmware in a fixed buffer in its memory (the receive buffer its
+parser reads, with an optional length word), through its peripheral reads
+(MMIO models, below), or both. Execution runs until the core goes idle
+(`WFI`, `WFE`, a branch to itself), reaches an `--exit-at` address, exits
+through semihosting, requests a system reset, runs out of input at a
+peripheral read, faults, or uses `--max-instructions`. Every basic block the core enters is counted in a
 64 KiB edge map that steers the builtin engine's mutator and power schedule.
 
 ```sh
@@ -843,6 +844,11 @@ bhf binary rehost firmware.elf --work-dir bhf_work \
 bhf binary rehost firmware.bin --base 0x08000000 --work-dir bhf_work \
   --input-buffer 0x20000008 --input-size 64 --inject-at 0x080000f0 \
   --ram 0x20000000:0x20000
+
+# No buffer: the firmware reads its input from a peripheral's data
+# register, after checking an ID register that must read a fixed value:
+bhf binary rehost firmware.elf --work-dir bhf_work \
+  --mmio 0x40013000=constant:0x4c31a5c3 --seed-file seed.bin
 ```
 
 - Addresses are hex, `0x` optional, so a value copied from `nm` or `objdump`
@@ -857,6 +863,34 @@ bhf binary rehost firmware.bin --base 0x08000000 --work-dir bhf_work \
   for every input until the input is written, so when no seed reaches it,
   no run will: bhf warns on stderr. Check the address, and whether the
   start-up code polls a peripheral first.
+- **Peripheral reads (MMIO models).** A load from the peripheral window
+  (`0x40000000`-`0x5fffffff`) is served by a model:
+  `--mmio ADDR[@PC]=MODEL` (repeatable) names one for the register at ADDR,
+  or with `@PC` for the instruction at PC only, which wins over a model for
+  the register. ADDR and PC are hex or ELF symbols; MODEL is `passthrough`
+  (each read takes as many bytes as it is wide from the input, so the
+  fuzzer drives what the firmware sees there; Fuzzware calls this model
+  "identity") or `constant:VALUE` (hex; a fixed value, such as the ID or
+  ready bit a driver checks once). A register no model names reads as
+  `--mmio-default`: `passthrough` when there is no `--input-buffer`, so
+  every unmodelled read takes the input, and `zero` when there is one, as
+  before models existed. Peripheral reads take the input in order, after
+  the bytes the buffer holds (when peripheral reads take input as well, the
+  buffer takes at most the input's first 4096 bytes, so an input the
+  mutator makes can reach the peripherals however large the buffer is; a
+  seed feeds them only with its bytes past the buffer's share), and a
+  run whose reads want more input than it has stops as `input_exhausted` in
+  the run JSON's `stops`: a clean stop, not a finding. Writes to peripheral
+  registers are dropped. A model for an address that `--ram` or an image
+  segment maps is refused, since memory answers those reads before any
+  model would.
+  `--mmio-models FILE` loads models from a JSON file: the `mmio` object a
+  run JSON's `setup` or a finding's `rehost.setup` records (or either whole
+  document), so a later campaign or a teammate starts from the same models;
+  `--mmio` adds to them. A file whose `mmio` object has no `default` leaves
+  the default to the rule above. The run JSON's `mmio_reads` counts the peripheral
+  reads of the campaign, and a finding's `input` block says how many bytes
+  its peripheral reads took (`mmio_bytes`).
 - `--ram BASE:SIZE` (repeatable) maps RAM; the default is
   `0x20000000:0x100000`, and an ELF's `.data` and `.bss` RAM is mapped as
   well. An initial stack pointer outside RAM is refused before anything
@@ -876,11 +910,13 @@ bhf binary rehost firmware.bin --base 0x08000000 --work-dir bhf_work \
     `BKPT` with no debugger, or an `SVC` at a priority that cannot take it.
 
   The finding records the fault (kind, PC, address, the branch that went
-  there, the registers), the testcase and the machine setup. Its
+  there, the registers), the testcase and the machine setup, its MMIO
+  models and default included (`rehost.setup.mmio`). Its
   `crash.signature` is the class, the kind and the faulting instruction (for
   a bad PC, the branch), so inputs that fault the same way are one finding.
-- `bhf replay <finding>` runs the testcase through the recorded setup again
-  and reports `MATCH` when it faults with the same signature; `--harness`
+- `bhf replay <finding>` runs the testcase through the recorded setup,
+  peripheral models included, again and reports `MATCH` when it faults with
+  the same signature; `--harness`
   names another copy of the image to run. It is the reproduce command
   `results/INDEX.md` and `findings.json` give for these findings (producer
   `binary rehost`); they get no `replay.py`, which runs a host harness.
@@ -889,10 +925,12 @@ bhf binary rehost firmware.bin --base 0x08000000 --work-dir bhf_work \
 CPU runs the real instructions: the Cortex-M3/M4 integer set with the M4's
 halfword multiplies and saturation, the banked stack pointers, `SVC`
 exception entry and return, and the System Control Block registers start-up
-code writes. Peripherals are **not modelled**: their registers read as zero
-and drop writes, so firmware that polls a status bit spins until
-`--max-instructions`. Interrupts, the FPU, the M4's SIMD instructions, the
-MPU and privilege are not modelled either. An instruction outside the model
+code writes. Peripherals are modelled only as far as their reads go: each
+read returns what its model says (the input's bytes or a constant), writes
+are dropped, and nothing a peripheral does on its own (a FIFO filling, a
+timer counting) happens. With no models and the `zero` default the block
+says peripherals are not modelled. Interrupts, the FPU, the M4's SIMD
+instructions, the MPU and privilege are not modelled. An instruction outside the model
 ends the run as `unsupported` in the run JSON's `stops` and `unsupported`
 fields, never as a finding. An UNPREDICTABLE encoding (one that sets a bit
 the architecture says should be clear, say) runs as the instruction it

@@ -275,3 +275,109 @@ fn an_input_the_firmware_never_receives_is_counted_and_warned_about() {
         text(&output)
     );
 }
+
+/// The length byte, then a "FUZZW" record for the peripheral fixture
+/// (`mmio.c`) that stores `value` at `offset` in its table.
+fn store_record(dir: &Path, offset: u32, value: u8) -> PathBuf {
+    let mut record = b"FUZZW".to_vec();
+    record.extend_from_slice(&offset.to_le_bytes());
+    record.push(value);
+    let mut bytes = vec![record.len() as u8];
+    bytes.extend_from_slice(&record);
+    let path = dir.join(format!("seed-store-{offset:08x}"));
+    fs::write(&path, bytes).unwrap();
+    path
+}
+
+#[test]
+fn a_peripheral_fed_image_reaches_its_parser_bug_and_replays_with_its_models() {
+    let root = TestDir::new("binary-rehost-mmio");
+    let work = root.join("work");
+    // An in-bounds store: the seed runs clean, one byte from a wild write.
+    let seed = store_record(&root, 4, 0x5a);
+    let output = bhf()
+        .args(["binary", "rehost"])
+        .arg(fixture("mmio.elf"))
+        .arg("--work-dir")
+        .arg(&work)
+        .args([
+            "--mmio",
+            "0x40013000=constant:0x4c31a5c3",
+            "--seed-file",
+            seed.to_str().unwrap(),
+            "--iterations",
+            "3000",
+        ])
+        .output()
+        .unwrap();
+    let run = summary(&output);
+    assert_eq!(run["setup"]["input"], Value::Null);
+    assert_eq!(run["setup"]["mmio"]["default"], "passthrough");
+    let findings = run["findings"].as_array().unwrap();
+    assert!(!findings.is_empty(), "{run:#}");
+    for id in findings {
+        let dir = work.join("results/findings").join(id.as_str().unwrap());
+        let finding: Value =
+            serde_json::from_slice(&fs::read(dir.join("finding.json")).unwrap()).unwrap();
+        // The wild store lands in unmapped memory or in the read-only image.
+        assert_eq!(finding["classification"], "invalid_access", "{finding:#}");
+        assert_eq!(
+            finding["rehost"]["setup"]["mmio"]["models"][0]["value"],
+            "0x4c31a5c3"
+        );
+        let replay = bhf().arg("replay").arg(&dir).output().unwrap();
+        assert_eq!(replay.status.code(), Some(0), "{}", text(&replay));
+        assert!(
+            String::from_utf8_lossy(&replay.stdout).contains("peripheral reads"),
+            "{}",
+            text(&replay)
+        );
+    }
+    // Without the ID model the firmware never reaches its parser.
+    let unmodelled = bhf()
+        .args(["binary", "rehost"])
+        .arg(fixture("mmio.elf"))
+        .arg("--work-dir")
+        .arg(root.join("unmodelled"))
+        .args([
+            "--seed-file",
+            store_record(&root, 0x4000_0000, 0x5a).to_str().unwrap(),
+            "--iterations",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    let unmodelled = summary(&unmodelled);
+    assert_eq!(
+        unmodelled["findings"],
+        serde_json::json!([]),
+        "{unmodelled:#}"
+    );
+}
+
+#[test]
+fn an_mmio_model_flag_that_does_not_parse_is_refused() {
+    let root = TestDir::new("binary-rehost-mmio-bad");
+    let output = bhf()
+        .args(["binary", "rehost"])
+        .arg(fixture("mmio.elf"))
+        .arg("--work-dir")
+        .arg(root.join("work"))
+        .args(["--mmio", "0x40013000=sometimes"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("\"sometimes\""),
+        "{}",
+        text(&output)
+    );
+    // The input buffer's companions need the buffer.
+    let output = bhf()
+        .args(["binary", "rehost"])
+        .arg(fixture("mmio.elf"))
+        .args(["--input-size", "16"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{}", text(&output));
+}

@@ -40,11 +40,20 @@
 //! assert!(machine.edge_map().edges() > 0);
 //! ```
 //!
-//! What a rehosted run does not model: peripherals (their registers read as
-//! zero and drop writes), interrupts, the floating-point unit, the M4's SIMD
-//! instructions, the MPU and privilege. An instruction outside the model
-//! stops the run as [`Stop::Unsupported`], a limit of the emulator rather
-//! than a fault of the firmware.
+//! Peripheral registers read through MMIO models ([`MmioConfig`]): a model
+//! for a register, or for one instruction's reads of it, either takes the
+//! read's bytes from the input (passthrough) or returns a constant, and a
+//! read no model names returns zero or, with [`MmioDefault::Passthrough`],
+//! the input's bytes. Peripheral reads take the input as a stream (after the
+//! bytes an [`InputBuffer`] holds), and a read the input has no bytes left
+//! for ends the run as [`Stop::InputExhausted`]. Peripheral writes are
+//! dropped.
+//!
+//! What a rehosted run does not model: peripheral behaviour beyond those
+//! reads, interrupts, the floating-point unit, the M4's SIMD instructions,
+//! the MPU and privilege. An instruction outside the model stops the run as
+//! [`Stop::Unsupported`], a limit of the emulator rather than a fault of the
+//! firmware.
 
 mod alu;
 #[cfg(test)]
@@ -55,6 +64,7 @@ mod fault;
 mod image;
 mod machine;
 mod memory;
+mod mmio;
 mod thumb16;
 mod thumb32;
 
@@ -65,3 +75,4 @@ pub use machine::{
     Execution, IdleReason, InputBuffer, Machine, MachineConfig, MemoryRange, SetupError, Stop,
     DEFAULT_MAX_INSTRUCTIONS, DEFAULT_RAM_BASE, DEFAULT_RAM_SIZE,
 };
+pub use mmio::{MmioAccess, MmioConfig, MmioDefault, MmioModel, MmioModelKind};

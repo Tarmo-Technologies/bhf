@@ -4,10 +4,12 @@
 //! input at a time.
 
 use crate::coverage::EdgeMap;
-use crate::cpu::{executable_region, Core, Trap};
+use crate::cpu::{executable_region, Core, Trap, PERIPHERAL_BASE, PERIPHERAL_END};
 use crate::fault::Fault;
 use crate::image::Image;
 use crate::memory::Memory;
+use crate::mmio::{Mmio, MmioAccess, MmioConfig};
+use std::collections::HashSet;
 use thiserror::Error;
 
 /// Where the RAM of most Cortex-M parts starts.
@@ -35,7 +37,8 @@ impl MemoryRange {
 }
 
 /// How a run's input reaches the firmware: written into a fixed buffer, as
-/// a receive routine would leave it.
+/// a receive routine would leave it. Peripheral reads that take input (see
+/// [`MmioConfig`]) take the bytes after the buffer's `capacity`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InputBuffer {
     /// Where the input is written.
@@ -62,6 +65,8 @@ pub struct MachineConfig {
     pub exit_at: Vec<u32>,
     /// The most instructions one run executes.
     pub max_instructions: u64,
+    /// What peripheral registers read as.
+    pub mmio: MmioConfig,
 }
 
 impl Default for MachineConfig {
@@ -72,6 +77,7 @@ impl Default for MachineConfig {
             input: None,
             exit_at: Vec::new(),
             max_instructions: DEFAULT_MAX_INSTRUCTIONS,
+            mmio: MmioConfig::default(),
         }
     }
 }
@@ -109,6 +115,24 @@ pub enum SetupError {
     NotCode { what: &'static str, address: u32 },
     #[error("the instruction budget is zero")]
     NoBudget,
+    #[error(
+        "the MMIO model for {address:#010x} is outside the peripheral window 0x40000000-0x5fffffff"
+    )]
+    MmioOutsidePeripherals { address: u32 },
+    #[error(
+        "the MMIO model for {address:#010x} would never be used: RAM or an image segment holds that \
+         address, and memory answers its reads"
+    )]
+    MmioInMemory { address: u32 },
+    #[error("two MMIO models for the register at {address:#010x} {}", read_by(*.pc))]
+    DuplicateMmioModel { address: u32, pc: Option<u32> },
+}
+
+fn read_by(pc: Option<u32>) -> String {
+    match pc {
+        Some(pc) => format!("read at pc {pc:#010x}"),
+        None => "read by any instruction".to_owned(),
+    }
 }
 
 /// Why the core went idle.
@@ -152,6 +176,9 @@ pub enum Stop {
         encoding: u32,
         what: &'static str,
     },
+    /// A peripheral read wanted more input than the run had left: the
+    /// firmware asked for more than the testcase holds.
+    InputExhausted { pc: u32, address: u32 },
     /// The firmware faulted.
     Fault(Fault),
 }
@@ -166,6 +193,7 @@ impl Stop {
             Self::SystemReset { .. } => "system_reset",
             Self::InstructionLimit => "instruction_limit",
             Self::Unsupported { .. } => "unsupported",
+            Self::InputExhausted { .. } => "input_exhausted",
             Self::Fault(_) => "fault",
         }
     }
@@ -180,8 +208,12 @@ pub struct Execution {
     /// Basic blocks the run entered.
     pub blocks: u64,
     /// Bytes of the input written into the buffer, or `None` when the run
-    /// never reached the address that writes it.
+    /// never reached the address that writes it or there is no buffer.
     pub input_delivered: Option<usize>,
+    /// Peripheral registers the run read.
+    pub mmio_reads: u64,
+    /// Bytes of the input its peripheral reads took.
+    pub mmio_input: usize,
     /// What the firmware wrote through semihosting.
     pub output: Vec<u8>,
 }
@@ -199,8 +231,9 @@ pub struct Machine {
 impl Machine {
     /// Map `image` and its RAM, and check that it can start: the vector table
     /// is in the image, the reset vector points at Thumb code, the stack is in
-    /// RAM, and the input buffer and the exit and injection addresses are in
-    /// memory.
+    /// RAM, the input buffer and the exit and injection addresses are in
+    /// memory, and each MMIO model names a peripheral register that no RAM
+    /// or image segment holds, at most once per site, read by code.
     pub fn new(image: &Image, config: MachineConfig) -> Result<Self, SetupError> {
         if config.max_instructions == 0 {
             return Err(SetupError::NoBudget);
@@ -248,8 +281,30 @@ impl Machine {
         for &address in &config.exit_at {
             check_code(&memory, "the exit address", address)?;
         }
+        let mut sites = HashSet::new();
+        for model in &config.mmio.models {
+            if !(PERIPHERAL_BASE..PERIPHERAL_END).contains(&model.address) {
+                return Err(SetupError::MmioOutsidePeripherals {
+                    address: model.address,
+                });
+            }
+            if memory.holds(model.address, 1) {
+                return Err(SetupError::MmioInMemory {
+                    address: model.address,
+                });
+            }
+            if let Some(pc) = model.pc {
+                check_code(&memory, "an MMIO model's instruction address", pc)?;
+            }
+            if !sites.insert((model.address, model.pc)) {
+                return Err(SetupError::DuplicateMmioModel {
+                    address: model.address,
+                    pc: model.pc,
+                });
+            }
+        }
         Ok(Self {
-            core: Core::new(memory, vector_table),
+            core: Core::new(memory, Mmio::new(&config.mmio), vector_table),
             initial_sp,
             reset_vector,
             input: config.input,
@@ -273,6 +328,17 @@ impl Machine {
         &self.core.edges
     }
 
+    /// Record the first `limit` peripheral reads of each run from now on;
+    /// zero stops recording.
+    pub fn trace_mmio(&mut self, limit: usize) {
+        self.core.mmio.set_trace_limit(limit);
+    }
+
+    /// The peripheral reads of the last run, as far as its trace holds them.
+    pub fn mmio_trace(&self) -> &[MmioAccess] {
+        &self.core.mmio.trace
+    }
+
     /// `len` bytes of the image or its RAM at `address` as the last run left
     /// them, or `None` when memory does not hold them all.
     pub fn read_memory(&mut self, address: u32, len: u32) -> Option<Vec<u8>> {
@@ -287,6 +353,12 @@ impl Machine {
     /// Reset the machine and run `input` until it stops.
     pub fn run(&mut self, input: &[u8]) -> Execution {
         self.core.reset(self.initial_sp, self.reset_vector);
+        // The buffer takes the input's first `capacity` bytes; peripheral
+        // reads take the rest.
+        let buffered = self
+            .input
+            .map_or(0, |buffer| input.len().min(buffer.capacity as usize));
+        self.core.mmio.begin(&input[buffered..]);
         let mut pending = self.input;
         let mut delivered = None;
         if let Some(buffer) = pending.filter(|buffer| buffer.inject_at.is_none()) {
@@ -314,6 +386,7 @@ impl Machine {
                     Trap::Idle { pc, reason } => Stop::Idle { pc, reason },
                     Trap::SemihostingExit { code } => Stop::SemihostingExit { code },
                     Trap::SystemReset { pc } => Stop::SystemReset { pc },
+                    Trap::InputExhausted { pc, address } => Stop::InputExhausted { pc, address },
                 };
             }
         };
@@ -322,6 +395,8 @@ impl Machine {
             instructions: self.core.instructions,
             blocks: self.core.blocks,
             input_delivered: delivered,
+            mmio_reads: self.core.mmio.reads,
+            mmio_input: self.core.mmio.consumed(),
             output: std::mem::take(&mut self.core.output),
         }
     }
@@ -555,6 +630,172 @@ mod tests {
         let run = machine.run(b"Z");
         assert_eq!(run.input_delivered, Some(1));
         assert_eq!(machine.core.r[1], u32::from(b'Z'));
+    }
+
+    /// `mov.w r0, #0x20000000; mov.w r1, #0x40000000; ldrb r2, [r0];
+    /// ldrb r3, [r1]; ldrh r4, [r1, #2]; wfi`: a buffer byte, then a byte
+    /// and a halfword of peripheral registers.
+    const BUFFER_THEN_PERIPHERAL: [u16; 8] = [
+        0xf04f, 0x5000, 0xf04f, 0x4180, 0x7802, 0x780b, 0x884c, 0xbf30,
+    ];
+
+    fn passthrough_at(address: u32) -> crate::MmioModel {
+        crate::MmioModel {
+            address,
+            pc: None,
+            kind: crate::MmioModelKind::Passthrough,
+        }
+    }
+
+    #[test]
+    fn the_buffer_takes_its_capacity_and_peripheral_reads_take_the_rest() {
+        let mut machine = Machine::new(
+            &image(&BUFFER_THEN_PERIPHERAL),
+            MachineConfig {
+                input: Some(InputBuffer {
+                    address: 0x2000_0000,
+                    capacity: 2,
+                    length_word: None,
+                    inject_at: None,
+                }),
+                mmio: MmioConfig {
+                    models: vec![passthrough_at(0x4000_0000)],
+                    default: crate::MmioDefault::Passthrough,
+                },
+                ..MachineConfig::default()
+            },
+        )
+        .unwrap();
+        let run = machine.run(b"ABcde");
+        assert!(matches!(run.stop, Stop::Idle { .. }), "{:?}", run.stop);
+        assert_eq!(run.input_delivered, Some(2));
+        assert_eq!(machine.core.r[2], u32::from(b'A'));
+        assert_eq!(
+            machine.core.r[3],
+            u32::from(b'c'),
+            "the byte after the buffer"
+        );
+        assert_eq!(machine.core.r[4], u32::from_le_bytes(*b"de\0\0"));
+        assert_eq!((run.mmio_reads, run.mmio_input), (2, 3));
+        // An input no longer than the buffer leaves the peripheral reads none.
+        let run = machine.run(b"AB");
+        assert_eq!(
+            run.stop,
+            Stop::InputExhausted {
+                pc: 0x4a,
+                address: 0x4000_0000
+            }
+        );
+    }
+
+    #[test]
+    fn without_models_peripheral_registers_read_as_zero() {
+        let mut machine =
+            Machine::new(&image(&BUFFER_THEN_PERIPHERAL), MachineConfig::default()).unwrap();
+        let run = machine.run(b"xyz");
+        assert!(matches!(run.stop, Stop::Idle { .. }), "{:?}", run.stop);
+        assert_eq!((machine.core.r[3], machine.core.r[4]), (0, 0));
+        assert_eq!((run.mmio_reads, run.mmio_input), (2, 0));
+    }
+
+    #[test]
+    fn setup_refuses_mmio_models_off_the_peripheral_window_twice_or_off_code() {
+        let image = image(&BUFFER_THEN_PERIPHERAL);
+        let with = |models: Vec<crate::MmioModel>| MachineConfig {
+            mmio: MmioConfig {
+                models,
+                default: crate::MmioDefault::Zero,
+            },
+            ..MachineConfig::default()
+        };
+        assert_eq!(
+            Machine::new(&image, with(vec![passthrough_at(0x2000_0000)])).err(),
+            Some(SetupError::MmioOutsidePeripherals {
+                address: 0x2000_0000
+            })
+        );
+        assert_eq!(
+            Machine::new(&image, with(vec![passthrough_at(0x6000_0000)])).err(),
+            Some(SetupError::MmioOutsidePeripherals {
+                address: 0x6000_0000
+            })
+        );
+        let error = Machine::new(
+            &image,
+            with(vec![
+                passthrough_at(0x4000_0000),
+                passthrough_at(0x4000_0000),
+            ]),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            error,
+            SetupError::DuplicateMmioModel {
+                address: 0x4000_0000,
+                pc: None
+            }
+        );
+        assert!(error.to_string().contains("by any instruction"), "{error}");
+        let at = |pc| crate::MmioModel {
+            pc: Some(pc),
+            ..passthrough_at(0x4000_0000)
+        };
+        // One model for the register and one for an instruction are two
+        // sites; two for the same instruction are one.
+        assert!(Machine::new(&image, with(vec![passthrough_at(0x4000_0000), at(0x4a)])).is_ok());
+        let error = Machine::new(&image, with(vec![at(0x4a), at(0x4a)]))
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("read at pc 0x0000004a"),
+            "{error}"
+        );
+        assert_eq!(
+            Machine::new(&image, with(vec![at(0x4b)])).err(),
+            Some(SetupError::NotCode {
+                what: "an MMIO model's instruction address",
+                address: 0x4b
+            })
+        );
+    }
+
+    #[test]
+    fn setup_refuses_an_mmio_model_for_an_address_memory_holds() {
+        // RAM mapped over a register answers its reads before any model
+        // would, so the model would never be used.
+        let image = image(&BUFFER_THEN_PERIPHERAL);
+        let config = |ram: Vec<MemoryRange>| MachineConfig {
+            ram,
+            mmio: MmioConfig {
+                models: vec![passthrough_at(0x4000_0000)],
+                default: crate::MmioDefault::Zero,
+            },
+            ..MachineConfig::default()
+        };
+        let over = MemoryRange {
+            base: 0x4000_0000,
+            size: 0x1000,
+        };
+        let error = Machine::new(&image, config(vec![MemoryRange::default_ram(), over]))
+            .err()
+            .unwrap();
+        assert_eq!(
+            error,
+            SetupError::MmioInMemory {
+                address: 0x4000_0000
+            }
+        );
+        assert!(error.to_string().contains("would never be used"), "{error}");
+        // RAM elsewhere in the window leaves the modelled register alone.
+        let beside = MemoryRange {
+            base: 0x4000_1000,
+            ..over
+        };
+        let mut machine =
+            Machine::new(&image, config(vec![MemoryRange::default_ram(), beside])).unwrap();
+        let run = machine.run(b"z");
+        assert_eq!((run.mmio_reads, machine.core.r[3]), (2, u32::from(b'z')));
     }
 
     #[test]

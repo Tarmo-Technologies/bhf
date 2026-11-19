@@ -8,12 +8,14 @@
 //! (with the M4's halfword multiplies and saturation, without its SIMD and
 //! floating-point instructions), the banked stack pointers, the IT state,
 //! `SVC` exception entry and return, the System Control Block registers a
-//! start-up file writes (`VTOR`, `CCR`, `CPACR`, `AIRCR`), and semihosting
-//! output and exit. Interrupts, the MPU and privilege checks are not.
+//! start-up file writes (`VTOR`, `CCR`, `CPACR`, `AIRCR`), semihosting
+//! output and exit, and peripheral reads through the MMIO models
+//! (`mmio.rs`). Interrupts, the MPU and privilege checks are not.
 
 use crate::coverage::EdgeMap;
 use crate::fault::{Fault, FaultKind};
 use crate::memory::{Memory, Miss};
+use crate::mmio::Mmio;
 use crate::IdleReason;
 use std::collections::HashMap;
 
@@ -60,6 +62,11 @@ pub(crate) enum Trap {
     SystemReset {
         pc: u32,
     },
+    /// A peripheral read wanted more input than the run had left.
+    InputExhausted {
+        pc: u32,
+        address: u32,
+    },
 }
 
 pub(crate) type Step = Result<(), Trap>;
@@ -100,6 +107,8 @@ pub(crate) struct Core {
     event: bool,
     monitor: bool,
     pub(crate) mem: Memory,
+    /// What peripheral registers read as.
+    pub(crate) mmio: Mmio,
     /// Words the private peripheral bus holds, other than the cached ones.
     ppb: HashMap<u32, u32>,
     vtor_reset: u32,
@@ -120,7 +129,7 @@ pub(crate) struct Core {
 }
 
 impl Core {
-    pub(crate) fn new(mem: Memory, vtor: u32) -> Self {
+    pub(crate) fn new(mem: Memory, mmio: Mmio, vtor: u32) -> Self {
         Self {
             r: [0; 16],
             pc: 0,
@@ -142,6 +151,7 @@ impl Core {
             event: false,
             monitor: false,
             mem,
+            mmio,
             ppb: HashMap::new(),
             vtor_reset: vtor,
             vtor,
@@ -455,8 +465,13 @@ impl Core {
             return Ok(self.ppb_read(address, size));
         }
         if (PERIPHERAL_BASE..PERIPHERAL_END).contains(&address) {
-            // No peripheral is modelled: every register reads as zero.
-            return Ok(0);
+            return self
+                .mmio
+                .read(address, self.pc, size, self.instructions)
+                .map_err(|_| Trap::InputExhausted {
+                    pc: self.pc,
+                    address,
+                });
         }
         if let Some((byte, bit)) = self.mem.bitband(address) {
             let value = self.mem.read(byte, 1).unwrap_or(0);
@@ -492,7 +507,7 @@ impl Core {
             return self.ppb_write(address, size, value);
         }
         if (PERIPHERAL_BASE..PERIPHERAL_END).contains(&address) {
-            // No peripheral is modelled: the write goes nowhere.
+            // Peripheral writes go nowhere.
             return Ok(());
         }
         if let Some((byte, bit)) = self.mem.bitband(address) {
