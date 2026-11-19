@@ -780,6 +780,13 @@ jobs:
           $lua = & scripts\ci\install-lua-windows.ps1 -Dest "$env:RUNNER_TEMP\lua54"
           Add-Content $env:GITHUB_PATH $lua
 
+      # The Rust lane builds its harness with a nightly (#326). It is installed
+      # before the integration suites, whose Rust capsule round trips build
+      # the lane too: a `cargo +nightly` there would otherwise make rustup
+      # install it while a test beside it reads the half-installed toolchain.
+      - name: Install a nightly Rust
+        run: rustup toolchain install nightly --profile minimal
+
       # The integration suites of the native Windows paths: the clang and
       # MSVC harness lanes, Visual Studio import, quoted build inputs, spaced
       # paths, capsules, explain, cartography and provenance, plus every
@@ -819,8 +826,6 @@ jobs:
         env:
           BHF_REQUIRE_TOOLS: "1"
         run: |
-          rustup toolchain install nightly --profile minimal
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not (Get-Command gfortran -ErrorAction SilentlyContinue)) {
             $dir = 'C:\mingw64\bin', 'C:\Strawberry\c\bin' | Where-Object { Test-Path (Join-Path $_ 'gfortran.exe') } | Select-Object -First 1
             if (-not $dir) { Write-Error 'no MinGW-w64 gfortran on the runner'; exit 1 }
