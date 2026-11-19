@@ -160,7 +160,7 @@ COMMANDS BY AREA (run `bhf <command> --help` for details):
   Crash triage  corpus, minimize, replay, capsule, verify-poc, env-capsule,
                 differential, relational, cmplog, explain, cartography, decode-args
   Binaries      binary (scan, adapter, fuzz, rehost — no source)
-  Kernel        kernel (syzlang — Linux driver ioctls for syzkaller)
+  Kernel        kernel (syzlang, import — Linux drivers with syzkaller)
   Projects      project (validate, list, run, import-ossfuzz),
                 extension (validate, evaluate)
   Supply chain  sbom, license-audit, static-scan, sloc, extract-state-machines
@@ -286,7 +286,7 @@ enum Command {
     Binary(BinaryArgs),
 
     // ── Kernel drivers: syzkaller ───────────────────────────────────────────
-    /// Linux kernel drivers with syzkaller: generate syzlang descriptions of a driver's ioctl interface from its source (syzlang)
+    /// Linux kernel drivers with syzkaller: generate syzlang descriptions of a driver's ioctl interface from its source (syzlang), import syzkaller crash reports into results (import)
     Kernel(kernel::KernelArgs),
 
     // ── External project/target profiles ────────────────────────────────────

@@ -4,6 +4,7 @@
 //! keeps the derived index in sync with the evidence on disk.
 
 pub mod confirmation;
+pub mod import_syzkaller;
 pub mod lock;
 pub mod manifest;
 pub mod migrate;

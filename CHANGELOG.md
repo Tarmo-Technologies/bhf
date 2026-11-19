@@ -5,6 +5,17 @@
 ## Unreleased
 
 ### Added
+- `bhf kernel import CRASHES... --work-dir DIR [--source-root DIR]` turns
+  syzkaller crash directories (or a syz-manager workdir) into findings
+  under `results/findings/F-KERNEL-*` (#349): the crash class, rule and CWE
+  from the title, syzkaller's title as the finding's, the stack, access and
+  object from the report, and `repro.c`/`repro.syz` as the reproducer, with
+  the reproduce command to run in the test VM (`syz-execprog` takes the
+  options syz-repro recorded atop `repro.prog`, in syz-manager's Go form or
+  the dashboard's JSON) and a `syscall` entry path rather than a harness
+  input. Re-importing updates the finding. `bhf.findings.v1` gains the `kernel import` producer and the
+  `console_log`, `repro_syz` and `repro_c` evidence roles (additive; an
+  older copy of the schema rejects them).
 - `bhf kernel syzlang SOURCE... --out DIR` writes the syzkaller description
   of a Linux driver's ioctl interface (#348): the handlers a `struct
   file_operations` registers, the `_IO`/`_IOR`/`_IOW`/`_IOWR` commands their

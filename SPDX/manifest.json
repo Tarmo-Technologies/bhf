@@ -3243,6 +3243,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/kernel_import_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/kernel_syzlang_cli.rs",
       "license": "Apache-2.0"
     },
@@ -4748,6 +4752,10 @@
     },
     {
       "path": "crates/results/src/confirmation.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/src/import_syzkaller.rs",
       "license": "Apache-2.0"
     },
     {

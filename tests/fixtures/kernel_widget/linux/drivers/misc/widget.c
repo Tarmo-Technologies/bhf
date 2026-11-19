@@ -6,7 +6,7 @@
  *
  * widget_copy_at() checks the slot index against the wrong bound, so
  * WIDGET_IOC_XFER with slot == WIDGET_SLOTS writes one record past the end of
- * the state, a slab-out-of-bounds write under KASAN.
+ * the state: the KASAN slab-out-of-bounds write ../../../crashes/ records.
  */
 #include <linux/fs.h>
 #include <linux/miscdevice.h>

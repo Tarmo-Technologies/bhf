@@ -17,7 +17,7 @@ index when it finishes. This doc describes that layout, the `bhf.findings.v1` /
 | `results/findings.sarif` | SARIF 2.1.0, one run, every finding kind except `sca` |
 | `results/manifest.json` | `bhf.results-manifest.v1`: tool, source, full producer history |
 | `results/attestation.json` | in-toto Statement v1 over every file under `results/` |
-| `results/findings/<ID>/` | Evidence for findings that have files: `finding.json`, `testcase.bin`, `min_testcase.bin` (when minimized), `sanitizer.log`, `decoded.json`, `replay.py` / `repro.adb`; plus `replay.log`, the raw output of `bhf replay`, and `replay-other-harness.log`, that of a `bhf replay` of another harness than the finding's own that did not `MATCH` (both covered by `attestation.json`, neither an evidence role) |
+| `results/findings/<ID>/` | Evidence for findings that have files: `finding.json`, `testcase.bin`, `min_testcase.bin` (when minimized), `sanitizer.log`, `decoded.json`, `replay.py` / `repro.adb` (an imported kernel crash: `sanitizer.log`, `console.log`, `repro.syz`, `repro.c`); plus `replay.log`, the raw output of `bhf replay`, and `replay-other-harness.log`, that of a `bhf replay` of another harness than the finding's own that did not `MATCH` (both covered by `attestation.json`, neither an evidence role) |
 | `results/legacy/` | Only in a work dir migrated from bhf ≤ 0.2.x: the old `FINDINGS.md`, `findings.csv`, `auto/findings.csv` and `findings/<ID>/replay.py`, and `migration.json` (what was moved, when) |
 | `results/static/` | Native `static-scan` output (`static-report.{json,md,sarif}`) |
 | `results/sbom/` | Native `sbom` output (`cyclonedx.json`, `sbom.spdx.json`, `openvex.json`, `vulnerabilities.json`, ...) |
@@ -57,7 +57,9 @@ evidence role)
 are optional in the schema, so documents written
 before them still validate; bhf always writes them. A validator holding the
 older schema rejects them. The `binary rehost` value of `producer` came
-later too, and an older schema rejects it. `reproduce.build.fidelity` is optional the same
+later too, and an older schema rejects it, as it rejects the `kernel import`
+producer and the `console_log`, `repro_syz` and `repro_c` evidence roles of
+an imported syzkaller crash. `reproduce.build.fidelity` is optional the same
 way, but written only for a finding whose harness build used fabricated
 inputs (below).
 
@@ -88,7 +90,7 @@ lines). INDEX.md says "Reached through N call stacks".
 |---|---|---|
 | `id` | string | unique within `results/` |
 | `kind` | enum | `fuzz`, `runtime`, `static`, `binary`, `differential`, `sca` |
-| `producer` | string | command that wrote it, inferred from the ID family; `binary rehost` for a `rehost_fault` record |
+| `producer` | string | command that wrote it, inferred from the ID family; `binary rehost` for a `rehost_fault` record, `kernel import` for a `kernel_crash` record (a syzkaller crash `bhf kernel import` brought in, `F-KERNEL-*`) |
 | `rule` | `{id, slug, name}`, each nullable | `id` is `BHF-NNNN`, the static rule id, or `null` when no catalog rule matches |
 | `title` | string | one line, for lists |
 | `message` | string | tool message (addresses stripped) |
@@ -108,13 +110,13 @@ lines). INDEX.md says "Reached through N call stacks".
 | `group` | string \| null | root-cause group key |
 | `occurrences` | int | members in the group this finding represents |
 | `first_seen`, `last_seen` | RFC 3339 \| null | `last_seen` updates when a later run reproduces the same `fingerprint.primary` |
-| `reachability` | object \| null | entry path for fuzz; fuzz reachability for SCA. Its `attacker_reachable` is the entry's signature verdict, so it can be `true` while the finding's `verdict` is `lab_only` for the reason in `verdict_reason` (such as `harness_sized_buffer`) |
+| `reachability` | object \| null | entry path for fuzz (`{kind, source, target}`: `harness`, its `testcase.bin`, the fuzzed function; for a `kernel import` finding `syscall`, the program syzkaller reached it with, `repro.syz`, else `repro.c`, else `console.log`, and the crashing function); fuzz reachability for SCA. Its `attacker_reachable` is the entry's signature verdict, so it can be `true` while the finding's `verdict` is `lab_only` for the reason in `verdict_reason` (such as `harness_sized_buffer`) |
 | `fidelity` | `{stubs_used, forced, caveats[]}` | `forced` when the target ran forced-and-stub-heavy under `--force` |
 | `remediation` | string \| null | |
 | `patch_hints` | `[{title, guidance}]` | advisory, not a literal diff |
-| `reproduce` | `{harness_id, command, build}` \| null | `build`: `{sanitizers[], binary_sha256, build_id}`, plus `fidelity` when the harness compiled only after bhf supplied inputs the build context lacked; `command` is relative to `results/`: it runs the finding's `replay.py`, or is `bhf replay findings/<id>` for a `binary rehost` finding |
+| `reproduce` | `{harness_id, command, build}` \| null | `build`: `{sanitizers[], binary_sha256, build_id}`, plus `fidelity` when the harness compiled only after bhf supplied inputs the build context lacked; `command` is relative to `results/`: it runs the finding's `replay.py`, or is `bhf replay findings/<id>` for a `binary rehost` finding; for a `kernel import` finding it compiles and runs `repro.c`, else runs `repro.syz` under `syz-execprog`, in the test VM |
 | `reproduce.build.fidelity` | `{level, context, fabricated[]}` (optional) | `level` is `reduced`; `context` is where the build context came from (`none`, `exact_tu_compile_database`, ...); each `fabricated` entry is `{kind, name, value}` with `kind` `macro`, `header`, `type`, or `include_dir` (a dir of real headers found by file name outside the scanned tree, which may be another project's). Such a finding's `confidence.level` is `low` and `fidelity.caveats` names what was fabricated: code compiled against a placeholder macro value or header can take paths the real build never does, so the finding may be false or not reproduce against the real build |
-| `evidence` | `{dir, files[]}` \| null | each file: `{role, path, sha256, size}` — roles: `finding`, `testcase`, `testcase_minimized`, `sanitizer_log`, `decoded`, `replay_script`, `repro_ada`, `byte_control`, `runtrace` (the runtrace events of the replay that recorded the comparison evidence) |
+| `evidence` | `{dir, files[]}` \| null | each file: `{role, path, sha256, size}` — roles: `finding`, `testcase`, `testcase_minimized`, `sanitizer_log`, `decoded`, `replay_script`, `repro_ada`, `byte_control`, `runtrace` (the runtrace events of the replay that recorded the comparison evidence); for a `kernel import` finding also `console_log` (syzkaller's `log0`), `repro_syz` and `repro_c` (its reproducers), with the kernel report as `sanitizer_log` |
 | `fuzz` | `{exception, classification, harness_id, dialect, oracle, access, input_to_state, input_to_state_input, input_to_state_status, input_to_state_reason, input_to_state_search, arguments, sanitizer_second_opinion, lineage}` \| null | `exception`: `{name, message, sanitizer}`; see [Fuzz block](#fuzz-block) |
 | `static` | `{engine, precision, snippet, baseline_status, triage_state}` \| null | |
 | `sca` | object \| null | `{vuln_id, aliases[], component, fixed_versions[], cvss, kev, references[], match_confidence, matching_method, vex}` |

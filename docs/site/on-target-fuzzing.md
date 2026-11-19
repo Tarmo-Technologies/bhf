@@ -60,7 +60,7 @@ binary release.
 | A proprietary RTOS image | **Actual RTOS execution** | VxWorks/INTEGRITY/QNX scheduler | ⛔ unproven (bring the image + toolchain) |
 | An on-device agent (TCP/serial) | **On-target agent** | Real device; coverage over the agent protocol | ⛔ unproven: the host side ships; no target-side agent does yet ([#289](https://github.com/Tarmo-Technologies/bhf/issues/289)), so you write one to the frame format in §3c |
 | A physical board | **HIL** (hardware-in-the-loop) | Silicon | ⛔ unproven (`BHF_HIL_GDB`) |
-| A Linux driver's source, and syzkaller | **syzkaller descriptions** (`bhf kernel syzlang`, §10) | syzkaller runs the kernel and its KCOV coverage; bhf describes the driver's ioctls | ✅ snapshot of the widget fixture's description; ⛔ syz-sysgen acceptance gated (needs a syzkaller checkout) |
+| A Linux driver's source, and syzkaller | **syzkaller descriptions and crash import** (`bhf kernel syzlang`, `bhf kernel import`, §10) | syzkaller runs the kernel and its KCOV coverage; bhf describes the driver's ioctls and triages the crashes | ✅ snapshot of the widget fixture's description, and the import of a crash directory in syz-manager's layout; ⛔ syz-sysgen acceptance and a fresh syz-manager workdir gated (need syzkaller) |
 | Only a firmware image (ELF or flash dump), no source | **Rehosting** (`bhf binary rehost`, §9) | bhf's own Cortex-M interpreter: the real instructions, no peripherals or interrupts | ✅ fixture images in `crates/rehost/tests/fixtures/`: edge coverage that grows with the input, invalid-access, bad-PC and HardFault findings, `bhf replay` MATCH |
 
 ---
@@ -906,7 +906,8 @@ them.
 A Linux driver's bugs are in the kernel, which a user-space harness never
 runs. bhf does not fuzz the kernel itself; it gives syzkaller what it needs
 to: `bhf kernel syzlang` reads the driver's C source and writes the syzkaller
-description (syzlang) of its ioctl interface.
+description (syzlang) of its ioctl interface, and `bhf kernel import` brings
+the crashes syzkaller finds back into `results/` (below).
 
 ```sh
 # The driver's directory and the uapi header that defines its commands:
@@ -977,6 +978,54 @@ member, `#pragma pack`, and a command whose number is computed at run time.
 Exit status: 0 when at least one command was described, 1 otherwise (no
 handler found, or no command describable).
 
+### Importing syzkaller crashes: `bhf kernel import`
+
+```sh
+# A syz-manager workdir, its crashes/ directory, or one crash directory:
+bhf kernel import ~/syzkaller/workdir --work-dir bhf_work --source-root ~/linux
+```
+
+Each crash directory syz-manager wrote (`crashes/<id>/`) becomes a finding
+under `<work-dir>/results/findings/F-KERNEL-NNNN-<hash>/`, and `results/` is
+rebuilt as after any producer (`INDEX.md`, `findings.json`, SARIF):
+
+- **Class.** The title (`description`) gives the crash class, rule and CWE:
+  KASAN and KFENCE out-of-bounds (`BHF-201`, CWE-122 and CWE-787 for a
+  write, CWE-125 for a read), use-after-free (`BHF-202`), double free,
+  invalid free; KMSAN uninit-value and kernel-infoleak; UBSAN checks under
+  bhf's UBSan rules; KCSAN data races; general protection faults, NULL
+  dereferences and paging requests; `WARNING`, `kernel BUG` and the other
+  `BUG:` checks (CWE-617); hung tasks and RCU stalls; lockdep deadlocks;
+  kmemleak leaks. `fuzz.exception.name` is the class (`SLAB_OUT_OF_BOUNDS`),
+  `fuzz.exception.sanitizer` the detector (`kasan`), the title is
+  syzkaller's, and `finding.json` keeps it all under `kernel`.
+- **Stack and access.** The report (`report0`, else `repro.report`, else the
+  console log) gives the stack, without the detector's own frames, printk
+  and the syscall entry; the access (`Write of size 16`); the object it hit
+  (`0 bytes to the right of allocated 104-byte region`); and its
+  allocation and free stacks. With `--source-root` (the kernel or driver
+  tree the report's paths are relative to) the finding keeps the frames of
+  that tree's files, and names them relative to it.
+- **Reproducer.** `repro.cprog` and `repro.prog` are copied as `repro.c`
+  and `repro.syz` (evidence roles `repro_c` and `repro_syz`), the report as
+  `sanitizer.log` and `log0` as `console.log`. The reproduce command is the
+  C program compiled and run, else `syz-execprog` with the options syz-repro
+  recorded (`-threaded`, `-repeat` with its count, `-procs`, `-sandbox` and
+  `-sandbox_arg`), read from the comment atop `repro.prog` in the form
+  syz-manager writes (`# {Threaded:true Repeat:true ... Sandbox:namespace
+  ...}`) or the dashboard's JSON (`#{"threaded":true,...}`), and kept under
+  `kernel.reproducer.options` with the JSON form's keys; run either in the
+  test VM, not on the host. A crash with a reproducer has confidence `high`,
+  one without `medium`. The finding's entry path (`reachability`, SARIF
+  `actionabilityEntryPath`) is `syscall`: the program syzkaller reached it
+  with (`repro.syz`, else `repro.c`, else `console.log`), not a harness
+  input.
+
+Importing a crash again updates its finding in place (a reproducer
+syz-repro found since is added). A crash of syzkaller's own test machine
+(`lost connection to test machine`, `SYZFAIL`) is skipped and listed. Exit
+status: 0 when at least one crash was imported, 1 otherwise.
+
 ---
 
 ## What is and isn't proven
@@ -1030,7 +1079,11 @@ handler found, or no command describable).
   accepts it is checked by `kernel_syzlang_cli`'s gated test, which needs a
   syzkaller checkout (`BHF_SYZKALLER_CLI=1`, `BHF_SYZKALLER=<checkout>`); no
   CI job installs syzkaller. bhf runs no kernel and collects no KCOV
-  coverage: syzkaller does both.
+  coverage: syzkaller does both. `bhf kernel import` is tested on a crash
+  directory written in syz-manager's layout for the fixture's planted bug
+  (`tests/fixtures/kernel_widget/crashes/`); `kernel_import_cli`'s gated
+  test imports a real syz-manager workdir (`BHF_SYZKALLER_CLI=1`,
+  `BHF_SYZKALLER_WORKDIR=<workdir>`).
 - **Not available yet:** typed mutation of a raw struct image in a big-endian
   target's byte order (decoded arguments are typed, little-endian as the
   decoder reads them; §5).

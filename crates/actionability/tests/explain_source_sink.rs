@@ -466,3 +466,43 @@ fn sink_keeps_project_frames_in_dirs_named_like_glibc_components() {
         );
     }
 }
+
+/// A kernel crash syzkaller found was reached through the syscalls of its
+/// program in the test VM: its entry is that program, not a harness input.
+#[test]
+fn an_imported_kernel_crash_is_entered_through_its_syscall_program() {
+    let mut raw = json!({
+        "kind": "kernel_crash",
+        "target": { "subprogram": "widget_copy_at", "source_path": "drivers/misc/widget.c", "line": 46 },
+        "kernel": { "function": "widget_copy_at" },
+        "exception": {
+            "name": "SLAB_OUT_OF_BOUNDS",
+            "sanitizer": "kasan",
+            "message": "KASAN: slab-out-of-bounds Write in widget_copy_at",
+            "stack": [{ "function": "widget_copy_at", "file": "drivers/misc/widget.c", "line": 46 }]
+        },
+        "paths": { "repro_syz": "repro.syz", "repro_c": "repro.c", "console_log": "console.log" }
+    });
+    let entry = |raw: &serde_json::Value| {
+        let record = backfill_actionability(RunMode::Reporting, raw, None);
+        let entry = record.entry_path.expect("an entry path");
+        let source = record.source.expect("a source");
+        assert_eq!(source.kind, "syscall");
+        assert_eq!(source.testcase, entry.source);
+        (entry.kind, entry.source, entry.target)
+    };
+    assert_eq!(
+        entry(&raw),
+        (
+            "syscall".to_owned(),
+            "repro.syz".to_owned(),
+            "widget_copy_at".to_owned()
+        )
+    );
+    // Without a reproducer, the console log holds the programs syzkaller ran.
+    raw["paths"] = json!({ "console_log": "console.log" });
+    assert_eq!(entry(&raw).1, "console.log");
+    // No frame in the source read: the function the title blames.
+    raw.as_object_mut().unwrap().remove("target");
+    assert_eq!(entry(&raw).2, "widget_copy_at");
+}

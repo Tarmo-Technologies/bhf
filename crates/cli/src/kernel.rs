@@ -10,6 +10,11 @@
 //! model recovers. It also writes the `.const` file syz-sysgen reads, with each
 //! command's number computed per architecture, so no kernel build or
 //! `syz-extract` run is needed.
+//!
+//! `bhf kernel import` brings what syzkaller found back: each crash
+//! directory syz-manager wrote (its title, report, console log and
+//! reproducers) becomes a finding in `<work>/results/`, with its crash class,
+//! rule, CWE, stack and reproducer (`results::import_syzkaller`).
 
 use anyhow::{bail, Context, Result};
 use c_parser::{CDispatchFunction, CIoctlFacts, CRecordDef, CValue};
@@ -44,6 +49,32 @@ enum KernelCommand {
     /// the reason. Exit 0 when at least one command was described, 1
     /// otherwise.
     Syzlang(SyzlangArgs),
+    /// Import syzkaller crash directories (description, report, log, repro) into <work-dir>/results as findings, with the crash class (KASAN, KMSAN, UBSAN, KCSAN, WARNING, ...), rule, CWE, stack and reproducer
+    ///
+    /// Takes crash directories (`<syz-manager workdir>/crashes/<id>`), a
+    /// workdir's `crashes/`, or a syz-manager workdir. Each crash becomes
+    /// `<work-dir>/results/findings/F-KERNEL-NNNN-<hash>/`: `finding.json`, the
+    /// report as `sanitizer.log`, the first console log as `console.log`, and
+    /// the reproducers as `repro.syz` and `repro.c`. The title gives the
+    /// class, rule and CWE; the report gives the stack, the access and the
+    /// object it hit. Importing a crash again updates its finding (a
+    /// reproducer syz-repro found since is added). A crash of syzkaller's own
+    /// test machine (`lost connection to test machine`) is skipped. Exit 0
+    /// when at least one crash was imported, 1 otherwise.
+    Import(ImportArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ImportArgs {
+    /// syzkaller crash directories, a workdir's crashes/ directory, or a syz-manager workdir
+    #[arg(required = true, value_name = "CRASHES")]
+    crashes: Vec<PathBuf>,
+    /// Work directory whose results/ receives the findings
+    #[arg(long, value_name = "DIR")]
+    work_dir: PathBuf,
+    /// The kernel or driver source tree the report's paths are relative to: findings then keep only the frames of its files, and name them relative to it
+    #[arg(long, value_name = "DIR")]
+    source_root: Option<PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -71,6 +102,71 @@ pub fn run(args: KernelArgs) -> i32 {
                 1
             }
         },
+        // A findings producer: results/ gets its manifest record and rebuild.
+        KernelCommand::Import(args) => crate::with_results(
+            &args.work_dir,
+            results::import_syzkaller::PRODUCER,
+            args.source_root.as_deref(),
+            |_| results::model::ProducerStatus::Complete,
+            || import(&args),
+        ),
+    }
+}
+
+fn import(args: &ImportArgs) -> i32 {
+    let mut dirs = Vec::new();
+    for path in &args.crashes {
+        match results::import_syzkaller::crash_dirs(path) {
+            Ok(found) if found.is_empty() => bhfeprintln!(
+                "bhf kernel import: {}: no syzkaller crash directory (one with a description \
+                 file) here or under its crashes/",
+                path.display()
+            ),
+            Ok(found) => dirs.extend(found),
+            Err(error) => {
+                bhfeprintln!("bhf kernel import: {error}");
+                return 1;
+            }
+        }
+    }
+    if dirs.is_empty() {
+        bhfeprintln!("bhf kernel import: nothing to import");
+        return 1;
+    }
+    let summary = match results::import_syzkaller::import(&args.work_dir, &dirs) {
+        Ok(summary) => summary,
+        Err(error) => {
+            bhfeprintln!("bhf kernel import: {error}");
+            return 1;
+        }
+    };
+    for crash in &summary.imported {
+        println!(
+            "{} {}: {} ({}, reproducer: {})",
+            if crash.updated { "updated" } else { "imported" },
+            crash.id,
+            crash.title,
+            crash.class,
+            crash.reproducer.unwrap_or("none")
+        );
+    }
+    for (dir, reason) in &summary.skipped {
+        println!("skipped {}: {reason}", dir.display());
+    }
+    println!(
+        "bhf kernel import: {} crash{} imported, {} skipped",
+        summary.imported.len(),
+        if summary.imported.len() == 1 {
+            ""
+        } else {
+            "es"
+        },
+        summary.skipped.len()
+    );
+    if summary.imported.is_empty() {
+        1
+    } else {
+        0
     }
 }
 

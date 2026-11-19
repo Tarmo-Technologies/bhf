@@ -278,7 +278,7 @@
       "properties": {
         "id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
         "kind": { "$ref": "#/$defs/kind" },
-        "producer": { "enum": ["auto", "fuzz", "static-scan", "binary fuzz", "binary rehost", "differential", "sbom"] },
+        "producer": { "enum": ["auto", "fuzz", "static-scan", "binary fuzz", "binary rehost", "kernel import", "differential", "sbom"] },
         "rule": {
           "type": "object",
           "additionalProperties": false,
@@ -423,7 +423,7 @@
                     "additionalProperties": false,
                     "required": ["role", "path", "sha256", "size"],
                     "properties": {
-                      "role": { "enum": ["finding", "testcase", "testcase_minimized", "sanitizer_log", "decoded", "replay_script", "repro_ada", "byte_control", "runtrace"] },
+                      "role": { "enum": ["finding", "testcase", "testcase_minimized", "sanitizer_log", "decoded", "replay_script", "repro_ada", "byte_control", "runtrace", "console_log", "repro_syz", "repro_c"] },
                       "path": { "type": "string", "pattern": "^findings/" },
                       "sha256": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
                       "size": { "type": "integer", "minimum": 0 }

@@ -2030,9 +2030,13 @@ fn normalize_finding(
     ensure_finding_cwe(&mut actionability, &raw, rule_id.as_deref());
     // Standalone Python reproducer for EVERY finding (C/C++/Ada/unknown): runs the
     // built harness on the recorded testcase with the sanitizer env. A
-    // rehosted firmware fault has no host harness: `bhf replay` reproduces it.
-    let rehost_fault = raw.get("kind").and_then(Value::as_str) == Some("rehost_fault");
-    let generated_repro_py = if rehost_fault {
+    // rehosted firmware fault has no host harness: `bhf replay` reproduces it;
+    // nor has an imported kernel crash: its syzkaller reproducer does.
+    let no_host_harness = matches!(
+        raw.get("kind").and_then(Value::as_str),
+        Some("rehost_fault" | "kernel_crash")
+    );
+    let generated_repro_py = if no_host_harness {
         None
     } else if generate_reproducers {
         repro_py_status(finding_dir, &id, &raw, &actionability)

@@ -100,6 +100,22 @@ class SchemaFilesTest(unittest.TestCase):
             finding.pop("verdict_reason", None)
         self.assertEqual(_errors(findings, older), [])
 
+    def test_an_imported_kernel_crash_validates(self):
+        """`bhf kernel import`: producer `kernel import`, and the console log
+        and syzkaller reproducers as evidence roles."""
+        findings = _validator("bhf.findings.v1.schema.json")
+        doc = json.loads((EXAMPLES / "findings.v1.example.json").read_text())
+        finding = doc["findings"][0]
+        finding["producer"] = "kernel import"
+        evidence_dir = finding["evidence"]["dir"]
+        for role, name in (("console_log", "console.log"), ("repro_syz", "repro.syz"), ("repro_c", "repro.c")):
+            finding["evidence"]["files"].append(
+                {"role": role, "path": f"{evidence_dir}/{name}", "sha256": None, "size": 12})
+        self.assertEqual(_errors(findings, doc), [])
+        bad = json.loads(json.dumps(doc))
+        bad["findings"][0]["evidence"]["files"][-1]["role"] = "repro_cobol"
+        self.assertNotEqual(_errors(findings, bad), [])
+
     def test_allocated_by_harness_is_an_optional_flag(self):
         findings = _validator("bhf.findings.v1.schema.json")
         doc = json.loads((EXAMPLES / "findings.v1.example.json").read_text())
