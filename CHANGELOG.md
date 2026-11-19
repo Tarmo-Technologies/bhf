@@ -111,6 +111,11 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- A SEGV on a fixed address is taken for a missing device register only when
+  the target reads that address as a register: a volatile access that is no
+  poison or sentinel value (#437). A fault on a plain pointer constant, such
+  as list.h's `LIST_POISON1`, keeps the crash's own classification and
+  severity.
 - An Ada harness given its input as a file on stdin reads it once (#304).
   Each loop reopened `/dev/stdin`, which starts a regular file over, so the
   harness read the same input until it was killed.

@@ -70,6 +70,10 @@ impl RegisterFault {
 
 /// The register a SEGV finding's fault address lies on, from the sources of
 /// its crash path (the stack frames' files and the headers they include).
+/// Only a register access counts (#437): a volatile one, and no sentinel
+/// ([`is_sentinel`]), the rule #341 maps device windows by. A fault on a
+/// plain pointer constant (list.h's `LIST_POISON1`) keeps its own
+/// classification.
 pub(crate) fn register_fault(raw: &serde_json::Value) -> Option<RegisterFault> {
     let fault = fault_address(raw)?;
     if fault < LOWEST_DEVICE_ADDRESS {
@@ -85,8 +89,39 @@ pub(crate) fn register_fault(raw: &serde_json::Value) -> Option<RegisterFault> {
         .collect();
     registers(&files)
         .into_iter()
+        .filter(|register| {
+            register.volatile && !is_sentinel(register.name.as_deref(), register.address)
+        })
         .find(|register| on_device(fault, register.address))
         .map(|register| RegisterFault { fault, register })
+}
+
+/// Whether a register named `name` at `address` is a poison or sentinel
+/// value rather than a device: list.h's `LIST_POISON1` and the fill patterns
+/// allocators and debuggers use. Mapping one would turn the fault its
+/// dereference is into a read of fuzz bytes.
+pub(crate) fn is_sentinel(name: Option<&str>, address: u64) -> bool {
+    const FILL_PATTERNS: &[u64] = &[
+        0xdead_beef,
+        0xdead_dead,
+        0xdead_c0de,
+        0xbaad_f00d,
+        0xcafe_babe,
+        0xfeed_face,
+        0xfeee_feee,
+        0xcccc_cccc,
+        0xcdcd_cdcd,
+        0xabab_abab,
+        0xa5a5_a5a5,
+        0x5a5a_5a5a,
+    ];
+    let named = name.is_some_and(|name| {
+        let name = name.to_ascii_uppercase();
+        ["POISON", "SENTINEL", "INVALID", "BOGUS"]
+            .iter()
+            .any(|word| name.contains(word))
+    });
+    named || FILL_PATTERNS.contains(&address)
 }
 
 /// Whether `fault` lies on the device whose register is at `register`.
@@ -1166,6 +1201,35 @@ mod tests {
         // A wild address, or NULL, is not one.
         assert!(register_fault(&segv(&c, "0x7ffd12345678")).is_none());
         assert!(register_fault(&segv(&c, "0x000000000000")).is_none());
+    }
+
+    /// #437: a fault on a constant that is no register access keeps the
+    /// crash's own classification. A plain pointer cast (list.h's
+    /// `LIST_POISON1`, here on a device-range address) and a named sentinel
+    /// are not missing devices; a volatile register on the same page is.
+    #[test]
+    fn only_a_register_access_is_a_missing_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = source(
+            dir.path(),
+            "list.c",
+            "#define LIST_POISON1 ((void *) 0x40100100)\n\
+             #define BAD_SLOT (*(volatile unsigned *)0x40200000u)\n\
+             #define TRACE_POISON (*(volatile unsigned *)0x40300000u)\n\
+             #define DEV_SR (*(volatile unsigned *)0x40400000u)\n\
+             struct node { struct node *next; };\n\
+             int walk(struct node *n) { n->next = LIST_POISON1; return BAD_SLOT + TRACE_POISON + DEV_SR; }\n",
+        );
+        assert!(
+            register_fault(&segv(&c, "0x000040100100")).is_none(),
+            "a plain pointer constant"
+        );
+        assert!(
+            register_fault(&segv(&c, "0x000040300000")).is_none(),
+            "a named sentinel"
+        );
+        let fault = register_fault(&segv(&c, "0x000040400000")).expect("a volatile register");
+        assert_eq!(fault.register.name.as_deref(), Some("DEV_SR"));
     }
 
     /// #341: only a volatile access is a register: a volatile cast, a CMSIS

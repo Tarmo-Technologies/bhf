@@ -3672,34 +3672,6 @@ const MMIO_HIGHEST_PAGE: u64 = 0x7fff_ffff_f000;
 /// fault on the host as they did before #341.
 const NO_MMIO_EMULATION: &str = "BHF_NO_MMIO_EMULATION";
 
-/// Whether a register named `name` at `address` is a poison or sentinel
-/// value rather than a device: list.h's `LIST_POISON1` and the fill patterns
-/// allocators and debuggers use. Mapping one would turn the fault its
-/// dereference is into a read of fuzz bytes.
-fn is_sentinel(name: Option<&str>, address: u64) -> bool {
-    const FILL_PATTERNS: &[u64] = &[
-        0xdead_beef,
-        0xdead_dead,
-        0xdead_c0de,
-        0xbaad_f00d,
-        0xcafe_babe,
-        0xfeed_face,
-        0xfeee_feee,
-        0xcccc_cccc,
-        0xcdcd_cdcd,
-        0xabab_abab,
-        0xa5a5_a5a5,
-        0x5a5a_5a5a,
-    ];
-    let named = name.is_some_and(|name| {
-        let name = name.to_ascii_uppercase();
-        ["POISON", "SENTINEL", "INVALID", "BOGUS"]
-            .iter()
-            .any(|word| name.contains(word))
-    });
-    named || FILL_PATTERNS.contains(&address)
-}
-
 /// The device windows the C target `function` (defined in `source`) reads
 /// or writes at fixed addresses: the pages of the volatile register accesses
 /// its code and the functions it calls make, in `source` and the headers
@@ -3708,7 +3680,7 @@ fn is_sentinel(name: Option<&str>, address: u64) -> bool {
 /// by the first register macro on it. Left out: a page whose register a loop
 /// condition polls (a status bit that holds one value for the whole run would
 /// spin there until the per-input timeout; unmapped, its read keeps #175's
-/// environment classification), sentinels ([`is_sentinel`]), and a target
+/// environment classification), sentinels ([`crate::auto::mmio_registers::is_sentinel`]), and a target
 /// with no register access at all.
 pub(crate) fn c_mmio_windows(
     source: &Path,
@@ -3728,7 +3700,7 @@ pub(crate) fn c_mmio_windows(
         let page = register.address & !(MMIO_PAGE - 1);
         if page > MMIO_HIGHEST_PAGE
             || polled.contains(&page)
-            || is_sentinel(register.name.as_deref(), register.address)
+            || crate::auto::mmio_registers::is_sentinel(register.name.as_deref(), register.address)
         {
             continue;
         }
