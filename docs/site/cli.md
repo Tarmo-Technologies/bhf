@@ -218,7 +218,8 @@ Keep the work directory outside the source tree. The main flags follow;
 
 Exit codes: `0` at least one target built and ran (a target that built but
 ran no input, a report-only target or a finding also gives `0`); `1`
-discovery found candidates but none built, or `auto` stopped on an error; `2`
+discovery found candidates but none built and ran (each failed to build, was
+skipped, or was built but not entered), or `auto` stopped on an error; `2`
 no candidates were discovered (a source path that does not exist included),
 the toolchain configuration was refused, as for `bhf build`, or bhf hit an
 internal panic; `3` harnesses built, but none ran, because their sanitizer

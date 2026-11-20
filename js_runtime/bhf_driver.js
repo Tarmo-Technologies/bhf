@@ -26,7 +26,8 @@
 // validation) is swallowed — the input is just rejected.
 //
 // Without BHF_FRAMED, argv[2] is a single input file to replay once (the
-// engine's per-spawn crash-isolation path), else stdin is read.
+// engine's per-spawn crash-isolation path), else stdin is read. BHF_JS_PROBE
+// runs a file of inputs once each, before any fuzzing (see probeInputs).
 
 'use strict';
 const fs = require('fs');
@@ -581,6 +582,72 @@ async function runInput(buf) {
   checkPrototypePollution();
 }
 
+// --- undefined-global probe (#398) ----------------------------------------
+// The build's last gate. BHF_JS_PROBE names a file of inputs, each framed as
+// {u32 little-endian length, bytes}. They run in order in this one process,
+// and the probe prints one verdict line on stderr:
+//   == bhf js probe: got past: <i>           input i did not stop there
+//   == bhf js probe: every input stopped: <n>: <global>: <frame>
+// The second means all n inputs threw `ReferenceError: <global> is not
+// defined` from the same frame, so no input reached code past that name. A
+// sink or prototype-pollution halt, or a hang, ends the run with no verdict
+// line, and the build then fuzzes the target as usual.
+
+// The name and throwing frame of an undefined-global ReferenceError, or null.
+function undefinedGlobal(err) {
+  if (!err || err.name !== 'ReferenceError' || !classify(err).finding) return null;
+  const m = /^([\w$]+) is not defined$/.exec(String(err.message || ''));
+  if (!m) return null;
+  const frame = String(err.stack || '')
+    .split('\n')
+    .map((line) => line.trim())
+    .find((line) => line.startsWith('at '));
+  return { name: m[1], frame: frame ? frame.slice(3) : '(unknown frame)' };
+}
+
+// Run one input as runInput does, but report where it stopped instead of
+// halting: the undefined global it threw for, or null.
+async function undefinedGlobalStop(buf) {
+  currentInput = buf.toString('latin1');
+  try {
+    await runOne(buf);
+  } catch (err) {
+    // A browser global the driver stands in for (#288): run it again with it.
+    const name = missingBrowserGlobal(err);
+    if (name !== null) {
+      standIn(name);
+      return undefinedGlobalStop(buf);
+    }
+    return undefinedGlobal(err);
+  }
+  return null;
+}
+
+async function probeInputs(path) {
+  const data = fs.readFileSync(path);
+  let first = null;
+  let count = 0;
+  for (let at = 0; at + 4 <= data.length; count++) {
+    const n = data.readUInt32LE(at);
+    const input = data.subarray(at + 4, at + 4 + n);
+    at += 4 + n;
+    const stop = await undefinedGlobalStop(input);
+    const same =
+      stop !== null &&
+      (first === null || (stop.name === first.name && stop.frame === first.frame));
+    if (!same) {
+      process.stderr.write(`== bhf js probe: got past: ${count}\n`);
+      return;
+    }
+    first = stop;
+  }
+  if (first !== null) {
+    process.stderr.write(
+      `== bhf js probe: every input stopped: ${count}: ${first.name}: ${first.frame}\n`
+    );
+  }
+}
+
 // --- harness resolution -----------------------------------------------------
 // The launcher sets BHF_JS_MODULE (absolute path to the target) and
 // BHF_JS_EXPORT (the dotted export path, e.g. "parse" or "Foo.bar") and
@@ -793,7 +860,9 @@ function armHangReport() {
 }
 
 function main() {
-  covInit();
+  // The probe only asks where inputs stop; it needs no coverage.
+  const probe = process.env.BHF_JS_PROBE;
+  if (probe === undefined) covInit();
   installSinkGuards();
   runOne = loadRunOne();
   // BHF_JS_LOAD_ONLY: prove the target can be PREPARED, then stop. The build
@@ -803,6 +872,10 @@ function main() {
   // empty input looks identical to one that could never load.
   if (process.env.BHF_JS_LOAD_ONLY !== undefined) {
     process.exit(0);
+  }
+  if (probe !== undefined) {
+    probeInputs(probe).then(() => process.exit(0));
+    return;
   }
   if (process.env.BHF_FRAMED !== undefined) {
     framedLoop().then(() => process.exit(0));

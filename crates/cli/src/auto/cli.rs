@@ -1240,7 +1240,9 @@ fn detect_custom_build(root: &Path) -> Option<(String, String)> {
 
 /// `bhf auto` exits 0 when at least one target built and ran.
 pub const EXIT_RAN: i32 = 0;
-/// Candidates were discovered, but none built.
+/// Candidates were discovered, but none built and ran: each failed to build,
+/// was skipped, or built but was not entered (a target-environment failure
+/// included).
 pub const EXIT_NONE_BUILT: i32 = 1;
 /// Nothing to sweep: no candidates, a source path that does not exist, or a
 /// refused configuration (an unusable toolchain, an invalid flag value).
@@ -5724,6 +5726,7 @@ pub(crate) fn outcome_label(o: &crate::auto::attempt::Outcome) -> &'static str {
         BuiltNotEntered { entry_miss, .. } => match entry_miss.as_str() {
             "stub_only" => "built, NOT entered (stub-only)",
             "no_execution" => "built, NOT entered (no execution)",
+            "target_environment" => "built, NOT entered (target environment)",
             _ => "built, NOT entered (target not reached)",
         },
         FailedBuild { .. } => "failed_build",

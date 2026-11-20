@@ -60,6 +60,29 @@ the target's findings lists them in `fidelity.environment_shim` and in its
 `fidelity_caveat`. Such a finding can depend on the stand-ins, so reproduce
 it in a real browser.
 
+Some globals are neither Node's nor among the stand-ins: `FileReader`, or a
+name the host defines, such as an embedding runtime's `app`. A target that
+reads one on every call would report the same `ReferenceError` for every
+input. So after the build, before fuzzing, bhf runs the target in one Node
+process on the empty input, `A` and `AAAAAAAA`. If all three stop at the same
+`ReferenceError: X is not defined`, thrown at the same place, bhf runs these
+inputs too, again in one process:
+
+- the run's seed inputs: `--seed-file` and `--seed-dir`, or the files mined
+  from the tree's test data;
+- each token of the target's fuzz dictionary (the string and number literals
+  of its source file), alone and followed by 64 `A`s;
+- 4096 `A`s, 64 zero bytes and 64 `0xff` bytes.
+
+If every one of them stops at that place too, the target is reported as
+`built, NOT entered (target environment)`. The reason names `X` and the
+frame that threw. The target is not fuzzed and no finding is written. If any
+input gets past, the target is fuzzed as usual, and the `ReferenceError` is a
+BHF-210 finding. bhf cannot tell an undefined global behind a check that none
+of these inputs passes (a format the literals do not spell) from one every
+input reaches. To have such a target fuzzed, pass an input that gets past the
+check with `--seed-file`.
+
 ### Oracle
 
 An **uncaught exception** that is not input rejection is a finding; the

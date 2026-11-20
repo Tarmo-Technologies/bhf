@@ -1906,6 +1906,21 @@
   missing prefix the same way, so a Windows finding replayed on a new machine
   no longer times out on its first run. An existing prefix costs one file
   check.
+- A failure every input hits before the target uses it is reported as the
+  target's environment, not a finding (#398). A Go harness is started once
+  without an input after it builds; when a package `init` panics (a
+  dependency refusing the installed Go release), the target is
+  `built_not_entered` with `entry_miss: "target_environment"` and a reason
+  naming the package and the panic, and is not fuzzed. Before fuzzing a
+  JavaScript or TypeScript target, bhf runs it on the fuzz passes' starting
+  inputs (the run's seed inputs included) and on inputs built from the
+  literals in its source file. When every one stops at the same
+  `ReferenceError: X is not defined` (such as `FileReader`), thrown at the
+  same place, it is reported the same way, naming `X`. A `ReferenceError`
+  that any of them gets past is still a finding. The new `entry_miss` value
+  is additive. Such targets are not listed in `bug-report.md`. A run whose
+  only targets are not entered this way exits 1 (none built and ran), where
+  the finding it used to write made it exit 0.
 - A SEGV on a fixed address is taken for a missing device register only when
   the target reads that address as a register: a volatile access that is no
   poison or sentinel value (#437). A fault on a plain pointer constant, such

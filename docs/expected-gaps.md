@@ -266,6 +266,17 @@ and retries; these are the ones where that is not enough: a dependency needs
 261 attempted targets here on the host's Go 1.22.2, and none on Go 1.27.4, where
 146 built and fuzzed against 26. A current `go` on `PATH` is the fix.
 
+### Go-5. A package `init` panics on this Go release — 1 — **ENVIRONMENT**
+
+v2ray-core's `qtls-go1-15` dependency panics in its `init`
+(`qtls.ClientSessionState doesn't match`) on any Go but the release it was
+written for, so the harness dies before `main` on every input. The
+[2026-11-16 re-sweep](validation/2026-11-16-go-resweep.md) counted it as a
+finding. The build now starts each Go harness once without an input, and a
+failure there is reported as `built_not_entered` (`target_environment`),
+naming the package and the panic, with no finding (#398). The Go release the
+project supports is the fix.
+
 ---
 
 ## Rust
@@ -415,6 +426,24 @@ The transpile now declares loaders for the usual non-code assets: inert text for
 markup and config, a data URL for binaries.
 
 ### JS-3. Unconstructible receiver — 58 — **[FIXED]**
+
+### JS-4. A host or browser API the driver does not stand in for — 6 findings — **ENVIRONMENT**
+
+`ReferenceError: FileReader is not defined` (three), `app is not defined`,
+`store is not defined` and `Javy is not defined`, in the
+[2026-11-16 re-sweep](validation/2026-11-16-go-resweep.md). These are a
+browser's API and names that an embedding host defines. Each call stopped at
+the missing name, so every input reported it as a finding. Before fuzzing,
+the build now runs each target on the fuzz passes' starting inputs (the
+run's seed inputs included) and on inputs built from the literals in its
+source file; [JavaScript](site/javascript.md#browser-globals) lists them.
+When every one stops at the same undefined global, thrown at the same place,
+the target is reported as `built_not_entered` (`target_environment`), naming
+the global, with no finding (#398). When any of them gets past it, the
+`ReferenceError` is still a finding. The gap that remains: an undefined
+global behind a check that none of those inputs passes, such as a format the
+literals do not spell, is also reported as the target's environment. A seed
+file with an input that passes the check gets the target fuzzed.
 
 ---
 

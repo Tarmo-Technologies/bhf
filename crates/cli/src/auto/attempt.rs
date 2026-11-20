@@ -803,8 +803,11 @@ pub enum Outcome {
         /// Stable sub-category naming WHY the target was never entered:
         /// `"stub_only"` (every external symbol was a blind stub, so only empty
         /// bodies ran), `"no_execution"` (built but no fuzz iteration executed),
-        /// or `"decode_or_bailout"` (inputs ran but were decode-rejected or the
-        /// harness bailed before the endpoint). Never vague.
+        /// `"decode_or_bailout"` (inputs ran but were decode-rejected or the
+        /// harness bailed before the endpoint), or `"target_environment"`
+        /// (#398: a Go package `init` panicked before any input, or every
+        /// input the JS/TS build probe ran stopped at the same undefined
+        /// global, so no pass ran). Never vague.
         entry_miss: String,
         /// Human-readable reason, named for the report + support bundle.
         reason: String,
@@ -1475,6 +1478,25 @@ pub(crate) fn entry_miss_classification(
             ),
         )
     })
+}
+
+/// #398: a harness that built, but whose build gate saw it fail the same way
+/// on every input it tried (a Go package `init` that panics, a JS global
+/// that every probe input stopped at): the target's environment. Recorded
+/// `built_not_entered` with no passes, so no finding is written; `reason`
+/// names the cause.
+pub(crate) fn target_environment_not_entered(reason: String) -> Outcome {
+    Outcome::BuiltNotEntered {
+        repairs: Vec::new(),
+        retries: 0,
+        passes: Vec::new(),
+        per_pass_budget_secs: 0,
+        total_wall_budget_secs: 0,
+        executions_per_sec: 0.0,
+        runtrace_events: Vec::new(),
+        entry_miss: "target_environment".to_owned(),
+        reason,
+    }
 }
 
 pub(crate) fn applicable_engines(
@@ -2751,6 +2773,13 @@ fn run_attempt(
             crate::auto::go_build::GoBuildResult::Built { forced } => {
                 forced_synthetic_params = forced;
             }
+            crate::auto::go_build::GoBuildResult::NotEntered { reason } => {
+                return Ok(AttemptResult {
+                    candidate: candidate.clone(),
+                    outcome: target_environment_not_entered(reason),
+                    harness_dir,
+                });
+            }
             crate::auto::go_build::GoBuildResult::Failed { reason, skip } => {
                 if skip {
                     return Ok(AttemptResult {
@@ -2918,8 +2947,20 @@ fn run_attempt(
     // parses, skips cleanly.
     if matches!(candidate.lang, crate::auto::candidate::Lang::Js) {
         progress.update(&ProgressUpdate::phase(Phase::Generate));
-        match crate::auto::js_build::build_js_harness(candidate, work_dir, &candidate.harness_id) {
+        match crate::auto::js_build::build_js_harness(
+            candidate,
+            work_dir,
+            &candidate.harness_id,
+            &options.user_seeds,
+        ) {
             crate::auto::js_build::JsBuildResult::Built => {}
+            crate::auto::js_build::JsBuildResult::NotEntered(reason) => {
+                return Ok(AttemptResult {
+                    candidate: candidate.clone(),
+                    outcome: target_environment_not_entered(reason),
+                    harness_dir,
+                });
+            }
             crate::auto::js_build::JsBuildResult::Skip(reason) => {
                 return Ok(AttemptResult {
                     candidate: candidate.clone(),
@@ -2957,8 +2998,16 @@ fn run_attempt(
             work_dir,
             &candidate.harness_id,
             options.source_root.as_deref(),
+            &options.user_seeds,
         ) {
             crate::auto::js_build::JsBuildResult::Built => {}
+            crate::auto::js_build::JsBuildResult::NotEntered(reason) => {
+                return Ok(AttemptResult {
+                    candidate: candidate.clone(),
+                    outcome: target_environment_not_entered(reason),
+                    harness_dir,
+                });
+            }
             crate::auto::js_build::JsBuildResult::Skip(reason) => {
                 return Ok(AttemptResult {
                     candidate: candidate.clone(),

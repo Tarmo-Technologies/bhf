@@ -258,6 +258,106 @@ func ParseRequest(req *Request) {
     );
 }
 
+/// A dependency's package `init` panics on this toolchain, so the harness dies
+/// before `main` on every input (#398). That is the target's environment, not
+/// a defect a fuzzer found: each target, the project's own fuzz test among
+/// them, is reported built but not entered, naming the package whose `init`
+/// failed, and no finding is written.
+#[test]
+fn a_dependency_init_panic_is_a_not_entered_target_naming_the_package() {
+    if !have_go() {
+        eprintln!("skipping: no go toolchain on PATH (GNAT-less rule)");
+        return;
+    }
+    let src_guard = TestDir::new("golane_initpanic");
+    let src = src_guard.join("src");
+    copy_dir(&fixture_named("go_init_panic"), &src).expect("copy go fixture module");
+    let work_guard = TestDir::new("golane_initpanic_w");
+    let work = work_guard.join("work");
+    let out = Command::new(bhf_bin())
+        .args([
+            "auto",
+            "--per-target-time",
+            "4",
+            "--single-pass",
+            "--jobs",
+            "1",
+            "--work-dir",
+            work.to_str().unwrap(),
+            src.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run bhf auto");
+    let log = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let run: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(work.join("auto/run.json")).unwrap_or_else(|e| panic!("{e}\n{log}")),
+    )
+    .expect("parse run.json");
+    let targets: Vec<&serde_json::Value> =
+        run["targets"].as_array().into_iter().flatten().collect();
+    let widget = targets
+        .iter()
+        .find(|target| target["name"] == "ParseWidget")
+        .unwrap_or_else(|| panic!("ParseWidget was not attempted: {run:#}\n{log}"));
+    assert!(
+        targets
+            .iter()
+            .any(|target| target["name"] == "FuzzParseWidget"),
+        "the provided fuzz test was not attempted: {run:#}"
+    );
+    for target in &targets {
+        let outcome = &target["outcome"];
+        assert_eq!(outcome["outcome"], "built_not_entered", "{target:#}\n{log}");
+        assert_eq!(outcome["entry_miss"], "target_environment", "{target:#}");
+        let reason = outcome["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("bhf.example/initpanic/legacycodec")
+                && reason.contains("init")
+                && reason.contains("session state layout doesn't match"),
+            "the reason must name the package whose init failed and why: {reason}"
+        );
+    }
+    assert_eq!(
+        widget["outcome"]["passes"],
+        serde_json::json!([]),
+        "{widget:#}"
+    );
+    let doc = results_doc(&work);
+    let findings = doc["findings"].as_array().map_or(0, Vec::len);
+    assert_eq!(
+        findings, 0,
+        "an init panic is not a finding: {doc:#}\n{log}"
+    );
+    assert!(
+        !work.join("results/findings").is_dir()
+            || std::fs::read_dir(work.join("results/findings"))
+                .unwrap()
+                .next()
+                .is_none(),
+        "no finding directory may be written"
+    );
+    // Not a row for bhf's maintainer: the target's environment stopped it.
+    let bug_report = std::fs::read_to_string(work.join("auto/bug-report.md")).unwrap_or_default();
+    assert!(
+        !bug_report.contains("legacycodec"),
+        "the target's environment is not a bhf issue: {bug_report}"
+    );
+    // Nothing built and ran, so the run exits 1, as auto.md documents.
+    assert_eq!(out.status.code(), Some(1), "{log}");
+}
+
+fn fixture_named(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures")
+        .join(name)
+        .canonicalize()
+        .unwrap_or_else(|e| panic!("canonicalize {name} fixture: {e}"))
+}
+
 fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(to)?;
     for entry in std::fs::read_dir(from)? {

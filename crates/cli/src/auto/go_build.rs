@@ -42,7 +42,18 @@ pub enum GoBuildResult {
         reason: String,
         skip: bool,
     },
+    /// The harness built, but it fails before it reads an input: a package
+    /// `init` panicked, or the process exited, as it loaded. Every input would
+    /// hit it, so it is the target's environment (often the Go release), not a
+    /// finding. `reason` names the package and the panic.
+    NotEntered {
+        reason: String,
+    },
 }
+
+/// Set in a Go harness's environment, it makes `main` return before it reads
+/// an input, once every package's `init` has run: the build's load gate.
+const GO_LOAD_ONLY_ENV: &str = "BHF_GO_LOAD_ONLY";
 
 fn probe_go() -> Option<PathBuf> {
     which::which("go").ok()
@@ -274,7 +285,10 @@ pub fn build_go_harness(
         }
     }
     match build {
-        Ok(out) if out.status.success() && bin.is_file() => GoBuildResult::Built { forced },
+        Ok(out) if out.status.success() && bin.is_file() => match load_failure(&bin, &auto_dir) {
+            Some(reason) => GoBuildResult::NotEntered { reason },
+            None => GoBuildResult::Built { forced },
+        },
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
             // A target needing external modules we can't fetch offline, or a newer Go
@@ -297,6 +311,121 @@ pub fn build_go_harness(
             skip: false,
         },
     }
+}
+
+/// The build's load gate (#398): run the built harness with
+/// [`GO_LOAD_ONLY_ENV`] set, so every package's `init` runs and `main` returns
+/// before it reads an input. A run that fails failed before the target could
+/// be called, on whatever input: a dependency's `init` that refuses this Go
+/// release, a `log.Fatal` as a package loads. Returns why, naming the package
+/// whose `init` panicked when the stack shows one; `None` when the harness
+/// loads, or when the run could not be started or was cut off (a hang as it
+/// loads is the fuzz pass's to report).
+fn load_failure(bin: &Path, dir: &Path) -> Option<String> {
+    let mut command = Command::new(bin);
+    command
+        .env(GO_LOAD_ONLY_ENV, "1")
+        .env_remove("BHF_FRAMED")
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null());
+    let (out, timed_out) = crate::command_output::output_with_timeout_flagged(
+        &mut command,
+        std::time::Duration::from_secs(60),
+    )
+    .ok()?;
+    if out.status.success() || timed_out {
+        return None;
+    }
+    Some(load_failure_reason(
+        &String::from_utf8_lossy(&out.stderr),
+        &out.status.to_string(),
+    ))
+}
+
+/// Why a harness that ran no input failed, from its stderr: the panic and the
+/// package whose `init` raised it, or else the last thing it printed.
+fn load_failure_reason(stderr: &str, status: &str) -> String {
+    let panic = stderr.lines().find_map(|line| {
+        let line = line.trim();
+        line.strip_prefix("panic: ")
+            .or_else(|| line.strip_prefix("fatal error: "))
+    });
+    let tail = "before it read an input, so every input fails the same way. That is the \
+                target's environment (often the Go release: try the one the project \
+                supports), not a finding";
+    match (panic, init_frame_package(stderr)) {
+        (Some(message), Some(package)) => format!(
+            "the harness never reached the target: package `{package}` panicked in its \
+             init (`{message}`) {tail}"
+        ),
+        (Some(message), None) => format!(
+            "the harness never reached the target: it panicked as its packages loaded \
+             (`{message}`) {tail}"
+        ),
+        (None, _) => {
+            let last = stderr
+                .lines()
+                .map(str::trim)
+                .rfind(|line| !line.is_empty() && !line.starts_with("warning: GOCOVERDIR"))
+                .unwrap_or("no output");
+            format!(
+                "the harness never reached the target: it exited ({status}) as its \
+                 packages loaded (`{last}`) {tail}"
+            )
+        }
+    }
+}
+
+/// The package of the outermost package-`init` frame in a Go traceback:
+/// `example.com/lib.init.0()` or `example.com/lib.init()` (a package-level
+/// variable's initializer), and the closures inside them
+/// (`example.com/lib.init.0.func1(...)`). The outermost, because the runtime
+/// calls a package's `init` itself, below anything it calls.
+fn init_frame_package(stderr: &str) -> Option<String> {
+    stderr.lines().rev().find_map(|line| {
+        if line.starts_with(char::is_whitespace) {
+            return None;
+        }
+        // A frame's function has no spaces (`panic: …` and `created by …` do).
+        let function = line.trim_end().split_once('(').map(|(name, _)| name)?;
+        if function.is_empty() || function.contains(char::is_whitespace) {
+            return None;
+        }
+        // Past the import path, the package name and the function are
+        // dot-separated.
+        let slash = function.rfind('/').map_or(0, |at| at + 1);
+        let (dir, last) = function.split_at(slash);
+        let mut parts = last.split('.');
+        let package = parts.next()?;
+        let rest: Vec<&str> = parts.collect();
+        // A package path element may itself hold dots (`yaml.v3`): the `init`
+        // is the first element that reads so. A method's receiver
+        // (`lib.(*T).init`) is not part of a path.
+        let init = rest.iter().position(|part| *part == "init")?;
+        if rest[..init]
+            .iter()
+            .any(|part| part.is_empty() || part.contains(['(', ')', '*', '[']))
+        {
+            return None;
+        }
+        let after = &rest[init + 1..];
+        let numbered = after
+            .first()
+            .is_some_and(|part| part.parse::<u32>().is_ok());
+        let closures = &after[usize::from(numbered)..];
+        if !closures.iter().all(|part| {
+            part.strip_prefix("func")
+                .is_some_and(|n| n.parse::<u32>().is_ok())
+                || part.parse::<u32>().is_ok()
+        }) {
+            return None;
+        }
+        let path = std::iter::once(package)
+            .chain(rest[..init].iter().copied())
+            .collect::<Vec<_>>()
+            .join(".");
+        Some(format!("{dir}{path}"))
+    })
 }
 
 /// The target plus every function parsed from its file — the siblings a receiver
@@ -1578,6 +1707,10 @@ func readU32(f *os.File) (int, bool) {{
 }}
 
 func main() {{
+	// The build's load gate: every package's init has run, stop before an input.
+	if os.Getenv("{load_only}") != "" {{
+		return
+	}}
 	// Keep the control pipe (stdout) and point stdout at the null device, so
 	// the target's prints can't corrupt the sync stream (#427).
 	control := bhfControlPipe()
@@ -1617,6 +1750,7 @@ func main() {{
         body = body,
         coverage = GO_COVERAGE_RUNTIME,
         entry = GO_TARGET_ENTRY_RUNTIME,
+        load_only = GO_LOAD_ONLY_ENV,
     )
 }
 
@@ -1803,7 +1937,8 @@ fn build_go_fuzz_test(
     harness_id: &str,
 ) -> GoBuildResult {
     match build_go_fuzz_test_inner(go, candidate, work_dir, harness_id) {
-        Ok(()) => GoBuildResult::Built { forced: None },
+        Ok(None) => GoBuildResult::Built { forced: None },
+        Ok(Some(reason)) => GoBuildResult::NotEntered { reason },
         Err((reason, skip)) => GoBuildResult::Failed { reason, skip },
     }
 }
@@ -1814,12 +1949,14 @@ struct GoTestFile {
     text: String,
 }
 
+/// `Ok(Some(why))` when the fuzz test built but fails before it reads an
+/// input ([`load_failure`]).
 fn build_go_fuzz_test_inner(
     go: &Path,
     candidate: &Candidate,
     work_dir: &Path,
     harness_id: &str,
-) -> Result<(), (String, bool)> {
+) -> Result<Option<String>, (String, bool)> {
     let source = crate::source_text::read_source_text(&candidate.source_path).map_err(|e| {
         (
             format!("read {}: {e}", candidate.source_path.display()),
@@ -1923,7 +2060,11 @@ fn build_go_fuzz_test_inner(
     if let Some(error) = last {
         return Err(error);
     }
-    probe_fuzz_test(&auto_dir, candidate, &test, &pkg_dir)
+    let bin = auto_dir.join(crate::auto::layout::harness_exe_name("main"));
+    if let Some(reason) = load_failure(&bin, &auto_dir) {
+        return Ok(Some(reason));
+    }
+    probe_fuzz_test(&auto_dir, candidate, &test, &pkg_dir).map(|()| None)
 }
 
 /// The other `_test.go` files of `pkg_dir` in `package`.
@@ -2547,6 +2688,10 @@ func readU32(f *os.File) (int, bool) {{
 }}
 
 func main() {{
+	// The build's load gate: every package's init has run, stop before an input.
+	if os.Getenv("{load_only}") != "" {{
+		return
+	}}
 	// The fuzz test runs in its package's directory, as under go test, so a
 	// replayed input named relative to where bhf started the harness is
 	// resolved first.
@@ -2595,6 +2740,7 @@ func main() {{
 "#,
         coverage = GO_COVERAGE_RUNTIME,
         entry = GO_TARGET_ENTRY_RUNTIME,
+        load_only = GO_LOAD_ONLY_ENV,
         dir = quote(package_dir),
         corpus = quote(corpus),
     )
@@ -3785,6 +3931,92 @@ func ParseRequest(req *Request) {}
         let out = lower_go_mod_directive(src, "1.22");
         assert!(out.contains("go 1.22\n"));
         assert!(out.contains("require golang.org/x/text v0.3.0"));
+    }
+
+    /// #398: the load gate's harness stops after every package's `init` and
+    /// before it touches the control pipe or reads an input, in the generated
+    /// harness and in a native fuzz test's.
+    #[test]
+    fn both_harness_mains_stop_after_init_when_asked_to_load_only() {
+        let fuzz_test = generate_fuzz_test_main_go(
+            "x/y",
+            "x/y/bhftesting",
+            "FuzzParse",
+            Path::new("/src/y"),
+            Path::new("/src/y/testdata/fuzz/FuzzParse"),
+        );
+        for main_go in [generate_main_go("x/y", "\ttgt.F()\n"), fuzz_test] {
+            let main = &main_go[main_go.find("func main() {").expect("a main")..];
+            let gate = main
+                .find("if os.Getenv(\"BHF_GO_LOAD_ONLY\") != \"\" {\n\t\treturn\n\t}")
+                .unwrap_or_else(|| panic!("no load-only return in main: {main}"));
+            let control = main.find("bhfControlPipe()").expect("a control pipe");
+            assert!(gate < control, "{main}");
+            assert!(gate < main.find("os.Args").expect("argv"), "{main}");
+        }
+    }
+
+    /// #398: a package `init` that panics names its package and its message;
+    /// the frame shapes are those `go1.22` prints for an `init` function, a
+    /// closure in one, and a package-level variable's initializer.
+    #[test]
+    fn a_failed_load_names_the_package_whose_init_panicked() {
+        let init_func = "panic: qtls.ClientSessionState doesn't match\n\n\
+            goroutine 1 [running]:\n\
+            github.com/marten-seemann/qtls-go1-15.init.0()\n\
+            \t/go/pkg/mod/github.com/marten-seemann/qtls-go1-15@v0.1.1/unsafe.go:20 +0x132\n";
+        assert_eq!(
+            init_frame_package(init_func).as_deref(),
+            Some("github.com/marten-seemann/qtls-go1-15")
+        );
+        let reason = load_failure_reason(init_func, "exit status: 2");
+        assert!(
+            reason.contains("package `github.com/marten-seemann/qtls-go1-15` panicked in its init")
+                && reason.contains("`qtls.ClientSessionState doesn't match`")
+                && reason.contains("not a finding"),
+            "{reason}"
+        );
+        let closure = "panic: codec: state doesn't match\n\ngoroutine 1 [running]:\n\
+            example.test/exp/codec.init.0.func1(...)\n\t/src/codec/codec.go:4\n\
+            example.test/exp/codec.init.0()\n\t/src/codec/codec.go:4 +0x6a\n";
+        assert_eq!(
+            init_frame_package(closure).as_deref(),
+            Some("example.test/exp/codec")
+        );
+        let initializer = "panic: bad table\n\ngoroutine 1 [running]:\n\
+            gopkg.in/legacy.v3.Table.init(...)\n\t/src/legacy/table.go:12\n\
+            gopkg.in/legacy.v3.build(...)\n\t/src/legacy/table.go:9\n\
+            gopkg.in/legacy.v3.init()\n\t/src/legacy/table.go:5 +0x8c\n";
+        assert_eq!(
+            init_frame_package(initializer).as_deref(),
+            Some("gopkg.in/legacy.v3")
+        );
+    }
+
+    /// Only a package's `init` names a package: a method called `init`, a
+    /// function whose name merely contains it, or a panic message does not.
+    #[test]
+    fn only_a_package_init_frame_names_a_package() {
+        for stderr in [
+            "panic: x\n\ngoroutine 1 [running]:\nexample.com/p.(*Codec).init(...)\n\t/p.go:3\n",
+            "panic: x\n\ngoroutine 1 [running]:\nexample.com/p.initTable()\n\t/p.go:3 +0x1\n",
+            "panic: x\n\ngoroutine 1 [running]:\nexample.com/p.(*Codec).init(...)\n\t/p.go:3\n\
+             example.com/p.Load()\n\t/p.go:9 +0x1\n",
+            "panic: a.init.0() failed\n",
+            "created by example.com/p.init.0 in goroutine 1\n",
+        ] {
+            assert_eq!(init_frame_package(stderr), None, "{stderr}");
+        }
+        // A load that failed without a panic names what it printed last.
+        let fatal = load_failure_reason(
+            "2026/11/20 10:00:00 config: no profile directory\n",
+            "exit status: 1",
+        );
+        assert!(
+            fatal.contains("exited (exit status: 1) as its packages loaded")
+                && fatal.contains("`2026/11/20 10:00:00 config: no profile directory`"),
+            "{fatal}"
+        );
     }
 
     #[test]

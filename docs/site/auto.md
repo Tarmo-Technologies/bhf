@@ -82,6 +82,17 @@ that does not build there is skipped with the reason:
 | JavaScript, TypeScript | TypeScript transpiled with esbuild | a warm Node process |
 | Ruby, Lua, PHP | loaded by the interpreter | their own interpreter, with in-process edge coverage |
 
+**Targets that fail before any input.** A built Go harness is first started
+once with `BHF_GO_LOAD_ONLY` set, which runs every package's `init` and stops
+before reading an input. When that run fails, every input would fail the same
+way, for example a dependency's `init` that refuses the installed Go release.
+bhf then reports the target as `built, NOT entered (target environment)`, with
+a reason that names the package whose `init` panicked and the panic message,
+and writes no finding. A JavaScript or TypeScript target gets the same outcome
+when every input bhf tries on it before fuzzing stops at the same undefined
+global, such as `FileReader` or a name only the host defines; [Browser
+globals](javascript.md#browser-globals) lists the inputs it tries.
+
 **Interpreter crashes.** When an interpreter (Python, Perl, Ruby, Lua, PHP or
 Node) dies by SIGSEGV without an error message of its own, bhf reports
 BHF-210 with CWE-674 (uncontrolled recursion) rather than an invalid memory
@@ -635,7 +646,7 @@ one portable binary, so they get no `Mayhemfile`.
 | Code | Meaning |
 |---|---|
 | 0 | At least one target built and ran. A target that built but ran no input, a report-only target or a finding also gives 0, and so do `--dry-run`, `--list-targets` and `--list-fakes` |
-| 1 | Candidates were discovered but none built, or `auto` stopped on an error |
+| 1 | Candidates were discovered but none built and ran: each one failed to build, was skipped, or built but was not entered (`built, NOT entered` in the summary, a target-environment failure included), or `auto` stopped on an error |
 | 2 | No candidates discovered (an empty tree, or a source path that does not exist), or a refused configuration or flag value. An internal bhf panic also exits 2, after writing the bug report |
 | 3 | Harnesses built, but none ran because their sanitizer runtime does not start on this host. Re-run with `--sanitizers none`, or with a compiler whose sanitizer runtime starts here |
 
