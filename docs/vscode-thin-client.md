@@ -26,7 +26,7 @@ configured findings directory exists.
 |---|---|---|
 | `bhf.daemonPath` | `bhf-daemon` | Daemon executable. |
 | `bhf.cliPath` | `bhf` | BHF CLI executable for the replay and minimize tasks. |
-| `bhf.findingsDir` | `findings` | Findings directory loaded through the daemon, relative to the workspace root unless absolute. `bhf auto` writes findings to `<work-dir>/results/findings`, so set this to that path (for example `bhf_work/results/findings`). |
+| `bhf.findingsDir` | `results/findings` | Findings directory loaded through the daemon, relative to the workspace root unless absolute. `bhf auto` writes findings to `<work-dir>/results/findings`, so the default fits a workspace opened on the work directory; otherwise set it to that path (for example `bhf_work/results/findings`). |
 | `bhf.harnessPath` | empty | Harness path passed as `--harness` to replay and minimize. |
 | `bhf.minimizeStrategy` | `bytes` | `bytes` or `typed`, passed as `--strategy` to minimize. |
 

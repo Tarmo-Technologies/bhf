@@ -10,7 +10,7 @@ The VS Code extension (`editors/vscode/`) and the GNAT Studio plugin
 | --- | --- | --- | --- |
 | Daemon path | `bhf.daemonPath` | `BHF/daemon-path` | Default `bhf-daemon` |
 | CLI path | `bhf.cliPath` | `BHF/cli-path` | Default `bhf` |
-| Findings directory | `bhf.findingsDir` | `BHF/findings-dir` | Default `findings`; a relative path resolves from the workspace or project root |
+| Findings directory | `bhf.findingsDir` | `BHF/findings-dir` | Default `results/findings`, where `bhf auto` writes findings in its work directory; a relative path resolves from the workspace or project root |
 | Harness override | `bhf.harnessPath` | `BHF/harness-path` | Optional. Both editors build the replay arguments from the configured CLI and the finding ID, and ignore any command text stored in a finding |
 | Minimize strategy | `bhf.minimizeStrategy` | `BHF/minimize-strategy` | `bytes` (default) or `typed` |
 | Request deadline | none | `BHF/daemon-timeout-seconds` | GNAT Studio default 30 seconds; see [Daemon reliability](enterprise-daemon-reliability.md) |

@@ -2596,7 +2596,7 @@ fn run_programmatic_campaign(mut args: FuzzArgs, workers: u32) -> Result<FuzzRun
         time_budget,
         bhf_bin,
         per_worker_env: Vec::new(),
-        extra_worker_args: worker_passthrough_args(&args),
+        extra_worker_args: worker_args(&args),
         kill_grace: Some(campaign_kill_grace(args.timeout)),
         harness_dirs,
         harness_executable,
@@ -3492,7 +3492,7 @@ fn run_multicore_campaign(mut args: FuzzArgs) -> i32 {
         time_budget: args.time.unwrap_or(Duration::ZERO),
         bhf_bin,
         per_worker_env: multicore_fuzz::sanitizer_envs(sanitizers.runtime_set()),
-        extra_worker_args: worker_passthrough_args(&args),
+        extra_worker_args: worker_args(&args),
         kill_grace: Some(campaign_kill_grace(args.timeout)),
         harness_dirs,
         harness_executable,
@@ -4013,6 +4013,17 @@ fn worker_seed_files(args: &mut FuzzArgs, harness: &Path) -> Result<(), String> 
         args.seeds_layout_prefixed = true;
     }
     materialize_seed_bytes(args)
+}
+
+/// A worker `bhf fuzz`'s arguments: the run's `--profile`, so the worker
+/// gates its tools on it as the run does, then the pass's own.
+fn worker_args(args: &FuzzArgs) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(profile) = config::Profile::given() {
+        out.extend(["--profile".to_owned(), profile.as_str().to_owned()]);
+    }
+    out.extend(worker_passthrough_args(args));
+    out
 }
 
 fn worker_passthrough_args(args: &FuzzArgs) -> Vec<String> {

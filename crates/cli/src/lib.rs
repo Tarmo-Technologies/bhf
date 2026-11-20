@@ -133,57 +133,72 @@ mod transport_replay;
 mod windows_env;
 pub mod workdir;
 
+/// The help heading of the options every command takes, which print after
+/// the command's own.
+const GLOBAL_OPTIONS: &str = "Global Options";
+
 #[derive(Debug, Parser)]
 #[command(name = "bhf")]
 #[command(version = env!("BHF_VERSION_FULL"))]
 #[command(long_version = concat!(env!("BHF_VERSION_FULL"), "\ncommit: ", env!("BHF_GIT_COMMIT")))]
 #[command(about = "Discover targets, build harnesses, and fuzz your source tree offline")]
 #[command(long_about = "\
-Discover targets, build harnesses, and fuzz your source tree offline.
+Discover targets, build harnesses, and fuzz your source tree offline. \
 No model or API key is required.
 
 START HERE:
   bhf auto /path/to/source --work-dir /path/to/bhf_work \\
     --jobs 1 --max-targets 1 --per-target-time 10
 
-Keep the work directory outside the source tree. Install the compiler or
-interpreter for the languages you fuzz: C and C++ need clang and make, and on
+Keep the work directory outside the source tree. Install the compiler or \
+interpreter for the languages you fuzz: C and C++ need clang and make, and on \
 Windows also Visual Studio C++ Build Tools and the Windows SDK.
 
-When the run ends, read /path/to/bhf_work/results/INDEX.md for the findings
-and /path/to/bhf_work/auto/summary.txt for the targets that built, fuzzed or
-were skipped. `bhf auto --help` covers language selection, time budgets and
-build options. If bhf itself fails, run again with `--debug`, then run
+When the run ends, read /path/to/bhf_work/results/INDEX.md for the findings \
+and /path/to/bhf_work/auto/summary.txt for the targets that built, fuzzed or \
+were skipped. `bhf auto --help` covers language selection, time budgets and \
+build options. If bhf itself fails, run again with `--debug`, then run \
 `bhf bug-report <work-dir> --preview`.
 
 COMMANDS BY AREA (run `bhf <command> --help` for details):
-  Pipeline      auto, snippet, scan, list, generate-harness, build, fuzz,
-                report, model
+  Pipeline      auto, snippet, scan, list, generate-harness,
+                build, fuzz, report, model
   Ada build     stub, instrument, fake-corba
-  Crash triage  corpus, minimize, replay, capsule, verify-poc, env-capsule,
-                differential, relational, cmplog, explain, cartography,
+  Crash triage  corpus, minimize, replay, capsule,
+                verify-poc, env-capsule, differential,
+                relational, cmplog, explain, cartography,
                 decode-args
-  Binaries      binary (scan, adapter, fuzz, rehost: no source needed)
-  Kernel        kernel (syzlang, import: Linux drivers and syzkaller;
-                run, fuzz, replay: a kernel in a qemu-system guest)
-  Projects      project (validate, list, run, import-ossfuzz),
-                extension (validate, evaluate, session, minimize)
-  Supply chain  sbom, license-audit, static-scan, sloc, extract-state-machines
+  Binaries      binary (scan, adapter, fuzz, rehost: no
+                source needed)
+  Kernel        kernel (syzlang, import: Linux drivers and
+                syzkaller; run, fuzz, replay: a kernel in a
+                qemu-system guest)
+  Projects      project (validate, list, run,
+                import-ossfuzz), extension (validate,
+                evaluate, session, minimize)
+  Supply chain  sbom, license-audit, static-scan, sloc,
+                extract-state-machines
   Reference     rules, list oracles
   Governance    policy, audit, pack, export
   Ops and CI    ci, runners, clean, introspect, bug-report
 
-To find a command by keyword, search this help: `bhf --help | grep -i sarif`.")]
+To find a command by keyword, search this help:
+  bhf --help | grep -i sarif")]
 struct Args {
-    /// License profile for the `--probe` checks and the `binary adapter` tools.
-    /// `strict-permissive` (default) allows no probe and refuses rizin, Ghidra
-    /// and angr; `external-tools` allows those adapters and the `gnat_actions`
-    /// probe; `research-lab` allows every tool and probe. bhf links only
-    /// Apache-2.0/MIT/BSD code, and runs GNAT, GPRbuild and AFL++, under every
-    /// profile. `auto --symcc`, the `--external-tools` analyzers and
-    /// `reset=fast` read `BHF_PROFILE` instead (default `external-tools`).
-    #[arg(long, default_value = "strict-permissive", value_parser = parse_profile, global = true)]
-    profile: Profile,
+    /// License profile: the external tools bhf may run as subprocesses and the
+    /// `--probe` capabilities a run may ask for
+    ///
+    /// `strict-permissive` allows no probe and none of the gated tools;
+    /// `external-tools` allows the `gnat_actions` probe, the rizin, Ghidra and
+    /// angr adapters, the `--external-tools` analyzers, SymCC (`auto --symcc`)
+    /// and bhf's QEMU plugin (`reset=fast`); `research-lab` allows every tool
+    /// and probe. bhf links only Apache-2.0/MIT/BSD code, and runs GNAT,
+    /// GPRbuild and AFL++, under every profile. Without this option the
+    /// `--probe` checks and `binary adapter` use `strict-permissive`, and
+    /// `auto --symcc`, the `--external-tools` analyzers and `reset=fast` use
+    /// `BHF_PROFILE`, else `external-tools`, which asking for them opts into.
+    #[arg(long, value_parser = parse_profile, global = true, help_heading = GLOBAL_OPTIONS)]
+    profile: Option<Profile>,
 
     /// Capability probe the run needs (`gnat_actions`, `libadalang`,
     /// `gnatfuzz`, `gnatcoverage`, `polyorb`). bhf exits 2 when the active
@@ -195,7 +210,7 @@ struct Args {
     /// RUST_BACKTRACE), keep going past a file that crashes bhf, and add
     /// detail to the bug-report.json it writes. Use it when bhf fails on your
     /// tree, so the report holds what is needed to fix the bug.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = GLOBAL_OPTIONS)]
     debug: bool,
 
     /// Windows: do not discover Visual Studio. By default, when `INCLUDE`/`LIB`
@@ -204,12 +219,23 @@ struct Args {
     /// the environment its VsDevCmd sets (cached per instance), and uses the
     /// standalone or Visual Studio-bundled clang when none is on PATH. Also
     /// `BHF_NO_VS_ENV=1`.
-    #[arg(long = "no-vs-env", global = true, hide = !cfg!(windows))]
+    #[arg(
+        long = "no-vs-env",
+        global = true,
+        hide = !cfg!(windows),
+        help_heading = GLOBAL_OPTIONS
+    )]
     no_vs_env: bool,
 
     /// Windows: target architecture of the discovered Visual Studio
     /// environment (`x64`, `x86`, `arm64`). Default: this machine's.
-    #[arg(long = "vs-arch", global = true, value_name = "ARCH", hide = !cfg!(windows))]
+    #[arg(
+        long = "vs-arch",
+        global = true,
+        value_name = "ARCH",
+        hide = !cfg!(windows),
+        help_heading = GLOBAL_OPTIONS
+    )]
     vs_arch: Option<String>,
 
     #[command(subcommand)]
@@ -539,14 +565,39 @@ fn run_multicall(argv: &[std::ffi::OsString]) -> Option<i32> {
     None
 }
 
+/// The narrowest terminal on which every command's short help (`-h`) prints
+/// each option's help beside it. On a narrower one there is no room beside
+/// the widest options, so short help prints each option's help on the line
+/// after it, as long help always does.
+const SIDE_BY_SIDE_HELP_WIDTH: usize = 72;
+
+/// The width help wraps to, found as clap finds it: the terminal's, else
+/// `COLUMNS` (when the output is not a terminal), else 100.
+fn help_width() -> usize {
+    terminal_size::terminal_size()
+        .map(|(width, _)| usize::from(width.0))
+        .or_else(|| std::env::var("COLUMNS").ok()?.parse().ok())
+        .filter(|&width| width > 0)
+        .unwrap_or(100)
+}
+
+/// bhf's command line, with its help laid out for a terminal `width` columns
+/// wide.
+fn command_for_width(width: usize) -> clap::Command {
+    use clap::CommandFactory;
+    Args::command()
+        .term_width(width)
+        .next_line_help(width < SIDE_BY_SIDE_HELP_WIDTH)
+}
+
 /// Parse bhf's command line. For `bhf auto`, `bhf ci` and `bhf build`, also
 /// record which flags the command line gave, so a config file fills only the
 /// others.
 fn parse_args(argv: Vec<std::ffi::OsString>) -> Result<Args, clap::Error> {
-    use clap::{CommandFactory, FromArgMatches};
-    let matches = Args::command().try_get_matches_from(argv)?;
-    let mut args =
-        Args::from_arg_matches(&matches).map_err(|error| error.format(&mut Args::command()))?;
+    use clap::FromArgMatches;
+    let mut command = command_for_width(help_width());
+    let matches = command.try_get_matches_from_mut(argv)?;
+    let mut args = Args::from_arg_matches(&matches).map_err(|error| error.format(&mut command))?;
     match (&mut args.command, matches.subcommand()) {
         (Some(Command::Auto(auto_args)), Some(("auto", sub))) => {
             auto_args.given = auto::cli::given_arg_ids(sub);
@@ -585,12 +636,16 @@ where
     // writes a bug-report.
     auto::bug_report::init(args.debug);
 
-    let profile = args.profile;
+    let profile = args.profile.unwrap_or(Profile::StrictPermissive);
     let probe_refs = args.probes.iter().map(String::as_str).collect::<Vec<_>>();
     if let Err(error) = enforce(profile, &probe_refs) {
         eprintln!("{error}");
         return 2;
     }
+    // A given `--profile` gates the tools this run asks for ahead of
+    // `BHF_PROFILE` until the run returns; the fuzz workers it starts get it
+    // on their command line.
+    let _given_profile = config::GivenProfile::enter(args.profile);
 
     #[cfg(windows)]
     if args.command.is_some() {
@@ -1080,6 +1135,158 @@ mod tests {
         }
         // `bhf model` trains the finding classifier a user labels: listed.
         assert!(!sub("model").expect("`model` exists").is_hide_set());
+    }
+
+    /// Every command's short (`-h`) and long (`--help`) help, hidden commands
+    /// included, as bhf prints it on a terminal `width` columns wide, each
+    /// named by the command line that prints it. clap's generated `help`
+    /// commands, which take no options, are left out.
+    fn every_help(width: usize) -> Vec<(String, String)> {
+        fn walk(command: &mut clap::Command, name: String, helps: &mut Vec<(String, String)>) {
+            helps.push((format!("{name} -h"), command.render_help().to_string()));
+            let long = command.render_long_help().to_string();
+            helps.push((format!("{name} --help"), long));
+            let subs = command.get_subcommands_mut();
+            for sub in subs.filter(|sub| sub.get_name() != "help") {
+                let name = format!("{name} {}", sub.get_name());
+                walk(sub, name, helps);
+            }
+        }
+        let mut root = super::command_for_width(width);
+        root.build();
+        let mut helps = Vec::new();
+        walk(&mut root, "bhf".to_owned(), &mut helps);
+        helps
+    }
+
+    /// Help wraps to the terminal width, short and long, on a terminal wide
+    /// enough for each option's help beside it and on one too narrow for
+    /// that: no line is wider, except what clap cannot wrap: one word that
+    /// does not fit, an option's name and value on a line of their own, and
+    /// the usage line.
+    #[test]
+    fn every_help_wraps_to_the_terminal_width() {
+        let unwrappable = |line: &str| {
+            let text = line.trim_start();
+            text.split_whitespace().count() == 1
+                || (text.starts_with('-') && !text.contains("  "))
+                || line.starts_with("Usage: ")
+        };
+        for width in [40, 60, 100] {
+            let helps = every_help(width);
+            assert!(helps.len() > 100, "{}", helps.len());
+            for (page, help) in helps {
+                for line in help.lines() {
+                    assert!(
+                        line.chars().count() <= width || unwrappable(line),
+                        "`{page}` at {width} columns has a wider line:\n{line}\n\n{help}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The help bhf writes out line by line (the top-level guide, `auto`'s
+    /// first-run help and recommended sweep) wraps evenly on any terminal:
+    /// each paragraph is one line, which clap wraps as a whole, and each
+    /// indented line (a command to copy, a table row) fits 60 columns, so it
+    /// prints whole there.
+    #[test]
+    fn the_help_written_line_by_line_wraps_evenly() {
+        use clap::CommandFactory;
+        fn texts(command: &clap::Command, name: String, out: &mut Vec<(String, String)>) {
+            let blocks = [
+                command.get_long_about(),
+                command.get_before_help(),
+                command.get_before_long_help(),
+                command.get_after_help(),
+                command.get_after_long_help(),
+            ];
+            for block in blocks.into_iter().flatten() {
+                out.push((name.clone(), block.to_string()));
+            }
+            for sub in command.get_subcommands() {
+                texts(sub, format!("{name} {}", sub.get_name()), out);
+            }
+        }
+        let mut blocks = Vec::new();
+        texts(&Args::command(), "bhf".to_owned(), &mut blocks);
+        let named = |command: &str| blocks.iter().any(|(name, _)| name == command);
+        assert!(named("bhf") && named("bhf auto"), "{blocks:?}");
+        let prose = |line: &str| !line.is_empty() && !line.starts_with(' ');
+        for (command, block) in &blocks {
+            let lines = block.lines().collect::<Vec<_>>();
+            for pair in lines.windows(2) {
+                assert!(
+                    !(prose(pair[0]) && prose(pair[1])),
+                    "`{command}` help wraps a paragraph by hand:\n{}\n{}",
+                    pair[0],
+                    pair[1]
+                );
+            }
+            for line in lines.iter().filter(|line| line.starts_with(' ')) {
+                assert!(
+                    line.chars().count() <= 60,
+                    "`{command}` help has an indented line wider than 60 columns:\n{line}"
+                );
+            }
+        }
+    }
+
+    /// The global options print after the command's own options and commands,
+    /// under their own heading, in every command's help.
+    #[test]
+    fn the_global_options_follow_each_commands_own() {
+        let starts_option = |part: &str, option: &str| {
+            part.lines()
+                .any(|line| line.split_whitespace().next() == Some(option))
+        };
+        for (page, help) in every_help(1000) {
+            let at = help
+                .find("\nGlobal Options:\n")
+                .unwrap_or_else(|| panic!("`{page}` has no Global Options:\n{help}"));
+            let (own, global) = help.split_at(at);
+            for option in ["--profile", "--debug"] {
+                assert!(
+                    starts_option(global, option) && !starts_option(own, option),
+                    "`{page}` lists {option} among its own options:\n{help}"
+                );
+            }
+            assert!(
+                !global.contains("\nOptions:\n") && !global.contains("\nCommands:\n"),
+                "`{page}` lists its own options after the global ones:\n{help}"
+            );
+        }
+    }
+
+    /// `--profile` is recorded only when the command line gives it, so a gate
+    /// with a default of its own tells `--profile strict-permissive` from none.
+    #[test]
+    fn the_profile_option_is_none_unless_given() {
+        let parse = |argv: &[&str]| {
+            super::parse_args(argv.iter().map(OsString::from).collect())
+                .unwrap()
+                .profile
+        };
+        assert_eq!(parse(&["bhf", "rules", "list"]), None);
+        assert_eq!(
+            parse(&["bhf", "rules", "--profile", "research-lab", "list"]),
+            Some(config::Profile::ResearchLab)
+        );
+    }
+
+    /// A run's `--profile` ends with the run. A later run in the same
+    /// process (bhf-daemon runs each request in process) that gives none
+    /// gates `reset=fast` on `BHF_PROFILE`, else on the default, which
+    /// allows it.
+    #[test]
+    fn a_given_profile_ends_with_its_run() {
+        use crate::auto::external_tools::qemu_plugin_profile;
+        let before = qemu_plugin_profile();
+        let code = run_from(["bhf", "--profile", "strict-permissive"]);
+        assert_eq!(code, 0);
+        assert_eq!(config::Profile::given(), None);
+        assert_eq!(qemu_plugin_profile(), before);
     }
 
     #[test]

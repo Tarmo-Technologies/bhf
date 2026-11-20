@@ -8,6 +8,8 @@ minimizing findings, and writing reports. This page describes each command
 group. `bhf --help` lists every command, and `bhf <command> --help` gives the
 exact flags, defaults and accepted values of the build you have.
 
+Help wraps to the width of the terminal; with no terminal it wraps at `COLUMNS` columns, or 100. On a terminal narrower than 60 columns, short help (`-h`) prints each option's help on the line after the option, as long help (`--help`) always does. Each command lists its own options first, then the options every command takes (`--profile`, `--debug`) under `Global Options:`.
+
 Most runs start with [bhf auto](#auto), which does every step for a whole
 source tree; the [Auto guide](auto.md) walks through it. The other commands
 run one step at a time or work on the results.
@@ -1831,7 +1833,7 @@ writes `static-report.json` and `static-report.md` to
 | `--jobs <N>` | the number of parallel file workers |
 | `--max-memory-mb <MB>` | the scan's resident-memory ceiling |
 | `--sloc <FILE>` | also write a per-language SLOC breakdown |
-| `--external-tools` | also run the installed gosec, Bandit, semgrep and GNATcheck as subprocesses and write their findings to `<out>/external-findings.json`; the license profile gates them, and this flag selects `external-tools` unless `BHF_PROFILE` names another |
+| `--external-tools` | also run the installed gosec, Bandit, semgrep and GNATcheck as subprocesses and write their findings to `<out>/external-findings.json`; the license profile gates them: the global `--profile`, else the one `BHF_PROFILE` names, else `external-tools`, which this flag selects |
 
 In work-dir mode, `--since <rev>` replaces
 `results/static/static-report.json` with the diff-scoped subset, so
@@ -2241,12 +2243,7 @@ Apache-2.0, MIT, BSD-2-Clause and BSD-3-Clause code.
 | `external-tools` | the GNAT compiler-action probe (`--probe gnat_actions`), and these tools as subprocesses: the rizin, Ghidra and angr binary adapters, the gosec, Bandit, semgrep and GNATcheck analyzers (`static-scan --external-tools`), SymCC (`auto --symcc`), and bhf's QEMU dirty-page plugin (`reset=fast`) |
 | `research-lab` | every probe, the GPL research tools Libadalang, GnatFuzz, GNATcoverage and PolyORB included, and any subprocess |
 
-`static-scan --external-tools`, `auto --external-tools`, `auto --symcc`
-and the `qemu-system:` lane's `reset=fast` take their profile from the
-`BHF_PROFILE` environment variable, not from `--profile`, and use
-`external-tools` when it is unset. GNAT, GPRbuild and AFL++ run under every
-profile. Use `external-tools` where running those tools is allowed, and
-`research-lab` only in a lab where any external analysis tool may run.
+`--profile` wins over the `BHF_PROFILE` environment variable everywhere. Without `--profile`, `static-scan --external-tools`, `auto --external-tools`, `auto --symcc` and the `qemu-system:` lane's `reset=fast` use the profile `BHF_PROFILE` names, else `external-tools`, which asking for them opts into; the `--probe` checks and `binary adapter` use `strict-permissive`. GNAT, GPRbuild and AFL++ run under every profile. Use `external-tools` where running those tools is allowed, and `research-lab` only in a lab where any external analysis tool may run.
 
 ## Enterprise Operations
 

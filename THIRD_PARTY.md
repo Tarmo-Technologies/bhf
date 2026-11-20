@@ -33,7 +33,7 @@ Tiers used in the matrix:
 | ASM (org.ow2.asm) | JVM bytecode instrumentation for bhf's own coverage agent | BSD-3-Clause | **Core (subprocess/agent runtime)** | Low (permissive, strict-permissive clean) | Not linked into the bhf Rust binary. Bundled into the standalone `bhf-jvm-agent.jar` (a `-javaagent` for the user's JVM, like GNAT subprocess use); built from `java_runtime/` by `build-agent.sh`, ASM is fetched into a cache, or pre-staged on an air-gapped host. |
 | cc (Rust) | Build helper for vendored parser C sources | MIT/Apache-2.0 | **Core build** | Low | Build-time only; covered by `bhf license-audit` and `cargo deny`. |
 | GPR2 library | Programmatic .gpr parsing | GPLv3 (with RLE for runtime, not for tooling linkage) | **Forbidden** (linked); **External-only** via `gprbuild --print-*` parsing | Copyleft contamination if linked | Do not link. Parse `.gpr` ourselves; shell out to `gprbuild` for builds. |
-| GPRbuild | Project build driver | GPLv3 | **External-only** | None when invoked as subprocess | Allowed as user-installed subprocess in `external-tools`; not bundled. |
+| GPRbuild | Project build driver | GPLv3 | **External-only** | None when invoked as subprocess | User-installed subprocess, run under every profile; not bundled. |
 | FSF GNAT/GCC | Ada compiler | GPLv3 + GCC Runtime Library Exception | **External-only** | The GCC RLE permits compiled-program redistribution but does not let us link Ada front-end libraries | Subprocess only; see [GCC RLE boundary](#gcc-rle-boundary). End users may compile generated Ada code against the GNAT runtime for their own harnesses. |
 | GNAT.Exception_Actions | Global raise hook | GPLv3 + GCC RLE | **Optional plug-in** (`external-tools`) | Same RLE terms as the runtime; implementation-defined unit | Source instrumentation is the default. `--probe gnat_actions` is allowed in `external-tools` and refused in `strict-permissive`. |
 | GNAT.Exception_Traces | Symbolic backtrace | GPLv3 + GCC RLE | **Optional plug-in** | Same | Opt-in. |
@@ -54,6 +54,7 @@ Tiers used in the matrix:
 | ASIS | Compiler-vendor semantic API | Vendor-dependent | **Forbidden** | Vendor lock | Not used. |
 | serde / serde_json (Rust) | Serialization | MIT/Apache-2.0 | **Core** | Low | Allow. |
 | clap (Rust) | CLI parsing | MIT/Apache-2.0 | **Core** | Low | Allow. |
+| terminal_size (Rust) | Terminal width, so help wraps to it (clap's `wrap_help`) and short help lays out for it | MIT/Apache-2.0 | **Core** | Low | Allow. |
 | anyhow / thiserror | Error types | MIT/Apache-2.0 | **Core** | Low | Allow. |
 | tempfile (Rust) | RAII cleanup for compiler capability canary files | MIT/Apache-2.0 | **Core** | Low | Allow. |
 | tera (Rust) | Harness template engine | MIT | **Core** | Low | Allow. |

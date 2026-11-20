@@ -13,6 +13,7 @@ fn help(args: &[&str]) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_bhf"))
         .args(args)
         .arg("--help")
+        .env("COLUMNS", "100")
         .output()
         .unwrap();
     assert!(output.status.success());

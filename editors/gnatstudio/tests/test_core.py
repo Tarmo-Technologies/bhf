@@ -227,7 +227,12 @@ class CoreTests(unittest.TestCase):
 
         self.assertEqual(
             build_replay_args({**FINDING, "replay": {"command": "evil-command"}}, config),
-            ["bhf", "replay", "--finding", "/work/project/findings/F-0001-alpha"],
+            [
+                "bhf",
+                "replay",
+                "--finding",
+                os.path.normpath("/work/project/results/findings/F-0001-alpha"),
+            ],
         )
 
     def test_build_replay_args_reject_path_escape_id(self):
@@ -248,7 +253,7 @@ class CoreTests(unittest.TestCase):
                 "bhf",
                 "minimize",
                 "--finding",
-                os.path.normpath("/work/project/findings/F-0001-alpha"),
+                os.path.normpath("/work/project/results/findings/F-0001-alpha"),
                 "--harness",
                 "build/main",
                 "--strategy",
@@ -306,6 +311,57 @@ class CoreTests(unittest.TestCase):
             [spec.action for spec in finding_action_specs(finding_without_repro)],
             ["replay", "minimize"],
         )
+
+
+class FakePreference:
+    """A GNAT Studio preference the user has not set."""
+
+    def __init__(self, gps: "FakeGps", name: str):
+        self.gps = gps
+        self.name = name
+
+    def create(self, label, kind, doc, default, *args):
+        self.gps.created[self.name] = default
+
+    def get(self):
+        raise KeyError(self.name)
+
+
+class FakeGps:
+    """The part of GNAT Studio's `GPS` module the plugin's settings use."""
+
+    def __init__(self):
+        self.created = {}
+
+    def Preference(self, name: str) -> FakePreference:
+        return FakePreference(self, name)
+
+
+class DefaultFindingsDirTests(unittest.TestCase):
+    """`bhf auto` writes findings to `results/findings` in its work dir."""
+
+    def test_core_config_defaults_to_results_findings(self):
+        config = BhfConfig(workspace_root="/work/project")
+
+        self.assertEqual(
+            config.resolved_findings_dir,
+            os.path.normpath("/work/project/results/findings"),
+        )
+
+    def test_plugin_preference_and_fallback_default_to_results_findings(self):
+        import bhf_gnatstudio as plugin
+
+        gps = FakeGps()
+        saved = plugin.GPS
+        plugin.GPS = gps
+        try:
+            plugin.create_preferences()
+            config = plugin.current_config()
+        finally:
+            plugin.GPS = saved
+
+        self.assertEqual(gps.created[plugin.PREF_FINDINGS], "results/findings")
+        self.assertEqual(config.findings_dir, "results/findings")
 
 
 if __name__ == "__main__":

@@ -399,9 +399,7 @@ SDK ceiling and central package management.
 
 ### Py-1. `ModuleNotFoundError` — 266 — **DEPENDENCY**
 
-The largest single class in the sweep. The manifest names each missing
-package; `bhf auto --install-deps` installs it with `pip3` where the network
-allows.
+The manifest names each missing Python package for manual installation. `bhf auto --install-deps` can fetch system headers and libraries with `apt-get` and Ada units with `alr`.
 
 ### Py-2. Instance method needs constructor arguments — 25 — **[FIXED]**
 

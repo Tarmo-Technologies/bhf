@@ -112,6 +112,17 @@ pub fn run(args: BinaryAdapterArgs, profile: Profile) -> i32 {
     }
 }
 
+/// The license-profile subprocess ids [`adapter_allowed`] checks.
+#[cfg(test)]
+pub(crate) fn gated_subprocess_ids() -> Vec<&'static str> {
+    use clap::ValueEnum;
+    AdapterKind::value_variants()
+        .iter()
+        .filter(|adapter| adapter.is_external())
+        .map(|adapter| adapter.as_str())
+        .collect()
+}
+
 fn adapter_allowed(profile: Profile, adapter: AdapterKind) -> bool {
     if !adapter.is_external() {
         return true;

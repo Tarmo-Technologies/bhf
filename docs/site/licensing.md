@@ -42,12 +42,7 @@ probes (`--probe`) a run may ask for; bhf never links those tools.
 
 bhf runs FSF GNAT, GPRbuild and AFL++ (Apache-2.0) under every profile.
 
-Two settings pick the profile. The global `--profile` option gates the
-`--probe` checks and the `bhf binary adapter` tools. The `--external-tools`
-analyzers of `bhf static-scan` and `bhf auto`, `bhf auto --symcc` and the
-`qemu-system:` lane's `reset=fast` read the `BHF_PROFILE` environment
-variable instead, and use `external-tools` when it is unset. Set
-`BHF_PROFILE=strict-permissive` to have bhf refuse them.
+The global `--profile` option picks the profile for every gate of the run, and bhf passes it to the fuzz workers the run starts. Without it, the `--probe` checks and the `bhf binary adapter` tools use `strict-permissive`, and the tools a run asks for by flag (the `--external-tools` analyzers of `bhf static-scan` and `bhf auto`, `bhf auto --symcc` and the `qemu-system:` lane's `reset=fast`) use the profile the `BHF_PROFILE` environment variable names, else `external-tools`, which asking for them opts into. Pass `--profile strict-permissive` to have bhf refuse them.
 
 The QEMU plugin is the one the `qemu-system:` lane's `reset=fast` has QEMU
 (GPL-2.0) load; bhf builds it from its own Apache-2.0 source with the host C

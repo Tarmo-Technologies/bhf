@@ -1525,6 +1525,8 @@
   `error LNK2019:` line as well as by an `error:` line.
 
 ### Changed
+- The global `--profile` picks the license profile of every gate and wins over `BHF_PROFILE` (#456): `auto --symcc`, the `--external-tools` analyzers of `auto` and `static-scan`, and `reset=fast` read `BHF_PROFILE` only when the command line gives no `--profile`, and bhf passes `--profile` to the fuzz workers a run starts. A run's `--profile` ends with the run, so a later run in the same process (bhf-daemon runs each request in process) reads `BHF_PROFILE` again. The `external-tools` profile no longer lists the `fsf_gnat`, `gprbuild` and `afl++` subprocess ids, which no gate checked; those tools run under every profile.
+- Short and long help (`-h` and `--help`) wrap to the terminal width. Below 72 columns, short help prints each option's description below the option. Every command lists the global options (`--profile`, `--debug`) after its own (#456).
 - The in-crate lane for private Rust targets (#83) is `bhf auto
   --rust-private` (#244), or `rust-private = true` in the config; it was
   reachable only through the undocumented `BHF_RUST_INCRATE_PRIVATE`, which
@@ -1886,6 +1888,7 @@
 - The HTML docs site gives every heading, `#` to `######`, the anchor GitHub gives it (#453). `scripts/docs/build-site.py` turned `_` and `.` into `-` and gave `####` headings no anchor, so links such as `auto.md#needed_for_build`, `auto.md#runjson` and the links to `####` headings in `cli.md` and `on-target-fuzzing.md` jumped nowhere on the site. The build now also fails on a link to a heading that does not exist.
 - The scheduled fast-snapshot benchmark no longer fails on runner timing noise (#452): `live_fullsystem_fast_snapshot_resets_five_times_faster_than_loadvm` (formerly `..._ten_times_...`) requires `reset=fast`'s mean reset to be at most a fifth of a `loadvm`'s, after a runner measured 9.5x against the old tenth, and its failure message reports the measured ratio.
 - The component archives carry the documentation (#451): in the `bhf`, `bhf-daemon`, `bhf_runtrace_shim` and `bhf_cc_intercept` archives, `docs/`, `examples/`, `schemas/`, `benchmarks/` and the pages `README.md` links sit beside `README.md`, so its relative links and those of `INSTALL.md` and `docs/site/index.md` resolve inside the extracted archive. The release workflow checks those links in each Linux archive.
+- The VS Code and GNAT Studio plugins load findings from `results/findings` by default, where `bhf auto` writes them in its work directory; the default was `findings`, where bhf writes nothing (#456).
 - The all-language container image ships OpenJDK 21.0.13.1+2 (#445). Its
   Ubuntu archive snapshot moves to 20261120T000000Z, which carries the fixed
   `openjdk-21-jdk-headless` and `openjdk-21-jre-headless` for CVE-2026-114938

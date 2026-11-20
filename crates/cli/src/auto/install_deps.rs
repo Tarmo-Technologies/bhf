@@ -15,12 +15,11 @@ use crate::auto::dep_manifest::{DepEntry, DepKind, DependencyManifest};
 use std::path::PathBuf;
 use std::process::Command;
 
+/// A package manager a plan fetches with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Manager {
     Apt,
     Alr,
-    Pip,
-    Npm,
 }
 
 impl Manager {
@@ -28,8 +27,6 @@ impl Manager {
         match self {
             Manager::Apt => "apt-get",
             Manager::Alr => "alr",
-            Manager::Pip => "pip3",
-            Manager::Npm => "npm",
         }
     }
 }
@@ -261,6 +258,45 @@ mod tests {
             "stubbed dep must not be planned"
         );
         assert_eq!(plans.len(), 2);
+    }
+
+    /// Every package manager bhf knows, from a match with no wildcard arm: a
+    /// new manager does not compile until it is listed here.
+    fn every_manager() -> Vec<Manager> {
+        let all = vec![Manager::Apt, Manager::Alr];
+        for manager in &all {
+            match manager {
+                Manager::Apt | Manager::Alr => {}
+            }
+        }
+        all
+    }
+
+    /// Each manager is one some dependency is fetched with: a dependency of
+    /// every kind, under names the planner knows, plans with all of them.
+    #[test]
+    fn every_manager_is_one_a_plan_uses() {
+        let mut m = DependencyManifest::new();
+        for (kind, name) in [
+            (DepKind::SharedLibrary, "z"),
+            (DepKind::Header, "zlib.h"),
+            (DepKind::PkgConfig, "libxml2"),
+            (DepKind::AdaUnit, "Util.Encoders"),
+            (DepKind::LanguagePackage, "requests"),
+            (DepKind::LanguagePackage, "left-pad"),
+            (DepKind::CodegenTool, "alr"),
+            (DepKind::Toolchain, "gnat"),
+            (DepKind::DlopenLibrary, "libz.so"),
+        ] {
+            m.push(kind, name, vec!["H1".into()], false);
+        }
+        let (plans, _) = plan_installs(&m);
+        for manager in every_manager() {
+            assert!(
+                plans.iter().any(|plan| plan.manager == manager),
+                "{manager:?} is never planned: {plans:?}"
+            );
+        }
     }
 
     #[test]

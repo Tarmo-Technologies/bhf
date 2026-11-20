@@ -140,7 +140,12 @@ pub struct CiArgs {
     pub fail_on_actionability: Option<FailOnActionability>,
 
     /// Lowest verdict confidence that counts for --fail-on-actionability.
-    #[arg(long, value_enum, default_value_t = MinActionabilityConfidence::Low)]
+    #[arg(
+        long,
+        value_enum,
+        value_name = "CONFIDENCE",
+        default_value_t = MinActionabilityConfidence::Low
+    )]
     pub min_actionability_confidence: MinActionabilityConfidence,
 
     /// Policy file whose CI gate also decides the exit status: the run fails

@@ -4,6 +4,9 @@ import path from "node:path";
 
 import type { BhfFinding } from "./findings";
 
+/** Where `bhf auto` writes findings in its work directory. */
+export const DEFAULT_FINDINGS_DIR = "results/findings";
+
 export interface CommandConfig {
   cliPath: string;
   findingsDir: string;

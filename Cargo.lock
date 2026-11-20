@@ -223,6 +223,7 @@ dependencies = [
  "target_rank",
  "target_transport",
  "tempfile",
+ "terminal_size",
  "thiserror",
  "toml",
  "tree-sitter",
@@ -434,6 +435,7 @@ dependencies = [
  "anstyle",
  "clap_lex",
  "strsim",
+ "terminal_size",
 ]
 
 [[package]]
@@ -2364,6 +2366,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61e0cadeeb54426080b4c5395d59769ce8293f542cc25511c167c742b2175809"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "terminal_size"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
+dependencies = [
+ "rustix",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

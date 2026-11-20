@@ -35,24 +35,31 @@ RECOMMENDED SWEEP:
     --sloc sloc.txt \\
     --debug
 
-  --work-dir   where everything is written; keep it outside the scanned tree
-  --jobs       targets built and fuzzed at once; their memory is about
-               jobs x --rss-limit-mb, plus room for bhf, compilers and the OS
-  --per-target-time  fuzz seconds per target (libFuzzer -max_total_time)
+  --work-dir   where everything is written; keep it
+               outside the scanned tree
+  --jobs       targets built and fuzzed at once; their
+               memory is about jobs x --rss-limit-mb, plus
+               room for bhf, compilers and the OS
+  --per-target-time  fuzz seconds per target (libFuzzer
+                     -max_total_time)
   --campaign-time    limit for the whole sweep, in seconds
-  --max-targets      stop once N targets have fuzzed (failures do not count)
+  --max-targets      stop once N targets have fuzzed
+                     (failures do not count)
   --unsafe-search-and-run-build-commands
-                     runs the tree's own build to recover its compile flags;
-                     use it only on sources you trust
-  --force      retry the targets the first phase could not fuzz, with
-               fabricated inputs and stubs; their findings are low-confidence
+                     runs the tree's own build to recover
+                     its compile flags; use it only on
+                     sources you trust
+  --force      retry the targets the first phase could not
+               fuzz, with fabricated inputs and stubs;
+               their findings are low-confidence
   --static     also analyze the whole tree statically
   --sbom       SBOM and VEX at the end of the run
   --sloc FILE  per-language line counts (.json for JSON)
-  --debug      backtrace if bhf itself panics; adds detail to the bug report
+  --debug      backtrace if bhf itself panics; adds detail
+               to the bug report
 
-  Read bhf_work/results/INDEX.md first. Full guide: RECOMMENDED-SWEEP.md
-  (docs/recommended-sweep.md in the repository).";
+Read bhf_work/results/INDEX.md first. Full guide: \
+RECOMMENDED-SWEEP.md (docs/recommended-sweep.md in the repository).";
 
 fn parse_positive_mib(value: &str) -> std::result::Result<usize, String> {
     value
@@ -69,21 +76,21 @@ FIRST RUN:
   bhf auto /path/to/source --work-dir /path/to/bhf_work \\
     --jobs 1 --max-targets 1 --per-target-time 10
 
-Keep the work directory outside the source tree. Install the compiler or
+Keep the work directory outside the source tree. Install the compiler or \
 interpreter for the languages you select.
 
-On Windows, C and C++ need Visual Studio Build Tools with the C++ workload and
-GNU make. bhf finds Build Tools and its clang, so no Developer shell is
-needed; `--cc cl` builds the harnesses with cl.exe. A Visual Studio solution
+On Windows, C and C++ need Visual Studio Build Tools with the C++ workload and \
+GNU make. bhf finds Build Tools and its clang, so no Developer shell is \
+needed; `--cc cl` builds the harnesses with cl.exe. A Visual Studio solution \
 in the tree is read for its include directories and defines.
 
-Fuzz harnesses the project already has (Go native fuzz tests, Atheris
-harnesses) are fuzzed first, from the seeds and dictionaries that come with
-them, and so are the fuzzers `bhf project import-ossfuzz` registered in the
+Fuzz harnesses the project already has (Go native fuzz tests, Atheris \
+harnesses) are fuzzed first, from the seeds and dictionaries that come with \
+them, and so are the fuzzers `bhf project import-ossfuzz` registered in the \
 work directory.
 
-When the run ends, read results/INDEX.md for the findings and
-auto/summary.txt for the targets that built, fuzzed or were skipped. To
+When the run ends, read results/INDEX.md for the findings and \
+auto/summary.txt for the targets that built, fuzzed or were skipped. To \
 continue a stopped run, run the same command again with --resume.";
 
 #[derive(Debug, clap::Args)]
@@ -791,8 +798,10 @@ pub struct AutoArgs {
     /// Also run the external static analyzers that are installed (gosec,
     /// Bandit, semgrep, GNATcheck) as subprocesses and merge their findings
     /// into the report, where fuzz results can confirm them. A tool runs only
-    /// when the license profile allows it: `strict-permissive` (the default)
-    /// runs none of them. Missing tools are skipped. Implies `--static`.
+    /// when the license profile allows it: the global `--profile`, else
+    /// BHF_PROFILE, else `external-tools`, which this flag opts into;
+    /// `strict-permissive` runs none of them. Missing tools are skipped.
+    /// Implies `--static`.
     #[arg(long = "external-tools")]
     pub external_tools: bool,
 
@@ -800,9 +809,10 @@ pub struct AutoArgs {
     /// `main_symcc`, compiled by SymCC's `symcc`/`sym++`), the concolic lane
     /// that solves comparisons on values the input holds only after hashing or
     /// modular arithmetic. SymCC is GPL-3.0 and runs only as a subprocess,
-    /// under a license profile that permits it: `BHF_PROFILE=external-tools`
-    /// or `research-lab`; without `BHF_PROFILE` this flag opts into
-    /// `external-tools`, and `strict-permissive` refuses it. Needs `symcc`
+    /// under a license profile that permits it: `external-tools` or
+    /// `research-lab`, from the global `--profile`, else BHF_PROFILE; without
+    /// either this flag opts into `external-tools`, and `strict-permissive`
+    /// refuses it. Needs `symcc`
     /// (C) and `sym++` (C++) on PATH, or SYMCC_CC/SYMCC_CXX naming them; a
     /// harness whose SymCC build fails is fuzzed without it, and
     /// `targets[].lanes.symcc` in run.json says why. Each builtin pass of a
@@ -1139,20 +1149,6 @@ pub(crate) fn strip_verbatim_prefix(p: std::path::PathBuf) -> std::path::PathBuf
 #[cfg(not(windows))]
 pub(crate) fn strip_verbatim_prefix(p: std::path::PathBuf) -> std::path::PathBuf {
     p
-}
-
-/// The license profile for gating external-tool subprocesses under `--external-tools`,
-/// from `BHF_PROFILE` (`strict-permissive` | `external-tools` | `research-lab`).
-/// An explicit `BHF_PROFILE` wins; otherwise the `--external-tools` flag itself
-/// opts into the `external-tools` profile so the flag does something useful without a
-/// second env var — mirroring `static-scan`. This resolver is only consulted after the
-/// operator has already opted in via the flag, so the default strict-permissive posture
-/// still holds for every run that does not pass `--external-tools`.
-fn resolve_license_profile() -> config::Profile {
-    std::env::var("BHF_PROFILE")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(config::Profile::ExternalTools)
 }
 
 /// Rebuild the build probe's archives for the cross sweep's `target` (see
@@ -3281,7 +3277,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     // permissive (the default) runs none. Their findings merge into the report and
     // the fuzz-confirmation join below.
     if args.external_tools {
-        let profile = resolve_license_profile();
+        let profile = config::Profile::for_requested_tools();
         let n = crate::auto::external_tools::run_external_adapters(&path, &work, profile);
         bhfeprintln!(
             "bhf auto: --external-tools ({}) — external analyzers wrote {n} finding(s)",
@@ -4416,6 +4412,7 @@ fn run_parallel_sweep(
         &slots,
         &admit,
     );
+    let profile = config::Profile::given();
     std::thread::scope(|scope| {
         for slot in 0..worker_count {
             scope.spawn(move || loop {
@@ -4500,6 +4497,7 @@ fn run_parallel_sweep(
                 let mut target_options = options.clone();
                 target_options.per_target_time = status.per_target_time();
                 let mut result = match crate::auto::bug_report::catch(attempt_ctx, || {
+                    let _profile = config::GivenProfile::enter(profile);
                     crate::auto::attempt::attempt_with_progress(
                         candidate,
                         work,

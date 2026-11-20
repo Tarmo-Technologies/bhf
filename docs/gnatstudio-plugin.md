@@ -35,7 +35,7 @@ The plugin creates these preferences on the `BHF` page:
 | `daemon-path` | `bhf-daemon` | Daemon executable. |
 | `daemon-timeout-seconds` | `30` | Deadline for a findings refresh; the plugin terminates its daemon process when it passes. |
 | `cli-path` | `bhf` | BHF CLI executable. |
-| `findings-dir` | `findings` | Findings directory loaded through the daemon. `bhf auto` writes findings to `<work-dir>/results/findings`, so set this to that path (for example `bhf_work/results/findings`). |
+| `findings-dir` | `results/findings` | Findings directory loaded through the daemon. `bhf auto` writes findings to `<work-dir>/results/findings`, so the default fits a project in the work directory; otherwise set it to that path (for example `bhf_work/results/findings`). |
 | `harness-path` | empty | Harness path for replay and minimize. |
 | `minimize-strategy` | `bytes` | `bytes` or `typed`. |
 

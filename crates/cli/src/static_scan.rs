@@ -77,8 +77,8 @@ pub struct StaticScanArgs {
     /// profile allows (gosec, Bandit, semgrep, GNATcheck), as subprocesses, and
     /// write their findings, such as XSS, CSRF and framework rules that bhf's
     /// own rules do not cover, to `<out>/external-findings.json`. The profile
-    /// comes from BHF_PROFILE and is `external-tools` when that is unset; bhf
-    /// links none of these tools.
+    /// is the global `--profile`, else BHF_PROFILE, else `external-tools`,
+    /// which this flag opts into; bhf links none of these tools.
     #[arg(long)]
     pub external_tools: bool,
 }
@@ -216,11 +216,11 @@ fn run_external_tools(
     out: &std::path::Path,
     fail_on: Option<FailOnSeverity>,
 ) -> bool {
-    let profile = resolve_external_profile();
+    let profile = config::Profile::for_requested_tools();
     let findings = crate::auto::external_tools::collect_external_findings(root, profile);
     if profile == config::Profile::StrictPermissive {
         bhfeprintln!(
-            "external tools: profile 'strict-permissive' allows no analyzers — set BHF_PROFILE=external-tools"
+            "external tools: profile 'strict-permissive' allows no analyzers — pass --profile external-tools"
         );
     }
     let mut by_tool: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
@@ -268,16 +268,6 @@ fn run_external_tools(
         path.display(),
     );
     gate
-}
-
-/// The license profile for `--external-tools`: an explicit `BHF_PROFILE` wins;
-/// otherwise the flag itself opts into `external-tools` (the permissive analyzers),
-/// mirroring `auto` while making the flag do something useful by default.
-fn resolve_external_profile() -> config::Profile {
-    std::env::var("BHF_PROFILE")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(config::Profile::ExternalTools)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]

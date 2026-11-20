@@ -73,8 +73,8 @@
         },
         "bhf.findingsDir": {
           "type": "string",
-          "default": "findings",
-          "description": "Findings directory to load through the daemon."
+          "default": "results/findings",
+          "description": "Findings directory to load through the daemon, relative to the workspace root unless absolute. `bhf auto` writes findings to `<work-dir>/results/findings`."
         },
         "bhf.harnessPath": {
           "type": "string",

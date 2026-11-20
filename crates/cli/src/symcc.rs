@@ -16,9 +16,10 @@
 //! SymCC is GPL-3.0. bhf never links it: `make symcc`, which drives SymCC's
 //! compiler, and the `main_symcc` binary it builds run as subprocesses, and
 //! only under a license profile that allows the `symcc` subprocess
-//! (`external-tools`, `research-lab`). An explicit `BHF_PROFILE` wins;
-//! without one, asking for SymCC opts into `external-tools`, as
-//! `--external-tools` does for the external static analyzers.
+//! (`external-tools`, `research-lab`): the global `--profile`, else
+//! `BHF_PROFILE`; without either, asking for SymCC opts into
+//! `external-tools`, as `--external-tools` does for the external static
+//! analyzers.
 
 use std::collections::{HashSet, VecDeque};
 use std::io::Write as _;
@@ -48,16 +49,11 @@ pub(crate) fn requested() -> bool {
     std::env::var(ENABLE_ENV).is_ok_and(|value| value.trim() == "1")
 }
 
-/// The license profile SymCC runs under: the one `BHF_PROFILE` names, else
-/// `external-tools`, which asking for SymCC opts into.
+/// The license profile SymCC runs under: the global `--profile`, else the one
+/// `BHF_PROFILE` names, else `external-tools`, which asking for SymCC opts
+/// into.
 pub(crate) fn license_profile() -> config::Profile {
-    profile_from(std::env::var("BHF_PROFILE").ok().as_deref())
-}
-
-fn profile_from(value: Option<&str>) -> config::Profile {
-    value
-        .and_then(|value| value.trim().parse().ok())
-        .unwrap_or(config::Profile::ExternalTools)
+    config::Profile::for_requested_tools()
 }
 
 /// Whether `profile` lets bhf run SymCC.
@@ -96,8 +92,8 @@ fn find_compiler(var: &str, default: &str) -> Option<PathBuf> {
 pub(crate) fn run_gate(profile: config::Profile, compilers: &Compilers) -> Result<String, String> {
     if !profile_allows(profile) {
         return Err(format!(
-            "the `{}` license profile does not allow SymCC (GPL-3.0) to run; set \
-             BHF_PROFILE=external-tools or research-lab to allow it",
+            "the `{}` license profile does not allow SymCC (GPL-3.0) to run; pass \
+             --profile external-tools or research-lab to allow it",
             profile.as_str()
         ));
     }
@@ -852,15 +848,8 @@ mod tests {
     }
 
     #[test]
-    fn an_explicit_profile_wins_and_none_opts_into_external_tools() {
+    fn only_the_external_tool_profiles_allow_symcc() {
         use config::Profile;
-        assert_eq!(profile_from(None), Profile::ExternalTools);
-        assert_eq!(
-            profile_from(Some("strict-permissive")),
-            Profile::StrictPermissive
-        );
-        assert_eq!(profile_from(Some("research-lab")), Profile::ResearchLab);
-        assert_eq!(profile_from(Some("widget")), Profile::ExternalTools);
         assert!(!profile_allows(Profile::StrictPermissive));
         assert!(profile_allows(Profile::ExternalTools));
         assert!(profile_allows(Profile::ResearchLab));
@@ -871,7 +860,7 @@ mod tests {
         use config::Profile;
         let strict = run_gate(Profile::StrictPermissive, &found()).unwrap_err();
         assert!(strict.contains("`strict-permissive`"), "{strict}");
-        assert!(strict.contains("BHF_PROFILE=external-tools"), "{strict}");
+        assert!(strict.contains("--profile external-tools"), "{strict}");
         let none = run_gate(Profile::ExternalTools, &Compilers::default()).unwrap_err();
         assert!(none.contains("no `symcc` or `sym++` on PATH"), "{none}");
         let c_only = Compilers {

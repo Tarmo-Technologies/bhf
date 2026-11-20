@@ -557,11 +557,7 @@ bhf fuzz bhf_work --harness H-C0001 \
   error rather than carry state from one input to the next.
 - **Pages**: 256 bytes by default; `page_bits=N` on the plugin (6 to 16) sets
   2^N.
-- **License profile.** The plugin runs inside QEMU (GPL-2.0), so `reset=fast`
-  runs under a profile that allows the `qemu_plugin` subprocess id:
-  `external-tools` (which asking for `reset=fast` opts into when
-  `BHF_PROFILE` is unset) or `research-lab`. `BHF_PROFILE=strict-permissive`
-  refuses it with exit 2.
+- **License profile.** The plugin runs inside QEMU (GPL-2.0), so `reset=fast` runs under a profile that allows the `qemu_plugin` subprocess id: `external-tools` or `research-lab`, from `--profile`, else `BHF_PROFILE`; without either, asking for `reset=fast` opts into `external-tools`. `--profile strict-permissive` refuses it with exit 2.
 - **Host.** The plugin shares its log with bhf through POSIX `mmap`, so bhf
   builds it on a Linux or macOS host only. On Windows use `reset=loadvm` or
   `reset=persistent`.
