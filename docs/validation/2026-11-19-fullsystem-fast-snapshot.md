@@ -28,20 +28,13 @@ the mode.
 
 ## Reset latency
 
-`live_fullsystem_fast_snapshot_resets_ten_times_faster_than_loadvm`
-(`#[ignore]`, run by `scripts/hil-emu.sh` on the nightly schedule, a manual
-dispatch or a local run) boots two guests from the same image, one with
-`reset=loadvm` and one with the plugin and `reset=fast`. After a warm-up of
-nine inputs each (the fast snapshot learns its pages there), it gives each
-3 s in six 500 ms slices taken in turn, running `0x42`, `0x00`, `0xF7` in a
-cycle, so a third of the inputs are HardFaults. It checks every run's exit
-and coverage, that no measured fast reset needed a `loadvm`, and that the
-mean fast reset is at most a tenth of the mean `loadvm`. Each reset's time
-is the session's own, in `RunOutcome::target.reset.time`.
+`live_fullsystem_fast_snapshot_resets_five_times_faster_than_loadvm` (`#[ignore]`, run by `scripts/hil-emu.sh` on the nightly schedule, a manual dispatch or a local run) boots two guests from the same image, one with `reset=loadvm` and one with the plugin and `reset=fast`. After a warm-up of nine inputs each (the fast snapshot learns its pages there), it gives each 3 s in six 500 ms slices taken in turn, running `0x42`, `0x00`, `0xF7` in a cycle, so a third of the inputs are HardFaults. It checks every run's exit and coverage, that no measured fast reset needed a `loadvm`, and that the mean fast reset is at most a fifth of the mean `loadvm`, and prints the measured ratio. Each reset's time is the session's own, in `RunOutcome::target.reset.time`.
+
+When this record was taken the test required a tenth and was named `live_fullsystem_fast_snapshot_resets_ten_times_faster_than_loadvm`. A scheduled run on a GitHub runner then measured 9.5x, so the threshold is now 5x (#452): below every ratio measured here and on the runners, and still a failure for a fast snapshot that regresses toward a `loadvm`'s cost.
 
 ```sh
 cargo test -p target_transport --test live_fullsystem \
-  live_fullsystem_fast_snapshot_resets_ten_times_faster_than_loadvm -- --ignored --nocapture
+  live_fullsystem_fast_snapshot_resets_five_times_faster_than_loadvm -- --ignored --nocapture
 ```
 
 | Host load (1 min) | `loadvm` mean reset | `reset=fast` mean reset | Ratio | exec/s (loadvm, fast) |

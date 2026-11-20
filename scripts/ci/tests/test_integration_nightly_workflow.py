@@ -674,7 +674,7 @@ class PersistentLoopBenchmarkTests(unittest.TestCase):
         self.assertIn(
             "if rv3_benchmark_runs; then\n"
             "  echo \"== RV-3 benchmarks against a loadvm per input: reset=persistent (needs 3x "
-            "the runs), reset=fast (needs a tenth of the reset latency) ==\"\n"
+            "the runs), reset=fast (needs a fifth of the reset latency) ==\"\n"
             "  BHF_HIL_REQUIRE=1 cargo test --locked -p target_transport --test live_fullsystem -- \\\n"
             "    --ignored --nocapture\n",
             lane,
@@ -689,7 +689,7 @@ class PersistentLoopBenchmarkTests(unittest.TestCase):
         tools = lane[start + len("required_tools=(") : lane.index(")", start)].split()
         self.assertIn("cc", tools)
         live = (ROOT / "crates/target_transport/tests/live_fullsystem.rs").read_text()
-        self.assertIn("fn live_fullsystem_fast_snapshot_resets_ten_times_faster_than_loadvm", live)
+        self.assertIn("fn live_fullsystem_fast_snapshot_resets_five_times_faster_than_loadvm", live)
         self.assertIn('#[ignore = "benchmark: run with --ignored (nightly, live QEMU)"]', live)
 
 

@@ -1003,14 +1003,7 @@ pushes to `main`, on pull requests that touch the transport code, on a
 nightly schedule and on manual dispatch. RV-1 through RV-3 are recorded in
 [the 2026-09-27 validation record](../validation/2026-09-27-hil-emu-live-qemu.md).
 
-The script also runs the ignored RV-3 benchmarks, one after the other, on the
-nightly schedule, a manual dispatch or a local run (a pull request or a push
-skips them). One measures `reset=persistent` against a `loadvm` per input
-and requires 3x the runs
-([record](../validation/2026-11-19-fullsystem-persistent-loop.md)). The other
-measures `reset=fast` against a `loadvm`, with the planted fault among the
-inputs, and requires a mean reset of at most a tenth of a `loadvm`'s
-([record](../validation/2026-11-19-fullsystem-fast-snapshot.md)).
+The script also runs the ignored RV-3 benchmarks, one after the other, on the nightly schedule, a manual dispatch or a local run (a pull request or a push skips them). One measures `reset=persistent` against a `loadvm` per input and requires 3x the runs ([record](../validation/2026-11-19-fullsystem-persistent-loop.md)). The other measures `reset=fast` against a `loadvm`, with the planted fault among the inputs, and requires a mean reset of at most a fifth of a `loadvm`'s; it prints the measured ratio, which is 12x to 21x locally and was 9.5x on one loaded scheduled runner ([record](../validation/2026-11-19-fullsystem-fast-snapshot.md)).
 
 ---
 

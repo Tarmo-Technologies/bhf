@@ -131,7 +131,7 @@ rv3_benchmark_runs() {
   esac
 }
 if rv3_benchmark_runs; then
-  echo "== RV-3 benchmarks against a loadvm per input: reset=persistent (needs 3x the runs), reset=fast (needs a tenth of the reset latency) =="
+  echo "== RV-3 benchmarks against a loadvm per input: reset=persistent (needs 3x the runs), reset=fast (needs a fifth of the reset latency) =="
   BHF_HIL_REQUIRE=1 cargo test --locked -p target_transport --test live_fullsystem -- \
     --ignored --nocapture
 else
