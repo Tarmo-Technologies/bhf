@@ -81,6 +81,60 @@ enum KernelCommand {
     /// stops the guest. Exit 0 when every program ran, 1 when the guest
     /// stopped or did not answer, or could not boot.
     Run(RunArgs),
+    /// Fuzz a Linux kernel in a qemu-system guest: run seed programs (made from a driver's source, given, or opening --device), then mutate them, keeping each program that reaches new KCOV edges
+    ///
+    /// Boots the guest as `bhf kernel run` does. The seeds: each ioctl
+    /// command the `--source` driver's handlers dispatch on (as `bhf kernel
+    /// syzlang` reads them), called on its device node with a zeroed
+    /// argument of its size, and all of them in one program; every program
+    /// in `--seeds`; with `--device` alone, a few calls on that node; and
+    /// the corpus an earlier run left in <work-dir>/kernel/corpus. The
+    /// commands' numbers (for the guest's architecture) and the node's path
+    /// are mutation tokens. Each program's KCOV PCs go into the coverage
+    /// map as a harness's breadcrumbs do (each pair of consecutive PCs an
+    /// edge), and a program that reached new coverage joins the corpus.
+    /// With KCOV comparisons in the kernel, each corpus program runs once
+    /// more for the comparisons its calls made: an argument holding one
+    /// operand is tried with the other (hints), and the operands are the
+    /// CmpLog its mutations splice from. A
+    /// run the guest does not survive (a kernel report panics it) is saved
+    /// under <work-dir>/kernel/crashes/ and the guest boots again. Writes
+    /// <work-dir>/kernel/fuzz.json. Exit 0 when the campaign ran its budget,
+    /// 1 when the guest could not boot, did not load a --module (the
+    /// executor's setup notes, which bhf prints and fuzz.json keeps, say
+    /// why: no program runs then), or no seed left it running.
+    Fuzz(KernelFuzzArgs),
+}
+
+#[derive(Debug, clap::Args)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub struct KernelFuzzArgs {
+    #[command(flatten)]
+    guest: GuestArgs,
+    /// Work directory: <work-dir>/kernel gets the guest's files, the corpus, the crashes and fuzz.json
+    #[arg(long, value_name = "DIR")]
+    work_dir: PathBuf,
+    /// The driver's C sources and headers, as `bhf kernel syzlang` reads them: each ioctl command becomes a seed program
+    #[arg(long = "source", value_name = "SOURCE")]
+    sources: Vec<PathBuf>,
+    /// The device node the seeds open when the source names none, or, without --source, a node to open and call read, write and ioctl on
+    #[arg(long, value_name = "PATH")]
+    device: Option<String>,
+    /// A directory of seed programs, in the executor's format
+    #[arg(long, value_name = "DIR")]
+    seeds: Option<PathBuf>,
+    /// Executions at most (default 1000, or no cap with --time)
+    #[arg(long)]
+    iterations: Option<usize>,
+    /// Wall-clock budget such as 30s, 5m or 1h
+    #[arg(long, value_parser = crate::fuzz::parse_duration)]
+    time: Option<std::time::Duration>,
+    /// Deterministic RNG seed for mutation
+    #[arg(long, default_value_t = 0x4b43_4f56)]
+    rng_seed: u64,
+    /// Longest program a mutation makes, in bytes (at most 65536)
+    #[arg(long, value_name = "BYTES", default_value_t = 4096)]
+    max_len: usize,
 }
 
 /// A wait for the guest, in seconds: 1 to a day.
@@ -186,6 +240,7 @@ pub fn run(args: KernelArgs) -> i32 {
             }
         },
         KernelCommand::Run(args) => run_programs(&args),
+        KernelCommand::Fuzz(args) => fuzz_kernel(&args),
         // A findings producer: results/ gets its manifest record and rebuild.
         KernelCommand::Import(args) => crate::with_results(
             &args.work_dir,
@@ -453,6 +508,435 @@ fn run_programs_inner(args: &RunArgs) -> Result<i32> {
         }
     }
     Ok(code)
+}
+
+#[cfg(not(unix))]
+fn fuzz_kernel(_args: &KernelFuzzArgs) -> i32 {
+    bhfeprintln!("bhf kernel fuzz: the guest lane needs a Linux or other Unix host");
+    1
+}
+
+#[cfg(unix)]
+fn fuzz_kernel(args: &KernelFuzzArgs) -> i32 {
+    match fuzz_kernel_inner(args) {
+        Ok(code) => code,
+        Err(error) => {
+            bhfeprintln!("bhf kernel fuzz: {error:#}");
+            1
+        }
+    }
+}
+
+/// Most seed files read from one directory.
+#[cfg(unix)]
+const MAX_SEED_FILES: usize = 10_000;
+
+/// The programs in `dir`, in name order.
+#[cfg(unix)]
+fn seed_files(dir: &Path) -> Result<Vec<Vec<u8>>> {
+    let mut paths: Vec<PathBuf> = fs::read_dir(dir)
+        .with_context(|| format!("read {}", dir.display()))?
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .map(|entry| entry.path())
+        .take(MAX_SEED_FILES)
+        .collect();
+    paths.sort();
+    paths.iter().map(|path| read_program(path)).collect()
+}
+
+#[cfg(unix)]
+fn fuzz_kernel_inner(args: &KernelFuzzArgs) -> Result<i32> {
+    use crate::kernel_guest as guest;
+    let dir = args.work_dir.join("kernel");
+    let setup = args.guest.setup(&dir.join("guest"))?;
+    let interface = if args.sources.is_empty() {
+        None
+    } else {
+        let interface = driver_interface(&args.sources, args.device.as_deref())?;
+        for (name, reason) in &interface.skipped {
+            println!("  no seed for {name}: {reason}");
+        }
+        Some(interface)
+    };
+    let mut given = Vec::new();
+    let mut origin = Vec::new();
+    if let Some(seeds) = &args.seeds {
+        let programs = seed_files(seeds)?;
+        origin.push(format!("{} from {}", programs.len(), seeds.display()));
+        given.extend(programs);
+    }
+    let corpus = dir.join("corpus");
+    if corpus.is_dir() {
+        let programs = seed_files(&corpus)?;
+        origin.push(format!(
+            "{} from the corpus of an earlier run",
+            programs.len()
+        ));
+        given.extend(programs);
+    }
+    let device = args.device.clone();
+    let seeds = move |hello: &guest::Hello| -> Result<guest::SeedSet> {
+        let mut set = guest::SeedSet::default();
+        if let Some(interface) = &interface {
+            let crate::kernel_guest::SeedSet {
+                programs,
+                dictionary,
+                ..
+            } = interface.seeds(&hello.machine)?;
+            set.origin.push(format!(
+                "{} from the ioctl commands of {} ({})",
+                programs.len(),
+                interface.device,
+                interface
+                    .commands
+                    .iter()
+                    .map(|command| command.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            set.programs.extend(programs);
+            set.dictionary.extend(dictionary);
+        } else if let Some(device) = &device {
+            set.programs.push(device_program(device)?);
+            set.dictionary.push(device.as_bytes().to_vec());
+            set.origin.push(format!("1 opening {device}"));
+        }
+        set.programs.extend(given.iter().cloned());
+        set.origin.extend(origin.iter().cloned());
+        Ok(set)
+    };
+    let config = guest::FuzzConfig {
+        dir: dir.clone(),
+        setup,
+        iterations: args.iterations.unwrap_or(if args.time.is_some() {
+            usize::MAX
+        } else {
+            1000
+        }),
+        time_budget: args.time,
+        timeout: args.guest.timeout(),
+        rng_seed: args.rng_seed,
+        max_len: args.max_len,
+    };
+    let summary = guest::fuzz(&config, &seeds)?;
+    for line in fuzz_report(&summary, &args.work_dir) {
+        println!("{line}");
+    }
+    Ok(match &summary.halted {
+        Some(reason) => {
+            bhfeprintln!("bhf kernel fuzz: stopped early: {reason}");
+            1
+        }
+        None => 0,
+    })
+}
+
+/// What `bhf kernel fuzz` prints of its campaign: the guest and its setup
+/// notes (each module loaded, or why not), the coverage and the crashes,
+/// under `work_dir`.
+#[cfg(unix)]
+fn fuzz_report(summary: &crate::kernel_guest::FuzzSummary, work_dir: &Path) -> Vec<String> {
+    let plural = |count: usize| if count == 1 { "" } else { "s" };
+    let mut lines = vec![format!(
+        "bhf kernel fuzz: {} executions ({:.1}/s) in Linux {} {} ({}), {} seeds",
+        summary.executions,
+        summary.executions_per_sec,
+        summary.release,
+        summary.machine,
+        summary.accel,
+        summary.seeds
+    )];
+    for note in &summary.notes {
+        lines.push(format!("  guest setup: {note}"));
+    }
+    lines.push(format!(
+        "  coverage: {} KCOV edges ({} after the seeds), corpus {} ({} new)",
+        summary.coverage.edges,
+        summary.coverage_after_seeds.edges,
+        summary.corpus,
+        summary.corpus_new
+    ));
+    lines.push(format!(
+        "  {} run{} the guest did not survive, {} boot{}",
+        summary.crashes,
+        plural(summary.crashes),
+        summary.boots,
+        plural(summary.boots)
+    ));
+    for crash in &summary.crash_dirs {
+        lines.push(format!("    {}", work_dir.join(crash).display()));
+    }
+    if !summary.kcov {
+        lines.push(
+            "  KCOV is off in the guest (no coverage): build the kernel with CONFIG_KCOV and \
+             CONFIG_DEBUG_FS"
+                .to_owned(),
+        );
+    }
+    lines.push(format!(
+        "  summary: {}",
+        work_dir.join("kernel").join("fuzz.json").display()
+    ));
+    lines
+}
+
+/// `O_RDWR`, which the seeds open device nodes with.
+#[cfg(unix)]
+const O_RDWR: u64 = 2;
+/// `AT_FDCWD`.
+#[cfg(unix)]
+const AT_FDCWD: u64 = -100i64 as u64;
+
+/// A program that opens `device` and reads, writes and makes an ioctl on
+/// it.
+#[cfg(unix)]
+fn device_program(device: &str) -> Result<Vec<u8>> {
+    use crate::kernel_guest::{ProgramBuilder, SeedArg};
+    let mut path = device.as_bytes().to_vec();
+    path.push(0);
+    let mut program = ProgramBuilder::default();
+    let fd = program.call(
+        "openat",
+        &[
+            SeedArg::Const(AT_FDCWD),
+            SeedArg::Data(&path),
+            SeedArg::Const(O_RDWR),
+            SeedArg::Const(0),
+        ],
+    )?;
+    program.call(
+        "read",
+        &[SeedArg::Result(fd), SeedArg::Out(64), SeedArg::Const(64)],
+    )?;
+    program.call(
+        "write",
+        &[
+            SeedArg::Result(fd),
+            SeedArg::Data(&[0; 16]),
+            SeedArg::Const(16),
+        ],
+    )?;
+    program.call(
+        "ioctl",
+        &[
+            SeedArg::Result(fd),
+            SeedArg::Const(0),
+            SeedArg::Data(&[0; 64]),
+        ],
+    )?;
+    program.call("close", &[SeedArg::Result(fd)])?;
+    Ok(program.finish())
+}
+
+#[cfg(unix)]
+/// One ioctl command of a driver, for seed programs.
+#[derive(Debug, Clone)]
+struct DriverCommand {
+    name: String,
+    /// `None` for a plain-number command, whose argument bhf does not know.
+    dir: Option<Dir>,
+    /// Per architecture of [`ARCHES`]: the command's number and its
+    /// argument's size, when they could be computed.
+    numbers: Vec<Option<(u64, u64)>>,
+}
+
+#[cfg(unix)]
+/// A driver's ioctl interface: its device node and commands.
+#[derive(Debug, Clone)]
+struct DriverInterface {
+    device: String,
+    commands: Vec<DriverCommand>,
+    /// Commands left out, and why.
+    skipped: Vec<(String, String)>,
+}
+
+#[cfg(unix)]
+/// The architecture of [`ARCHES`] a guest's `uname -m` names.
+fn arch_index(machine: &str) -> Option<usize> {
+    let name = match machine {
+        "x86_64" | "amd64" => "amd64",
+        "i386" | "i486" | "i586" | "i686" => "386",
+        "aarch64" | "arm64" => "arm64",
+        machine if machine.starts_with("arm") => "arm",
+        "riscv64" => "riscv64",
+        "ppc64le" => "ppc64le",
+        "mips64" | "mips64el" => "mips64le",
+        "s390x" => "s390x",
+        "loongarch64" => "loong64",
+        _ => return None,
+    };
+    ARCHES.iter().position(|arch| arch.name == name)
+}
+
+#[cfg(unix)]
+/// The ioctl interface of the driver `sources` hold, as `bhf kernel
+/// syzlang` reads it; `device` names its node when the source does not.
+fn driver_interface(sources: &[PathBuf], device: Option<&str>) -> Result<DriverInterface> {
+    let corpus = Corpus::read(sources)?;
+    for warning in &corpus.warnings {
+        bhfeprintln!("bhf kernel: warning: {warning}");
+    }
+    let handlers = find_handlers(&corpus);
+    if handlers.is_empty() {
+        bail!(
+            "no ioctl handler found in the source read: no `struct file_operations` registers \
+             an .unlocked_ioctl or .compat_ioctl, and no function takes (struct file *, \
+             unsigned int, unsigned long)"
+        );
+    }
+    let mut names = Vec::new();
+    for handler in &handlers {
+        for command in handled_commands(&corpus, &handler.function) {
+            if !names.contains(&command) {
+                names.push(command);
+            }
+        }
+    }
+    if names.is_empty() {
+        names = all_ioc_commands(&corpus);
+    }
+    let device = match device {
+        Some(device) => device.to_owned(),
+        None => find_device_nodes(&corpus)
+            .into_iter()
+            .map(|node| node.path.replace('#', "0"))
+            .next()
+            .ok_or_else(|| {
+                anyhow::anyhow!("the source names no device node; give it with --device")
+            })?,
+    };
+    let mut interface = DriverInterface {
+        device,
+        commands: Vec::new(),
+        skipped: Vec::new(),
+    };
+    for name in names {
+        let Some(def) = command_def(&corpus, &name, true) else {
+            continue;
+        };
+        let command = match &def.shape {
+            CommandShape::Plain => eval(&corpus, &def.value)
+                .ok()
+                .and_then(|value| u64::try_from(value).ok())
+                .filter(|value| *value <= u64::from(u32::MAX))
+                .map(|value| DriverCommand {
+                    name: name.clone(),
+                    dir: None,
+                    numbers: vec![Some((value, 0)); ARCHES.len()],
+                })
+                .ok_or_else(|| format!("`{}` is not a 32-bit ioctl number", def.value)),
+            CommandShape::Ioc { dir, kind, nr, arg } => (|| {
+                let kind = u64::try_from(eval(&corpus, kind)?)
+                    .map_err(|_| format!("type `{kind}` is negative"))?;
+                let nr = u64::try_from(eval(&corpus, nr)?)
+                    .map_err(|_| format!("number `{nr}` is negative"))?;
+                let ty = arg
+                    .as_deref()
+                    .map(|arg| parse_type(&corpus, arg))
+                    .transpose()?;
+                let numbers = ARCHES
+                    .iter()
+                    .map(|arch| {
+                        let size = match &ty {
+                            Some(ty) => layout(&corpus, ty, arch, 0).ok()?.0,
+                            None => 0,
+                        };
+                        Some((ioc(arch, *dir, kind, nr, size).ok()?, size))
+                    })
+                    .collect();
+                Ok(DriverCommand {
+                    name: name.clone(),
+                    dir: Some(*dir),
+                    numbers,
+                })
+            })(),
+        };
+        match command {
+            Ok(command) => interface.commands.push(command),
+            Err(reason) => interface.skipped.push((name, reason)),
+        }
+    }
+    if interface.commands.is_empty() {
+        bail!(
+            "the driver's handlers dispatch on no ioctl command bhf could compute{}",
+            interface
+                .skipped
+                .iter()
+                .map(|(name, reason)| format!("; {name}: {reason}"))
+                .collect::<String>()
+        );
+    }
+    Ok(interface)
+}
+
+#[cfg(unix)]
+impl DriverInterface {
+    /// Seed programs for a guest whose `uname -m` is `machine`: one per
+    /// command, opening the device and calling it with a zeroed argument of
+    /// its size, and one calling every command; and the dictionary: the
+    /// commands' numbers (as 4- and 8-byte words) and the device's path.
+    fn seeds(&self, machine: &str) -> Result<crate::kernel_guest::SeedSet> {
+        use crate::kernel_guest::{ProgramBuilder, SeedArg, MAX_ARG_BYTES, MAX_CALLS};
+        let arch = arch_index(machine).unwrap_or(DEFAULT_ARCH);
+        let mut path = self.device.as_bytes().to_vec();
+        path.push(0);
+        let zeros = vec![0u8; MAX_ARG_BYTES];
+        let open = |program: &mut ProgramBuilder| {
+            program.call(
+                "openat",
+                &[
+                    SeedArg::Const(AT_FDCWD),
+                    SeedArg::Data(&path),
+                    SeedArg::Const(O_RDWR),
+                    SeedArg::Const(0),
+                ],
+            )
+        };
+        let call = |program: &mut ProgramBuilder, fd: usize, command: &DriverCommand| {
+            let Some((number, size)) = command.numbers[arch] else {
+                return Ok(false);
+            };
+            let size = (size as usize).min(MAX_ARG_BYTES);
+            let arg = match command.dir {
+                None => SeedArg::Data(&zeros[..64]),
+                Some(Dir::None) => SeedArg::Const(0),
+                Some(Dir::Read) if size > 0 => SeedArg::Out(size as u16),
+                Some(_) if size > 0 => SeedArg::Data(&zeros[..size]),
+                Some(_) => SeedArg::Const(0),
+            };
+            program
+                .call("ioctl", &[SeedArg::Result(fd), SeedArg::Const(number), arg])
+                .map(|_| true)
+        };
+        let mut programs = Vec::new();
+        let mut all = ProgramBuilder::default();
+        let all_fd = open(&mut all)?;
+        let mut in_all = 0;
+        let mut dictionary = vec![self.device.as_bytes().to_vec()];
+        for command in &self.commands {
+            let mut program = ProgramBuilder::default();
+            let fd = open(&mut program)?;
+            if call(&mut program, fd, command)? {
+                programs.push(program.finish());
+                if in_all + 1 < MAX_CALLS && call(&mut all, all_fd, command)? {
+                    in_all += 1;
+                }
+            }
+            if let Some((number, _)) = command.numbers[arch] {
+                dictionary.push((number as u32).to_le_bytes().to_vec());
+                dictionary.push(number.to_le_bytes().to_vec());
+            }
+        }
+        if in_all > 1 {
+            programs.push(all.finish());
+        }
+        Ok(crate::kernel_guest::SeedSet {
+            programs,
+            dictionary,
+            origin: Vec::new(),
+        })
+    }
 }
 
 fn import(args: &ImportArgs) -> i32 {
@@ -2901,6 +3385,114 @@ mod tests {
         *ARCHES.iter().find(|arch| arch.name == name).unwrap()
     }
 
+    #[cfg(unix)]
+    fn widget_source() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/kernel_widget/linux")
+    }
+
+    /// `(call name, ioctl number, argument)` of each ioctl call of a seed.
+    #[cfg(unix)]
+    fn ioctls(program: &[u8]) -> Vec<(String, u64, String)> {
+        use crate::kernel_guest::{decode, ArgValue};
+        let decoded = decode(program);
+        assert_eq!(decoded.calls[0].sys.name(), "openat");
+        match &decoded.calls[0].args[1].value {
+            ArgValue::Data { bytes, .. } => assert_eq!(&program[bytes.clone()], b"/dev/widget\0"),
+            other => panic!("{other:?}"),
+        }
+        decoded.calls[1..]
+            .iter()
+            .map(|call| {
+                assert_eq!(call.args[0].value, ArgValue::Result(Some(0)));
+                let number = match call.args[1].value {
+                    ArgValue::Const(number) => number,
+                    ref other => panic!("{other:?}"),
+                };
+                let arg = match &call.args[2].value {
+                    ArgValue::Const(value) => format!("const {value}"),
+                    ArgValue::Data { bytes, .. } => {
+                        assert!(program[bytes.clone()].iter().all(|b| *b == 0));
+                        format!("data {}", bytes.len())
+                    }
+                    ArgValue::Out { len, .. } => format!("out {len}"),
+                    other => panic!("{other:?}"),
+                };
+                (call.sys.name(), number, arg)
+            })
+            .collect()
+    }
+
+    /// The widget driver's commands become seeds that open its node and
+    /// call each with an argument of its size, for the guest's
+    /// architecture.
+    #[cfg(unix)]
+    #[test]
+    fn a_drivers_ioctl_commands_become_seed_programs() {
+        let interface = driver_interface(&[widget_source()], None).unwrap();
+        assert_eq!(interface.device, "/dev/widget");
+        let names: Vec<&str> = interface.commands.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "WIDGET_IOC_RESET",
+                "WIDGET_IOC_SET_CONFIG",
+                "WIDGET_IOC_GET_STATS",
+                "WIDGET_IOC_SET_MODE",
+                "WIDGET_IOC_WRITE_REG",
+                "WIDGET_IOC_XFER"
+            ]
+        );
+        let seeds = interface.seeds("x86_64").unwrap();
+        let (programs, dictionary) = (seeds.programs, seeds.dictionary);
+        assert_eq!(programs.len(), 7);
+        let single: Vec<(String, u64, String)> =
+            programs[..6].iter().flat_map(|p| ioctls(p)).collect();
+        let expected = [
+            (0x5700, "const 0"),
+            (0x4020_5701, "data 32"),
+            (0x8018_5702, "out 24"),
+            (0x4004_5704, "data 4"),
+            (0x4007_5705, "data 7"),
+            (0xc028_5703, "data 40"),
+        ];
+        for ((call, number, arg), (want, want_arg)) in single.iter().zip(expected) {
+            assert_eq!(call, "ioctl");
+            assert_eq!((*number, arg.as_str()), (want, want_arg));
+        }
+        // The last calls every command on one descriptor.
+        assert_eq!(ioctls(&programs[6]), single);
+        assert!(dictionary.contains(&b"/dev/widget".to_vec()));
+        assert!(dictionary.contains(&0xc028_5703u32.to_le_bytes().to_vec()));
+        assert!(dictionary.contains(&0xc028_5703u64.to_le_bytes().to_vec()));
+
+        // On a 32-bit x86 guest `unsigned long` is 4 bytes: widget_stats is
+        // 20, and so is the number.
+        let programs = interface.seeds("i686").unwrap().programs;
+        assert_eq!(ioctls(&programs[2])[0].1, 0x8014_5702);
+        assert_eq!(arch_index("aarch64"), arch_index("arm64"));
+        assert_eq!(arch_index("x86_64"), Some(DEFAULT_ARCH));
+        assert_eq!(arch_index("sparc64"), None);
+
+        // --device names another node.
+        let other = driver_interface(&[widget_source()], Some("/dev/widget1")).unwrap();
+        assert_eq!(other.device, "/dev/widget1");
+        let error = driver_interface(&[widget_source().join("include")], None).unwrap_err();
+        assert!(error.to_string().contains("no ioctl handler"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_device_alone_is_opened_read_written_and_called() {
+        let program = device_program("/dev/widget").unwrap();
+        let text = crate::kernel_guest::decode(&program).text();
+        let calls: Vec<&str> = text
+            .lines()
+            .map(|line| line.split_once(" = ").unwrap().1.split('(').next().unwrap())
+            .collect();
+        assert_eq!(calls, ["openat", "read", "write", "ioctl", "close"]);
+        assert!(text.contains("\"/dev/widget\\x00\""), "{text}");
+    }
+
     #[test]
     fn ioctl_numbers_match_the_kernels_per_architecture() {
         // FS_IOC_GETFLAGS = _IOR('f', 1, long), as syzkaller's const files
@@ -3533,6 +4125,56 @@ mod tests {
         assert_eq!(device_path("widget"), "/dev/widget");
         assert_eq!(device_path("widget%d"), "/dev/widget#");
         assert_eq!(device_path("widget/ctl%lu"), "/dev/widget/ctl#");
+    }
+
+    /// A campaign's report says what the guest's executor did at setup:
+    /// each module it loaded, or why not.
+    #[cfg(unix)]
+    #[test]
+    fn a_campaign_report_prints_the_guests_setup_notes() {
+        use crate::kernel_guest::{FuzzSummary, FUZZ_SUMMARY_SCHEMA};
+        let summary = FuzzSummary {
+            schema: FUZZ_SUMMARY_SCHEMA,
+            kernel: "bzImage".to_owned(),
+            release: "6.12.118".to_owned(),
+            machine: "x86_64".to_owned(),
+            accel: "tcg",
+            kcov: true,
+            notes: vec![
+                "module 00-broken.ko: not loaded: Exec format error".to_owned(),
+                "ready (kcov on, comparisons on)".to_owned(),
+            ],
+            seeds: 1,
+            seed_origin: Vec::new(),
+            executions: 0,
+            comparisons: true,
+            comparison_runs: 0,
+            hint_runs: 0,
+            corpus_new: 0,
+            corpus: 0,
+            coverage_after_seeds: Default::default(),
+            coverage: Default::default(),
+            crashes: 0,
+            crash_dirs: Vec::new(),
+            boots: 1,
+            halted: Some("the guest did not load every --module".to_owned()),
+            elapsed_secs: 1.0,
+            executions_per_sec: 0.0,
+        };
+        let lines = fuzz_report(&summary, Path::new("work"));
+        assert_eq!(
+            lines[..3],
+            [
+                "bhf kernel fuzz: 0 executions (0.0/s) in Linux 6.12.118 x86_64 (tcg), 1 seeds",
+                "  guest setup: module 00-broken.ko: not loaded: Exec format error",
+                "  guest setup: ready (kcov on, comparisons on)",
+            ]
+        );
+        assert!(
+            lines[3].starts_with("  coverage: 0 KCOV edges"),
+            "{lines:#?}"
+        );
+        assert_eq!(lines.last().unwrap(), "  summary: work/kernel/fuzz.json");
     }
 
     /// The guest's waits are seconds a u64 holds: one longer than a day is

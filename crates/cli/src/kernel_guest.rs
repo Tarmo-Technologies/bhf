@@ -56,7 +56,6 @@ const RAW_SELECTOR: u8 = SYSCALLS.len() as u8;
 const TAG_CONST: u8 = 0;
 const TAG_DATA: u8 = 1;
 const TAG_RESULT: u8 = 2;
-#[cfg(test)]
 const TAG_OUT: u8 = 3;
 
 /// What a call is.
@@ -109,6 +108,8 @@ pub(crate) struct DecodedArg {
 pub(crate) struct DecodedCall {
     pub sys: CallSys,
     pub args: Vec<DecodedArg>,
+    /// The call's bytes in the program, its selector first.
+    pub span: Range<usize>,
 }
 
 /// A program, as the executor decodes it.
@@ -152,6 +153,7 @@ pub(crate) fn decode(input: &[u8]) -> Program<'_> {
     };
     'calls: while program.calls.len() < MAX_CALLS && len - pos >= 2 {
         let saved = program.data_used;
+        let start = pos;
         let selector = input[pos] % (RAW_SELECTOR + 1);
         let nargs = usize::from(input[pos + 1]) % (MAX_ARGS + 1);
         pos += 2;
@@ -237,7 +239,11 @@ pub(crate) fn decode(input: &[u8]) -> Program<'_> {
             };
             args.push(arg);
         }
-        program.calls.push(DecodedCall { sys, args });
+        program.calls.push(DecodedCall {
+            sys,
+            args,
+            span: start..pos,
+        });
     }
     program
 }
@@ -362,7 +368,6 @@ fn bytes_text(bytes: &[u8]) -> String {
     }
 }
 
-#[cfg(test)]
 /// One argument of a program [`ProgramBuilder`] writes.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum SeedArg<'a> {
@@ -374,7 +379,6 @@ pub(crate) enum SeedArg<'a> {
     Out(u16),
 }
 
-#[cfg(test)]
 /// Writes programs in the executor's format.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct ProgramBuilder {
@@ -382,7 +386,6 @@ pub(crate) struct ProgramBuilder {
     calls: usize,
 }
 
-#[cfg(test)]
 impl ProgramBuilder {
     /// Add a call to `name` (one of [`SYSCALLS`]); its index.
     pub(crate) fn call(&mut self, name: &str, args: &[SeedArg<'_>]) -> anyhow::Result<usize> {
@@ -394,6 +397,7 @@ impl ProgramBuilder {
     }
 
     /// Add a raw call by number; its index.
+    #[cfg(test)]
     pub(crate) fn raw(&mut self, nr: u16, args: &[SeedArg<'_>]) -> anyhow::Result<usize> {
         self.push(RAW_SELECTOR, Some(nr), args)
     }
@@ -508,6 +512,8 @@ pub(crate) struct Hello {
     pub kcov: bool,
     /// It runs as the guest's `/init`.
     pub init: bool,
+    /// KCOV records comparisons (`CONFIG_KCOV_ENABLE_COMPARISONS`).
+    pub comparisons: bool,
     pub cover_entries: u32,
     pub max_program: u32,
     pub max_calls: u32,
@@ -518,6 +524,32 @@ pub(crate) struct Hello {
     pub release: String,
     /// What setup did: each module loaded, or why not, and KCOV.
     pub notes: String,
+}
+
+impl Hello {
+    /// The setup notes, a line each.
+    pub(crate) fn note_lines(&self) -> Vec<String> {
+        self.notes
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The notes that say a module was not loaded: the executor notes
+    /// `module <name>: loaded` for each it loaded, and `module <name>: not
+    /// loaded: <error>` or `module <name>: open: <error>` for one it did
+    /// not.
+    pub(crate) fn unloaded_modules(&self) -> Vec<String> {
+        self.note_lines()
+            .into_iter()
+            .filter(|line| {
+                line.strip_prefix("module ")
+                    .is_some_and(|rest| !rest.ends_with(": loaded"))
+            })
+            .collect()
+    }
 }
 
 /// How a program's run ended.
@@ -574,6 +606,33 @@ impl ExecStatus {
     }
 }
 
+/// What KCOV records while a program runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Collect {
+    /// The PCs of the kernel code each call ran.
+    Pcs,
+    /// The comparisons that code made, and their operands.
+    Comparisons,
+}
+
+/// One comparison KCOV recorded (`KCOV_TRACE_CMP`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KcovComparison {
+    /// KCOV's type word: bit 0 set when an operand is a constant, bits 1-2
+    /// the operands' size (1, 2, 4 or 8 bytes).
+    pub kind: u64,
+    pub arg1: u64,
+    pub arg2: u64,
+    pub pc: u64,
+}
+
+impl KcovComparison {
+    /// The operands' size in bytes.
+    pub(crate) fn size(self) -> usize {
+        1 << ((self.kind >> 1) & 3)
+    }
+}
+
 /// One call's result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CallResult {
@@ -584,7 +643,9 @@ pub(crate) struct CallResult {
     pub ret: i64,
     /// The kernel PCs KCOV recorded while the call ran, in order.
     pub pcs: Vec<u64>,
-    /// KCOV's buffer filled, or the program's PC cap was reached.
+    /// The comparisons it recorded, when they were asked for instead.
+    pub comparisons: Vec<KcovComparison>,
+    /// KCOV's buffer filled, or the program's cap was reached.
     pub truncated: bool,
 }
 
@@ -721,6 +782,7 @@ pub(crate) fn parse_hello(payload: &[u8]) -> Result<Hello, ProtocolError> {
         protocol,
         kcov: flags & 1 != 0,
         init: flags & 2 != 0,
+        comparisons: flags & 4 != 0,
         cover_entries: fields.u32()?,
         max_program: fields.u32()?,
         max_calls: fields.u32()?,
@@ -738,7 +800,8 @@ pub(crate) fn parse_hello(payload: &[u8]) -> Result<Hello, ProtocolError> {
 pub(crate) fn encode_hello(hello: &Hello) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&hello.protocol.to_le_bytes());
-    let flags = u32::from(hello.kcov) | (u32::from(hello.init) << 1);
+    let flags =
+        u32::from(hello.kcov) | (u32::from(hello.init) << 1) | (u32::from(hello.comparisons) << 2);
     for word in [
         flags,
         hello.cover_entries,
@@ -756,19 +819,23 @@ pub(crate) fn encode_hello(hello: &Hello) -> Vec<u8> {
     out
 }
 
-pub(crate) fn encode_exec(id: u64, collect: bool, timeout_ms: u32, program: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_exec(id: u64, collect: Collect, timeout_ms: u32, program: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(20 + program.len());
     out.extend_from_slice(&id.to_le_bytes());
-    out.extend_from_slice(&u32::from(collect).to_le_bytes());
+    let flags: u32 = match collect {
+        Collect::Pcs => 1,
+        Collect::Comparisons => 2,
+    };
+    out.extend_from_slice(&flags.to_le_bytes());
     out.extend_from_slice(&timeout_ms.to_le_bytes());
     out.extend_from_slice(&(program.len() as u32).to_le_bytes());
     out.extend_from_slice(program);
     out
 }
 
+/// An EXEC payload: `(id, flags, timeout_ms, program)`.
 #[cfg(test)]
-/// An EXEC payload: `(id, collect, timeout_ms, program)`.
-pub(crate) fn parse_exec(payload: &[u8]) -> Result<(u64, bool, u32, Vec<u8>), ProtocolError> {
+pub(crate) fn parse_exec(payload: &[u8]) -> Result<(u64, u32, u32, Vec<u8>), ProtocolError> {
     let mut fields = Fields::new("EXEC", payload);
     let id = fields.u64()?;
     let flags = fields.u32()?;
@@ -776,7 +843,7 @@ pub(crate) fn parse_exec(payload: &[u8]) -> Result<(u64, bool, u32, Vec<u8>), Pr
     let len = fields.u32()?;
     let program = fields.take(len as usize)?.to_vec();
     fields.finish()?;
-    Ok((id, flags & 1 != 0, timeout, program))
+    Ok((id, flags, timeout, program))
 }
 
 pub(crate) fn parse_reply(payload: &[u8]) -> Result<ExecReply, ProtocolError> {
@@ -794,27 +861,51 @@ pub(crate) fn parse_reply(payload: &[u8]) -> Result<ExecReply, ProtocolError> {
             reason: format!("{ran} calls ran of {decoded}"),
         });
     }
+    let comparisons = flags & 4 != 0;
     let mut calls = Vec::with_capacity(ran as usize);
     for _ in 0..ran {
         let index = fields.u32()?;
         let errno = fields.u32()?;
         let ret = fields.u64()? as i64;
-        let npcs = fields.u32()? as usize;
+        let nwords = fields.u32()? as usize;
         let call_flags = fields.u32()?;
-        let raw = fields.take(npcs.checked_mul(8).ok_or(ProtocolError::Malformed {
+        let raw = fields.take(nwords.checked_mul(8).ok_or(ProtocolError::Malformed {
             what: "REPLY",
-            reason: format!("{npcs} PCs"),
+            reason: format!("{nwords} words"),
         })?)?;
+        let words: Vec<u64> = raw
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|word| u64::from_le_bytes(*word))
+            .collect();
+        let (pcs, records) = if comparisons {
+            let (records, rest) = words.as_chunks::<4>();
+            if !rest.is_empty() {
+                return Err(ProtocolError::Malformed {
+                    what: "REPLY",
+                    reason: format!("{nwords} words are not comparisons of four"),
+                });
+            }
+            let records = records
+                .iter()
+                .map(|[kind, arg1, arg2, pc]| KcovComparison {
+                    kind: *kind,
+                    arg1: *arg1,
+                    arg2: *arg2,
+                    pc: *pc,
+                })
+                .collect();
+            (Vec::new(), records)
+        } else {
+            (words, Vec::new())
+        };
         calls.push(CallResult {
             index,
             errno,
             ret,
-            pcs: raw
-                .as_chunks::<8>()
-                .0
-                .iter()
-                .map(|word| u64::from_le_bytes(*word))
-                .collect(),
+            pcs,
+            comparisons: records,
             truncated: call_flags & 1 != 0,
         });
     }
@@ -834,7 +925,9 @@ pub(crate) fn encode_reply(reply: &ExecReply) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&reply.id.to_le_bytes());
     let (status, detail) = reply.status.to_wire();
-    let flags = u32::from(reply.kcov) | (u32::from(reply.truncated) << 1);
+    let comparisons = reply.calls.iter().any(|call| !call.comparisons.is_empty());
+    let flags =
+        u32::from(reply.kcov) | (u32::from(reply.truncated) << 1) | (u32::from(comparisons) << 2);
     for word in [
         status,
         detail,
@@ -849,10 +942,18 @@ pub(crate) fn encode_reply(reply: &ExecReply) -> Vec<u8> {
         out.extend_from_slice(&call.index.to_le_bytes());
         out.extend_from_slice(&call.errno.to_le_bytes());
         out.extend_from_slice(&call.ret.to_le_bytes());
-        out.extend_from_slice(&(call.pcs.len() as u32).to_le_bytes());
+        let words: Vec<u64> = if comparisons {
+            call.comparisons
+                .iter()
+                .flat_map(|cmp| [cmp.kind, cmp.arg1, cmp.arg2, cmp.pc])
+                .collect()
+        } else {
+            call.pcs.clone()
+        };
+        out.extend_from_slice(&(words.len() as u32).to_le_bytes());
         out.extend_from_slice(&u32::from(call.truncated).to_le_bytes());
-        for pc in &call.pcs {
-            out.extend_from_slice(&pc.to_le_bytes());
+        for word in &words {
+            out.extend_from_slice(&word.to_le_bytes());
         }
     }
     out
@@ -891,12 +992,12 @@ impl<C: Read + Write> ExecutorClient<C> {
         &mut self.channel
     }
 
-    /// Run `program`; the executor kills it after `timeout`. With `collect`
-    /// KCOV records the PCs of each call.
+    /// Run `program`, KCOV collecting what `collect` says; the executor
+    /// kills it after `timeout`.
     pub(crate) fn execute(
         &mut self,
         program: &[u8],
-        collect: bool,
+        collect: Collect,
         timeout: Duration,
     ) -> Result<ExecReply, ProtocolError> {
         if program.len() > self.hello.max_program as usize {
@@ -1509,12 +1610,22 @@ impl Guest {
     /// Run `program`, which the executor kills after `timeout`; the host
     /// waits a little longer for the reply.
     pub(crate) fn run(&mut self, program: &[u8], timeout: Duration) -> GuestRun {
+        self.run_collecting(program, Collect::Pcs, timeout)
+    }
+
+    /// [`Guest::run`], KCOV collecting what `collect` says.
+    pub(crate) fn run_collecting(
+        &mut self,
+        program: &[u8],
+        collect: Collect,
+        timeout: Duration,
+    ) -> GuestRun {
         let start = std::time::Instant::now();
         let mark = self.console.mark();
         let wait = reply_wait(timeout);
         let end = match self.client.channel_mut().set_read_timeout(Some(wait)) {
             Err(error) => RunEnd::Stopped(format!("executor channel: {error}")),
-            Ok(()) => match self.client.execute(program, true, timeout) {
+            Ok(()) => match self.client.execute(program, collect, timeout) {
                 Ok(reply) => RunEnd::Replied(reply),
                 Err(ProtocolError::Timeout) => RunEnd::NoReply,
                 Err(error) => {
@@ -1631,6 +1742,710 @@ fn wait_timeout(
             _ => return None,
         }
     }
+}
+
+// ── Coverage ─────────────────────────────────────────────────────────────
+
+/// A kernel PC as an edge-map id: its two halves folded together. The
+/// kernel's text and its modules' share the upper half of their addresses
+/// (`0xffffffff` on x86_64), so distinct PCs keep distinct ids, and
+/// `nokaslr` keeps them where they are on every boot.
+pub(crate) fn pc_id(pc: u64) -> u32 {
+    (pc as u32) ^ ((pc >> 32) as u32)
+}
+
+/// A reply's trace for the coverage map: each call's PCs as edge-map ids,
+/// the calls in order. The builtin engine's coverage map counts each id's
+/// hits in buckets and each pair of consecutive ids as an edge, as it does
+/// a harness's breadcrumbs; the pair across two calls is the return to user
+/// space and the next system call's entry.
+pub(crate) fn coverage_ids(reply: &ExecReply) -> Vec<u32> {
+    reply
+        .calls
+        .iter()
+        .flat_map(|call| call.pcs.iter().map(|pc| pc_id(*pc)))
+        .collect()
+}
+
+/// Fold `ids` into `coverage`: the bits it had not seen.
+pub(crate) fn fold_coverage(
+    coverage: &mut fuzz_engine_builtin::CoverageProxy,
+    ids: &[u32],
+) -> fuzz_engine_builtin::CoverageFeedback {
+    let testcase = event_log::Testcase {
+        testcase_id: 0,
+        target_id: 0,
+        target_entered: false,
+        crumbs: ids.to_vec(),
+        handlers: Vec::new(),
+        raises: Vec::new(),
+        top_level: None,
+        end: None,
+        mocks: Vec::new(),
+    };
+    coverage.record(fuzz_engine_builtin::CoverageInput::new(&testcase, &[]))
+}
+
+// ── Mutating programs ────────────────────────────────────────────────────
+
+/// Most comparisons one program's CmpLog keeps.
+const MAX_COMPARISONS: usize = 4096;
+
+/// The comparisons a reply recorded, as the CmpLog a mutation of `program`
+/// splices from: an operand found in the program is replaced with the value
+/// the kernel compared it against (a bound, a magic number, a command).
+pub(crate) fn comparison_log(reply: &ExecReply, program: &[u8]) -> cmplog::CmpLog {
+    let mut seen = std::collections::HashSet::new();
+    let mut log = cmplog::CmpLog::new();
+    for comparison in reply.calls.iter().flat_map(|call| &call.comparisons) {
+        let size = comparison.size();
+        let a = comparison.arg1.to_le_bytes()[..size].to_vec();
+        let b = comparison.arg2.to_le_bytes()[..size].to_vec();
+        if a == b || !seen.insert((a.clone(), b.clone())) {
+            continue;
+        }
+        log.record(cmplog::CmpEntry {
+            site_id: comparison.pc,
+            operand_a: a,
+            operand_b: b,
+            kind: cmplog::CmpKind::IntegerCompare,
+        });
+    }
+    log.retain_spliceable(program);
+    log.entries.truncate(MAX_COMPARISONS);
+    log
+}
+
+/// Bytes of a data buffer whose 4-byte words are typed spans (the fields
+/// of the struct an ioctl takes).
+const TYPED_DATA_PREFIX: usize = 64;
+
+/// Most hint programs one corpus program yields.
+pub(crate) const MAX_HINTS: usize = 128;
+
+/// The programs the comparisons of `reply` suggest, as syzkaller's hints
+/// do: wherever an argument of a call (a constant's low bytes, or a word of
+/// a data buffer at the operand's alignment) holds one operand of a
+/// comparison the kernel made while that call ran, that argument with the
+/// other operand. The calls take turns, so each gets its share of the `max`
+/// hints; each hint is made once.
+pub(crate) fn hint_programs(program: &[u8], reply: &ExecReply, max: usize) -> Vec<Vec<u8>> {
+    let decoded = decode(program);
+    let mut per_call: Vec<std::collections::VecDeque<Vec<u8>>> = Vec::new();
+    let mut made = std::collections::HashSet::new();
+    made.insert(program.to_vec());
+    for (call, result) in decoded.calls.iter().zip(&reply.calls) {
+        let mut pairs = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for comparison in &result.comparisons {
+            let size = comparison.size();
+            let a = comparison.arg1.to_le_bytes()[..size].to_vec();
+            let b = comparison.arg2.to_le_bytes()[..size].to_vec();
+            if a != b && seen.insert((a.clone(), b.clone())) {
+                pairs.push((a.clone(), b.clone()));
+                pairs.push((b, a));
+            }
+        }
+        // Where a value of each size can be replaced: (offset, size).
+        let mut places = Vec::new();
+        for arg in &call.args {
+            match &arg.value {
+                ArgValue::Const(_) => {
+                    for size in [1, 2, 4, 8] {
+                        places.push((arg.span.start, size));
+                    }
+                }
+                ArgValue::Data { bytes, .. } => {
+                    for size in [1, 2, 4, 8] {
+                        let mut offset = bytes.start;
+                        while offset + size <= bytes.end {
+                            places.push((offset, size));
+                            offset += size;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut hints = std::collections::VecDeque::new();
+        for (from, to) in &pairs {
+            for &(offset, size) in &places {
+                if size != from.len() || program[offset..offset + size] != from[..] {
+                    continue;
+                }
+                let mut hint = program.to_vec();
+                hint[offset..offset + size].copy_from_slice(to);
+                if made.insert(hint.clone()) {
+                    hints.push_back(hint);
+                }
+            }
+        }
+        per_call.push(hints);
+    }
+    let mut hints = Vec::new();
+    while hints.len() < max && per_call.iter().any(|call| !call.is_empty()) {
+        for call in per_call.iter_mut() {
+            if let Some(hint) = call.pop_front() {
+                if hints.len() < max {
+                    hints.push(hint);
+                }
+            }
+        }
+    }
+    hints
+}
+
+impl Program<'_> {
+    /// The spans a typed mutation rewrites: each constant (8 bytes), each
+    /// result's index, each out buffer's length, each data buffer, and the
+    /// 4-byte words of a buffer's first 64 bytes.
+    pub(crate) fn typed_spans(&self) -> Vec<fuzz_engine_builtin::TypedSpan> {
+        use fuzz_engine_builtin::{TypedSpan, TypedValueKind};
+        let mut spans = Vec::new();
+        for arg in self.calls.iter().flat_map(|call| &call.args) {
+            match &arg.value {
+                ArgValue::Const(_) | ArgValue::Result(_) | ArgValue::Out { .. } => {
+                    spans.push(TypedSpan::new(
+                        arg.span.clone(),
+                        TypedValueKind::UnsignedInteger,
+                    ));
+                }
+                ArgValue::Data { bytes, .. } if !bytes.is_empty() => {
+                    spans.push(TypedSpan::new(bytes.clone(), TypedValueKind::Bytes));
+                    let words = bytes.len().min(TYPED_DATA_PREFIX) / 4;
+                    for word in 0..words {
+                        let start = bytes.start + word * 4;
+                        spans.push(TypedSpan::new(
+                            start..start + 4,
+                            TypedValueKind::UnsignedInteger,
+                        ));
+                    }
+                }
+                ArgValue::Data { .. } => {}
+            }
+        }
+        spans
+    }
+
+    /// The calls as an operation sequence: the mutator swaps two, or
+    /// changes one's selector.
+    pub(crate) fn operations(&self) -> fuzz_engine_builtin::OperationSequenceLayout {
+        use fuzz_engine_builtin::{OperationSequenceLayout, OperationStepSpan};
+        let steps = self
+            .calls
+            .iter()
+            .map(|call| {
+                OperationStepSpan::new(call.span.clone(), call.span.start..call.span.start + 1)
+            })
+            .collect();
+        OperationSequenceLayout::new(None, 0, MAX_CALLS, SYSCALLS.len() + 1, steps)
+    }
+}
+
+/// Hint programs waiting to run at most.
+const MAX_PENDING_HINTS: usize = 4096;
+/// Hint programs remembered as queued, so none is queued twice: past it the
+/// memory starts again, and a hint may run twice.
+const MAX_HINTED: usize = 1 << 20;
+/// Corpus programs whose comparisons are kept for their mutations.
+const MAX_CMPLOGS: usize = 256;
+
+/// 128 bits of a program's SHA-256: what remembers it.
+fn program_digest(program: &[u8]) -> [u8; 16] {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(program);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest[..16]);
+    out
+}
+
+/// The hint programs the comparisons suggested, to run before the next
+/// mutation: each queued once (by digest, not by its bytes), at most
+/// `max_pending` waiting.
+#[derive(Debug)]
+pub(crate) struct HintQueue {
+    pending: std::collections::VecDeque<Vec<u8>>,
+    queued: std::collections::HashSet<[u8; 16]>,
+    max_pending: usize,
+    max_queued: usize,
+}
+
+impl HintQueue {
+    pub(crate) fn new(max_pending: usize, max_queued: usize) -> Self {
+        Self {
+            pending: Default::default(),
+            queued: Default::default(),
+            max_pending,
+            max_queued: max_queued.max(1),
+        }
+    }
+
+    /// Queue `hint` unless it was queued before or the queue is full:
+    /// whether it was.
+    pub(crate) fn offer(&mut self, hint: Vec<u8>) -> bool {
+        if self.pending.len() >= self.max_pending {
+            return false;
+        }
+        if self.queued.len() >= self.max_queued {
+            self.queued.clear();
+        }
+        if !self.queued.insert(program_digest(&hint)) {
+            return false;
+        }
+        self.pending.push_back(hint);
+        true
+    }
+
+    pub(crate) fn pop(&mut self) -> Option<Vec<u8>> {
+        self.pending.pop_front()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending(&self) -> usize {
+        self.pending.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remembered(&self) -> usize {
+        self.queued.len()
+    }
+}
+
+/// The comparisons of at most `capacity` corpus programs, by digest: the
+/// one used least recently goes when another comes.
+#[derive(Debug)]
+pub(crate) struct CmpLogCache {
+    logs: std::collections::HashMap<[u8; 16], (u64, std::sync::Arc<cmplog::CmpLog>)>,
+    clock: u64,
+    capacity: usize,
+}
+
+impl CmpLogCache {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            logs: Default::default(),
+            clock: 0,
+            capacity: capacity.max(1),
+        }
+    }
+
+    pub(crate) fn insert(&mut self, program: &[u8], log: cmplog::CmpLog) {
+        self.clock += 1;
+        let key = program_digest(program);
+        if !self.logs.contains_key(&key) && self.logs.len() >= self.capacity {
+            if let Some(oldest) = self
+                .logs
+                .iter()
+                .min_by_key(|(_, (used, _))| *used)
+                .map(|(key, _)| *key)
+            {
+                self.logs.remove(&oldest);
+            }
+        }
+        self.logs
+            .insert(key, (self.clock, std::sync::Arc::new(log)));
+    }
+
+    /// `program`'s comparisons, which are then the most recently used.
+    pub(crate) fn get(&mut self, program: &[u8]) -> Option<std::sync::Arc<cmplog::CmpLog>> {
+        self.clock += 1;
+        let clock = self.clock;
+        self.logs
+            .get_mut(&program_digest(program))
+            .map(|(used, log)| {
+                *used = clock;
+                log.clone()
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.logs.len()
+    }
+}
+
+// ── The campaign ─────────────────────────────────────────────────────────
+
+/// The seed programs of a campaign, and the tokens its mutations splice in
+/// (command numbers, the device's path).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SeedSet {
+    pub programs: Vec<Vec<u8>>,
+    pub dictionary: Vec<Vec<u8>>,
+    /// What the seeds were made from, for the summary.
+    pub origin: Vec<String>,
+}
+
+/// A `bhf kernel fuzz` campaign.
+#[derive(Debug, Clone)]
+pub(crate) struct FuzzConfig {
+    /// `<work>/kernel`: the guest's files, the corpus, the crashes, the
+    /// summary.
+    pub dir: PathBuf,
+    pub setup: GuestSetup,
+    /// Executions at most.
+    pub iterations: usize,
+    pub time_budget: Option<Duration>,
+    /// How long one program may run.
+    pub timeout: Duration,
+    pub rng_seed: u64,
+    pub max_len: usize,
+}
+
+/// Coverage of the campaign at one point.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct CoverageCount {
+    /// Distinct edges (pairs of consecutive PCs).
+    pub edges: usize,
+    /// Distinct PCs and hit-count buckets.
+    pub blocks: usize,
+}
+
+impl CoverageCount {
+    fn of(coverage: &fuzz_engine_builtin::CoverageProxy) -> Self {
+        let snapshot = coverage.snapshot();
+        Self {
+            edges: snapshot.edge_bits,
+            blocks: snapshot.breadcrumb_bits,
+        }
+    }
+}
+
+/// What a campaign did, as `<work>/kernel/fuzz.json` records it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct FuzzSummary {
+    pub schema: &'static str,
+    pub kernel: String,
+    pub release: String,
+    pub machine: String,
+    pub accel: &'static str,
+    pub kcov: bool,
+    /// The executor's setup notes in its HELLO: each module loaded or why
+    /// not, KCOV.
+    pub notes: Vec<String>,
+    pub seeds: usize,
+    pub seed_origin: Vec<String>,
+    pub executions: usize,
+    /// KCOV recorded comparisons: each corpus program ran once more for
+    /// them, its mutations splice their operands in, and the programs
+    /// their operands suggest (hints) ran.
+    pub comparisons: bool,
+    pub comparison_runs: usize,
+    pub hint_runs: usize,
+    /// Programs that reached new coverage and joined the corpus.
+    pub corpus_new: usize,
+    pub corpus: usize,
+    /// Coverage once every seed had run, and at the end.
+    pub coverage_after_seeds: CoverageCount,
+    pub coverage: CoverageCount,
+    /// Runs the guest did not survive (it stopped, or did not answer).
+    pub crashes: usize,
+    /// Where each such run's program and console are, under `<work>`.
+    pub crash_dirs: Vec<String>,
+    pub boots: usize,
+    /// Why the campaign stopped before its budget.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub halted: Option<String>,
+    pub elapsed_secs: f64,
+    pub executions_per_sec: f64,
+}
+
+/// The schema of `fuzz.json`.
+pub(crate) const FUZZ_SUMMARY_SCHEMA: &str = "bhf.kernel-fuzz.v1";
+
+/// A run the guest did not survive, saved for its triage.
+#[cfg(unix)]
+fn save_crash(dir: &Path, index: usize, program: &[u8], run: &GuestRun) -> anyhow::Result<PathBuf> {
+    use anyhow::Context;
+    let crash = dir.join("crashes").join(format!("{index:04}"));
+    std::fs::create_dir_all(&crash).with_context(|| format!("create {}", crash.display()))?;
+    let reason = match &run.end {
+        RunEnd::Replied(reply) => format!("replied: {}", reply.status.describe()),
+        RunEnd::Stopped(reason) => format!("the guest stopped: {reason}"),
+        RunEnd::NoReply => "no reply: the guest hung".to_owned(),
+    };
+    for (name, bytes) in [
+        ("program.bin", program.to_vec()),
+        ("program.txt", decode(program).text().into_bytes()),
+        ("console.log", run.console.clone().into_bytes()),
+        ("reason.txt", format!("{reason}\n").into_bytes()),
+    ] {
+        std::fs::write(crash.join(name), bytes)
+            .with_context(|| format!("write {}", crash.join(name).display()))?;
+    }
+    Ok(crash)
+}
+
+/// The campaign's state between runs.
+#[cfg(unix)]
+struct Campaign<'a> {
+    config: &'a FuzzConfig,
+    guest: Option<Guest>,
+    hello: Option<Hello>,
+    accel: Accel,
+    coverage: fuzz_engine_builtin::CoverageProxy,
+    scheduler: fuzz_engine_builtin::PowerScheduler,
+    executions: usize,
+    corpus_new: usize,
+    crashes: usize,
+    crash_dirs: Vec<String>,
+    boots: usize,
+    /// The comparisons of the corpus programs scheduled last.
+    cmplogs: CmpLogCache,
+    comparison_runs: usize,
+    hints: HintQueue,
+    hint_runs: usize,
+}
+
+#[cfg(unix)]
+impl Campaign<'_> {
+    /// The guest, booted when there is none (at the start, and after a run
+    /// it did not survive).
+    fn guest(&mut self) -> anyhow::Result<&mut Guest> {
+        if self.guest.is_none() {
+            let log = self.config.dir.join("guest").join("console.log");
+            let guest = Guest::boot(&self.config.setup, Some(&log))?;
+            self.boots += 1;
+            self.accel = guest.accel();
+            self.hello.get_or_insert_with(|| guest.hello().clone());
+            self.guest = Some(guest);
+        }
+        Ok(self.guest.as_mut().expect("booted above"))
+    }
+
+    /// Run `program`; fold its coverage in, and keep it when `seed` or when
+    /// it reached new coverage.
+    fn run(&mut self, program: &[u8], seed: bool) -> anyhow::Result<()> {
+        let timeout = self.config.timeout;
+        let run = self.guest()?.run(program, timeout);
+        self.executions += 1;
+        let RunEnd::Replied(reply) = &run.end else {
+            return self.crashed(program, &run);
+        };
+        let feedback = fold_coverage(&mut self.coverage, &coverage_ids(reply));
+        let new = feedback.new_bitmap_bits() > 0;
+        if !(seed || new) {
+            return Ok(());
+        }
+        self.scheduler
+            .insert_with_feedback(program, feedback.to_schedule_feedback());
+        if !seed {
+            self.corpus_new += 1;
+        }
+        let corpus = self.config.dir.join("corpus");
+        std::fs::create_dir_all(&corpus)?;
+        std::fs::write(
+            corpus.join(format!("{}.bin", &sha256_hex(program)[..16])),
+            program,
+        )?;
+        if self.hello.as_ref().is_some_and(|hello| hello.comparisons)
+            && self.executions < self.config.iterations
+        {
+            self.learn_comparisons(program)?;
+        }
+        Ok(())
+    }
+
+    /// Run a corpus program again for the comparisons its calls made.
+    fn learn_comparisons(&mut self, program: &[u8]) -> anyhow::Result<()> {
+        let timeout = self.config.timeout;
+        let run = self
+            .guest()?
+            .run_collecting(program, Collect::Comparisons, timeout);
+        self.executions += 1;
+        self.comparison_runs += 1;
+        let RunEnd::Replied(reply) = &run.end else {
+            return self.crashed(program, &run);
+        };
+        for hint in hint_programs(program, reply, MAX_HINTS) {
+            self.hints.offer(hint);
+        }
+        let log = comparison_log(reply, program);
+        if !log.entries.is_empty() {
+            self.cmplogs.insert(program, log);
+        }
+        Ok(())
+    }
+
+    /// A run the guest did not survive: save it, and boot a fresh guest for
+    /// the next.
+    fn crashed(&mut self, program: &[u8], run: &GuestRun) -> anyhow::Result<()> {
+        let dir = save_crash(&self.config.dir, self.crashes, program, run)?;
+        self.crashes += 1;
+        self.crash_dirs.push(
+            dir.strip_prefix(self.config.dir.parent().unwrap_or(&self.config.dir))
+                .unwrap_or(&dir)
+                .display()
+                .to_string(),
+        );
+        self.guest = None;
+        Ok(())
+    }
+}
+
+/// Run a campaign: boot the guest, run every seed `seeds` gives for the
+/// guest's HELLO, then mutate the corpus, coverage-guided, until the
+/// iteration cap or the time budget. A run the guest does not survive is
+/// saved under `<dir>/crashes/` and the next run boots it again.
+#[cfg(unix)]
+pub(crate) fn fuzz(
+    config: &FuzzConfig,
+    seeds: &dyn Fn(&Hello) -> anyhow::Result<SeedSet>,
+) -> anyhow::Result<FuzzSummary> {
+    use fuzz_engine_builtin::{
+        Dictionary, MutationInput, MutationRng, MutatorConfig, MutatorSuite,
+    };
+    use std::time::Instant;
+
+    let start = Instant::now();
+    let mut campaign = Campaign {
+        config,
+        guest: None,
+        hello: None,
+        accel: config.setup.accel,
+        coverage: Default::default(),
+        scheduler: Default::default(),
+        executions: 0,
+        corpus_new: 0,
+        crashes: 0,
+        crash_dirs: Vec::new(),
+        boots: 0,
+        cmplogs: CmpLogCache::new(MAX_CMPLOGS),
+        comparison_runs: 0,
+        hints: HintQueue::new(MAX_PENDING_HINTS, MAX_HINTED),
+        hint_runs: 0,
+    };
+    campaign.guest()?;
+    let hello = campaign.hello.clone().expect("the first boot said HELLO");
+    let seed_set = seeds(&hello)?;
+    anyhow::ensure!(
+        !seed_set.programs.is_empty(),
+        "no seed programs: give --seeds, --source or --device"
+    );
+    let out_of_budget = |executions: usize| {
+        executions >= config.iterations
+            || config
+                .time_budget
+                .is_some_and(|budget| start.elapsed() >= budget)
+    };
+    // A module under test the guest did not load leaves nothing of it to
+    // reach: no program runs.
+    let unloaded = hello.unloaded_modules();
+    let mut halted = (!unloaded.is_empty()).then(|| {
+        format!(
+            "the guest did not load every --module, so no program could reach its driver: {}",
+            unloaded.join("; ")
+        )
+    });
+    for program in &seed_set.programs {
+        if halted.is_some() {
+            break;
+        }
+        if out_of_budget(campaign.executions) {
+            break;
+        }
+        if let Err(error) = campaign.run(program, true) {
+            halted = Some(format!("{error:#}"));
+            break;
+        }
+    }
+    let coverage_after_seeds = CoverageCount::of(&campaign.coverage);
+
+    let mutator = MutatorSuite::new(MutatorConfig {
+        max_len: config.max_len.clamp(1, MAX_PROGRAM),
+        structured_records: false,
+        structured_json: false,
+        structured_xml: false,
+        structured_key_value: false,
+        structured_url_encoded: false,
+        structured_multipart: false,
+        structured_csv: false,
+        structured_http: false,
+        structured_ini: false,
+        structured_toml: false,
+        structured_yaml: false,
+        structured_chunked: false,
+        structured_recursive: false,
+    });
+    let mut rng = MutationRng::new(config.rng_seed);
+    let dictionary = Dictionary::from_tokens(seed_set.dictionary.iter().cloned());
+    'campaign: while halted.is_none() && !out_of_budget(campaign.executions) {
+        // The hints the corpus's comparisons suggest run first.
+        if let Some(hint) = campaign.hints.pop() {
+            campaign.hint_runs += 1;
+            if let Err(error) = campaign.run(&hint, false) {
+                halted = Some(format!("{error:#}"));
+            }
+            continue;
+        }
+        let Some(scheduled) = campaign.scheduler.select_next() else {
+            halted = Some("every seed crashed the guest: nothing to mutate".to_owned());
+            break;
+        };
+        for _ in 0..scheduled.energy.max(1) {
+            if out_of_budget(campaign.executions) {
+                break 'campaign;
+            }
+            let program = decode(&scheduled.bytes);
+            let spans = program.typed_spans();
+            let operations = program.operations();
+            let cmplog = campaign.cmplogs.get(&scheduled.bytes);
+            let mut input = MutationInput::new(&scheduled.bytes, &dictionary)
+                .with_typed_spans(&spans)
+                .with_operation_sequence(&operations);
+            if let Some(log) = cmplog.as_deref() {
+                input = input.with_cmplog(log);
+            }
+            let mutated = mutator
+                .mutate(&input, &mut rng)
+                .map(|result| result.bytes)
+                .unwrap_or_else(|| scheduled.bytes.clone());
+            if let Err(error) = campaign.run(&mutated, false) {
+                halted = Some(format!("{error:#}"));
+                break 'campaign;
+            }
+            if !campaign.hints.is_empty() {
+                break;
+            }
+        }
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    let summary = FuzzSummary {
+        schema: FUZZ_SUMMARY_SCHEMA,
+        kernel: config.setup.kernel.display().to_string(),
+        release: hello.release.clone(),
+        machine: hello.machine.clone(),
+        accel: campaign.accel.as_str(),
+        kcov: hello.kcov,
+        notes: hello.note_lines(),
+        comparisons: hello.comparisons,
+        comparison_runs: campaign.comparison_runs,
+        hint_runs: campaign.hint_runs,
+        seeds: seed_set.programs.len(),
+        seed_origin: seed_set.origin.clone(),
+        executions: campaign.executions,
+        corpus_new: campaign.corpus_new,
+        corpus: campaign.scheduler.len(),
+        coverage_after_seeds,
+        coverage: CoverageCount::of(&campaign.coverage),
+        crashes: campaign.crashes,
+        crash_dirs: campaign.crash_dirs.clone(),
+        boots: campaign.boots,
+        halted,
+        elapsed_secs: elapsed,
+        executions_per_sec: if elapsed > 0.0 {
+            campaign.executions as f64 / elapsed
+        } else {
+            0.0
+        },
+    };
+    let path = config.dir.join("fuzz.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(&summary)?)?;
+    Ok(summary)
 }
 
 #[cfg(test)]
@@ -1949,6 +2764,7 @@ mod tests {
             protocol: PROTOCOL,
             kcov,
             init: true,
+            comparisons: kcov,
             cover_entries: 1 << 18,
             max_program: MAX_PROGRAM as u32,
             max_calls: MAX_CALLS as u32,
@@ -1960,8 +2776,8 @@ mod tests {
         }
     }
 
-    /// An EXEC the mock executor read: `(id, collect, timeout_ms)`.
-    type Seen = (u64, bool, u32);
+    /// An EXEC the mock executor read: `(id, flags, timeout_ms)`.
+    type Seen = (u64, u32, u32);
 
     /// What the mock executor does with an EXEC.
     enum Answer {
@@ -1989,8 +2805,8 @@ mod tests {
             guest.write_all(&hello).unwrap();
             while let Ok((kind, payload)) = read_message(&mut guest) {
                 assert_eq!(kind, MSG_EXEC);
-                let (id, collect, timeout, program) = parse_exec(&payload).unwrap();
-                seen.push((id, collect, timeout));
+                let (id, flags, timeout, program) = parse_exec(&payload).unwrap();
+                seen.push((id, flags, timeout));
                 match answer(id, program) {
                     Answer::Send(bytes) => guest.write_all(&bytes).unwrap(),
                     Answer::SendAndClose(bytes) => {
@@ -2026,6 +2842,7 @@ mod tests {
                     errno: if index == 1 { 22 } else { 0 },
                     ret: if index == 1 { -1 } else { 4 },
                     pcs: pcs.to_vec(),
+                    comparisons: Vec::new(),
                     truncated: false,
                 })
                 .collect(),
@@ -2057,7 +2874,7 @@ mod tests {
         assert_eq!(client.hello(), &hello(true));
         for expected_id in [1, 2] {
             let reply = client
-                .execute(&program, true, Duration::from_millis(2500))
+                .execute(&program, Collect::Pcs, Duration::from_millis(2500))
                 .unwrap();
             assert_eq!(reply.id, expected_id);
             assert_eq!(reply.status, ExecStatus::Ok);
@@ -2068,7 +2885,7 @@ mod tests {
             assert_eq!(reply.edges(), 2);
         }
         drop(client);
-        assert_eq!(mock.join().unwrap(), vec![(1, true, 2500), (2, true, 2500)]);
+        assert_eq!(mock.join().unwrap(), vec![(1, 1, 2500), (2, 1, 2500)]);
     }
 
     #[cfg(unix)]
@@ -2080,7 +2897,7 @@ mod tests {
             });
         let mut client = ExecutorClient::handshake(host).unwrap();
         let error = client
-            .execute(&[], true, Duration::from_secs(1))
+            .execute(&[], Collect::Pcs, Duration::from_secs(1))
             .unwrap_err();
         assert!(
             matches!(
@@ -2144,7 +2961,7 @@ mod tests {
             });
         let mut client = ExecutorClient::handshake(host).unwrap();
         assert!(matches!(
-            client.execute(&[], true, Duration::from_secs(1)),
+            client.execute(&[], Collect::Pcs, Duration::from_secs(1)),
             Err(ProtocolError::Malformed { what: "REPLY", .. })
         ));
 
@@ -2156,7 +2973,7 @@ mod tests {
             });
         let mut client = ExecutorClient::handshake(host).unwrap();
         assert!(matches!(
-            client.execute(&[], true, Duration::from_secs(1)),
+            client.execute(&[], Collect::Pcs, Duration::from_secs(1)),
             Err(ProtocolError::Closed)
         ));
 
@@ -2172,7 +2989,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_millis(100)))
             .unwrap();
         assert!(matches!(
-            client.execute(&[], true, Duration::from_secs(1)),
+            client.execute(&[], Collect::Pcs, Duration::from_secs(1)),
             Err(ProtocolError::Timeout)
         ));
         drop(client);
@@ -2185,7 +3002,11 @@ mod tests {
             });
         let mut client = ExecutorClient::handshake(host).unwrap();
         assert!(matches!(
-            client.execute(&vec![0u8; MAX_PROGRAM + 1], true, Duration::from_secs(1)),
+            client.execute(
+                &vec![0u8; MAX_PROGRAM + 1],
+                Collect::Pcs,
+                Duration::from_secs(1)
+            ),
             Err(ProtocolError::Malformed {
                 what: "program",
                 ..
@@ -2257,7 +3078,7 @@ mod tests {
         // Executed, reboot(0, 0, 0, 0) would fail with EINVAL.
         builder.raw(reboot, &[]).unwrap();
         let reply = client
-            .execute(&builder.finish(), true, Duration::from_secs(5))
+            .execute(&builder.finish(), Collect::Pcs, Duration::from_secs(5))
             .unwrap();
         assert_eq!(reply.status, ExecStatus::Ok);
         assert!(!reply.kcov);
@@ -2274,7 +3095,7 @@ mod tests {
             .unwrap();
         let started = std::time::Instant::now();
         let reply = client
-            .execute(&sleep.finish(), true, Duration::from_millis(200))
+            .execute(&sleep.finish(), Collect::Pcs, Duration::from_millis(200))
             .unwrap();
         assert_eq!(reply.status, ExecStatus::Timeout(200));
         assert!(reply.calls.is_empty());
@@ -2286,16 +3107,247 @@ mod tests {
         exit.raw(exit_group, &[SeedArg::Const(3)]).unwrap();
         exit.call("dup", &[SeedArg::Const(0)]).unwrap();
         let reply = client
-            .execute(&exit.finish(), true, Duration::from_secs(5))
+            .execute(&exit.finish(), Collect::Pcs, Duration::from_secs(5))
             .unwrap();
         assert_eq!(reply.status, ExecStatus::Exited(3));
         assert_eq!((reply.decoded, reply.calls.len()), (3, 1));
 
         // The executor goes on serving after each.
-        let reply = client.execute(&[], true, Duration::from_secs(5)).unwrap();
+        let reply = client
+            .execute(&[], Collect::Pcs, Duration::from_secs(5))
+            .unwrap();
         assert_eq!((reply.status, reply.decoded), (ExecStatus::Ok, 0));
         drop(client);
         assert!(child.wait().unwrap().success());
+    }
+
+    // ── Coverage and mutation ──────────────────────────────────────────
+
+    /// A program and the reply the guest sent for it, recorded in
+    /// `tests/fixtures/kernel_guest/replies/`.
+    fn recorded(name: &str) -> (Vec<u8>, ExecReply) {
+        let dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/kernel_guest/replies");
+        let program = std::fs::read(dir.join(format!("{name}.prog"))).unwrap();
+        let reply = parse_reply(&std::fs::read(dir.join(format!("{name}.reply"))).unwrap())
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        (program, reply)
+    }
+
+    /// Where the guest loaded its modules (the module area, without KASLR).
+    const MODULES: u64 = 0xffff_ffff_a000_0000;
+
+    /// The ids of the PCs of call `index` that are the driver module's.
+    fn module_ids(reply: &ExecReply, index: usize) -> Vec<u32> {
+        reply.calls[index]
+            .pcs
+            .iter()
+            .filter(|pc| **pc >= MODULES)
+            .map(|pc| pc_id(*pc))
+            .collect()
+    }
+
+    #[test]
+    fn recorded_replies_map_their_kcov_pcs_into_the_coverage_map() {
+        let runs: Vec<(Vec<u8>, ExecReply)> =
+            ["xfer-slot1", "xfer-slot1-again", "xfer-slot7", "get-stats"]
+                .iter()
+                .map(|name| recorded(name))
+                .collect();
+        for (program, reply) in &runs {
+            assert_eq!(reply.status, ExecStatus::Ok);
+            assert!(reply.kcov);
+            assert_eq!((reply.decoded, reply.calls.len()), (2, 2));
+            assert_eq!(decode(program).calls.len(), 2);
+            // Every PC of every call, in order, as its id.
+            let ids = coverage_ids(reply);
+            let expected: Vec<u32> = reply
+                .calls
+                .iter()
+                .flat_map(|call| call.pcs.iter().map(|pc| pc_id(*pc)))
+                .collect();
+            assert_eq!(ids, expected);
+            assert_eq!(
+                ids.len(),
+                reply.calls[0].pcs.len() + reply.calls[1].pcs.len()
+            );
+        }
+        // The kernel's PCs share their upper half, so an id is the low half
+        // inverted, and no two PCs share an id.
+        assert_eq!(pc_id(0xffff_ffff_8188_ed16), !0x8188_ed16u32);
+        let pcs: std::collections::HashSet<u64> = runs
+            .iter()
+            .flat_map(|(_, reply)| reply.calls.iter().flat_map(|call| call.pcs.iter().copied()))
+            .collect();
+        let ids: std::collections::HashSet<u32> = pcs.iter().map(|pc| pc_id(*pc)).collect();
+        assert!(pcs.len() > 500, "{}", pcs.len());
+        assert_eq!(ids.len(), pcs.len());
+
+        // The whole trace: the first program is all new coverage.
+        let mut map = fuzz_engine_builtin::CoverageProxy::default();
+        let first = fold_coverage(&mut map, &coverage_ids(&runs[0].1));
+        let edges: std::collections::HashSet<(u32, u32)> = coverage_ids(&runs[0].1)
+            .windows(2)
+            .map(|pair| (pair[0], pair[1]))
+            .collect();
+        assert_eq!(first.new_edge_bits as usize, edges.len());
+        assert!(first.new_breadcrumb_bits > 0);
+
+        // The driver's own code: the same program takes the same path
+        // through it, and adds nothing; slot 7 takes its EINVAL path and
+        // GET_STATS another command's, and each adds edges.
+        let mut driver = fuzz_engine_builtin::CoverageProxy::default();
+        let slot1 = module_ids(&runs[0].1, 1);
+        assert!(slot1.len() > 3, "{slot1:x?}");
+        assert!(fold_coverage(&mut driver, &slot1).new_edge_bits > 0);
+        assert_eq!(module_ids(&runs[1].1, 1), slot1);
+        assert!(fold_coverage(&mut driver, &module_ids(&runs[1].1, 1)).is_empty());
+        let slot7 = fold_coverage(&mut driver, &module_ids(&runs[2].1, 1));
+        assert!(slot7.new_edge_bits > 0, "{slot7:?}");
+        assert_eq!(runs[2].1.calls[1].errno, 22);
+        let stats = fold_coverage(&mut driver, &module_ids(&runs[3].1, 1));
+        assert!(stats.new_edge_bits > 0, "{stats:?}");
+        // And the slot-1 path folded again is still nothing new.
+        assert!(fold_coverage(&mut driver, &slot1).is_empty());
+    }
+
+    #[test]
+    fn a_reply_carries_comparisons_in_fours() {
+        let comparison = |kind, arg1, arg2, pc| KcovComparison {
+            kind,
+            arg1,
+            arg2,
+            pc,
+        };
+        let mut reply = reply_to(9, &[&[], &[]]);
+        reply.calls[1].comparisons = vec![
+            comparison(5, 4, 0, MODULES + 0x32e),
+            comparison(6, 0xdead_beef_0000_0001, 7, MODULES + 0x40),
+        ];
+        let parsed = parse_reply(&encode_reply(&reply)).unwrap();
+        assert_eq!(parsed, reply);
+        assert_eq!(parsed.calls[1].comparisons[0].size(), 4);
+        assert_eq!(parsed.calls[1].comparisons[1].size(), 8);
+        assert!(parsed.calls[1].pcs.is_empty());
+        // Words that are not whole comparisons are refused.
+        let mut payload = encode_reply(&reply);
+        let at = payload.len() - 8 * 8 - 8;
+        payload[at..at + 4].copy_from_slice(&7u32.to_le_bytes());
+        payload.truncate(payload.len() - 8);
+        assert!(matches!(
+            parse_reply(&payload),
+            Err(ProtocolError::Malformed { what: "REPLY", .. })
+        ));
+    }
+
+    /// `openat(widget)`, then `ioctl(r0, WIDGET_IOC_XFER, zeroed xfer)`.
+    fn xfer_program() -> Vec<u8> {
+        let mut builder = open_then(b"/dev/widget\0", 2);
+        builder
+            .call(
+                "ioctl",
+                &[
+                    SeedArg::Result(0),
+                    SeedArg::Const(0xc028_5703),
+                    SeedArg::Data(&[0u8; 40]),
+                ],
+            )
+            .unwrap();
+        builder.finish()
+    }
+
+    #[test]
+    fn a_comparison_the_kernel_made_suggests_its_other_operand_where_the_call_had_one() {
+        let program = xfer_program();
+        let decoded = decode(&program);
+        let data = match &decoded.calls[1].args[2].value {
+            ArgValue::Data { bytes, .. } => bytes.clone(),
+            other => panic!("{other:?}"),
+        };
+        let cmd = decoded.calls[1].args[1].span.clone();
+        let mut reply = reply_to(1, &[&[], &[]]);
+        let cmp = |kind, arg1, arg2| KcovComparison {
+            kind,
+            arg1,
+            arg2,
+            pc: MODULES,
+        };
+        // openat compared its flags (2) with 0x40; the ioctl compared its
+        // command with another, and the slot (0) with the bound 4.
+        reply.calls[0].comparisons = vec![cmp(5, 0x40, 2)];
+        reply.calls[1].comparisons =
+            vec![cmp(5, 0x4004_5704, 0xc028_5703), cmp(5, 4, 0), cmp(5, 9, 9)];
+        let hints = hint_programs(&program, &reply, MAX_HINTS);
+        let slot4 = hints
+            .iter()
+            .find(|hint| hint[data.start..data.start + 4] == 4u32.to_le_bytes())
+            .expect("the slot takes the bound");
+        assert_eq!(slot4[..data.start], program[..data.start]);
+        assert_eq!(slot4[data.start + 4..], program[data.start + 4..]);
+        assert!(hints
+            .iter()
+            .any(|hint| hint[cmd.clone()] == 0x4004_5704u64.to_le_bytes()));
+        // openat's comparison changes openat's flags, not the ioctl's words.
+        let flags = decoded.calls[0].args[2].span.clone();
+        let opened = hints
+            .iter()
+            .filter(|hint| hint[flags.clone()] != program[flags.clone()])
+            .collect::<Vec<_>>();
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0][flags.clone()], 0x40u64.to_le_bytes());
+        // Each hint is made once, none is the program itself, a comparison
+        // of equal operands suggests nothing, and the cap holds.
+        let unique: std::collections::HashSet<&Vec<u8>> = hints.iter().collect();
+        assert_eq!(unique.len(), hints.len());
+        assert!(!hints.contains(&program));
+        assert!(hints.iter().all(|hint| hint.len() == program.len()));
+        assert_eq!(hint_programs(&program, &reply, 2).len(), 2);
+        // Both calls get their turn under a small cap.
+        let two = hint_programs(&program, &reply, 2);
+        assert!(two
+            .iter()
+            .any(|hint| hint[flags.clone()] != program[flags.clone()]));
+
+        // The same comparisons as a CmpLog keep only what splices into it.
+        let log = comparison_log(&reply, &program);
+        assert!(log
+            .entries
+            .iter()
+            .any(|entry| entry.operand_a == 4u32.to_le_bytes() && entry.operand_b == [0; 4]));
+        assert!(log
+            .entries
+            .iter()
+            .all(|entry| entry.operand_a != entry.operand_b));
+    }
+
+    #[test]
+    fn mutations_see_each_argument_and_call() {
+        use fuzz_engine_builtin::TypedValueKind;
+        let program = xfer_program();
+        let decoded = decode(&program);
+        let spans = decoded.typed_spans();
+        // 3 consts and a 12-byte path (3 words) in openat; a result, a
+        // const and 40 bytes (10 words) in the ioctl.
+        let integers = spans
+            .iter()
+            .filter(|span| span.kind == TypedValueKind::UnsignedInteger)
+            .count();
+        assert_eq!(integers, 3 + 3 + 1 + 1 + 10);
+        let data = &decoded.calls[1].args[2].span;
+        assert!(spans
+            .iter()
+            .any(|span| span.kind == TypedValueKind::Bytes && span.range == *data));
+        assert!(spans.iter().all(|span| span.valid_for(program.len())));
+        let operations = decoded.operations();
+        assert_eq!(operations.operation_count, SYSCALLS.len() + 1);
+        assert_eq!(operations.steps.len(), 2);
+        assert_eq!(operations.steps[0].range, decoded.calls[0].span);
+        assert_eq!(operations.steps[1].range.end, program.len());
+        assert_eq!(
+            operations.steps[1].op_index_range,
+            decoded.calls[1].span.start..decoded.calls[1].span.start + 1
+        );
+        operations.validate_for_input(&program).unwrap();
     }
 
     // ── The initramfs and the guest's command line ─────────────────────
@@ -2571,5 +3623,167 @@ while True:
         let run = guest.run(&open_then(b"/dev/null\0", 1).finish(), Duration::MAX);
         assert!(matches!(run.end, RunEnd::Stopped(_)), "{:?}", run.end);
         assert_eq!(stub_launches(dir.path()), 2);
+    }
+
+    /// A campaign in `dir/work` against the stand-in in `dir/stub`, with one
+    /// seed and `iterations` runs at most; `None` without python3.
+    #[cfg(unix)]
+    fn stub_campaign(
+        dir: &Path,
+        hello: &Hello,
+        steps: &[&str],
+        console: &str,
+        iterations: usize,
+    ) -> Option<FuzzConfig> {
+        let stub = dir.join("stub");
+        std::fs::create_dir_all(&stub).unwrap();
+        let setup = stub_qemu(&stub, hello, steps, console)?;
+        let work_dir = dir.join("work");
+        // Where `bhf kernel fuzz` builds the guest's files, and its console log goes.
+        std::fs::create_dir_all(work_dir.join("kernel").join("guest")).unwrap();
+        Some(FuzzConfig {
+            dir: work_dir.join("kernel"),
+            setup,
+            iterations,
+            time_budget: None,
+            timeout: Duration::from_secs(5),
+            rng_seed: 7,
+            max_len: 4096,
+        })
+    }
+
+    /// One seed: open /dev/widget.
+    #[cfg(unix)]
+    fn widget_seed(_: &Hello) -> anyhow::Result<SeedSet> {
+        Ok(SeedSet {
+            programs: vec![open_then(b"/dev/widget\0", 2).finish()],
+            ..SeedSet::default()
+        })
+    }
+
+    /// A `--module` the guest did not load leaves the campaign nothing of
+    /// the driver to reach: it stops before it runs a program, and
+    /// fuzz.json keeps the HELLO's notes that say why.
+    #[cfg(unix)]
+    #[test]
+    fn a_module_the_guest_did_not_load_stops_the_campaign_before_it_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut said = hello(true);
+        said.notes = "module 00-broken.ko: not loaded: Exec format error\n\
+                      ready (kcov on, comparisons on)\n"
+            .to_owned();
+        let Some(config) = stub_campaign(dir.path(), &said, &["panic"], "", 8) else {
+            return;
+        };
+        let summary = fuzz(&config, &widget_seed).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(config.dir.join("fuzz.json")).unwrap()).unwrap();
+        assert_eq!(written["executions"], 0, "{written:#}");
+        assert_eq!(
+            written["notes"],
+            serde_json::json!([
+                "module 00-broken.ko: not loaded: Exec format error",
+                "ready (kcov on, comparisons on)"
+            ])
+        );
+        let halted = written["halted"].as_str().unwrap_or_default();
+        assert!(
+            halted.contains("module 00-broken.ko: not loaded: Exec format error"),
+            "{halted}"
+        );
+        assert_eq!(summary.executions, 0);
+        assert_eq!(summary.notes, said.note_lines());
+        assert_eq!(stub_launches(&dir.path().join("stub")), 1);
+    }
+
+    /// The HELLO's notes name each module the executor could not load, in
+    /// the executor's own words.
+    #[test]
+    fn the_hello_notes_name_each_module_the_guest_did_not_load() {
+        let mut said = hello(true);
+        said.notes = "mount debugfs on /sys/kernel/debug: No such device\n\
+                      module 00-broken.ko: not loaded: Exec format error\n\
+                      module 01-widget.ko: loaded\n\
+                      module 02-gone.ko: open: No such file or directory\n\
+                      \n\
+                      kcov: no comparisons (CONFIG_KCOV_ENABLE_COMPARISONS is off)\n"
+            .to_owned();
+        assert_eq!(
+            said.unloaded_modules(),
+            [
+                "module 00-broken.ko: not loaded: Exec format error",
+                "module 02-gone.ko: open: No such file or directory"
+            ]
+        );
+        assert_eq!(said.note_lines().len(), 5);
+        assert_eq!(said.note_lines()[2], "module 01-widget.ko: loaded");
+        assert!(hello(true).unloaded_modules().is_empty());
+    }
+
+    /// The hints queued are remembered by a 16-byte digest, not by their
+    /// bytes, and neither the queue nor the memory grows past its bound.
+    #[test]
+    fn hints_are_queued_once_each_and_their_memory_is_bounded() {
+        let hint = |n: u32| {
+            let mut bytes = vec![0xa5; 4096];
+            bytes[..4].copy_from_slice(&n.to_le_bytes());
+            bytes
+        };
+        let mut queue = HintQueue::new(3, 4);
+        assert!(queue.offer(hint(1)));
+        assert!(!queue.offer(hint(1)), "a hint queued again");
+        assert!(queue.offer(hint(2)));
+        assert!(queue.offer(hint(3)));
+        assert!(!queue.offer(hint(4)), "past the pending bound");
+        assert_eq!(queue.pop(), Some(hint(1)));
+        // Run, it is still remembered: not queued again.
+        assert!(!queue.offer(hint(1)));
+        assert!(queue.offer(hint(5)));
+        assert_eq!(queue.pending(), 3);
+        // The memory holds at most four digests, then starts again.
+        for n in 6..1000 {
+            while queue.pop().is_some() {}
+            queue.offer(hint(n));
+            assert!(queue.remembered() <= 4, "{} remembered", queue.remembered());
+        }
+        assert!(!queue.is_empty());
+    }
+
+    /// The CmpLogs of at most so many programs are kept, the one used
+    /// least recently giving way.
+    #[test]
+    fn the_comparisons_of_the_programs_used_least_recently_give_way() {
+        let log = |site: u64| {
+            let mut log = cmplog::CmpLog::new();
+            log.record(cmplog::CmpEntry {
+                site_id: site,
+                operand_a: vec![1],
+                operand_b: vec![2],
+                kind: cmplog::CmpKind::IntegerCompare,
+            });
+            log
+        };
+        let site = |cache: &mut CmpLogCache, program: &[u8]| {
+            cache.get(program).map(|log| log.entries[0].site_id)
+        };
+        let mut cache = CmpLogCache::new(2);
+        cache.insert(b"a", log(1));
+        cache.insert(b"b", log(2));
+        assert_eq!(site(&mut cache, b"a"), Some(1));
+        // b was used least recently.
+        cache.insert(b"c", log(3));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(site(&mut cache, b"b"), None);
+        assert_eq!(site(&mut cache, b"a"), Some(1));
+        assert_eq!(site(&mut cache, b"c"), Some(3));
+        // Replacing a program's log keeps the others.
+        cache.insert(b"c", log(4));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(site(&mut cache, b"c"), Some(4));
+        assert_eq!(site(&mut cache, b"a"), Some(1));
+        for n in 0..100u32 {
+            cache.insert(&n.to_le_bytes(), log(u64::from(n)));
+        }
+        assert_eq!(cache.len(), 2);
     }
 }

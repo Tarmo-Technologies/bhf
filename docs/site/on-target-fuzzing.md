@@ -61,7 +61,7 @@ binary release.
 | An on-device agent (TCP/serial) | **On-target agent** | Real device; coverage over the agent protocol | ⛔ unproven: the host side ships; no target-side agent does yet ([#289](https://github.com/Tarmo-Technologies/bhf/issues/289)), so you write one to the frame format in §3c |
 | A physical board | **HIL** (hardware-in-the-loop) | Silicon | ⛔ unproven (`BHF_HIL_GDB`) |
 | A Linux driver's source, and syzkaller | **syzkaller descriptions and crash import** (`bhf kernel syzlang`, `bhf kernel import`, §10) | syzkaller runs the kernel and its KCOV coverage; bhf describes the driver's ioctls and triages the crashes | ✅ snapshot of the widget fixture's description, and the import of a crash directory in syz-manager's layout; ⛔ syz-sysgen acceptance and a fresh syz-manager workdir gated (need syzkaller) |
-| A Linux kernel built with KCOV (and KASAN), and qemu-system | **Kernel guest** (`bhf kernel run`, §10) | The real kernel in a qemu-system guest; bhf's executor runs system-call programs and returns each call's KCOV PCs | ✅ the executor's decoder and protocol, on the host; ⛔ the guest itself gated (`BHF_KERNEL_GUEST=1`, a kernel from `scripts/ci/build-kcov-guest-kernel.sh`) |
+| A Linux kernel built with KCOV (and KASAN), and qemu-system | **Kernel guest** (`bhf kernel run`, `bhf kernel fuzz`, §10) | The real kernel in a qemu-system guest; bhf's executor runs system-call programs and returns each call's KCOV PCs or comparisons, which the campaign maps into its coverage map | ✅ the executor's decoder and protocol, on the host, and the edge mapping on recorded replies; ⛔ the guest itself gated (`BHF_KERNEL_GUEST=1`, a kernel from `scripts/ci/build-kcov-guest-kernel.sh`) |
 | Only a firmware image (ELF or flash dump), no source | **Rehosting** (`bhf binary rehost`, §9) | `rehosted, peripheral-modelled`: bhf's own Cortex-M interpreter runs the real instructions; peripheral reads come from per-register models (input-fed, constant, or bit-extract inferred from polling loops) in the windows the part's SVD file gives (or the whole peripheral region); interrupts the firmware enables are raised on a schedule the input chooses | ✅ fixture images in `crates/rehost/tests/fixtures/`: edge coverage that grows with the input, invalid-access, bad-PC and HardFault findings, a parser fed through a peripheral data register, a polled UART's parser bug reached through inferred models, an RX-interrupt handler's bug reached through the interrupt schedule, a read between an SVD's peripherals found as an invalid access (Arm's CMSIS example SVD parsed), `bhf replay` MATCH |
 
 ---
@@ -1192,7 +1192,8 @@ reads the driver's C source and writes the syzkaller description (syzlang) of
 its ioctl interface, and `bhf kernel import` brings the crashes syzkaller
 finds back into `results/` (below). `bhf kernel run` boots the kernel itself
 in a qemu-system guest and runs system-call programs in it with KCOV
-coverage ([below](#kernel-guest)).
+coverage, and `bhf kernel fuzz` fuzzes it with them
+([below](#kernel-guest)).
 
 ```sh
 # The driver's directory and the uapi header that defines its commands:
@@ -1366,6 +1367,72 @@ edges it took (distinct pairs of consecutive PCs).
 Exit status: 0 when every program ran, 1 when the guest stopped or did not
 answer (the console's last lines are printed), or could not boot.
 
+<a id="kernel-guest-fuzz"></a>
+#### Fuzzing it: `bhf kernel fuzz`
+
+```sh
+bhf kernel fuzz --kernel bzImage --module widget.ko \
+  --source drivers/misc/widget include/uapi/linux/widget.h \
+  --work-dir bhf_work --time 1h
+```
+
+The guest boots as for `bhf kernel run` (the same options), and the
+campaign runs in it:
+
+- **Seeds.** With `--source` (the driver's sources and headers, read as
+  `bhf kernel syzlang` reads them), each ioctl command its handlers
+  dispatch on becomes a program that opens its device node (`O_RDWR`) and
+  calls it with a zeroed argument of its size (an out buffer for `_IOR`, a
+  constant 0 for `_IO`), and one more program calls them all. The numbers
+  are computed for the guest's architecture (its `uname -m`), and they and
+  the node's path are mutation tokens. `--device` names the node when the
+  source does not; without `--source`, a program that opens `--device` and
+  reads, writes and calls ioctl on it is the seed. `--seeds DIR` adds the
+  programs in DIR, and a corpus an earlier run left in
+  `<work-dir>/kernel/corpus/` runs again first.
+- **The modules.** bhf prints the executor's setup notes (each module
+  loaded, or why not, and KCOV) and `fuzz.json` keeps them (`notes`). A
+  `--module` the guest did not load (built for another kernel, a vermagic
+  mismatch, a file that is no module) leaves nothing of the driver to
+  reach: the campaign stops before it runs a program, and exits 1.
+- **Coverage.** Each call's KCOV PCs, in order, are the coverage map's
+  breadcrumbs, as a harness's are: a PC is an id (its two 32-bit halves
+  XORed: the kernel's and its modules' upper halves are the same, so ids
+  stay distinct), each id's hits are counted in buckets, and each pair of
+  consecutive ids is an edge. A program that adds to the map joins the
+  corpus (`<work-dir>/kernel/corpus/`).
+- **Comparisons.** When the kernel has `CONFIG_KCOV_ENABLE_COMPARISONS`,
+  each corpus program runs once more with KCOV recording the comparisons
+  its calls made. Wherever a call's argument (a constant's low bytes, or an
+  aligned word of a buffer) holds one operand of a comparison made while
+  that call ran, the program with the other operand there runs next (as
+  syzkaller's hints do; at most 128 per program, the calls taking turns),
+  and the operands are the CmpLog its mutations splice from (at most 4096
+  hints wait, and the CmpLogs of the 256 corpus programs used last are
+  kept, so memory stays bounded as the corpus grows). A driver's
+  bound check (`if (xfer->slot > WIDGET_SLOTS)`) gives the boundary value
+  this way.
+- **Mutation.** bhf's builtin mutator, on the program's bytes, with each
+  constant, result index and out-buffer length as an integer, each buffer as
+  bytes and its first 64 bytes as 4-byte words, and the calls as an
+  operation sequence (swapped, or their selector changed). Every mutated
+  program decodes. `--max-len` (default 4096) caps a program; `--rng-seed`
+  makes the mutations repeat.
+- **A run the guest does not survive.** A kernel report panics the guest;
+  the program, its decoded text, the console and the reason go to
+  `<work-dir>/kernel/crashes/NNNN/`, and the next run boots the guest again.
+- **The budget.** `--iterations` (default 1000; with `--time` alone, none)
+  counts every run, the comparison runs and hints included; `--time` bounds
+  the wall clock.
+
+`<work-dir>/kernel/fuzz.json` (`bhf.kernel-fuzz.v1`) records the guest
+(release, machine, accel, KCOV and comparisons), the seeds and where they
+came from, the executions, comparison runs and hint runs, the coverage once
+the seeds had run and at the end (edges, and PCs with their hit buckets),
+the corpus, the crashes and the boots. Exit status: 0 when the campaign ran
+its budget, 1 when the guest could not boot again or no seed left it
+running.
+
 ---
 
 ## What is and isn't proven
@@ -1426,7 +1493,10 @@ answer (the console's last lines are printed), or could not boot.
 - **The kernel guest (§10):** the executor's program decoder is checked
   against bhf's own on programs and noise, and its protocol against a mock
   executor and against the executor itself over pipes on the host, in every
-  run. Booting a guest needs a KCOV kernel: `kernel_guest_cli` runs with
+  run, and so is the mapping of KCOV PCs into the coverage map, on replies
+  recorded from the guest (`tests/fixtures/kernel_guest/`). Booting a guest
+  needs a KCOV kernel: `kernel_guest_cli` (which also checks that a
+  campaign's coverage grows past its seeds') runs with
   `BHF_KERNEL_GUEST=1` and `BHF_KERNEL_IMAGE` (and `BHF_KERNEL_MODULE` for
   the widget driver), which `scripts/ci/build-kcov-guest-kernel.sh` builds;
   it was run on that kernel under QEMU 8.2.2 with tcg.

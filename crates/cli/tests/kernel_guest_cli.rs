@@ -202,3 +202,60 @@ fn a_module_given_at_boot_serves_its_device() {
     assert_eq!(calls[1]["result"], 0, "{runs:#?}");
     assert_eq!(calls[1]["errno"], 0, "{runs:#?}");
 }
+
+fn widget_source() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/kernel_widget/linux")
+}
+
+fn fuzz(kernel: &Path, module: &Path, work: &Path, iterations: usize) -> Output {
+    bhf()
+        .args(["kernel", "fuzz", "--timeout", "20", "--rng-seed", "7"])
+        .arg("--kernel")
+        .arg(kernel)
+        .arg("--module")
+        .arg(module)
+        .arg("--source")
+        .arg(widget_source())
+        .arg("--work-dir")
+        .arg(work)
+        .args(["--iterations", &iterations.to_string()])
+        .output()
+        .expect("bhf runs")
+}
+
+/// A campaign of a fixed number of programs on the widget driver: the
+/// KCOV coverage grows past the seeds', and the programs that grew it join
+/// the corpus.
+#[test]
+fn coverage_grows_over_a_fixed_number_of_programs() {
+    let Some(kernel) = guest_kernel() else {
+        return;
+    };
+    let Some(module) = widget_module() else {
+        return;
+    };
+    let work = TestDir::new("kernel-guest-fuzz");
+    let output = fuzz(&kernel, &module, &work, 150);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: Value =
+        serde_json::from_slice(&fs::read(work.join("kernel/fuzz.json")).unwrap()).unwrap();
+    assert_eq!(summary["schema"], "bhf.kernel-fuzz.v1");
+    assert_eq!(summary["kcov"], true, "{summary:#}");
+    assert_eq!(summary["executions"], 150, "{summary:#}");
+    // One seed per command the handler dispatches on, and one with all.
+    assert_eq!(summary["seeds"], 7, "{summary:#}");
+    let after_seeds = summary["coverage_after_seeds"]["edges"].as_u64().unwrap();
+    let end = summary["coverage"]["edges"].as_u64().unwrap();
+    assert!(after_seeds > 0, "{summary:#}");
+    assert!(end > after_seeds, "{summary:#}");
+    let corpus_new = summary["corpus_new"].as_u64().unwrap();
+    assert!(corpus_new > 0, "{summary:#}");
+    let kept = fs::read_dir(work.join("kernel/corpus")).unwrap().count() as u64;
+    assert_eq!(kept, summary["corpus"].as_u64().unwrap(), "{summary:#}");
+    assert!(stdout.contains("KCOV edges"), "{stdout}");
+}

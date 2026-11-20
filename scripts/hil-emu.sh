@@ -26,9 +26,10 @@
 #         profile's serial lane
 #   RV-7  the Renode transport (#340): live_renode and the shipped CLI against
 #         the pinned Renode BHF_RENODE names (scripts/ci/install-renode.sh)
-#   RV-8  the kernel guest lane (#350): bhf kernel run against the KCOV/KASAN
-#         guest kernel and widget module BHF_KERNEL_IMAGE and
-#         BHF_KERNEL_MODULE name (scripts/ci/build-kcov-guest-kernel.sh)
+#   RV-8  the kernel guest lane (#350, #378): bhf kernel run and fuzz
+#         against the KCOV/KASAN guest kernel and widget module
+#         BHF_KERNEL_IMAGE and BHF_KERNEL_MODULE name
+#         (scripts/ci/build-kcov-guest-kernel.sh)
 #
 # Unlike the default `cargo test` (which self-skips when the emulator/cross
 # toolchains are absent), this lane first HARD-FAILS if any required tool is

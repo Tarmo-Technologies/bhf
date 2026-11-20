@@ -32,6 +32,18 @@
   and the run JSON gains `interrupts_taken`. `--no-interrupts` keeps the
   old behaviour. With interrupts on, an input buffer takes at most the
   input's first 4096 bytes, as with peripheral input.
+- `bhf kernel fuzz --kernel IMAGE [--module M.ko]... --work-dir DIR` fuzzes
+  a Linux kernel in the qemu-system guest `bhf kernel run` boots (#378):
+  seeds from a driver's ioctl commands (`--source`, numbers for the guest's
+  architecture), `--seeds` or `--device`; each call's KCOV PCs mapped into
+  the builtin engine's coverage map as edges and hit buckets; KCOV
+  comparisons turned into hint programs and a CmpLog; typed and per-call
+  mutations; a run the guest does not survive saved under
+  `kernel/crashes/` and the guest booted again; `kernel/fuzz.json`
+  (`bhf.kernel-fuzz.v1`, with the executor's setup notes, which bhf also
+  prints). A `--module` the guest did not load stops the campaign before
+  it runs a program (exit 1). The executor's protocol gains comparison
+  collection (EXEC flag 2, REPLY flag 4, HELLO flag 4).
 - `bhf kernel run --kernel IMAGE [--module M.ko]... PROGRAM...` boots a
   Linux kernel in a qemu-system guest whose `/init` is bhf's executor
   (`c_runtime/kernel_executor.c`, built statically by bhf) and runs

@@ -20,16 +20,20 @@
  * Messages (all integers little-endian): a header {u32 magic 'BKX1', u32
  * type, u32 length} and `length` payload bytes.
  *
- *   HELLO (1, guest->host): u32 protocol, u32 flags (1: KCOV, 2: /init),
+ *   HELLO (1, guest->host): u32 protocol, u32 flags (1: KCOV, 2: /init,
+ *     4: KCOV comparisons),
  *     u32 cover entries per call, u32 max program bytes, u32 max calls,
  *     u32 data area size, u64 data area address, then three strings (u32
  *     length, bytes): uname machine, uname release, setup notes.
- *   EXEC (2, host->guest): u64 id, u32 flags (1: collect coverage), u32
- *     timeout in ms, u32 program length, the program.
+ *   EXEC (2, host->guest): u64 id, u32 flags (1: collect the PCs, 2:
+ *     collect the comparisons instead), u32 timeout in ms, u32 program
+ *     length, the program.
  *   REPLY (3, guest->host): u64 id, u32 status, u32 detail, u32 calls
- *     decoded, u32 calls run, u32 flags (1: KCOV on, 2: PCs truncated), u32
- *     0, then per call run: u32 index, u32 errno, i64 result, u32 PC count,
- *     u32 flags (1: truncated), u64 PCs.
+ *     decoded, u32 calls run, u32 flags (1: KCOV on, 2: truncated, 4: the
+ *     words are comparisons), u32 0, then per call run: u32 index, u32
+ *     errno, i64 result, u32 word count, u32 flags (1: truncated), and the
+ *     words: the PCs, or for each comparison KCOV's four (type, the two
+ *     operands, PC).
  *
  * Programs (version 1). Every byte string decodes: a call that the input
  * ends inside is dropped, and every selector is taken modulo its range.
@@ -107,6 +111,10 @@
 #define BKX_KCOV_INIT_TRACE _IOR('c', 1, unsigned long)
 #define BKX_KCOV_ENABLE _IO('c', 100)
 #define BKX_KCOV_TRACE_PC 0
+#define BKX_KCOV_TRACE_CMP 1
+
+/* What a program's run collects. */
+enum { BKX_COLLECT_NONE = 0, BKX_COLLECT_PCS = 1, BKX_COLLECT_CMPS = 2 };
 
 enum { BKP_CONST = 0, BKP_DATA = 1, BKP_RESULT = 2, BKP_OUT = 3 };
 
@@ -542,6 +550,8 @@ struct call_record {
 struct results {
 	uint32_t executed;
 	uint32_t truncated;
+	/* What KCOV collected: BKX_COLLECT_*. */
+	uint32_t collected;
 	struct call_record calls[BKP_MAX_CALLS];
 	uint64_t pcs[BKX_MAX_PROGRAM_PCS];
 };
@@ -549,6 +559,9 @@ struct results {
 static struct results *results;
 static uint64_t *cover;
 static int kcov_fd = -1;
+/* A second KCOV handle, for the comparisons. */
+static uint64_t *cmp_cover;
+static int kcov_cmp_fd = -1;
 
 static int denied(long nr)
 {
@@ -612,8 +625,17 @@ static void run_child(const uint8_t *in, const struct bkp_program *prog, int col
 				memcpy(data + arg->value, in + arg->src, arg->len);
 		}
 	}
-	if (collect && kcov_fd >= 0 && ioctl(kcov_fd, BKX_KCOV_ENABLE, BKX_KCOV_TRACE_PC) != 0)
-		collect = 0;
+	uint64_t *area = NULL, per = 1, max_records;
+	if (collect == BKX_COLLECT_CMPS && kcov_cmp_fd >= 0 &&
+	    ioctl(kcov_cmp_fd, BKX_KCOV_ENABLE, BKX_KCOV_TRACE_CMP) == 0) {
+		area = cmp_cover;
+		per = 4;
+	} else if (collect == BKX_COLLECT_PCS && kcov_fd >= 0 &&
+		   ioctl(kcov_fd, BKX_KCOV_ENABLE, BKX_KCOV_TRACE_PC) == 0) {
+		area = cover;
+	}
+	results->collected = area ? (uint32_t)collect : BKX_COLLECT_NONE;
+	max_records = (BKX_COVER_ENTRIES - 1) / per;
 	for (c = 0; c < prog->ncalls; c++) {
 		const struct bkp_call *call = &prog->calls[c];
 		struct call_record *rec = &results->calls[c];
@@ -641,29 +663,31 @@ static void run_child(const uint8_t *in, const struct bkp_program *prog, int col
 			ret = -1;
 			err = EPERM;
 		} else {
-			if (collect)
-				__atomic_store_n(&cover[0], 0, __ATOMIC_RELAXED);
+			if (area)
+				__atomic_store_n(&area[0], 0, __ATOMIC_RELAXED);
 			errno = 0;
 			ret = syscall(nr, a[0], a[1], a[2], a[3], a[4], a[5]);
 			err = ret == -1 ? errno : 0;
-			if (collect)
-				n = __atomic_load_n(&cover[0], __ATOMIC_RELAXED);
+			if (area)
+				n = __atomic_load_n(&area[0], __ATOMIC_RELAXED);
 			/* A process the call forked runs none of what follows. */
 			if (getpid() != self)
 				_exit(0);
 		}
 		res[c] = (uint64_t)ret;
-		if (n >= BKX_COVER_ENTRIES - 1) {
-			n = BKX_COVER_ENTRIES - 1;
+		/* n records of `per` words, the buffer and the program's cap. */
+		if (n >= max_records) {
+			n = max_records;
 			rec->flags |= 1;
 		}
+		n *= per;
 		if (n > BKX_MAX_PROGRAM_PCS - total) {
-			n = BKX_MAX_PROGRAM_PCS - total;
+			n = (BKX_MAX_PROGRAM_PCS - total) / per * per;
 			rec->flags |= 1;
 			results->truncated = 1;
 		}
 		for (k = 0; k < n; k++)
-			results->pcs[total + k] = cover[k + 1];
+			results->pcs[total + k] = area[k + 1];
 		rec->err = (uint32_t)err;
 		rec->ret = ret;
 		rec->npcs = (uint32_t)n;
@@ -687,7 +711,10 @@ static int execute(uint64_t id, uint32_t flags, uint32_t timeout_ms, const uint8
 	static struct bkp_program prog;
 	struct buf reply = {0, 0, 0};
 	uint32_t status = BKX_STATUS_OK, detail = 0, executed, c, at = 0;
-	int collect = (flags & 1) && kcov_fd >= 0, wstatus = 0, ret;
+	int collect = (flags & 2)   ? BKX_COLLECT_CMPS
+		      : (flags & 1) ? BKX_COLLECT_PCS
+				    : BKX_COLLECT_NONE;
+	int wstatus = 0, ret;
 	uint64_t deadline;
 	pid_t pid;
 
@@ -745,7 +772,9 @@ static int execute(uint64_t id, uint32_t flags, uint32_t timeout_ms, const uint8
 	put32(&reply, detail);
 	put32(&reply, prog.ncalls);
 	put32(&reply, executed);
-	put32(&reply, (collect ? 1u : 0u) | (results->truncated ? 2u : 0u));
+	put32(&reply, (results->collected != BKX_COLLECT_NONE ? 1u : 0u) |
+			      (results->truncated ? 2u : 0u) |
+			      (results->collected == BKX_COLLECT_CMPS ? 4u : 0u));
 	put32(&reply, 0);
 	for (c = 0; c < executed; c++) {
 		const struct call_record *rec = &results->calls[c];
@@ -775,7 +804,8 @@ static int send_hello(int is_init)
 	memset(&uts, 0, sizeof(uts));
 	uname(&uts);
 	put32(&hello, BKX_PROTOCOL);
-	put32(&hello, (kcov_fd >= 0 ? 1u : 0u) | (is_init ? 2u : 0u));
+	put32(&hello, (kcov_fd >= 0 ? 1u : 0u) | (is_init ? 2u : 0u) |
+			      (kcov_cmp_fd >= 0 ? 4u : 0u));
 	put32(&hello, BKX_COVER_ENTRIES);
 	put32(&hello, BKP_MAX_PROGRAM);
 	put32(&hello, BKP_MAX_CALLS);
@@ -789,27 +819,52 @@ static int send_hello(int is_init)
 	return ret;
 }
 
-static void open_kcov(void)
+/* Open a KCOV handle with a buffer of BKX_COVER_ENTRIES words: its fd. */
+static int open_kcov_handle(uint64_t **area)
 {
 	int fd = open("/sys/kernel/debug/kcov", O_RDWR | O_CLOEXEC);
 	if (fd < 0) {
 		note("kcov: %s (no KCOV in this kernel, or debugfs is not mounted)", strerror(errno));
-		return;
+		return -1;
 	}
 	if (ioctl(fd, BKX_KCOV_INIT_TRACE, (unsigned long)BKX_COVER_ENTRIES) != 0) {
 		note("kcov: KCOV_INIT_TRACE: %s", strerror(errno));
 		close(fd);
-		return;
+		return -1;
 	}
-	cover = mmap(NULL, BKX_COVER_ENTRIES * sizeof(uint64_t), PROT_READ | PROT_WRITE, MAP_SHARED,
-		     fd, 0);
-	if (cover == MAP_FAILED) {
+	*area = mmap(NULL, BKX_COVER_ENTRIES * sizeof(uint64_t), PROT_READ | PROT_WRITE,
+		     MAP_SHARED, fd, 0);
+	if (*area == MAP_FAILED) {
 		note("kcov: mmap: %s", strerror(errno));
-		cover = NULL;
+		*area = NULL;
 		close(fd);
-		return;
+		return -1;
 	}
-	kcov_fd = fd;
+	return fd;
+}
+
+static void open_kcov(void)
+{
+	pid_t pid;
+	int status = 0;
+	kcov_fd = open_kcov_handle(&cover);
+	if (kcov_fd < 0)
+		return;
+	kcov_cmp_fd = open_kcov_handle(&cmp_cover);
+	if (kcov_cmp_fd < 0)
+		return;
+	/* Comparisons need CONFIG_KCOV_ENABLE_COMPARISONS: try them once. */
+	pid = fork();
+	if (pid == 0)
+		_exit(ioctl(kcov_cmp_fd, BKX_KCOV_ENABLE, BKX_KCOV_TRACE_CMP) == 0 ? 0 : 1);
+	if (pid < 0 || waitpid(pid, &status, 0) != pid || !WIFEXITED(status) ||
+	    WEXITSTATUS(status) != 0) {
+		note("kcov: no comparisons (CONFIG_KCOV_ENABLE_COMPARISONS is off)");
+		munmap(cmp_cover, BKX_COVER_ENTRIES * sizeof(uint64_t));
+		cmp_cover = NULL;
+		close(kcov_cmp_fd);
+		kcov_cmp_fd = -1;
+	}
 }
 
 /* Serve EXEC messages until the channel fails. */
@@ -950,7 +1005,8 @@ int main(int argc, char **argv)
 		}
 		chan_out = chan_in;
 	}
-	note("ready (kcov %s)", kcov_fd >= 0 ? "on" : "off");
+	note("ready (kcov %s, comparisons %s)", kcov_fd >= 0 ? "on" : "off",
+	     kcov_cmp_fd >= 0 ? "on" : "off");
 	i = serve(is_init);
 	if (is_init)
 		power_off();
