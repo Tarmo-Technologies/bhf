@@ -1932,6 +1932,22 @@
   `lab_only` as a `must_panic`. Ranking puts `MustX` below `X` when both are
   in the same file; the Go score breakdown gains `must_wrapper`, and a
   discovery cache from an earlier build is not reused.
+- `bhf project import-ossfuzz --sandbox firejail` builds, and confines the
+  build as bubblewrap does (#443). firejail dropped `$TMPDIR`, so the
+  compilers wrote to the read-only `/tmp` and failed. It also left much of
+  the host open to `build.sh`. A setuid program still raised privileges, so
+  where `sudo` needs no password the build could become root. The home
+  directory, `/dev/shm`, `/var/tmp` and writable mounts under the system
+  directories could be written. Every host file and Unix socket (the Docker
+  socket included), `/sys`, the system log socket `/dev/log`, the X11
+  cookie, this user's SysV shared memory, the sound, video and input
+  devices, and the terminal bhf ran on could be reached. Now no privileges
+  can be gained; every directory of `/` but the system ones is hidden, as
+  are the home and runtime directories, `/sys` and `/dev/log`; the build
+  gets its own `/dev` without those devices, its own IPC namespace and its
+  own session, and X11 is off; and only `$SRC`, `$WORK` and `$OUT` are
+  writable. The import's tests run under both sandboxes, and the nightly
+  installs firejail.
 - A SEGV on a fixed address is taken for a missing device register only when
   the target reads that address as a register: a volatile access that is no
   poison or sentinel value (#437). A fault on a plain pointer constant, such

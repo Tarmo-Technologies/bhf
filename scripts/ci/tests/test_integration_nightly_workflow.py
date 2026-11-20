@@ -417,7 +417,8 @@ class IntegrationNightlyBinaryAnalyzerTests(unittest.TestCase):
 
 class IntegrationNightlyOssfuzzSandboxTests(unittest.TestCase):
     """The OSS-Fuzz import's sandbox tests run nightly under a bubblewrap
-    allowed its namespaces on that job's runner only (#334)."""
+    allowed its namespaces on that job's runner only (#334), and under
+    firejail (#443)."""
 
     def setUp(self) -> None:
         self.job = job_block("ossfuzz-sandbox")
@@ -444,16 +445,40 @@ class IntegrationNightlyOssfuzzSandboxTests(unittest.TestCase):
         source = WORKFLOW.read_text()
         self.assertEqual(source.count("apparmor_restrict_unprivileged_userns=0"), 1)
 
+    def test_it_installs_firejail_and_checks_it_before_the_tests_require_it(self) -> None:
+        install = self.job.index(
+            "sudo apt-get install -y -q --no-install-recommends bubblewrap firejail"
+        )
+        probe = self.job.index("firejail --quiet --noprofile --net=none -- true")
+        tests = self.job.index("-E 'binary(=ossfuzz_import)'")
+        self.assertLess(install, probe)
+        self.assertLess(probe, tests)
+        # BHF_OSSFUZZ_SANDBOX=1 requires both, so neither one's tests skip.
+        tests_source = (ROOT / "crates/cli/tests/ossfuzz_import.rs").read_text()
+        for sandbox in ("bubblewrap", "firejail"):
+            for test in (
+                "build_sh_builds_the_fixture_under_",
+                "build_sh_has_no_network_under_",
+                "build_sh_cannot_write_outside_src_work_and_out_under_",
+                "build_sh_cannot_see_the_hosts_files_under_",
+                "build_sh_cannot_reach_the_host_through_ipc_devices_or_its_terminal_under_",
+            ):
+                self.assertIn(f"fn {test}{sandbox}()", tests_source)
+
     def test_the_hash_shards_may_skip_only_the_sandbox_tests(self) -> None:
         allowed = (ROOT / "scripts/ci/allowed-skips.txt").read_text()
-        self.assertIn(
-            "bhf::ossfuzz_import::build_sh_*  skip build_sh_*: no working bubblewrap or firejail "
-            "here (set BHF_OSSFUZZ_SANDBOX=1 to require one)",
-            allowed,
-        )
+        for sandbox in ("bubblewrap", "firejail"):
+            self.assertIn(
+                f"bhf::ossfuzz_import::build_sh_*  skip build_sh_*: {sandbox} does not work "
+                "here (set BHF_OSSFUZZ_SANDBOX=1 to require it)",
+                allowed,
+            )
+        self.assertNotIn("no working bubblewrap or firejail", allowed)
         tests = (ROOT / "crates/cli/tests/ossfuzz_import.rs").read_text()
         self.assertIn('const SANDBOX_REQUIRED: &str = "BHF_OSSFUZZ_SANDBOX";', tests)
-        self.assertIn("no working bubblewrap or firejail here (set {SANDBOX_REQUIRED}=1", tests)
+        self.assertIn(
+            '"skip {test}: {} does not work here (set {SANDBOX_REQUIRED}=1 to require it)"', tests
+        )
 
 
 class RenodeLaneTests(unittest.TestCase):

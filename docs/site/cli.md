@@ -2629,16 +2629,27 @@ off for the build, as OSS-Fuzz does. `$SRC`, `$WORK` and `$OUT` are emptied
 before each import, and the source tree itself is never written.
 
 **Sandbox.** `build.sh` runs project code, so it runs in bubblewrap (`bwrap`)
-or, without that, firejail, with no network and no writes outside `$SRC`,
-`$WORK` and `$OUT`. Under bubblewrap the build sees the system directories
-(`/usr`, `/etc`, `/opt`, ...) and bhf's engine read-only and the three
-directories read-write, with an empty, read-only `/tmp` and no home
-directory. Under firejail the whole filesystem is read-only except the three
-directories. Before anything is staged, bhf runs the sandbox once with the
-build's mounts; when no sandbox works it refuses the import and says which
-tool is missing or why it failed. An unprivileged `bwrap` on Ubuntu 24.04
-gets no user namespace while `kernel.apparmor_restrict_unprivileged_userns`
-is 1 and no AppArmor profile allows it. `--sandbox bubblewrap` or
+or, without that, firejail. Either way the build has no network and can
+write only to `$SRC`, `$WORK` and `$OUT`. It sees the system directories
+(`/usr`, `/etc`, `/opt`, ...) and bhf's engine read-only, an empty,
+read-only `/tmp`, and none of your other files: no home directory, no
+`/run`, `/var` or `/sys`, and so no Unix socket such as the Docker socket or
+the session bus. It also gets its own `/dev`, with `null`, `zero`, `random`,
+`tty` and the like but no sound, video, GPU, input or disc device and no
+`/dev/log`; its own IPC namespace, so none of your shared memory; and its
+own session, so it cannot open the terminal you run bhf from. It cannot
+gain privileges either: a setuid program such as `sudo` does not raise
+them. bubblewrap builds this view up from an empty root. firejail starts
+from the host's filesystem instead, so bhf hides every other directory of
+`/`, the home directory and `/run/user/<uid>` behind empty mounts, and turns
+off firejail's X11 support, which would otherwise copy your `~/.Xauthority`
+into the sandbox.
+
+Before anything is staged, bhf runs the sandbox once with the build's
+mounts; when no sandbox works it refuses the import and says which tool is
+missing or why it failed. An unprivileged `bwrap` on Ubuntu 24.04 gets no
+user namespace while `kernel.apparmor_restrict_unprivileged_userns` is 1
+and no AppArmor profile allows it. `--sandbox bubblewrap` or
 `--sandbox firejail` picks one, `--sandbox-tool` names its executable, and
 `--sandbox none` runs `build.sh` directly, with your network and file
 access.
