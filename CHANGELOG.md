@@ -32,6 +32,15 @@
   and the run JSON gains `interrupts_taken`. `--no-interrupts` keeps the
   old behaviour. With interrupts on, an input buffer takes at most the
   input's first 4096 bytes, as with peripheral input.
+- `bhf kernel run --kernel IMAGE [--module M.ko]... PROGRAM...` boots a
+  Linux kernel in a qemu-system guest whose `/init` is bhf's executor
+  (`c_runtime/kernel_executor.c`, built statically by bhf) and runs
+  system-call programs in it (#350): the executor loads the modules, opens
+  KCOV, runs each program in a child and returns each call's result and the
+  kernel PCs it took over a virtio-serial port; `--json` prints the calls and
+  the KCOV edges; `--boot-timeout` and `--timeout` take 1 to 86400 seconds.
+  `scripts/ci/build-kcov-guest-kernel.sh` builds a KCOV and
+  KASAN guest kernel and the widget driver fixture's module.
 - `bhf kernel import CRASHES... --work-dir DIR [--source-root DIR]` turns
   syzkaller crash directories (or a syz-manager workdir) into findings
   under `results/findings/F-KERNEL-*` (#349): the crash class, rule and CWE

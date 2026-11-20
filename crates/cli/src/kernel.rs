@@ -15,6 +15,11 @@
 //! directory syz-manager wrote (its title, report, console log and
 //! reproducers) becomes a finding in `<work>/results/`, with its crash class,
 //! rule, CWE, stack and reproducer (`results::import_syzkaller`).
+//!
+//! `bhf kernel run` boots the kernel itself, in a qemu-system guest whose
+//! `/init` is bhf's executor (`c_runtime/kernel_executor.c`), and runs
+//! system-call programs in it: each call's result and the KCOV edges it
+//! took come back over a virtio-serial port (`crate::kernel_guest`).
 
 use anyhow::{bail, Context, Result};
 use c_parser::{CDispatchFunction, CIoctlFacts, CRecordDef, CValue};
@@ -62,6 +67,84 @@ enum KernelCommand {
     /// test machine (`lost connection to test machine`) is skipped. Exit 0
     /// when at least one crash was imported, 1 otherwise.
     Import(ImportArgs),
+    /// Boot a Linux kernel in a qemu-system guest with bhf's executor as its /init, run system-call programs in it, and print each call's result and the KCOV edges it took
+    ///
+    /// The guest boots `--kernel` (built with CONFIG_KCOV and
+    /// CONFIG_DEBUG_FS, and CONFIG_KASAN for memory-safety reports) with an
+    /// initramfs bhf builds: the executor, compiled from
+    /// c_runtime/kernel_executor.c with `--cc` and linked statically, as
+    /// /init, and each `--module`, which it loads at boot. The executor
+    /// talks to bhf over a virtio-serial port; each PROGRAM (the executor's
+    /// program format: a finding's testcase.bin, a `bhf kernel fuzz` corpus
+    /// file) runs in a child process with KCOV on. The kernel boots with
+    /// `nokaslr panic_on_warn=1 oops=panic panic=-1`, so a kernel report
+    /// stops the guest. Exit 0 when every program ran, 1 when the guest
+    /// stopped or did not answer, or could not boot.
+    Run(RunArgs),
+}
+
+/// A wait for the guest, in seconds: 1 to a day.
+fn guest_wait() -> clap::builder::RangedU64ValueParser {
+    clap::value_parser!(u64).range(1..=crate::kernel_guest::MAX_WAIT_SECS)
+}
+
+/// How the guest kernel boots: the options `bhf kernel run` and `fuzz`
+/// share.
+#[derive(Debug, Clone, clap::Args)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub struct GuestArgs {
+    /// The guest kernel image (a bzImage), built with CONFIG_KCOV and CONFIG_DEBUG_FS, and CONFIG_KASAN for memory-safety reports
+    #[arg(long, value_name = "PATH")]
+    kernel: PathBuf,
+    /// A kernel module (.ko) the guest loads at boot, before the executor serves; repeat for more, loaded in order
+    #[arg(long = "module", value_name = "PATH")]
+    modules: Vec<PathBuf>,
+    /// The qemu-system binary
+    #[arg(long, value_name = "PATH", default_value = "qemu-system-x86_64")]
+    qemu: PathBuf,
+    /// How QEMU runs the guest: kvm when /dev/kvm is usable (auto), else tcg
+    #[arg(long, value_enum, default_value = "auto")]
+    accel: crate::kernel_guest::Accel,
+    /// Guest memory in MiB
+    #[arg(long, value_name = "MIB", default_value_t = 1024)]
+    memory: u32,
+    /// Guest CPUs
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    smp: u32,
+    /// Kernel command-line arguments added after bhf's own (console=ttyS0 nokaslr panic_on_warn=1 oops=panic panic=-1 rcupdate.rcu_cpu_stall_timeout=100)
+    #[arg(long, value_name = "ARGS")]
+    append: Option<String>,
+    /// An extra qemu argument (repeat for more), such as `-machine virt` for another architecture's qemu
+    #[arg(long = "qemu-arg", value_name = "ARG", allow_hyphen_values = true)]
+    qemu_args: Vec<String>,
+    /// The C compiler that builds the executor for the guest; it links statically
+    #[arg(long, value_name = "CC", default_value = "cc")]
+    cc: String,
+    /// A prebuilt executor (c_runtime/kernel_executor.c, linked statically for the guest) in place of building one
+    #[arg(long, value_name = "PATH")]
+    executor: Option<PathBuf>,
+    /// Seconds the guest has to boot and its executor to connect (at most 86400)
+    #[arg(long, value_name = "SECS", default_value_t = 300, value_parser = guest_wait())]
+    boot_timeout: u64,
+    /// Seconds one program may run before the executor kills it (at most 86400)
+    #[arg(long, value_name = "SECS", default_value_t = 10, value_parser = guest_wait())]
+    timeout: u64,
+}
+
+#[derive(Debug, clap::Args)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub struct RunArgs {
+    #[command(flatten)]
+    guest: GuestArgs,
+    /// Programs to run, in the executor's format
+    #[arg(required = true, value_name = "PROGRAM")]
+    programs: Vec<PathBuf>,
+    /// Directory for the executor, the initramfs and the console log (default: a temporary directory, removed after)
+    #[arg(long, value_name = "DIR")]
+    work_dir: Option<PathBuf>,
+    /// Print one JSON object per program
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -102,6 +185,7 @@ pub fn run(args: KernelArgs) -> i32 {
                 1
             }
         },
+        KernelCommand::Run(args) => run_programs(&args),
         // A findings producer: results/ gets its manifest record and rebuild.
         KernelCommand::Import(args) => crate::with_results(
             &args.work_dir,
@@ -111,6 +195,264 @@ pub fn run(args: KernelArgs) -> i32 {
             || import(&args),
         ),
     }
+}
+
+#[cfg(not(unix))]
+fn run_programs(_args: &RunArgs) -> i32 {
+    bhfeprintln!("bhf kernel run: the guest lane needs a Linux or other Unix host");
+    1
+}
+
+#[cfg(unix)]
+impl GuestArgs {
+    /// The guest's setup, its executor and initramfs built in `dir`.
+    fn setup(&self, dir: &Path) -> Result<crate::kernel_guest::GuestSetup> {
+        use crate::kernel_guest as guest;
+        fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        let executor = match &self.executor {
+            Some(path) => {
+                anyhow::ensure!(
+                    path.is_file(),
+                    "--executor {} is not a file",
+                    path.display()
+                );
+                path.clone()
+            }
+            None => guest::build_executor(&self.cc, dir)?,
+        };
+        let initrd = dir.join("initramfs.cpio");
+        guest::build_initramfs(&executor, &self.modules, &initrd)?;
+        Ok(guest::GuestSetup {
+            qemu: self.qemu.clone(),
+            kernel: self.kernel.clone(),
+            initrd,
+            memory_mb: self.memory,
+            smp: self.smp.max(1),
+            accel: self.accel,
+            append: self.append.clone(),
+            qemu_args: self.qemu_args.clone(),
+            boot_timeout: std::time::Duration::from_secs(self.boot_timeout.max(1)),
+        })
+    }
+
+    fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.timeout.max(1))
+    }
+}
+
+/// The name of a Linux errno, for the call results bhf prints.
+#[cfg(unix)]
+fn errno_name(errno: u32) -> String {
+    const NAMES: &[(u32, &str)] = &[
+        (1, "EPERM"),
+        (2, "ENOENT"),
+        (3, "ESRCH"),
+        (4, "EINTR"),
+        (5, "EIO"),
+        (6, "ENXIO"),
+        (7, "E2BIG"),
+        (9, "EBADF"),
+        (11, "EAGAIN"),
+        (12, "ENOMEM"),
+        (13, "EACCES"),
+        (14, "EFAULT"),
+        (16, "EBUSY"),
+        (17, "EEXIST"),
+        (19, "ENODEV"),
+        (20, "ENOTDIR"),
+        (21, "EISDIR"),
+        (22, "EINVAL"),
+        (24, "EMFILE"),
+        (25, "ENOTTY"),
+        (28, "ENOSPC"),
+        (29, "ESPIPE"),
+        (34, "ERANGE"),
+        (38, "ENOSYS"),
+        (95, "EOPNOTSUPP"),
+    ];
+    NAMES
+        .iter()
+        .find(|(number, _)| *number == errno)
+        .map(|(_, name)| (*name).to_owned())
+        .unwrap_or_else(|| format!("errno {errno}"))
+}
+
+/// Read a program file: at most what the executor takes.
+#[cfg(unix)]
+fn read_program(path: &Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .with_context(|| format!("open {}", path.display()))?
+        .take(crate::kernel_guest::MAX_PROGRAM as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read {}", path.display()))?;
+    anyhow::ensure!(
+        bytes.len() <= crate::kernel_guest::MAX_PROGRAM,
+        "{} is larger than a program the executor takes ({} bytes)",
+        path.display(),
+        crate::kernel_guest::MAX_PROGRAM
+    );
+    Ok(bytes)
+}
+
+/// The calls of `program` with the results `reply` gives them, one line
+/// each.
+#[cfg(unix)]
+fn call_lines(program: &[u8], reply: &crate::kernel_guest::ExecReply) -> Vec<String> {
+    let decoded = crate::kernel_guest::decode(program);
+    let text = decoded.text();
+    text.lines()
+        .enumerate()
+        .map(|(index, line)| match reply.calls.get(index) {
+            Some(call) if call.errno != 0 => format!(
+                "{line} = -1 {}  [{} PCs]",
+                errno_name(call.errno),
+                call.pcs.len()
+            ),
+            Some(call) => format!("{line} = {:#x}  [{} PCs]", call.ret, call.pcs.len()),
+            None => format!("{line}  (not run)"),
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn run_programs(args: &RunArgs) -> i32 {
+    match run_programs_inner(args) {
+        Ok(code) => code,
+        Err(error) => {
+            bhfeprintln!("bhf kernel run: {error:#}");
+            1
+        }
+    }
+}
+
+#[cfg(unix)]
+fn run_programs_inner(args: &RunArgs) -> Result<i32> {
+    use crate::kernel_guest::{Guest, RunEnd};
+    let programs = args
+        .programs
+        .iter()
+        .map(|path| Ok((path, read_program(path)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let temp;
+    let dir = match &args.work_dir {
+        Some(dir) => dir.join("kernel").join("guest"),
+        None => {
+            temp = tempfile::Builder::new()
+                .prefix("bhf-kernel-run-")
+                .tempdir()
+                .context("create a temporary directory")?;
+            temp.path().to_path_buf()
+        }
+    };
+    let setup = args.guest.setup(&dir)?;
+    let console_log = dir.join("console.log");
+    let mut guest = Guest::boot(&setup, Some(&console_log))?;
+    let hello = guest.hello().clone();
+    if !args.json {
+        println!(
+            "guest: Linux {} {}, {}, KCOV {}",
+            hello.release,
+            hello.machine,
+            guest.accel().as_str(),
+            if hello.kcov { "on" } else { "off" }
+        );
+        for note in hello.notes.lines().filter(|line| !line.trim().is_empty()) {
+            println!("  {note}");
+        }
+    }
+    let mut code = 0;
+    for (path, program) in &programs {
+        let run = guest.run(program, args.guest.timeout());
+        match &run.end {
+            RunEnd::Replied(reply) => {
+                if args.json {
+                    let calls: Vec<serde_json::Value> = reply
+                        .calls
+                        .iter()
+                        .zip(crate::kernel_guest::decode(program).calls.iter())
+                        .map(|(result, call)| {
+                            serde_json::json!({
+                                "call": call.sys.name(),
+                                "result": result.ret,
+                                "errno": result.errno,
+                                "pcs": result.pcs.len(),
+                                "truncated": result.truncated,
+                            })
+                        })
+                        .collect();
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "program": path.display().to_string(),
+                            "status": reply.status.describe(),
+                            "decoded": reply.decoded,
+                            "calls": calls,
+                            "kcov": reply.kcov,
+                            "pcs": reply.calls.iter().map(|call| call.pcs.len()).sum::<usize>(),
+                            "edges": reply.edges(),
+                            "elapsed_ms": run.elapsed.as_millis() as u64,
+                        })
+                    );
+                } else {
+                    println!(
+                        "{}: {} of {} calls ran ({}), {} KCOV edges",
+                        path.display(),
+                        reply.calls.len(),
+                        reply.decoded,
+                        reply.status.describe(),
+                        reply.edges()
+                    );
+                    for line in call_lines(program, reply) {
+                        println!("  {line}");
+                    }
+                }
+            }
+            RunEnd::Stopped(_) | RunEnd::NoReply if args.json => {
+                let reason = match &run.end {
+                    RunEnd::Stopped(reason) => reason.clone(),
+                    _ => "no reply".to_owned(),
+                };
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "program": path.display().to_string(),
+                        "status": "stopped",
+                        "reason": reason,
+                        "console": run.console,
+                    })
+                );
+                code = 1;
+                break;
+            }
+            end => {
+                let reason = match end {
+                    RunEnd::Stopped(reason) => reason.clone(),
+                    _ => format!(
+                        "no reply within {}s",
+                        crate::kernel_guest::reply_wait(args.guest.timeout()).as_secs()
+                    ),
+                };
+                println!("{}: the guest stopped: {reason}", path.display());
+                let lines: Vec<&str> = run.console.lines().collect();
+                for line in &lines[lines.len().saturating_sub(40)..] {
+                    println!("  | {line}");
+                }
+                code = 1;
+                break;
+            }
+        }
+    }
+    if !args.json {
+        if let Some(dir) = &args.work_dir {
+            println!(
+                "console log: {}",
+                dir.join("kernel/guest/console.log").display()
+            );
+        }
+    }
+    Ok(code)
 }
 
 fn import(args: &ImportArgs) -> i32 {
@@ -3191,5 +3533,35 @@ mod tests {
         assert_eq!(device_path("widget"), "/dev/widget");
         assert_eq!(device_path("widget%d"), "/dev/widget#");
         assert_eq!(device_path("widget/ctl%lu"), "/dev/widget/ctl#");
+    }
+
+    /// The guest's waits are seconds a u64 holds: one longer than a day is
+    /// refused when the command line is read, not left to overflow a
+    /// deadline.
+    #[test]
+    fn a_guest_wait_longer_than_a_day_is_refused() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            run: RunArgs,
+        }
+        let parse = |flag: &str, secs: &str| {
+            <Cli as clap::Parser>::try_parse_from([
+                "bhf", "--kernel", "bzImage", flag, secs, "prog.bin",
+            ])
+        };
+        for flag in ["--boot-timeout", "--timeout"] {
+            let error = match parse(flag, "18446744073709551615") {
+                Ok(_) => panic!("{flag} 18446744073709551615 was accepted"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("1..=86400"), "{flag}: {error}");
+            assert!(parse(flag, "86400").is_ok(), "{flag} 86400");
+        }
+        let cli = parse("--timeout", "86400").unwrap();
+        assert_eq!(
+            (cli.run.guest.boot_timeout, cli.run.guest.timeout),
+            (300, 86400)
+        );
     }
 }

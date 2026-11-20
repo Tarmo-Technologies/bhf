@@ -115,3 +115,4 @@ static struct miscdevice widget_misc = {
 module_misc_device(widget_misc);
 
 MODULE_DESCRIPTION("widget misc device");
+MODULE_LICENSE("Apache-2.0");

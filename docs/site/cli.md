@@ -14,7 +14,7 @@ checks.
 | Build and instrumentation support | `stub`, `instrument`, `fake-corba` |
 | Corpus and crash triage | `corpus`, `minimize`, `replay`, `capsule`, `verify-poc`, `env-capsule`, `differential`, `relational`, `cmplog`, `explain`, `cartography`, `decode-args` |
 | Source-unavailable binaries | `binary` (`scan`, `adapter`, `fuzz`, `rehost`) |
-| Linux kernel drivers (syzkaller) | `kernel` (`syzlang`, `import`); see [On-Target & Embedded §10](../on-target-fuzzing/#10-linux-kernel-drivers-syzkaller-descriptions) |
+| Linux kernel drivers (syzkaller, a qemu-system guest) | `kernel` (`syzlang`, `import`, `run`); see [On-Target & Embedded §10](../on-target-fuzzing/#10-linux-kernel-drivers-syzkaller-descriptions) |
 | External project profiles | `project` (`validate`, `list`, `run`) |
 | Out-of-process extensions | `extension` (`validate`, `evaluate`), and `fuzz --extension` |
 | Static and supply chain | `static-scan`, `sloc`, `sbom`, `license-audit`, `extract-state-machines` |

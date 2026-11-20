@@ -459,6 +459,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "c_runtime/kernel_executor.c",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "c_runtime/zephyr/bhf_agent_zephyr.c",
       "license": "Apache-2.0"
     },
@@ -1935,6 +1939,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/kernel_guest.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/launch_spec.rs",
       "license": "Apache-2.0"
     },
@@ -3244,6 +3252,10 @@
     },
     {
       "path": "crates/cli/tests/java_driver_noise.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/kernel_guest_cli.rs",
       "license": "Apache-2.0"
     },
     {

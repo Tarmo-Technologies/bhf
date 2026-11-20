@@ -61,6 +61,7 @@ binary release.
 | An on-device agent (TCP/serial) | **On-target agent** | Real device; coverage over the agent protocol | ⛔ unproven: the host side ships; no target-side agent does yet ([#289](https://github.com/Tarmo-Technologies/bhf/issues/289)), so you write one to the frame format in §3c |
 | A physical board | **HIL** (hardware-in-the-loop) | Silicon | ⛔ unproven (`BHF_HIL_GDB`) |
 | A Linux driver's source, and syzkaller | **syzkaller descriptions and crash import** (`bhf kernel syzlang`, `bhf kernel import`, §10) | syzkaller runs the kernel and its KCOV coverage; bhf describes the driver's ioctls and triages the crashes | ✅ snapshot of the widget fixture's description, and the import of a crash directory in syz-manager's layout; ⛔ syz-sysgen acceptance and a fresh syz-manager workdir gated (need syzkaller) |
+| A Linux kernel built with KCOV (and KASAN), and qemu-system | **Kernel guest** (`bhf kernel run`, §10) | The real kernel in a qemu-system guest; bhf's executor runs system-call programs and returns each call's KCOV PCs | ✅ the executor's decoder and protocol, on the host; ⛔ the guest itself gated (`BHF_KERNEL_GUEST=1`, a kernel from `scripts/ci/build-kcov-guest-kernel.sh`) |
 | Only a firmware image (ELF or flash dump), no source | **Rehosting** (`bhf binary rehost`, §9) | `rehosted, peripheral-modelled`: bhf's own Cortex-M interpreter runs the real instructions; peripheral reads come from per-register models (input-fed, constant, or bit-extract inferred from polling loops) in the windows the part's SVD file gives (or the whole peripheral region); interrupts the firmware enables are raised on a schedule the input chooses | ✅ fixture images in `crates/rehost/tests/fixtures/`: edge coverage that grows with the input, invalid-access, bad-PC and HardFault findings, a parser fed through a peripheral data register, a polled UART's parser bug reached through inferred models, an RX-interrupt handler's bug reached through the interrupt schedule, a read between an SVD's peripherals found as an invalid access (Arm's CMSIS example SVD parsed), `bhf replay` MATCH |
 
 ---
@@ -1186,10 +1187,12 @@ them.
 ## 10. Linux kernel drivers: syzkaller descriptions
 
 A Linux driver's bugs are in the kernel, which a user-space harness never
-runs. bhf does not fuzz the kernel itself; it gives syzkaller what it needs
-to: `bhf kernel syzlang` reads the driver's C source and writes the syzkaller
-description (syzlang) of its ioctl interface, and `bhf kernel import` brings
-the crashes syzkaller finds back into `results/` (below).
+runs. bhf gives syzkaller what it needs to fuzz one: `bhf kernel syzlang`
+reads the driver's C source and writes the syzkaller description (syzlang) of
+its ioctl interface, and `bhf kernel import` brings the crashes syzkaller
+finds back into `results/` (below). `bhf kernel run` boots the kernel itself
+in a qemu-system guest and runs system-call programs in it with KCOV
+coverage ([below](#kernel-guest)).
 
 ```sh
 # The driver's directory and the uapi header that defines its commands:
@@ -1308,6 +1311,61 @@ syz-repro found since is added). A crash of syzkaller's own test machine
 (`lost connection to test machine`, `SYZFAIL`) is skipped and listed. Exit
 status: 0 when at least one crash was imported, 1 otherwise.
 
+<a id="kernel-guest"></a>
+### A kernel in a qemu-system guest: `bhf kernel run`
+
+```sh
+# A kernel built with KCOV, debugfs and KASAN, and the driver as a module:
+bhf kernel run --kernel bzImage --module widget.ko program.bin
+```
+
+bhf boots `--kernel` under qemu-system with an initramfs it builds: its
+executor (`c_runtime/kernel_executor.c`, compiled with `--cc`, default `cc`,
+and linked statically; `--executor` takes a prebuilt one) as `/init`, and
+each `--module`, which the executor loads at boot in the order given. The
+executor mounts `/dev`, `/proc`, `/sys` and debugfs, opens
+`/sys/kernel/debug/kcov`, and serves bhf over a virtio-serial port
+(`org.bhf.executor`) that QEMU connects to a Unix socket. Each program runs in
+a forked child with KCOV on; the reply carries each call's result and errno
+and the kernel PCs KCOV recorded while it ran, at most 256 Ki per call and
+512 Ki per program. `--json` prints one object per program, with the KCOV
+edges it took (distinct pairs of consecutive PCs).
+
+- **The kernel.** `CONFIG_KCOV` and `CONFIG_DEBUG_FS` for coverage
+  (without them the programs run, and the HELLO's notes say why there is no
+  coverage), `CONFIG_DEVTMPFS` and `CONFIG_VIRTIO_CONSOLE` for the executor,
+  and `CONFIG_KASAN` for memory-safety reports.
+  `scripts/ci/build-kcov-guest-kernel.sh OUT` builds one: a pinned
+  kernel.org release (6.12), x86_64 defconfig and `kvm_guest.config` with
+  those options and DWARF debug info, and the widget driver fixture as
+  `widget.ko`.
+- **The command line.** `console=ttyS0 nokaslr panic_on_warn=1 oops=panic
+  panic=-1 rcupdate.rcu_cpu_stall_timeout=100`, then `--append`: the PCs do
+  not move between boots, and the first kernel report panics the guest,
+  which QEMU (`-no-reboot`) then leaves.
+- **The guest.** `--qemu` (default `qemu-system-x86_64`), `--accel` (kvm
+  when `/dev/kvm` can be opened, else tcg), `--memory` (MiB, default 1024),
+  `--smp` (default 1), and `--qemu-arg` for anything else (another
+  architecture's machine, with its `--append console=` and an `--executor`
+  built for it). `--boot-timeout` (default 300 s) bounds the boot,
+  `--timeout` (default 10 s) each program (each at most 86400 s): the
+  executor kills a program that outlasts it, and bhf waits twice as long,
+  and 10 s more, for the reply.
+- **Programs.** A program is a list of calls, each a selector byte, an
+  argument count and the arguments: a constant, bytes copied into the data
+  area (1 MiB at `0x20000000`; the argument is their address), zeroed bytes
+  there for the kernel to fill, or the result of an earlier call (a file
+  descriptor). The selector names openat, close, read, write, ioctl, mmap,
+  munmap, pread64, pwrite64, lseek, fcntl or dup, or a raw call by number.
+  Every byte string decodes to a program, so a mutated one is one too. A
+  raw call that would reboot the guest, load or unload modules, change
+  mounts, silence the console, signal or trace other processes, or reach I/O
+  ports is not made and fails with EPERM. The format is described in full
+  atop `c_runtime/kernel_executor.c`.
+
+Exit status: 0 when every program ran, 1 when the guest stopped or did not
+answer (the console's last lines are printed), or could not boot.
+
 ---
 
 ## What is and isn't proven
@@ -1360,12 +1418,18 @@ status: 0 when at least one crash was imported, 1 otherwise.
   numbers the kernel defines (`FS_IOC_GETFLAGS`, `KVM_CREATE_VM`). That syz-sysgen
   accepts it is checked by `kernel_syzlang_cli`'s gated test, which needs a
   syzkaller checkout (`BHF_SYZKALLER_CLI=1`, `BHF_SYZKALLER=<checkout>`); no
-  CI job installs syzkaller. bhf runs no kernel and collects no KCOV
-  coverage: syzkaller does both. `bhf kernel import` is tested on a crash
+  CI job installs syzkaller. `bhf kernel import` is tested on a crash
   directory written in syz-manager's layout for the fixture's planted bug
   (`tests/fixtures/kernel_widget/crashes/`); `kernel_import_cli`'s gated
   test imports a real syz-manager workdir (`BHF_SYZKALLER_CLI=1`,
   `BHF_SYZKALLER_WORKDIR=<workdir>`).
+- **The kernel guest (§10):** the executor's program decoder is checked
+  against bhf's own on programs and noise, and its protocol against a mock
+  executor and against the executor itself over pipes on the host, in every
+  run. Booting a guest needs a KCOV kernel: `kernel_guest_cli` runs with
+  `BHF_KERNEL_GUEST=1` and `BHF_KERNEL_IMAGE` (and `BHF_KERNEL_MODULE` for
+  the widget driver), which `scripts/ci/build-kcov-guest-kernel.sh` builds;
+  it was run on that kernel under QEMU 8.2.2 with tcg.
 - **Not available yet:** typed mutation of a raw struct image in a big-endian
   target's byte order (decoded arguments are typed, little-endian as the
   decoder reads them; §5).
