@@ -1948,6 +1948,17 @@
   own session, and X11 is off; and only `$SRC`, `$WORK` and `$OUT` are
   writable. The import's tests run under both sandboxes, and the nightly
   installs firejail.
+- A Rust harness whose target's dependencies instantiate core or alloc
+  generics links (#409). With SanitizerCoverage's trace-pc-guard and ASan
+  both on, the ThinLTO rustc runs across a crate's codegen units at
+  `opt-level = 1` left such instances (core's sort for a dependency's own
+  type) local to one unit while another called them, so the staticlib
+  failed to link with undefined symbols. The Rust lane, its `build-afl.sh`
+  and a capsule's rebuild add `-Clto=off` to their `RUSTFLAGS`, and the
+  capsule manifest records them in `build_recipe.rustflags`. The
+  measurements, and a rerun of meilisearch's 26 heed codec targets in which
+  none fails at the link, are in
+  `docs/validation/2026-11-20-rust-generic-link.md`.
 - A SEGV on a fixed address is taken for a missing device register only when
   the target reads that address as a register: a volatile access that is no
   poison or sentinel value (#437). A fault on a plain pointer constant, such

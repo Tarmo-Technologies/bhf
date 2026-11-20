@@ -126,9 +126,14 @@ Rust harnesses are instrumented by the compiler, not by source rewriting. The
 target crate and harness are built as a `staticlib` with `cargo +nightly`,
 under `RUSTFLAGS` that arm SanitizerCoverage (`-Cpasses=sancov-module`,
 `-Cllvm-args=-sanitizer-coverage-trace-pc-guard`,
-`-Cllvm-args=-sanitizer-coverage-trace-compares`) and ASan
-(`-Zsanitizer=address`). The resulting `.a` is linked with `clang` against
-the shared C fork-server driver, which is compiled with the matching
+`-Cllvm-args=-sanitizer-coverage-trace-compares`), ASan
+(`-Zsanitizer=address`) and `-Clto=off`. The harness crate builds at
+`opt-level = 1`, where rustc otherwise runs ThinLTO across each crate's codegen
+units; with trace-pc-guard and ASan both on, that pass can leave a
+dependency's generic instances (core's sort for the dependency's own types, for
+example) undefined when the staticlib is linked, so bhf turns it off. The
+resulting `.a` is linked with `clang` against the shared C fork-server driver,
+which is compiled with the matching
 `-fsanitize=address -fsanitize-coverage=trace-pc-guard,trace-cmp` and carries
 the same SanitizerCoverage runtime as the C/C++ lane. A Rust harness
 therefore has the same coverage-feedback channels as a C/C++ one, and feeds

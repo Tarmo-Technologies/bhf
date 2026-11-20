@@ -56,7 +56,8 @@ A decoder in meilisearch's `meilitool` crate, whose dependency graph is
 smaller, built and fuzzed. Each milli harness compiles the crate's ~400
 dependencies under ASan from scratch, so a full meilisearch rerun exceeds
 the sweep's 1,800 s per-project cap. Recording the codecs' outcomes is part
-of #409.
+of #409: [2026-11-20](2026-11-20-rust-generic-link.md) has the link fix and
+a rerun of all 26 codec targets.
 
 ## Rust-1
 

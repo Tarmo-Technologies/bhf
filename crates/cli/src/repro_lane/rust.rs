@@ -45,11 +45,6 @@ const RUST_TOOLS: &[Toolchain] = &[
 const WINDOWS_ASAN_OPTIONS: &str =
     "const char *__asan_default_options(void) { return \"windows_hook_rtl_allocators=1\"; }";
 
-/// The flags bhf builds the harness crate with (`rust_build::sancov_rustflags`).
-const RUSTFLAGS: &str = "-Cpasses=sancov-module -Cllvm-args=-sanitizer-coverage-level=4 \
-                         -Cllvm-args=-sanitizer-coverage-trace-pc-guard \
-                         -Cllvm-args=-sanitizer-coverage-trace-compares -Zsanitizer=address";
-
 impl Lane for RustLane {
     fn tag(&self) -> &'static str {
         "rust"
@@ -169,6 +164,8 @@ impl Lane for RustLane {
         script.push_str(&relocate::resolve_tool("TOOL_CARGO", &RUST_TOOLS[0]));
         script.push_str(&relocate::resolve_tool("TOOL_CC", &RUST_TOOLS[1]));
         script.push_str(&relocator.render_script(&relocated));
+        // The flags bhf built the harness crate with.
+        let rustflags = crate::auto::rust_build::sancov_rustflags();
         // An MSVC host (#326) builds the staticlib with the static CRT clang
         // links an ASan program with, names it `bhf_rust_harness.lib`, and
         // links it with Windows' system libraries and the ASan default that
@@ -178,7 +175,7 @@ impl Lane for RustLane {
         script.push_str(&format!(
             "CHANNEL=\"+${{BHF_RUST_NIGHTLY:-nightly}}\"\n\
              HOST=$(\"$TOOL_CARGO\" \"$CHANNEL\" -vV | sed -n 's/^host: //p' | tr -d '\\r')\n\
-             FLAGS=\"{RUSTFLAGS}\"\n\
+             FLAGS=\"{rustflags}\"\n\
              case \"$HOST\" in *-windows-msvc) FLAGS=\"$FLAGS -Ctarget-feature=+crt-static\" ;; esac\n\
              RUSTFLAGS=\"$FLAGS\" \"$TOOL_CARGO\" \"$CHANNEL\" build --offline \\\n\
              \x20 --manifest-path build/harness/rust_harness/Cargo.toml \\\n\
@@ -231,7 +228,7 @@ impl Lane for RustLane {
             build_script: script,
             build_summary: "cargo +nightly build the harness, link ./poc (ASan)".to_owned(),
             build_facts: json!({
-                "rustflags": RUSTFLAGS,
+                "rustflags": rustflags,
                 "nightly_channel_env": "BHF_RUST_NIGHTLY",
                 "vendored": vendor.is_some(),
                 "relocated_files": relocated.templates,
@@ -401,6 +398,49 @@ mod tests {
             "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n\
              [source.vendored-sources]\ndirectory = \"vendor\"\n"
         );
+    }
+
+    /// A capsule rebuilds the harness with the flags `bhf auto` built it
+    /// with (#409): a copy that lagged them rebuilt with crate-local ThinLTO
+    /// on, which leaves a dependency's generic instances undefined at the
+    /// link.
+    #[test]
+    fn a_capsule_rebuilds_with_the_flags_the_lane_built_with() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let harness = work.join("harnesses").join("H-R0001");
+        let widget = temp.path().join("src").join("widget");
+        std::fs::create_dir_all(harness.join("rust_harness/src")).unwrap();
+        std::fs::create_dir_all(widget.join("src")).unwrap();
+        std::fs::write(
+            widget.join("Cargo.toml"),
+            "[package]\nname = \"widget\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(widget.join("src/lib.rs"), "pub fn parse_record() {}\n").unwrap();
+        std::fs::write(
+            harness.join("rust_harness/Cargo.toml"),
+            format!(
+                "[package]\nname = \"bhf_rust_harness\"\nversion = \"0.0.0\"\n\
+                 [dependencies]\nwidget = {{ path = {:?} }}\n",
+                widget.to_string_lossy().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        std::fs::write(harness.join("rust_harness/src/lib.rs"), "").unwrap();
+        std::fs::write(harness.join("main.c"), "int main(void) { return 0; }\n").unwrap();
+
+        let plan = RUST_LANE
+            .plan_capsule(&HarnessContext::new(&work, "H-R0001", &harness))
+            .unwrap();
+        let flags = crate::auto::rust_build::sancov_rustflags();
+        assert!(flags.contains("-Clto=off"), "{flags}");
+        assert!(
+            plan.build_script.contains(&format!("FLAGS=\"{flags}\"")),
+            "{}",
+            plan.build_script
+        );
+        assert_eq!(plan.build_facts["rustflags"], flags);
     }
 
     #[test]

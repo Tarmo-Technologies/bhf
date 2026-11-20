@@ -324,14 +324,16 @@ trait was Rust-4, fixed since.
 Fuzz bytes would violate the caller's contract, so a crash would come from the
 harness, not the target. bhf refuses these.
 
-### Rust-4. Static method of a non-in-crate trait impl — 11 — **[FIXED]**, residue in #409
+### Rust-4. Static method of a non-in-crate trait impl — 11 — **[FIXED]**
 
 A dependency's trait is resolved through the impl file's `use` declarations
 or its full spelling, and the harness crate depends on the trait's crate
 with the target's spec (#338). `From<&[u8]>`/`From<&str>` join the standard
 conversions. In [the rerun](validation/2026-11-17-rust-trait-and-param-classes.md):
-- 7 of meilisearch's 9 `BytesDecode` codecs resolve, then fail to link with
-  undefined monomorphized generics (#409);
+- 7 of meilisearch's 9 `BytesDecode` codecs resolve. They failed to link,
+  with undefined monomorphized generics, until the Rust lane stopped using
+  crate-local ThinLTO (#409). Rerun with that change, all seven link
+  ([2026-11-20](validation/2026-11-20-rust-generic-link.md));
 - 2 are impls on a generic type, which need a type argument;
 - one is a `Default::default`, which takes no input;
 - one was not discovered.
@@ -674,8 +676,7 @@ By fixable targets, highest first:
 4. **Go undrivable parameters** (Go-1; 58 before `context.Context` was
    fixed): the rest are project and library types (`*zap.Logger`,
    `*pflag.FlagSet`).
-5. **Rust project-type and handle parameters** (Rust-1; 12 of 42 left) and
-   the staticlib link of large workspaces (#409, the Rust-4 residue).
+5. **Rust project-type and handle parameters** (Rust-1; 12 of 42 left).
 6. **Java project-type parameters** (Java-1; 29 of the 57 that `results-0728`
    left): a project or dependency type with no no-arg constructor, factory or
    constant to build it from. JDK collections are decoded since #236.
@@ -685,8 +686,9 @@ Closed since the list was first ranked, and dropped from it: the C++
 non-self-contained header (C++-1), the Go receiver with a sibling
 constructor (Go-2), `context.Context` (Go-1), the TS asset loaders (TS-1),
 the C++ compile-flag quoting (C++-6), private-module trait-impl methods
-(Rust-2), the JS browser globals (JS-2) and the Python receiver with
-constructor arguments (Py-2).
+(Rust-2), the JS browser globals (JS-2), the Python receiver with
+constructor arguments (Py-2) and the Rust staticlib link of large
+workspaces (#409).
 
 ## Method
 
