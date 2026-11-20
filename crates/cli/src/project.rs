@@ -792,7 +792,7 @@ fn plan_to_binary_fuzz_args(
         runner: launch.runner.clone(),
         runner_args: launch.runner_args.clone(),
         target_args: launch.target_args.clone(),
-        sandbox: SandboxModeArg::Auto,
+        sandbox: SandboxModeArg::None,
         engine: match launch.engine {
             PpBinaryEngine::Builtin => BinaryFuzzEngine::Builtin,
             PpBinaryEngine::AflQemu => BinaryFuzzEngine::AflQemu,

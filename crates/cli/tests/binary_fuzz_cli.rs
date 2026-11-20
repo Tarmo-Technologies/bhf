@@ -13,6 +13,33 @@ use std::process::Command;
 mod test_support;
 use test_support::TestDir;
 
+#[test]
+fn binary_fuzz_refuses_unsupported_sandbox_modes_before_creating_results() {
+    let root = temp_dir("unsupported-sandbox");
+    let binary = root.join("unopened-target");
+    let work = root.join("work");
+
+    for command in [&["binary", "fuzz"][..], &["binary-fuzz"][..]] {
+        for mode in ["auto", "firejail", "bubblewrap"] {
+            let output = Command::new(bhf_bin())
+                .args(command)
+                .arg(&binary)
+                .arg("--work-dir")
+                .arg(&work)
+                .args(["--sandbox", mode])
+                .output()
+                .expect("run bhf");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(2), "{stderr}");
+            assert!(
+                stderr.contains("binary fuzz does not support sandboxing"),
+                "{stderr}"
+            );
+            assert!(!work.exists(), "{command:?} accepted sandbox mode {mode}");
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn binary_fuzz_finds_replayable_stdin_and_file_crashes() {

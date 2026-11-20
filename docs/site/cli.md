@@ -2044,9 +2044,9 @@ not inventory is exit 1.
 delivers each input on stdin or as a file (`--input-mode stdin|file`, default
 `stdin`), starts from `--seed-input` and `--seed-file` seeds, kills an
 execution after `--timeout-ms` (default 10000), and takes repeatable
-`--env KEY=VALUE` launch settings. The target runs with your user's access
-and no sandbox; `--sandbox` only sets the label in each finding's
-provenance, so run an untrusted binary in a VM or container. Crashes and
+`--env KEY=VALUE` launch settings. The target runs with your user's access.
+`--sandbox` defaults to `none` and refuses other modes before launching the binary.
+Run untrusted binaries in an isolated VM. Crashes and
 timeouts are written under
 `<work-dir>/results/findings/BF-NNNN/` as `kind: binary_crash` findings, with
 the command, input mode, testcase, environment, binary SHA-256, a stderr

@@ -86,9 +86,9 @@ pub struct BinaryFuzzArgs {
     #[arg(long = "target-arg")]
     pub target_args: Vec<String>,
 
-    /// Sandbox label recorded in each finding's provenance. `bhf binary fuzz`
-    /// runs the target without a sandbox whatever this says.
-    #[arg(long, value_enum, default_value_t = SandboxModeArg::Auto)]
+    /// Target isolation. Only `none` is supported; other modes are refused
+    /// before the target runs.
+    #[arg(long, default_value = "none", value_parser = parse_binary_sandbox)]
     pub sandbox: SandboxModeArg,
 
     /// Fuzzing engine. `builtin` runs the seeds, then stacked byte mutations
@@ -352,6 +352,14 @@ pub(crate) struct BinaryMinimizeSummary {
     pub(crate) reduced: bool,
 }
 
+fn parse_binary_sandbox(value: &str) -> Result<SandboxModeArg, &'static str> {
+    if value == "none" {
+        Ok(SandboxModeArg::None)
+    } else {
+        Err("binary fuzz does not support sandboxing; run untrusted binaries in an isolated VM")
+    }
+}
+
 pub fn run(args: BinaryFuzzArgs) -> i32 {
     match run_inner(args) {
         Ok(summary) => {
@@ -369,6 +377,9 @@ pub fn run(args: BinaryFuzzArgs) -> i32 {
 }
 
 fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
+    if args.sandbox != SandboxModeArg::None {
+        return Err(anyhow!("binary fuzz does not support sandboxing"));
+    }
     if args.iterations == 0 {
         return Err(anyhow!("--iterations must be greater than zero"));
     }
@@ -3263,7 +3274,7 @@ mod tests {
             runner: Some("/bin/sh".to_owned()),
             runner_args: Vec::new(),
             target_args,
-            sandbox: SandboxModeArg::Auto,
+            sandbox: SandboxModeArg::None,
             engine: BinaryFuzzEngine::Builtin,
             time: None,
             runtime_oracles: crate::runtime_oracles::RuntimeOracleMode::Off,
@@ -3879,7 +3890,7 @@ mod afl_qemu_tests {
             runner: None,
             runner_args: Vec::new(),
             target_args: Vec::new(),
-            sandbox: SandboxModeArg::Auto,
+            sandbox: SandboxModeArg::None,
             engine: BinaryFuzzEngine::Builtin,
             time: None,
             runtime_oracles: crate::runtime_oracles::RuntimeOracleMode::On,
@@ -3970,7 +3981,7 @@ mod afl_qemu_tests {
             runner: None,
             runner_args: Vec::new(),
             target_args: Vec::new(),
-            sandbox: SandboxModeArg::Auto,
+            sandbox: SandboxModeArg::None,
             engine: BinaryFuzzEngine::Builtin,
             time: None,
             // Runtime oracles OFF: the collector is an independent view.
@@ -4283,7 +4294,7 @@ mod afl_qemu_tests {
             runner: None,
             runner_args: Vec::new(),
             target_args: Vec::new(),
-            sandbox: SandboxModeArg::Auto,
+            sandbox: SandboxModeArg::None,
             engine: BinaryFuzzEngine::Builtin,
             time: None,
             runtime_oracles: crate::runtime_oracles::RuntimeOracleMode::Off,
