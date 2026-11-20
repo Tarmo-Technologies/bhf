@@ -2,15 +2,27 @@
 
 # Third-Party Licensing
 
-BHF fuzzes sixteen languages — **Ada, C, C++, Rust, Java, Python, Perl, Go, COBOL, Fortran, C#, JavaScript, TypeScript, Ruby, Lua, and PHP**. SBOM/SCA ingestion spans a broader set of ecosystems still (Cargo, npm, PyPI, Go modules, Maven/Gradle, NuGet, RubyGems, Packagist, CPAN, Conan/vcpkg/CMake/Meson, and Alire), scanned for supply-chain findings whether or not the language is a fuzzing lane. This document covers the licensing of bhf's core dependencies.
+This page lists the libraries bhf links and the external tools it can run, with each one's license and the tier it may be used in. [Licensing](docs/site/licensing.md) describes the `--profile` values (`strict-permissive`, `external-tools`, `research-lab`) and the `bhf license-audit` command.
+
+Tiers used in the matrix:
+
+| Tier | Meaning |
+|---|---|
+| **Core** | Linked into the bhf binaries. Only Apache-2.0, MIT, BSD and the other permissive licenses `bhf license-audit` accepts. |
+| **Core dev** / **Core build** | Used only by tests or at build time; not shipped. |
+| **Optional embedded** | Linked only into a bhf built with the named Cargo feature. |
+| **Optional adapter** / **Optional external** / **External-only** | Installed by you and run by bhf as a subprocess; never bundled or linked. |
+| **Optional plug-in** | Off by default; enabled per run (for example `--probe gnat_actions`) in a profile that allows it. |
+| **Candidate** / **Not used** | License reviewed; not in `Cargo.lock`. |
+| **Forbidden** | Never linked. Where the row says `research-lab` only, the tool is allowed only under `--profile research-lab`. |
 
 ## Dependency matrix
 
 | Component | Purpose | License | Tier | Risk | Recommendation |
 |---|---|---|---|---|---|
-| From-scratch scanner (bhf) | Permissive Ada lexer + structural parser | Apache-2.0 (ours) | **Core** | Grammar drift | Author in-house. Only path to true permissive guarantee. |
+| From-scratch scanner (bhf) | Permissive Ada lexer + structural parser | Apache-2.0 (ours) | **Core** | Grammar drift | Written in-house, so the Ada scanner stays permissive. |
 | tree-sitter | Generic incremental parser engine | MIT | **Core** | Low | Link directly. |
-| tree-sitter-ada | Ada grammar for tree-sitter | MIT (verify per release) | **Core** (after license re-verification per upgrade) | License churn, grammar coverage gaps | Vendor at a pinned commit; CI license-audit job. |
+| tree-sitter-ada | Ada grammar for tree-sitter | MIT (verify per release) | **Core** (after license re-verification per upgrade) | License churn, grammar coverage gaps | Vendored at a pinned commit under `vendor/tree-sitter-ada/`; the License Audit workflow checks its license checksum. |
 | tree-sitter-c | C grammar for tree-sitter | MIT | **Core** | Low | Link directly for C source scanning. |
 | tree-sitter-cpp | C++ grammar for tree-sitter | MIT | **Core** | Low | Link directly for C++ source scanning. |
 | tree-sitter-rust | Rust grammar for tree-sitter | MIT | **Core** | Low | Link directly for Rust source scanning (native Rust discovery lane). |
@@ -18,18 +30,20 @@ BHF fuzzes sixteen languages — **Ada, C, C++, Rust, Java, Python, Perl, Go, CO
 | tree-sitter-python | Python grammar for tree-sitter | MIT | **Core** | Low | Link directly for Python source scanning (native Python discovery lane). |
 | tree-sitter-perl | Perl grammar for tree-sitter | MIT | **Core** | Low | Link directly for Perl source scanning (native Perl discovery lane). |
 | tree-sitter-go | Go grammar for tree-sitter | MIT | **Core** | Low | Link directly for Go source scanning (native Go discovery lane). |
-| ASM (org.ow2.asm) | JVM bytecode instrumentation for bhf's own coverage agent | BSD-3-Clause | **Core (subprocess/agent runtime)** | Low (permissive, strict-permissive clean) | NOT linked into the bhf Rust binary. Bundled into the standalone `bhf-jvm-agent.jar` (a `-javaagent` for the user's JVM, like GNAT subprocess use); built from `java_runtime/` by `build-agent.sh`, ASM fetched into a cache (or pre-staged for air-gap). |
+| ASM (org.ow2.asm) | JVM bytecode instrumentation for bhf's own coverage agent | BSD-3-Clause | **Core (subprocess/agent runtime)** | Low (permissive, strict-permissive clean) | Not linked into the bhf Rust binary. Bundled into the standalone `bhf-jvm-agent.jar` (a `-javaagent` for the user's JVM, like GNAT subprocess use); built from `java_runtime/` by `build-agent.sh`, ASM is fetched into a cache, or pre-staged on an air-gapped host. |
 | cc (Rust) | Build helper for vendored parser C sources | MIT/Apache-2.0 | **Core build** | Low | Build-time only; covered by `bhf license-audit` and `cargo deny`. |
 | GPR2 library | Programmatic .gpr parsing | GPLv3 (with RLE for runtime, not for tooling linkage) | **Forbidden** (linked); **External-only** via `gprbuild --print-*` parsing | Copyleft contamination if linked | Do not link. Parse `.gpr` ourselves; shell out to `gprbuild` for builds. |
 | GPRbuild | Project build driver | GPLv3 | **External-only** | None when invoked as subprocess | Allowed as user-installed subprocess in `external-tools`; not bundled. |
-| FSF GNAT/GCC | Ada compiler | GPLv3 + GCC Runtime Library Exception | **External-only** | The GCC RLE permits compiled-program redistribution but does not let us link Ada front-end libraries | Subprocess only. Document RLE boundary in `THIRD_PARTY.md`. Generated Ada code that links GNAT runtime is fine for end users compiling their own harnesses. |
-| GNAT.Exception_Actions | Global raise hook | GPLv3 + GCC RLE | **Optional plug-in** (day-one in `external-tools`) | Same RLE caveat as runtime; implementation-defined unit | Source-instrumentation default. `--probe gnat_actions` available on day one in `external-tools`; refused in `strict-permissive`. |
+| FSF GNAT/GCC | Ada compiler | GPLv3 + GCC Runtime Library Exception | **External-only** | The GCC RLE permits compiled-program redistribution but does not let us link Ada front-end libraries | Subprocess only; see [GCC RLE boundary](#gcc-rle-boundary). End users may compile generated Ada code against the GNAT runtime for their own harnesses. |
+| GNAT.Exception_Actions | Global raise hook | GPLv3 + GCC RLE | **Optional plug-in** (`external-tools`) | Same RLE terms as the runtime; implementation-defined unit | Source instrumentation is the default. `--probe gnat_actions` is allowed in `external-tools` and refused in `strict-permissive`. |
 | GNAT.Exception_Traces | Symbolic backtrace | GPLv3 + GCC RLE | **Optional plug-in** | Same | Opt-in. |
-| GNATfuzz | AdaCore fuzzing tool | Proprietary / non-free distribution | **Forbidden** | Direct competitor; license incompatible | Never depend on. |
-| GNATcoverage | Coverage tool | GPLv3 | **Forbidden** in core | Subprocess use still pulls in copyleft tooling expectations and doesn't fit MVP | `research-lab` only. |
-| AFL++ | Coverage-guided fuzzer | Apache-2.0 | **Optional adapter** | Low | Run as a subprocess (`bhf fuzz --engine afl++`, `bhf auto --engine afl++`) on harnesses whose templates carry AFL++ entry blocks. Not bundled binary; user-installed. **Native C/C++ targets only** — not Ada, Rust, Java, or cross-compiled/emulated targets. |
-| LibAFL | Embeddable fuzzing library | MIT/Apache-2.0 dual | **Optional embedded** | Low | Optional Cargo feature `libafl-engine`. |
-| LLVM / libFuzzer | LLVM compiler infra and in-process fuzzer | Apache-2.0 with LLVM exceptions | **Deferred** | LLVM/Ada front end is not production-grade | Deferred — not yet implemented (awaiting Ada/LLVM toolchain). Only the builtin engine and AFL++ participate in the auto cascade. |
+| GNATfuzz | AdaCore fuzzing tool | Proprietary / non-free distribution | **Forbidden** in core | License incompatible | Not a dependency; `research-lab` only (`--probe gnatfuzz`). |
+| GNATcoverage | Coverage tool | GPLv3 | **Forbidden** in core | Copyleft tooling obligations even as a subprocess | `research-lab` only (`--probe gnatcoverage`). |
+| AFL++ | Coverage-guided fuzzer | Apache-2.0 | **Optional adapter** | Low | Run as a subprocess (`bhf fuzz --engine afl++`, `bhf auto --engine afl++`). Not in the bhf binaries or release bundles; the container image installs Ubuntu's `afl++` package and the QEMU/Frida modes, with their notices under `/usr/share/bhf/licenses/afl` (see [`docker/compliance/README.md`](docker/compliance/README.md)). `bhf auto` uses it for C/C++, COBOL, Fortran, Rust and Ada targets and runs the builtin engine for other lanes. |
+| LibAFL | Embeddable fuzzing library | MIT/Apache-2.0 dual | **Optional embedded** | Low | Optional Cargo feature `libafl-engine` (`bhf fuzz --engine libafl`). |
+| LLVM / libFuzzer | LLVM compiler infra and in-process fuzzer | Apache-2.0 with LLVM exceptions | **Optional adapter** | Low | User-installed with clang; not bundled. `bhf fuzz --engine libfuzzer` builds and runs the harness's `main_libfuzzer`. The Rust lane's generated cargo-fuzz crate links the libFuzzer runtime into your harness, not into bhf. |
+| honggfuzz | Coverage-guided fuzzer | Apache-2.0 | **Optional adapter** | Low | User-installed subprocess (`bhf fuzz --engine honggfuzz`); not bundled. |
+| WinAFL | Coverage-guided fuzzer for Windows binaries | Apache-2.0 | **Optional adapter** | Low | User-installed subprocess on native Windows (`--engine winafl`, with a user-installed DynamoRIO); not bundled. |
 | PolyORB | Free Ada ORB | GPLv3 | **Forbidden** as core dep | Copyleft | `research-lab` only. |
 | TAO | C++ ORB | DOC license (BSD-ish but unusual) | **Forbidden** in core | Audit cost | `research-lab` only. |
 | omniORB | C++ ORB | LGPL/GPL | **Forbidden** | Copyleft on linkage | `research-lab` only. |
@@ -43,10 +57,10 @@ BHF fuzzes sixteen languages — **Ada, C, C++, Rust, Java, Python, Perl, Go, CO
 | anyhow / thiserror | Error types | MIT/Apache-2.0 | **Core** | Low | Allow. |
 | tempfile (Rust) | RAII cleanup for compiler capability canary files | MIT/Apache-2.0 | **Core** | Low | Allow. |
 | tera (Rust) | Harness template engine | MIT | **Core** | Low | Allow. |
-| tokio | Async runtime | MIT | **Candidate** (not in `Cargo.lock`) | Low | Pre-cleared to allow if a future async need arises; not currently linked. |
+| tokio | Async runtime | MIT | **Candidate** (not in `Cargo.lock`) | Low | License reviewed for a future async need; not linked. |
 | nom / chumsky | Parser combinators (IDL) | MIT/Apache-2.0 | **Not used** | Low | The IDL subset parser (`crates/idl_parser`) is hand-rolled; neither crate is linked. |
-| zstd / lz4 | Corpus compression | BSD-3 / BSD-2 | **Candidate** (not in `Cargo.lock`) | Low | Pre-cleared; corpus storage is currently uncompressed. |
-| sha2 | Hashing | MIT/Apache-2.0 | **Core** | Low | Allow. `blake3` is pre-cleared (BSD/CC0/Apache-2.0) but not currently linked. |
+| zstd / lz4 | Corpus compression | BSD-3 / BSD-2 | **Candidate** (not in `Cargo.lock`) | Low | License reviewed; corpus storage is uncompressed. |
+| sha2 | Hashing | MIT/Apache-2.0 | **Core** | Low | Allow. `blake3` (BSD/CC0/Apache-2.0) is license-reviewed and not linked. |
 | ring (Rust) | Ed25519 signing and verification for authenticated packs and release artifacts | Apache-2.0 AND ISC | **Core** | Low | Allow. Verify the resolved version and retain its license notices in distribution review. |
 | regex | Diagnostic parsing | MIT/Apache-2.0 | **Core** | Low | Allow. |
 | num_cpus (Rust) | Detect host CPU count for `bhf auto` worker pool | MIT/Apache-2.0 | **Core** | Low | Allow. |
@@ -60,12 +74,14 @@ BHF fuzzes sixteen languages — **Ada, C, C++, Rust, Java, Python, Perl, Go, CO
 | ruzstd (Rust) | zstd (`data.tar.zst`) decoding for `binary scan` container recursion | MIT | **Core** | Low | Allow. Pure-Rust zstd (distinct from the C `zstd` candidate above); no `zstd-sys`. |
 | windows-sys (Rust) | Native Windows ETW / Win32 bindings for the `bhf_collector_win` runtime-event provider sidecar | MIT OR Apache-2.0 | **Core (Windows-only sidecar)** | Low | Allow. Pure-Rust generated FFI (no `cc`/C toolchain), declared under `[target.'cfg(windows)'.dependencies]` so it never enters a non-Windows build; the crate compiles to its pure core on the Linux matrices. Transitive `windows-targets`/`windows_*_msvc` stay transitive. |
 | ureq + rustls/webpki roots (Rust) | Bounded synchronous HTTPS for optional OpenAI/Anthropic LLM providers | MIT/Apache-2.0; certificate trust-anchor data is CDLA-Permissive-2.0 | **Core (optional network path at runtime)** | Remote data disclosure if explicitly selected; certificate data has a permissive attribution license | No request occurs by default. API keys are environment-only, response sizes/timeouts are bounded, and local/MCP modes remain token-free. |
-| criterion | Bench (dev-only) | Apache-2.0/MIT | **Candidate** dev (not in `Cargo.lock`) | Low | Pre-cleared for benchmarking; not currently a dev-dependency. |
-| toml (Rust) | Golden-file manifest parsing in tests | MIT/Apache-2.0 | **Core dev** | Low | Dev-only dependency for hand-written corpus manifests. |
+| criterion | Bench (dev-only) | Apache-2.0/MIT | **Candidate** dev (not in `Cargo.lock`) | Low | License reviewed for benchmarking; not a dev-dependency. |
+| toml (Rust) | Parsing config files, project and protocol manifests, and Cargo manifests for SBOM ingestion | MIT/Apache-2.0 | **Core** | Low | Allow. Also used by tests for hand-written corpus manifests. |
 
-CI enforces the SPDX allow-list with `cargo deny`, the per-file SPDX header check (`crates/spdx_check`), and `bhf license-audit` for the resolved core dependency graph plus this matrix. Reviewers are responsible for keeping this matrix in sync with `Cargo.lock` when adding dependencies.
+The License Audit workflow runs `cargo deny check`, the per-file SPDX header check (`crates/spdx_check`), and `bhf license-audit`, which checks the resolved core dependency graph and fails when a direct third-party dependency of a workspace crate has no row in this matrix. Add the row in the same change as the dependency.
 
-BHF's CORBA support is self-contained: it generates its own fake-CORBA scaffolding and IDL-to-Ada mapping, so the ORB libraries above (PolyORB, TAO, omniORB, JacORB) are listed only to document why they remain forbidden or `research-lab`-only — they are never linked dependencies. The LD_PRELOAD runtrace shim that supplies bhf's behavioral/taint oracles (BHF-405 path control, BHF-304 command injection, BHF-417 insecure temp, BHF-305 sensitive env) is native-only (C/C++/Ada/Rust); it is not armed during Java fuzzing or under cross-compiled/emulated (qemu/wine) targets, where those oracle classes are unavailable.
+BHF generates its own fake-CORBA scaffolding and IDL-to-Ada mapping and links none of the ORB libraries above (PolyORB, TAO, omniORB, JacORB); their rows record their tier.
+
+The LD_PRELOAD runtrace shim (`bhf_runtrace_shim`) that supplies bhf's behavioral and taint oracles is bhf's own Apache-2.0 code. [Sink oracles](docs/site/sink-oracles.md) lists the lanes it loads into.
 
 ## Test fixtures
 
@@ -85,4 +101,4 @@ BHF's CORBA support is self-contained: it generates its own fake-CORBA scaffoldi
 
 ## GCC RLE boundary
 
-Generated Ada files (`adafuzz-*.ad?`, harnesses, fake-CORBA, and stubs) are Apache-2.0 and include SPDX headers. End users compile those generated files against their own GNAT runtime. The GCC Runtime Library Exception applies to redistribution of binaries produced by that compilation, but bhf does not link GPL Ada front-end libraries into the core Rust graph.
+Generated Ada files (`adafuzz-*.ad?`, harnesses, fake-CORBA, and stubs) are Apache-2.0 and include SPDX headers. End users compile those generated files against their own GNAT runtime. The GCC Runtime Library Exception applies to redistribution of binaries produced by that compilation; bhf does not link GPL Ada front-end libraries into the core Rust graph.

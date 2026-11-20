@@ -119,8 +119,8 @@
 - `qemu-system:` takes `reset=persistent` (needs `done=`) (#346): between
   clean inputs the guest continues its own input loop from the `done=`
   breakpoint, with a `loadvm` only before the first input and after a crash,
-  hang or inconclusive run (about 4x the exec/s on the RV-3 image;
-  `reset=loadvm` stays the default). Until a continuation comes back to
+  hang or inconclusive run (about 4x the exec/s on the bare-metal Cortex-M
+  test image of `live_fullsystem`; `reset=loadvm` stays the default). Until a continuation comes back to
   `done=` with coverage, any other is run again from the snapshot; a `done`
   that branches to itself, or a firmware that never proves its loop, is
   refused. The transport summary gains `executions_per_sec` and each
@@ -214,6 +214,1309 @@
   both builds (`UNVERIFIED` without the second). An input that grows either
   build's coverage is kept. The run summary gains a `differential` block
   (additive).
+- A `rehost` crate runs an unmodified Cortex-M firmware image in an emulator
+  (#351): an ELF, or a raw image at a base address, starts at the reset
+  vector with the stack pointer its vector table names. Each input is
+  written into a fixed buffer in the firmware's memory, with an optional
+  length word, at reset or when the core first reaches a given address (so
+  the start-up code's `.bss` clearing does not wipe it), and every basic
+  block the core enters is counted in a 64 KiB edge map. The emulator is
+  bhf's own ARMv7-M Thumb-2 interpreter: integer instructions, `SVC`
+  exceptions, the System Control Block registers start-up code writes, and
+  semihosting output and exit. Peripheral registers read as zero, and
+  interrupts and floating point are not modelled; an instruction outside
+  the model stops the run as unsupported rather than as a firmware fault,
+  while `UDF` and the encodings ARMv7-M leaves unallocated fault as
+  undefined instructions. Semihosting writes stop reading memory once the
+  64 KiB output is full.
+- `bhf binary rehost <IMAGE>` fuzzes an unmodified Cortex-M firmware image
+  in that emulator (#380): the input goes into a fixed buffer named by
+  address (hex, `0x` optional, as `nm` prints it) or ELF symbol
+  (`--input-buffer`, `--input-size`, `--input-length`, `--inject-at`; the
+  run JSON's `input_not_delivered` counts runs that never reached
+  `--inject-at`, and bhf warns when no seed does), RAM is
+  `--ram BASE:SIZE`, a raw image loads at `--base`, and the edge coverage
+  steers the builtin engine's mutator. A run that faults is a `kind: rehost_fault` finding
+  (`finding_kind: binary`, rule `BHF-501`) classified as `invalid_access`,
+  `bad_pc` or `hard_fault`, with the fault, the registers and the machine
+  setup; `bhf replay` runs its testcase through that setup again and
+  reports `MATCH` on the same fault signature (`--harness` names another
+  copy of the image). The run JSON is `bhf.binary_rehost.run.v1`, and it
+  and every finding carry a `fidelity` block saying peripherals and
+  interrupts are not modelled. In `results/` these findings have producer
+  `binary rehost` (a value added to the `bhf.findings.v1` schema's
+  `producer` enum) and the reproduce command `bhf replay findings/<id>`;
+  they get no `replay.py`.
+- `bhf binary rehost` serves the firmware's peripheral reads from MMIO models
+  (#352): `--mmio ADDR[@PC]=MODEL` names a `passthrough` model (the read's
+  bytes come from the input) or a `constant:VALUE` model for a register, or
+  for one instruction's reads of it; `--mmio-models FILE` loads models a run
+  JSON or finding records; `--mmio-default zero|passthrough` sets what an
+  unmodelled register reads as (`passthrough` without `--input-buffer`,
+  which is now optional, and `zero` with it, as before; a models file that
+  records no `default` leaves it to that rule). Peripheral reads take the
+  input after the buffer's bytes (the buffer then takes at most the first
+  4096); a run that wants more stops as `input_exhausted`. A model for an
+  address `--ram` or an image segment maps is refused, since memory would
+  answer its reads. The setup in the run JSON and in each finding
+  (`rehost.setup.mmio`, absent in older findings, which replay as before)
+  records the models, so `bhf replay` runs the same models again; `input`
+  may now be null, a finding's `input` block gains `mmio_reads` and
+  `mmio_bytes` and modes `rehost-mmio` and `rehost-buffer+mmio`, and the run
+  JSON gains `mmio_reads`, all additive to `bhf.binary_rehost.run.v1` and
+  `bhf.rehost.v1`. The `rehost` crate gains `MmioConfig` and a recorded
+  trace of a run's peripheral reads (`Machine::trace_mmio`).
+- `bhf binary rehost` infers bit-extract MMIO models for status-register
+  polling loops (#381): before the campaign the seeds and an input of zeros
+  run with their peripheral reads recorded, a register one instruction reads
+  8 or more times in a row is a polling loop, and probes that flip one bit
+  of its read at a time find the bits that decide it. The instruction gets
+  a `bitextract` model feeding those bits from the input (a constant that
+  ends the loop when only an input buffer takes input), and inference
+  repeats past each loop to find the next. A loop whose read the
+  `passthrough` default already feeds from the input keeps it whole unless
+  it is shown to be a status poll (a bit ends it, it stores nothing new
+  between reads, and no value of the other bits changes its path), so a
+  data register a getter reads in a dispatch loop is not narrowed. `--mmio`
+  takes `bitextract:MASK`; `--no-mmio-inference` turns inference off. The
+  run JSON gains `mmio_inference` (the loops, masks, exit values, `writes`,
+  `not_a_poll`, rounds and probes), and inferred models carry
+  `"inferred": true` in the recorded setup, which `bhf replay` runs as
+  recorded and a `--mmio-models` rerun keeps; both additive. The `rehost`
+  crate gains `infer_polling_models`, `polling_loops`, `decide` and
+  `NotAPoll`, and its trace of peripheral reads records a digest of the
+  stores between them.
+- `bhf auto` fuzzes the Go native fuzz tests a project ships (#336): each
+  `func FuzzXxx(f *testing.F)` in a `_test.go` file is a target, built
+  against a stand-in for `testing` whose `f.Fuzz` hands bhf's inputs to the
+  fuzz target, with `go build -cover` edge coverage, and started from its
+  `f.Add` seeds and its `testdata/fuzz/FuzzXxx` corpus. A panic, or a failure
+  the fuzz target reports through `t.Error`/`t.Fatal`, is a finding. An
+  external test that calls what its package's `export_test.go` exports
+  builds too. `testdata/` and `_`-prefixed directories are skipped, as the
+  go tool skips them. These
+  provided harnesses rank ahead of generated targets; `run.json` marks each
+  with `targets[].provided_harness` and counts them in
+  `summary.provided_harnesses` (both new, omitted otherwise).
+- `bhf auto` runs the Atheris harnesses a Python project ships (#337): the
+  function a file registers with `atheris.Setup` is a target, run under
+  bhf's Python driver with a stand-in `atheris` module (Atheris need not be
+  installed) whose `FuzzedDataProvider` decodes values from the input, and
+  started from its seed corpus with its `<stem>.dict`. As under Atheris,
+  every exception it lets escape is a finding, located in the code that
+  raised it rather than at the harness's call. `run.json` reports it with
+  `provided_harness.origin` `atheris`; the record gains `dictionaries` and
+  `dictionary_tokens` (omitted when empty).
+- `bhf auto` fuzzes the fuzzers a `bhf project import-ossfuzz` of the tree
+  registered in its work dir (#435): each one linked with bhf's driver is a
+  provided harness, staged from the import's `$OUT` with its unpacked seed
+  corpus, its merged dictionaries and its `.options` limits, and reported in
+  `run.json` with `provided_harness.origin` `ossfuzz-import` and the new
+  `provided_harness.options` (omitted when empty). A generated target in the
+  fuzzer's own source is not fuzzed again. A fresh run keeps the import's
+  `<work>/build/<name>` registrations instead of clearing them, and a run
+  over another tree no longer archives the import with the earlier run. The
+  import now builds with a `-fdebug-prefix-map` from its `$SRC` copy to the
+  tree, so findings name the project's files. The note on what discovery
+  skipped by default no longer counts the provided harnesses' files.
+- `bhf differential --metamorphic-transform` has a transform registry (#330):
+  `append-newline`, `trailing-whitespace` (a space and a tab at the end of
+  every line), `reorder-json-keys` (every JSON object's members in reverse
+  order, every other byte kept) and `utf8-bom` (a byte order mark before the
+  input). Each declares the relation its variant must keep: the same stdout
+  and exit status, or for `utf8-bom` the same exit status only, so a parser
+  that echoes the mark is not flagged and one that rejects it is. The flag
+  takes several transforms, comma-separated or repeated, each applied to
+  every input; a finding's `metamorphic` block names the `relation` it
+  broke. Only `append-newline` existed before.
+- `bhf minimize --strategy grammar --grammar <PATH>` minimizes a grammar
+  finding on its derivation tree (#369), so the minimized input is a smaller
+  sentence of the grammar that still reproduces; byte-wise minimization broke
+  its structure. The testcase is parsed with the grammar (an Earley parse),
+  and each subtree, outermost first, is replaced by its rule's smallest
+  derivation, a same-rule subtree inside it, or a smaller production of its
+  rule that keeps its children, while the finding reproduces, as Nautilus
+  and Perses do. `bhf auto --grammar` minimizes a finding whose testcase the
+  grammar derives the same way.
+- `--grammar` mutates derivation trees (#329), as Nautilus does: the builtin
+  engine keeps the derivation tree of each input it derives from the grammar,
+  and most children of such an input are tree mutations, a subtree derived
+  afresh from its rule, a recursion repeated, or a subtree spliced in from
+  another input's tree of the same rule, so they stay sentences of the
+  grammar. A derivation ends within `--max-len` by taking each rule's
+  smallest production as it nears it, where it was cut off mid-sentence. The
+  `--grammar` help said "a Nautilus-style grammar mutator" when the engine
+  only generated fresh derivations; it now says what the engine does. A
+  grammar whose smallest derivation nests more than 512 rules deep is refused.
+- `bhf fuzz --frame <profile.toml>` fuzzes a single-input harness through a
+  binary frame descriptor (#328): a `bhf.protocol.v1` profile of one message,
+  whose typed fields, lengths, checksums, TLVs and offsets the session lane
+  already reads. The builtin engine decodes each input into the message's
+  fields, edits a field or mutates the frame's bytes, and recomputes every
+  derived field before the harness runs it, as AFL++'s
+  `afl_custom_post_process` does, so a mutant passes a length/CRC gate that
+  byte mutation alone breaks. Seeds are repaired the same way and the
+  message's own frame is a seed. Before, only the session lane used the frame
+  fix-ups.
+- `bhf project import-ossfuzz` imports what OSS-Fuzz keeps beside each
+  fuzzer (#335): `<name>_seed_corpus.zip` is unpacked with the system
+  `unzip` (no zip library) into the manifest target's seeds, with any
+  symlink it restores removed; `<name>.dict` and the dictionary `.options`
+  names are merged into the harness's `dictionary.txt` and are the target's
+  dictionaries; and the `[libfuzzer]` `max_len`, `timeout` and
+  `rss_limit_mb` options set the target's `max-len`, `timeout` and
+  `rss-limit-mb`, with every other option reported as not applied. A seed
+  corpus without `unzip` on PATH stops the import with what to install.
+- The fuzzers `bhf project import-ossfuzz` builds are registered as
+  harnesses of the work dir (#377): each is staged at
+  `<work>/build/<name>/main`, where `bhf fuzz --harness <name>`, replay and
+  minimize find it, with the framed input mode declared beside one linked
+  with bhf's driver, and is a target of the `bhf.project.v1` manifest the
+  import writes to `<work>/ossfuzz/bhf.project.toml` for `bhf project run`
+  (`engine = "builtin"`, or `engine = "binary"` with `input-mode = "file"`
+  for a libFuzzer binary linked without bhf's driver). The import lists them
+  with the commands that fuzz them.
+- `bhf project import-ossfuzz` builds a project's existing OSS-Fuzz or
+  ClusterFuzzLite integration (#334). It runs the project's `build.sh` as
+  OSS-Fuzz does, `bash -eux $SRC/build.sh` from `$SRC/<name>`, with the
+  OSS-Fuzz build variables: `$SRC`, `$WORK` and `$OUT` under
+  `<work>/ossfuzz/`, clang as `$CC`/`$CXX`, OSS-Fuzz's address-sanitizer
+  `$CFLAGS`/`$CXXFLAGS` with the coverage bhf's driver reads, and
+  `$LIB_FUZZING_ENGINE` an archive of bhf's own driver, so every fuzz target
+  the build links is a bhf harness. The build runs in bubblewrap or
+  firejail, with no network and no writes outside `$SRC`, `$WORK` and `$OUT`,
+  and with nothing of bhf's environment beyond the build contract; the
+  import is refused, naming the missing tool or why it failed, when no
+  sandbox works, and `--sandbox none` runs it directly. The fuzzers are
+  collected from `$OUT` by OSS-Fuzz's own rule. The nightly runs the
+  sandbox tests in a job of their own that lets bubblewrap create its
+  namespaces, which the hosted Ubuntu 24.04 image denies.
+- The Fortran lane runs on native Windows (#327). MinGW-w64's gfortran ships
+  no AddressSanitizer, so there the Fortran objects are compiled with
+  gfortran's bounds and pointer checks, a failed check is a crash instead of
+  an `exit(2)`, MinGW's gcc builds the driver and glue, and each finding's
+  `fidelity.sanitizers` says `none (toolchain limit)` with the reason. With
+  it no lane is refused on native Windows any more.
+- The Rust lane runs on native Windows (#326): the harness crate builds as
+  an MSVC staticlib with SanitizerCoverage, AddressSanitizer and the static
+  CRT, and clang links it with the driver and the system libraries rustc's
+  `native-static-libs` note names. The harness sets ASan's
+  `windows_hook_rtl_allocators=1` default, since Rust's allocator calls the
+  Windows heap directly. A Rust capsule's `build.sh` rebuilds the same way
+  on an MSVC host, and its vendored packages are found there.
+- The Perl, Ruby, Lua and PHP lanes run on native Windows (#325): each `main`
+  launcher has a launch spec, `PERL5LIB` and the Ruby load path take the
+  host's separator, and Perl's driver sends the target's output to the
+  platform's null device. Lua reads its standard input in text mode on
+  Windows, so there its driver asks for hex frames: a harness whose ready
+  byte is `H` is sent each input as hex digits.
+  `scripts/ci/install-lua-windows.ps1` builds Lua 5.4 from lua.org's source,
+  and the Windows CI job runs the four lanes' tests.
+- `bhf fuzz --extension` gives the builtin loop the extension's mutation
+  stage (#314): one in four mutated children is the extension's
+  `mutator.mutate` of the base the loop picked, within at most 1000 calls and
+  a quarter of the pass's `--time`; a call that times out cuts the stage off
+  and the campaign goes on. The run summary's `extension.stages` records it.
+- With `codec.decode` and `codec.encode`, a child is the base decoded, one
+  value of it mutated and encoded back, so a framed format keeps its length
+  and checksum right (#373). Codec errors are counted, never findings.
+- The extension's `lifecycle.setup`, `reset` and `teardown` run around the
+  campaign and between its cases (#374). A setup or reset the extension
+  answers as failed stops the campaign with its message.
+- `bhf extension session --session-transport SPEC` drives a real target
+  over the session lane's transport (#313), where it could drive only a
+  built-in toy target: each scenario message goes to the target as the
+  extension framed it, and the target's reply is what the extension observes
+  and binds. `--session-server-cmd` starts the service, waits for its port
+  and stops it after the session, and `--session-reply-timeout` bounds a
+  reply. A target that ends the session or a service that exits is exit `3`
+  with the reason in `extension.json` (a service's sanitizer report included),
+  never an extension fault or a finding.
+- `bhf binary fuzz --engine afl-frida` runs AFL++'s Frida mode (`afl-fuzz
+  -O`) on a binary without source (#322). Both binary-only modes record their
+  engine, the trace program or library, `executions` and a `fidelity` object
+  (coverage source, CmpLog, edges found) in the run JSON, and the container
+  acceptance runs both through bhf.
+- `bhf binary fuzz --persistent-addr <ADDR>` runs the target in AFL++'s
+  persistent loop from that address under QEMU or Frida mode
+  (`AFL_QEMU_PERSISTENT_ADDR` with `AFL_QEMU_PERSISTENT_GPR=1`, or
+  `AFL_FRIDA_PERSISTENT_ADDR`), and `--entrypoint <ADDR>` starts the fork
+  server later (`AFL_ENTRYPOINT`) (#375).
+- QEMU- and Frida-mode runs of `bhf binary fuzz` use CmpLog (`afl-fuzz -c 0`)
+  by default; `--no-cmplog` turns it off (#376).
+- The nightly builds AFL++'s QEMU and Frida modes with
+  `scripts/ci/build-afl-binary-modes.sh`, which the container image's stage
+  now runs too, and runs the binary-only tests against them.
+- The container image ships AFL++'s QEMU and Frida modes (#321):
+  `/usr/bin/afl-qemu-trace` and `/usr/lib/afl/afl-frida-trace.so`, built from
+  the AFL++ release Ubuntu's `afl++` package carries (4.09c), with the qemuafl
+  commit that release pins and a digest-checked Frida GumJS devkit, so
+  `bhf binary fuzz` fuzzes a binary without source with coverage there
+  instead of falling back to the blind builtin loop. The container
+  acceptance runs both modes on an uninstrumented binary, and the image
+  inventory lists them. `bhf binary fuzz --engine afl-qemu` now merges
+  `symbolize=0` into the `ASAN_OPTIONS`, `UBSAN_OPTIONS` and `LSAN_OPTIONS`
+  it passes `afl-fuzz`, which refuses a custom setting without it, as the
+  image's defaults are.
+- Linux aarch64 release binaries (#343): a release publishes
+  `aarch64-unknown-linux-gnu` archives of the CLI, the daemon and both preload
+  shims, and the shell installers install them on a 64-bit ARM host. They are
+  built natively on an `ubuntu-24.04-arm` runner in a digest-pinned
+  `manylinux2014_aarch64` image and held to the same glibc 2.17 ceiling as
+  x86_64; the runtrace shim links with the toolchain's own `rust-lld`. The
+  release job unpacks the aarch64 archives and runs the Linux release smoke on
+  the ARM64 runner before uploading them, and a new CI job,
+  `arm64-release-build`, which CI acceptance and so the release's CI gate
+  require, builds them the same way, installs them through the generated
+  installers and runs the same smoke. The all-in-one signed bundle stays
+  x86_64 only.
+- The MSan corpus replay covers C++ (#323): a C++ harness's `make msan` builds
+  against the MSan-instrumented libc++ `BHF_MSAN_LIBCXX` names, which the full
+  image builds into `/opt/msan-libcxx`. A run whose MSan runtime stops before
+  it runs the input (a refused re-run with address-space randomization off,
+  as in a container on a kernel with 32 bits of mmap randomization) is run
+  again.
+- `bhf export regression [--lang c|ada]` writes a work dir's harnesses,
+  corpora and findings' minimized inputs as a standalone regression suite
+  (#339): `run.sh` builds each harness against the scanned tree and fails
+  when an input crashes, so a finding fails it until its bug is fixed.
+- The Java, JavaScript and TypeScript lanes run on native Windows (#307):
+  their launchers have launch specs (`java` with the agent, `node` on the
+  driver), Java's classpaths take the host's separator, the JVM agent jar is
+  built by `build-agent.ps1` there (cached in `%LOCALAPPDATA%\bhf\jvm`), and
+  the JS lane's load check runs the launch spec.
+- The C# lane runs on native Windows (#306): its `main` and `main_symbols`
+  launchers have launch specs (`dotnet` on the harness assembly), and the
+  driver maps the coverage file and runs the framed protocol through .NET's
+  file mapping and console streams where there is no libc to call
+  (`BHF_CS_PORTABLE_IO=1` takes that path on any host).
+- The Python lane runs on native Windows (#305). Beside its POSIX `main`
+  launcher it writes `main.launch.json` (the interpreter, the driver and the
+  environment), which the harness runner execs directly where the launcher
+  cannot run; `PYTHONPATH` takes the host's separator and the coverage map is
+  mapped without `MAP_SHARED` there. `BHF_LAUNCH_SPEC=1` runs a harness from
+  its launch spec on any host.
+- A GitLab CI template (`ci/gitlab/bhf.gitlab-ci.yml`) and a GitLab SAST
+  report (#320): `bhf ci --gitlab-sast <PATH>` and `bhf report --gitlab-sast`
+  write `gl-sast-report.json` (GitLab's format 15.2.1) for a merge request's
+  security widget. The template fuzzes a merge request's changes, keeps the
+  corpus and stored findings in the cache, and sweeps the whole tree on a
+  schedule.
+- The bhf-pr action takes a `mode` (#319): `pr` (the diff-scoped gate, the
+  default), `batch` (the whole tree), `prune` (rebuild the harnesses and keep
+  each corpus's inputs that add coverage) and `coverage` (the run's line
+  coverage, with `results/coverage/` as an artifact). A scheduled example
+  workflow runs batch, prune and coverage in turn on the shared corpus cache.
+- The bhf-pr action keeps its work between runs (#317): with
+  `corpus-cache` (default on), it restores the corpus, the discovery cache
+  and the stored findings of the newest cache of the PR's branch, else of
+  the base branch, into `corpus-dir` before the run, says what it restored,
+  and saves them after it. Its run step is
+  `.github/actions/bhf-pr/scripts/run-bhf.sh`.
+- `bhf ci` replays stored findings against the run's build before it judges
+  the run (#318): a finding that still reproduces fails the gate, and one
+  that no longer does is reported fixed. A work dir restored from a cache
+  keeps its last findings in `regressions/`, one per root cause, and
+  `--regressions <DIR>` adds more; their minimized inputs seed the run, and
+  `--ci-json` lists the ids that reproduced, were fixed or were not
+  replayed.
+- `bhf auto --engine afl++` runs Ada targets under AFL++ (#304). The
+  harness's objects link again with AFL++'s runtime into
+  `build/<id>/main_afl`; the Ada coverage runtime forwards its trace-pc edges
+  into AFL++'s map, an exception that escapes the target aborts it
+  (`BHF_CRASH_ON_FINDING`), and each crash AFL++ saves is replayed with the
+  event log and reported, minimized and replayed as the builtin engine's
+  are. AFL++'s GCC plugin is not used: a distribution's plugin refuses a GCC
+  of another point release.
+- `bhf auto --engine afl++` runs Rust targets under AFL++ (#303). A Rust
+  harness's `build-afl.sh` builds its crate again with bhf's trace-pc-guard
+  instrumentation and links the staticlib with afl-clang-fast and a persistent
+  driver, as cargo-afl links a crate; the same binary is the CmpLog build.
+  The build's target tree is removed after it.
+- `bhf auto --engine afl++` runs COBOL and Fortran targets under AFL++
+  (#302). Their C glue builds with afl-clang-fast and links as the lane's
+  `main` does (`lane-ldflags.txt`), the passthrough driver has an AFL++
+  persistent loop, and gfortran's trace-pc edges reach AFL++'s map through a
+  guard table of the driver's own. A crash AFL++ saves with no sanitizer
+  report, as a COBOL program's libcob error is, is a reachable-crash finding
+  as it is under the builtin engine.
+- `--sanitizers hwasan` (`hwaddress`) builds the fuzzed C/C++ harness with
+  HWAddressSanitizer in place of ASan on an AArch64 host (#333). Its reports
+  are findings under the rule ASan gives the same bug, the kind taken from the
+  report's first specific `Cause:`, and `HWASAN_OPTIONS` is merged as
+  `ASAN_OPTIONS` is. It is refused beside `asan` and, with the reason, on any
+  other host.
+- `bhf auto --sanitizers ...,realtime` replays the corpus of each target that
+  must not block through a RealtimeSanitizer build (`make rtsan`, clang 20+
+  `-fsanitize=realtime`) after the fuzz passes (#298). The marked target runs
+  in a real-time context, and an allocation, lock, sleep or system call made
+  there is a BHF-232 (CWE-1322) finding that `bhf replay` reproduces with that
+  build. `--nonblocking <entry-points | all | NAME>` picks the targets; the
+  default marks interrupt handlers and RTOS task bodies. Without clang 20 the
+  lane is skipped and the run says so.
+- `bhf auto --sanitizers ...,cfi` replays each C/C++ harness's corpus through a
+  control-flow integrity build (`make cfi`, clang `-fsanitize=cfi -flto
+  -fvisibility=hidden`, reporting through the UBSan runtime) after the fuzz
+  passes (#297). A cast to the wrong class or a call through a function
+  pointer or vtable of the wrong type is a BHF-221 finding that `bhf replay`
+  reproduces with that build; a harness whose CFI build fails is named.
+  `run.json` (`summary.unobservable_classes`) and `run.md` list the bug classes
+  no lane of the run could observe in its C/C++ targets, and what would.
+- A protocol profile of `kind = "giop"` drives a CORBA servant (#315):
+  every message is a GIOP 1.2 Request, its fields the operation's `in`
+  parameters at their IDL types (`octet`, `boolean`, `short`, `long`, their
+  unsigned forms, `enum`, `string`, `sequence<octet>`), marshalled in CDR by
+  the `iiop` crate, which no command used before, and sent over the session
+  lane's TCP transport. A `[giop]` table gives the object key and byte
+  order; replies are framed by their GIOP header (`framing = "giop"`) and
+  must answer the request's id, and a capture reads the Reply's
+  `reply_status` or `request_id` or the next value of its body, so a
+  captured handle can be passed to a later operation. The `iiop` crate
+  gains a GIOP 1.2 Reply encoder and a CDR string from raw bytes. A test
+  fixture server built on `iiop` has a servant that crashes on a store into
+  a slot past a bin's, behind an `open_bin` handle; the campaign finds it as
+  a dropped session at that store, which `bhf replay` reproduces.
+- Reference protocol profiles for CoAP and RTPS/DDS over UDP (#372), in
+  `profiles/protocols/coap.toml` and `rtps.toml`, for the session lane's
+  `udp:` backend. The CoAP session discovers `/.well-known/core`, reads
+  `/limit` and updates it with a conditional PUT whose If-Match carries the
+  ETag the read returned; only a piggybacked 2.05 or 2.04 advances it. The
+  RTPS 2.3 session announces a participant (SPDP), heartbeats its SEDP
+  publications writer to the participant that answered, addressed with the
+  GUID prefix that participant announced, and sends the publication at the
+  sequence number the reader's ACKNACK asked for. Each profile is tested
+  against a fixture server over UDP.
+- Reference protocol profiles for Modbus/TCP and MQTT 3.1.1 (#311), in
+  `profiles/protocols/modbus-tcp.toml` and `mqtt-3.1.1.toml`. The Modbus
+  session reads a holding register, writes back the value it read and writes
+  a block of registers; the MQTT session connects, subscribes, publishes at
+  QoS 2, releases the publication with the packet id the broker's PUBREC
+  named, and pings. A state is reached only on the reply that answers the
+  request: a Modbus exception response or a refused CONNECT does not advance
+  the session. A profile's `[framing]` can be `length_field`, for a protocol
+  whose header carries the message's length (Modbus's MBAP length at byte 4,
+  MQTT's Remaining Length, a variable byte integer, at byte 1): a request is
+  written as it is and a reply read by that length, header included. Each
+  profile is tested against a fixture server.
+- Ada harnesses get a coverage report too (#310): the replay records the PC
+  of each trace-pc edge an input reaches (`BHF_COV_PCS`, in the Ada coverage
+  runtime), takes the binary's calls to the callback as the instrumented
+  edges, places both on the original Ada lines (`addr2line` and the
+  instrumented copies' line maps) and writes `lcov.info`, `functions.txt` and
+  `functions.json` per subprogram to `results/coverage/<id>/`, and the covered
+  lines to `covered-lines.txt`.
+- The coverage report lists the comparisons each corpus reached and never
+  passed (#309): `results/coverage/<id>/blockers.{txt,json}` give the file,
+  line and function of each compare whose branch ran one way only, with the
+  operand it wants and values it got instead, from the harness's comparison
+  log placed by `llvm-symbolizer`. The sweep prints how many there are.
+- `bhf auto` writes each C/C++ harness's coverage report to
+  `results/coverage/<id>/` (#308): `lcov.info`, llvm-cov's HTML report under
+  `html/`, and a per-function table (`functions.txt` from
+  `llvm-cov report -show-functions`, `functions.json` with each function's
+  calls and lines), all cut to the files under the sweep's root.
+- Board profiles (#293): `bhf fuzz --board-profile board.toml` takes
+  `--target-transport` and `--transport-coverage-map` from a TOML file of one
+  board's specs, its debug-probe lane (`gdb`, `coverage_map`) or, with
+  `--board-lane serial`, the agent on its UART (`serial`); each spec is
+  checked when the file is read. `docs/hil-boards/nucleo-f411re.toml` is the
+  template and `docs/hil-bringup.md` now lists each bring-up step with its
+  expected output. The `gdb:` transport takes the completion contract of
+  `qemu-system:` (`done=`, `fault=` and their widths and kinds) and
+  `reset=restart|monitor:CMD`, since QEMU's system gdbstub refuses the `R`
+  restart and a board resets by `monitor reset halt`.
+  `crates/target_transport/tests/hil_board.rs`
+  reads a profile (`BHF_HIL_PROFILE`) and runs against a QEMU stand-in that
+  starts as a board does, and the reference agent's `--pty` mode serves a
+  pseudo-terminal for the serial lane; the hil-emu lane runs both.
+- Semihosting coverage for the `gdb` and `qemu-system` transports (#292):
+  with `coverage=semihosting` in `--transport-coverage-map` (and no ring
+  keys), each run's coverage is the event stream the `semihosting` probe
+  backend writes to fd 2. The gdb client now serves the File-I/O requests a
+  debugger-routed semihosting call makes (QEMU's
+  `-semihosting-config target=gdb`, OpenOCD's `semihosting_fileio`): it reads
+  each write's buffer, keeps fd 1 as console output and fd 2 as the
+  semihosting channel, and refuses other calls. A run that used semihosting
+  used to fail on the first such request. Each reply carries the Ctrl-C flag
+  and the client continues the target after it, because QEMU 8.2 sends no
+  stop reply for the rest of a run after a plain File-I/O reply.
+- `bhf fuzz --engine libafl` runs a LibAFL campaign (#296) on the harness's
+  `main`, in a bhf built with the `libafl-engine` feature (another bhf refuses
+  the engine and names the rebuild). LibAFL mutates with havoc and the harness
+  dictionary's tokens, each input runs in a fresh process, and the edge bitmap
+  the harness writes is its coverage map. The inputs that crashed the harness
+  go through the external-engine ingest into findings. CI runs the engine's
+  end-to-end test in its feature build.
+- `bhf fuzz --engine honggfuzz` runs honggfuzz in persistent mode (#295) on the
+  harness's `main_honggfuzz`, a new Makefile target built with honggfuzz's
+  `hfuzz-clang` (with ASan and UBSan) when absent. honggfuzz is found in
+  `BHF_HONGGFUZZ_PATH` or on PATH. The crash files it saves go through the
+  external-engine ingest into findings that replay through `main_honggfuzz`.
+  The nightly builds honggfuzz 2.6 for the gated test.
+- `bhf fuzz --engine libfuzzer` runs the harness's libFuzzer build (#294):
+  `main_libfuzzer`, built with `make libfuzzer` when absent, for `--time`, with
+  the per-input timeout, length and memory limits and the harness dictionary.
+  Its `crash-`, `oom-` and `leak-` artifacts are replayed through it and
+  recorded as findings, and a `timeout-` one that hangs again is a hang finding,
+  through the same external-engine ingest AFL++'s crashes and hangs now go
+  through. The findings replay through `main_libfuzzer`. `--engine` took only
+  builtin, afl++ and winafl.
+- The reference agent runs as a Zephyr module (#291). `c_runtime/zephyr/`
+  serves the agent protocol on the UART the devicetree's chosen
+  `bhf,agent-uart` names (`CONFIG_BHF_AGENT=y`,
+  `bhf_agent_zephyr_run(LLVMFuzzerTestOneInput)`). Zephyr ends a thread that
+  faults, so the module's `k_sys_fatal_error_handler` records the fault for
+  the running input, and the calling thread sends the reply
+  (`bhf_agent_report_fault`, new in `bhf_agent.h`) and starts a new agent
+  thread. Its `qemu_cortex_m3` sample runs clean, fault and clean inputs in one
+  boot and replays the fault (`transport_zephyr_agent_cli`, opt in with
+  `BHF_ZEPHYR_CLI=1`; hil-emu installs Zephyr and runs it). The glue also runs
+  on the host against a stand-in for the Zephyr API, in `agent_loopback`.
+- `bhf auto` fuzzes a Python instance method whose class's `__init__` takes
+  arguments (#286). The harness decodes each required `__init__` argument from
+  the input ahead of the method's own, as it decodes a method parameter of that
+  annotation or name, and builds the receiver from them. An `__init__`
+  parameter annotated with a type bhf cannot decode still skips the target,
+  and the reason names it. Only a receiver whose `__init__` took no required
+  argument was built. A union annotation (`str | Path`, `Optional[str]`) is
+  decoded as its first member bhf can build, a `Path` as a `pathlib.Path` of
+  decoded text, and the Python driver treats an `ImportError` the target
+  raises as the environment, not a finding.
+- `bhf auto` fuzzes Python 2 sources under a `python2` interpreter (#285):
+  `python2`, `python2.7`, or a `python` that is 2.x. The Python runtime (driver,
+  coverage and decoder) runs on Python 2.7 as well as Python 3, and the target is
+  resolved with the Python 2 extractor. Without such an interpreter a Python 2
+  target is report-only, as before, with a reason that says to install one. The
+  nightly builds CPython 2.7.18 for the gated test.
+- `bhf auto` fuzzes Ada 83 units from an Ada 2012 harness (#284). Ada 83 has
+  no child units, so an instrumented Ada 83 unit names the probe through the
+  runtime's library-level `AdaFuzz_Probe83`, which renames the probe's
+  subprograms, and its exception handlers are not rewritten: their probe binds
+  the occurrence, which Ada 83 cannot. The dialect was report-only, and the
+  instrumented unit's `with AdaFuzz.Probe;` did not compile under
+  `pragma Ada_83`.
+- `bhf auto` fuzzes K&R C definitions (#283). The harness declares the
+  prototype the definition's parameter declarations give, with the default
+  argument promotions (`char` and `short` as `int`, `float` as `double`), and
+  passes the arguments it decodes. The modern parse read an old-style
+  definition as taking no parameters, and the dialect was report-only.
+  Pre-C++98 C++ stays report-only.
+- On-target CmpLog for the `gdb` and `qemu-system` transports (#386).
+  `--transport-coverage-map ...,cmplog=ADDR,cmplog_cap=N` names a record the
+  firmware's `-fsanitize-coverage=trace-cmp` callbacks fill, `{u32 count,
+  u32 reserved}` then `{u64 lhs, u64 rhs, u32 width, u32 site}` entries. bhf
+  zeroes the count before each run and reads the entries after it. A mutation
+  of a corpus entry splices the operands its run compared. The summary's
+  `comparisons` counts them. On the mps2-an385 fixture a 4-byte magic is
+  solved within 300 executions with `cmplog=` and not without it. The
+  transport lane had no comparison feedback.
+- `bhf fuzz --target-transport ... --workers N` drives N targets at once
+  (#316). The spec names each worker's with `{worker}` or `{BASE+worker}`
+  (`agent:tcp:127.0.0.1:{9000+worker}`). The workers share one corpus,
+  coverage map, schedule and finding set, the iteration cap and time budget
+  are the campaign's, and a finding's transport profile names the spec of
+  the worker that found it. A spec without a template is refused with
+  `--workers`. The transport lane was single-worker.
+- The reference agent runs as a FreeRTOS task under `qemu-system-arm`
+  (#290). `crates/target_transport/tests/freertos/agent_task.c` serves the
+  agent protocol over UART0 of `mps2-an385`, which `-serial tcp:` makes a
+  socket. Its HardFault handler returns from the exception into a recovery
+  function that reports the fault from the task. `transport_freertos_agent_cli`
+  (opt in with `BHF_RTOS_CLI=1`) runs clean, fault and clean inputs in one
+  boot and replays the fault (`docs/validation/2026-11-18-freertos-agent.md`).
+  The agent lane had not been run against anything but mocks.
+- A reference target-side agent ships for `agent:tcp` and `agent:serial`
+  (#289): `c_runtime/bhf_agent.{h,c}`, freestanding C99 with no heap. It
+  serves the agent protocol over the board's read and write callbacks and
+  collects each input's SanitizerCoverage guards. It reports a fault from
+  the board's vector or signal handler (`bhf_agent_fault`) and goes on with
+  the next input. An input longer than its buffer is refused, a new
+  protocol status (`3`) the host takes as an inconclusive run.
+  `c_runtime/examples/agent_posix.c` runs it over TCP, and a loopback test
+  and a `bhf fuzz` run drive it to a fault that `bhf replay` reproduces.
+  Users had to implement the protocol from its description.
+- The JS lane runs browser-oriented modules (#288). A module that needs
+  `window`, `document` or `navigator`, at load or when called, gets inert
+  stand-ins for the browser globals Node lacks, and for any
+  `HTML…Element`, `SVG…Element` or `…Observer` class it hits. The harness's
+  `browser-globals.txt` records which, and later starts install them before
+  the target loads, as an ES module needs. The target's findings carry them
+  in `fidelity.environment_shim` and `fidelity_caveat`, since a finding may
+  depend on them. A module that tests `typeof window` gets none. These
+  modules were skipped as not loadable (JS-2). Re-running the sweep's 37 JS-2
+  targets built and fuzzed 23 of them
+  (`docs/validation/2026-11-18-js2-browser-globals.md`).
+- `bhf minimize --strategy typed` minimizes a generated C/C++ harness's
+  finding (#279). By the harness's `arg-layout.json`, it reduces each decoded
+  integer or flag to the first of 0, 1, -1 and its type's limits that still
+  crashes, then an integer to the value nearest zero that does, keeping the
+  input's layout. `minimization.typed` records what it tried and kept. A
+  lane without an argument layout, a binary finding and a transport finding
+  are refused by name. The strategy was Ada-only, and it refused every other
+  harness as "C/C++".
+- `bhf minimize` minimizes on-target transport findings (#280). It rebuilds
+  the transport from the finding's profile as `bhf replay` does
+  (`--transport-endpoint` relocates it), then delta-debugs the input,
+  keeping a reduction only when it faults with the same rule at the same
+  site, or for a deadline finding is again a clean run past the deadline.
+  It refused transport findings.
+- The workers of a `bhf fuzz --workers` campaign share their corpus while
+  they run (#277). Every `BHF_SYNC_INTERVAL_MS` (10 s by default, spread
+  over the workers), each writes the entries its pool kept to
+  `fuzz_campaigns/<harness>/sync/worker-<id>/`. It also runs the entries
+  the others wrote that it has not seen, by content hash, and keeps those
+  that add coverage. An entry is written once, and each worker logs its
+  imports to `sync-import.log`. The workers merged their queues only after
+  all of them had exited.
+- `bhf fuzz --engine afl++ --workers N` runs AFL++'s own parallel mode
+  (#276): a `-M main` instance, which runs CmpLog, and N-1 `-S` instances in
+  one output directory. They sync each other's queues at start and every
+  quarter of `--time` (1 to 30 minutes, unless `AFL_SYNC_TIME` is set). All
+  their crashes, hangs and queues are harvested, the summary's
+  `afl.instances` names them, and the stats add up. It ran N bhf workers
+  with an afl-fuzz each, in their own directories, that never synced.
+- The AFL++ lane keeps its session (#275). `afl_out/<harness>/out` is kept
+  between runs, `bhf auto` runs included, and afl-fuzz resumes it
+  (`AFL_AUTORESUME`). Seeds the session was not given before join its queue
+  (`offered-seeds.txt` records the ones it was given). After each run its
+  queue is taken into the bhf corpus (`corpus_persisted`). Inputs afl-fuzz
+  saved as hangs are re-run through `main_afl` with twice its 1 s limit, and
+  one that hangs again is a BHF-230 finding (`hangs` in the summary). The
+  crashes and hangs of a session a resume moved aside are harvested too. A
+  session afl-fuzz cannot resume is started over, once. The out directory
+  was deleted at the start of every run, the queue was never imported, and
+  `hangs/` was never read.
+- The AFL++ lane runs CmpLog (#274). The harness Makefile has an
+  `afl_cmplog` target that builds `main_afl_cmplog` under
+  `AFL_LLVM_CMPLOG=1`. `bhf auto --engine afl++` and `bhf build --c-engine
+  afl++` build it beside `main_afl`, and afl-fuzz runs with `-c
+  main_afl_cmplog -l 2AT`, so AFL++ solves magic values and checksums no
+  dictionary holds. The run's `afl` block records `cmplog_binary`. A CmpLog
+  binary older than `main_afl` is not used. The lane ran without CmpLog,
+  which bhf's own comparison measures AFL++ with.
+- `--session-transport transport:<spec>` drives a protocol session through a
+  `--target-transport` backend (#261): an on-target agent, a debug probe or
+  an emulator, with `--transport-coverage-map` for the gdb and qemu-system
+  backends. Each message is one execution, in order. A fault, crash or hang
+  at a message is a disconnect finding once a second drive confirms it, and
+  `bhf replay` reproduces it. The executions' edges feed the lane's code
+  channel (`coverage_source = "target"`). A reply is the backend's stdout,
+  which the agent backends do not have. The session lane could not reach a
+  protocol on the target.
+- `--session-transport serial:PATH[,baud=N]` drives a protocol session over
+  a UART or a pty (#262), opened raw as the agent's serial transport is, with
+  the profile's framing and every read bounded by the reply deadline.
+  `--session-reset reconnect` reopens the device; `none` keeps it open. The
+  session lane reached only TCP and UDP services, not a device's command
+  set.
+- `bhf fuzz --session-server-cmd ... --runtime-oracles on` runs the service
+  under the runtrace shim (#364). Before each session bhf writes the bytes
+  the session carries where the shim matches its sinks against its input
+  (`BHF_SHIM_INPUT_FILE_SHARED=1`, one file for every process of the
+  service). Each session's events are evaluated as that session's, and the
+  service's start-up is excluded. A command, path, library or query built
+  from a session's bytes is a finding of that session, once per rule and
+  sink API, which `bhf replay` reproduces under the shim. Sessions had only
+  the profile's response and state oracles, and the lane refused
+  `--runtime-oracles`.
+- A service the session lane runs with `--session-server-cmd` reports its
+  code coverage (#363). It gets `BHF_COV_SHM`, an edge map bhf keeps for the
+  campaign, which a service built with SanitizerCoverage and the new
+  `c_runtime/bhf_service_cov.c` fills. A session that reaches new code is
+  kept and scheduled as one that reaches a new state is. The summary's
+  `coverage_edges` counts the service's edges, and `coverage_source` says
+  whether it is `service`, `uninstrumented_service` or `none`. The lane
+  folded an empty edge set, so on a one-state protocol it kept nothing past
+  the seeds.
+- The zoxide harness-parity row is rerun with the in-crate lane (#245,
+  completing #83): with `--rust-private`, auto picks the private
+  `Database::deserialize` and enters and covers it (754 edges), and run at
+  the expert's `Database::open_dir` it materializes `db.zo` and enters and
+  covers that (961 edges)
+  (`docs/validation/2026-11-17-zoxide-incrate-parity.md`). The in-crate lane
+  declares its harness module beside the file that defines the target, so
+  a private associated function of a submodule (zoxide's `deserialize`)
+  compiles; at the crate root it was E0624. The parity runner passes extra
+  `bhf auto` arguments with `--bhf-arg` and records them in each row.
+- `bhf fuzz --session-server-cmd COMMAND` runs the service the session lane
+  fuzzes (#260). bhf starts it with its stderr kept, waits until it serves
+  the transport's port, and after each session checks whether it exited. A
+  session after which it exits, again on a restart, is a finding: from the
+  sanitizer report in its stderr (oracle `session-server-crash`, with
+  `sanitizer.log`), else a BHF-210 exit (`session-server-exit`). The service
+  is started again and the campaign goes on; `server_starts` counts the
+  starts. A service that does not start is exit 2 with its stderr, and
+  `bhf replay` and `bhf minimize` start it for each drive. The lane could not
+  start a service, so it had no sanitizer oracle and stopped once the service
+  crashed.
+- `bhf binary adapter --adapter rizin` runs Rizin's analysis (#264):
+  `rizin -q -c 'aaa; aflj; axlj; izj'`, under `--timeout-secs` (default 900)
+  and a 128 MiB output cap. It maps the functions (with `imported` for an
+  import stub), the call edges, the xrefs and the data-section strings into
+  the report, each array capped, with `truncated` naming one that was cut.
+  The adapter only ran the tool's version probe and wrote empty arrays, and
+  the probe it ran, `rizin --version`, opens a file named `--version` in
+  Rizin's shell and waits; it is `rizin -v`. A failed analysis is `status:
+  error`, exit 1, with `timeout`, `tool_error`, `output_too_large` or
+  `bad_output`.
+- `bhf binary adapter --adapter ghidra` runs Ghidra headless (#265):
+  `analyzeHeadless` imports and analyzes the binary in a throwaway project
+  and the bundled `BhfExport.java` post-script exports its functions, calls,
+  defined strings and references. Addresses are moved back from Ghidra's
+  load base (`0x100000` for a PIE) to the binary's own, so they match
+  Rizin's and `nm`'s; an import's function in Ghidra's EXTERNAL block is
+  left out for its PLT thunk. The version is read from the install's
+  `application.properties`.
+- `bhf binary adapter --adapter angr` runs the bundled `angr_export.py`
+  (#266): CFGFast over the main object, with data and cross references,
+  moved back from angr's load base (`0x400000` for a PIE). A Python that
+  cannot import angr is `skipped`, exit 1; the adapter ran `python3
+  --version` and reported a successful analysis without angr.
+- The nightly's binary-analyzers job installs Rizin 0.9.1, Ghidra 12.2 with
+  a JDK 25, and angr 10.0.7, pinned by digest
+  (`scripts/ci/install-binary-analyzers.sh`), and runs each adapter on a
+  fixture with `BHF_REQUIRE_TOOLS=1`: the fixture's functions at the
+  addresses `nm` gives, its call edges, its magic string and a call xref.
+- `bhf binary fuzz` and `bhf binary scan` take `--adapter-report` (#267).
+  The strings the binary's code references seed the mutation dictionary
+  (the builtin engine's, and afl-fuzz's `-x`), and its own functions are
+  ranked as fuzz entry points by the input-handling imports they call, the
+  strings they reference and their calls, the first being the candidate
+  persistent address. `binary fuzz` records them in the run JSON's
+  `adapter_report`; `binary scan` adds them as `adapter` to the entry of the
+  binary whose SHA-256 the report records (its new `target_sha256`).
+  Nothing read the report before.
+- The Rust lane harnesses more targets (#338,
+  `docs/validation/2026-11-17-rust-trait-and-param-classes.md`):
+  - A static method of a dependency's trait impl (`impl heed::BytesDecode
+    for Codec`) is called by UFCS: the trait is resolved through the impl
+    file's `use` declarations or its full spelling, and the harness crate
+    depends on the trait's crate with the target's spec. `From<&[u8]>` and
+    `From<&str>` join the standard conversions.
+  - An owned parameter of a crate type with `Default` is built from
+    `T::default()`, as a `&T` one was; `Option<T>` of a decodable `T` and
+    `i128`/`u128` decode.
+  - The harness crate's `Cargo.lock` starts as the target's, so an offline
+    build resolves a git dependency with no rev and the versions the target
+    was built with.
+
+  A trait-impl method that takes no input, or one on a generic type, is
+  refused with its own reason instead of as an outside trait.
+- `bhf-daemon --security-config FILE` runs the JSON-RPC daemon with
+  workspace-scoped security (#273): `workspace_shared` or `multi_tenant`
+  tenants, each with a token read from its own `token_file`, a workspace
+  root and a role. A token file its group or others can read or write, a
+  short or shared token, or an unknown field stops the daemon at start with
+  exit 2 and the reason. The shipped daemon always ran single-user, so a
+  shared deployment that followed daemon.md ran with no authentication.
+- `bhf-daemon --jobs-dir DIR` runs the continuous fuzzing scheduler behind
+  the `submitJob`, `listJobs` and `cancelJob` JSON-RPC methods (#271), with
+  `--job-workers` and `--bhf`. A tenant submits, sees and cancels only jobs
+  for projects inside its workspace root; a viewer only lists them. The
+  scheduler gained `Scheduler::cancel` and a `cancelled` state: a queued
+  job never starts, and a running one's process tree is killed. It had no
+  consumer at all.
+- A protocol profile's response captures take TLV records (#259): a `tlv`
+  capture walks the records from its offset to the one with its `tag` and
+  binds the value, which a later request echoes from a `bytes` or `tlv`
+  reference field. A profile with a TLV capture did not compile, and a
+  reference field could only be an integer.
+- The session lane has a UDP backend (#258): `--session-transport
+  udp:HOST:PORT` sends each message as one datagram, framed as the profile
+  says, from a socket of its own per session, and waits for one reply
+  datagram. `--session-reply-timeout` sets how long a reply may take, over
+  TCP (5s by default) or UDP (1s); a UDP reply that does not come, or a
+  datagram the host refuses, ends the session as a dropped TCP connection
+  does. The lane accepted only `tcp:HOST:PORT`.
+- The Java lane fuzzes a target that takes a JDK collection (#236):
+  `List<String>`, `Map<String, Object>`, `Set<Integer>`, a sorted map, a
+  nested collection, a wildcard, and an `int[]`, `long[]` or `double[]`. The
+  harness declared every local with `var`, which infers the wrong element
+  type for a collection built from the input, so these were skipped as
+  unsupported. A collection local is declared with its parsed type, spelled
+  fully qualified, and filled with a fuzzed number of elements (0 to 8),
+  each decoded by its type: a string, a boxed scalar, an `Object`, a
+  `byte[]`, an enum constant, a default instance of a tree type, or another
+  collection. A sorted collection is used only for elements that compare with
+  each other. A collection of strings ranks as a byte channel, as a string
+  does, and a `java.util.Random` parameter is seeded from the input.
+  Of the 57 targets the 2026-07-28 sweep skipped as Java-1, 7 now pass the
+  parameter they were skipped on and none builds: five need the project's
+  Maven or Gradle build, which fails, one fails javac on the tree, and one
+  stops at its next parameter
+  (`docs/validation/2026-11-16-java1-collections.md`). `go1_rerun.py` re-runs
+  Java targets (`--lang java`), several projects at once (`--jobs`), and can
+  let bhf run a project's build (`--run-untrusted`).
+- The Go lane fuzzes a package outside every Go module (#237): a GOPATH-era
+  tree, or a dir of `.go` files. Its harness imports the target through a
+  module `replace`, which needs a dir with a `go.mod`, so these were skipped.
+  bhf copies the package into the harness dir (`bhf_target/`) with a `go.mod`
+  of its own, and the scanned tree is not written to. A `package main` is
+  renamed in the copy so it can be imported. From a dir of `go run` scripts,
+  each with its own `main`, only the target's file is copied. Each copied
+  file opens with a `//line` directive, so a finding names the project's
+  file and line, and the capsule ships the copy with the harness. Of the 17
+  targets the 2026-07-28 sweep skipped this way, 15 now build and fuzz; the
+  other 2 are SWIG bindings, which need `swig`
+  (`docs/validation/2026-11-16-go3-loose-packages.md`). `go1_rerun.py`
+  re-runs any Go class by name (`--class`), across every lane's rows
+  (`--all-lanes`).
+- The engine trade study records coverage over time and retained findings
+  (#256). It snapshots each engine's corpus at 10, 25, 50 and 75% of the
+  budget and replays each through the shared coverage binary, so a row has a
+  coverage curve and the summary its distribution per checkpoint; and it
+  replays every crash input an engine kept through the oracle, so a row
+  counts the kept, confirmed and distinct findings and the summary gives
+  their distributions. `BHF_LIVE_CORPUS_DIR` makes bhf's built-in engine
+  write each input it keeps there as it keeps it, since its queue is written
+  when the pass ends.
+- Pinned build recipes for the trade study's libpng and re2 targets
+  (#371), so all six real-code targets are runnable: libpng's library
+  sources with its prebuilt `pnglibconf.h`, linked with the zlib recipe, and
+  RE2 2023-06-01 (re-pinned: the latest release that builds with a
+  distribution Abseil) against the system Abseil. A recipe can name
+  libraries to link, which bhf's lane passes as `--ldflags`; adapters are
+  named `<target>_adapter`, and two sources with one file name are refused.
+- Pinned build recipes for the trade study's zlib and libyaml targets
+  (#370): zlib's core translation units with its checked-in `zconf.h`, and
+  libyaml's `src/*.c` with the `config.h` its configure writes for 0.2.5,
+  each with an adapter. The dry run lists four of the six real-code targets
+  as runnable.
+- Pinned, checksum-verified build recipes for the trade study's cjson and
+  sqlite real-code targets (#255). `recipes.py` turns a checkout fetched at
+  its pin into the sources, include dirs and flags to compile: cjson is
+  `cJSON.c`; sqlite is the amalgamation its own `make sqlite3.c` generates out
+  of tree. Each recipe checks the SHA-256 of the files it takes or generates,
+  and each target has an adapter under `adapters/`. The dry run lists both as
+  runnable, and a smoke build (`BHF_TRADE_STUDY_SOURCES`) builds and runs both
+  harnesses.
+- The engine trade study's bhf lane fuzzes a provided harness (#254): with
+  `bhf_harness_mode=provided` it wraps the same `harnesses/libfuzzer.c` every
+  other engine builds, with the target's sources, include dirs and flags
+  (`bhf generate-harness ... --target LLVMFuzzerTestOneInput`, then
+  `bhf build --cflags`), and runs the same `bhf fuzz` budget and seeds. The
+  dry run lists the lane as runnable, and `--bhf-harness-mode` sets the mode
+  for every target. It was a hard-coded unsupported row. CI runs the study's
+  unit tests.
+- `bhf pack import-nvd INPUT... --out cve-db.json` builds an advisory
+  database from NVD CVE JSON 2.0 files (#387), with the OSV importer's
+  writer. Each vulnerable CPE match becomes a record identified by its CPE,
+  with its version bounds as a range (or the CPE's own version) and the
+  CVE's CVSS base severity, so a C or C++ library named by CPE matches by
+  CPE and version range. Malformed records are reported and skipped.
+- `bhf pack import-osv INPUT... --out cve-db.json` builds an advisory
+  database for `bhf sbom --vuln-db` from OSV records (#223): an unzipped OSV
+  ecosystem export or single record files. Each affected package becomes a
+  record with bhf's ecosystem name, explicit versions, version ranges and a
+  severity (the GitHub advisory rating, else the CVSS v3 base score's
+  rating). Malformed records are reported and skipped. The database format
+  takes `affected_ranges` (version bounds) beside `affected_versions`, and
+  `docs/site/inventory-assurance.md` documents it. No command built a
+  database from a public feed.
+- The persistent built-in engine calibrates the inputs it adds to the corpus
+  (#232), as AFL++ does. It re-runs each one four times, each from a zeroed
+  edge bitmap, and counts an edge that one run hit and another did not as
+  variable. An input whose only new coverage was variable edges is left out,
+  and the re-runs' edges count as seen. The run summary's `stability` gives
+  `stability_pct`, `variable_edges`, `calibrated_entries` and
+  `unstable_entries_dropped`; the status line shows the stability, and below
+  90% bhf says the harness keeps state between executions and suggests
+  `--no-fork-server`. A target that switches on a static call counter filled
+  the corpus with an entry per counter value, with no warning.
+- The runtime comparison log records integer comparison constants (#221):
+  the C/C++ driver writes the constant of each comparison the compiler
+  emitted against one as an `"int"` record, with its own size budget, and
+  the learned dictionary takes it as a constant from one record, in
+  little- and then big-endian bytes. A constant computed at build time that
+  no source literal spells now carries to the next run and to the AFL++ and
+  WinAFL dictionaries; it was solved again by every run. Constants of at
+  most 0xff, and all ones, are not recorded.
+- Stack depth is a coverage channel of the C/C++ driver (#220): it records
+  the deepest stack each execution reached, and the built-in engine keeps an
+  input that recursed a quarter deeper again than every input before it,
+  though it ran no new edge. A new mutator doubles the longest run of a
+  nesting opener (`[`, `{`, `(`, `<`) in an input. An unbounded recursion now
+  reaches the end of the stack and is reported as a BHF-207 stack overflow;
+  edge coverage kept none of the deeper inputs, so it was not found.
+  `BHF_DISABLE_STACK_DEPTH=1` turns the channel off.
+- `bhf auto --collector SPEC` (and `--collector-window-ms`) observes each
+  fuzzed target with the runtime-event collector: after its passes, the
+  target's retained inputs are replayed one by one under it, as
+  `bhf fuzz --collector` does, and run.json records each target's
+  `collector` observation with each replay's testcase, input SHA-256 and PID.
+  `bhf auto` had no collector: its fuzz runs left it off.
+- The FreeRTOS reference profile has an interrupt-driven entry point: its
+  `-DBHF_ISR_ENTRY` image takes its input from a receive interrupt whose
+  handler posts it to the consumer task with `xQueueSendFromISR`. A CLI test
+  finds the planted fault through it. `task_id=ADDR` on a `qemu-system:` or
+  `gdb:` transport reads the firmware's task identity word after each run, and
+  a fault finding records it as `target_task.id`; `bhf_task_id` was written but
+  never read. on-target-fuzzing.md lists the five validation levels (host
+  stubs, ISA emulation, full-system bare metal, an actual RTOS, silicon) and
+  which ones BHF has validated.
+- On-target deadlines can be timed by the target: `cycles=dwt` on a `gdb:` or
+  `qemu-system:` transport reads the Cortex-M DWT cycle counter around each
+  run, `cycles=ADDR` a free-running 32-bit counter, and with `cpu_hz=N`
+  `--deadline` uses the target's time instead of the host's round-trip time.
+  The run summary's `target_cycles` gives the fewest and most cycles a run
+  took, the transport profile records the timing basis, and replay judges a
+  deadline finding by it. QEMU does not count `DWT_CYCCNT`, which the run
+  reports; the FreeRTOS profile's test reads the MPS2 FPGAIO counter.
+- `bhf replay --stability-runs N` re-drives an on-target transport finding's
+  input N times, each from the transport's reset, and reports how many runs
+  reproduced it. A finding some runs reproduce and others do not is
+  `MISMATCH nondeterministic, K of N runs reproduced the finding` (exit 3);
+  transport replay ran once and could not tell a flaky fault from a fixed one.
+- Seed lineage: the built-in engine records what each input it keeps was
+  mutated from (`corpus/<harness-id>/lineage.jsonl`, one line per queue
+  entry, beside the queue), and each finding's `finding.json` gains
+  `lineage`: whether its input descends from a mined seed, a user seed, a
+  queue entry with no record or an input bhf generated, that seed's sha256 and
+  path, how many mutation generations down it is, and its immediate parent.
+  Later passes, `--resume` and multi-worker campaigns keep the chain (each
+  worker starts from the campaign's records and names the seeds it was
+  given, not bhf's copies of them); the file is trimmed to twice the queue's
+  entry limit or twice the files the queue holds, whichever is more (a
+  multi-worker merge can leave the shared queue holding more than the
+  limit), keeping what the queue needs first. A queue entry with no record
+  is a `corpus` root whatever its file is named. A corpus saved without the
+  file still loads, and what it cannot say is `unknown` with a reason, as is
+  the lineage of a crash AFL++ found (`bhf fuzz --engine afl++`, `bhf binary
+  fuzz --engine afl-qemu`), whose queue bhf does not track. The
+  corpus replays (MSan, TSan, the memory profile, `--differential`) record
+  the lineage of the queue entry they ran, and `bhf binary fuzz`'s
+  seed-replay engine and `bhf differential` name the operator's input as a
+  user seed. `bhf explain` prints it as one line, also for an MSan or TSan
+  finding, which saves no testcase and names its input by sha256, and
+  `bhf.findings.v1` carries it as the optional `fuzz.lineage`.
+- Windows: a WinAFL engine, `--engine winafl` on `bhf fuzz` and `bhf auto`
+  (native Windows only; refused on other hosts before anything is built).
+  WinAFL fuzzes `main_winafl.exe`, the harness's sources built without
+  AddressSanitizer or SanitizerCoverage by the new `make winafl` lane (`bhf
+  build --c-engine winafl`), in persistent mode through the driver's exported
+  `bhf_winafl_fuzz(path)` entry, with DynamoRIO coverage of the harness
+  (`--winafl-coverage-module` adds target DLLs) or Intel PT
+  (`--winafl-instrumentation intel-pt`). An ASan binary does not run under
+  DynamoRIO (it hangs at start-up under `drrun`, and WinAFL counts ASan's
+  shadow-memory access violations as crashes), so the crashes and hangs WinAFL
+  saves, and the seeds its dry run found crashing, are replayed through the
+  sanitized `main.exe`, and each report becomes a finding through the same
+  dedupe and `results/` flow as an AFL++ crash; `bhf replay`, `explain`,
+  `capsule` and `verify-poc` work on it, its `finding.json` says how it was
+  found (`discovery`), and its fidelity record that WinAFL's build had no
+  sanitizer. The replay is bounded: each distinct input once, at most half the
+  time budget (30 s to 10 min), half of that kept for the hangs however many
+  crashes come first, and hangs until 8 time out again with no report in
+  between (a hang that replays clean does not count); an input that fails to
+  replay is a warning. The WinAFL build checks the heap after every input,
+  and `--winafl-page-heap` runs it under full PageHeap for the run, so a heap
+  overflow faults as a crash rather than ending in a fail-fast WinAFL records
+  as a hang. PageHeap is set for a copy of the build
+  under a name only that run uses, so no other run or campaign gets it; bhf
+  tags the key with its owner and the copy with a marker file, prints the
+  key, and removes only what it wrote when the run ends or is stopped with
+  Ctrl-C, Ctrl-Break or a closed console (then stopping the targets first and
+  deleting the copy), and a later run, or `make clean`, removes what a killed
+  one left. `page_heap` in `run.json` and the finding is the setting actually
+  in effect. It needs an elevated shell and is refused up front without one.
+  `--rss-limit-mb` becomes WinAFL's `-m` (for an x86 harness only while it is
+  below what a 32-bit process can address, else `-m none`). Seeds are handed
+  over byte for byte, the harness dictionaries are merged into WinAFL's one `-x`
+  file, and WinAFL's queue returns to the corpus. bhf enforces the time budget
+  (WinAFL has none), stops afl-fuzz, drrun and the target together through a
+  job object, restarts WinAFL on its queue when it stops early (and still
+  replays what a session that stopped early saved, failing only when nothing
+  was). A run stopped by Ctrl-C before its replay prints where WinAFL's saved
+  inputs are, and the next WinAFL run of that harness in the work dir replays
+  them (`earlier_inputs`). bhf records WinAFL's own coverage, executions and
+  the replay outcomes in `run.json` (`winafl`). WinAFL and DynamoRIO are found
+  from
+  `--winafl-path`/`--dynamorio-path` (config keys `winafl-path`/
+  `dynamorio-path`, explicit `--config` only), `BHF_WINAFL_PATH`,
+  `BHF_DYNAMORIO_PATH`/`DYNAMORIO_HOME`, or `PATH`, and a missing one, a
+  `winafl.dll` of the wrong architecture, or an ARM64 target, is an error
+  naming what to do (`bhf auto` exits 2 before its sweep; `bhf fuzz` exits 1,
+  as for a missing `afl-fuzz`, and 3 on a host other than Windows or for
+  `--winafl-page-heap` outside an elevated shell). `bhf fuzz` refuses
+  `--engine winafl` with `--target-transport` or `--protocol-profile`, which
+  only the builtin engine runs. Validated with WinAFL master `fd85f38` and
+  DynamoRIO 11.91.20763 on a Windows Server 2022 VM; see
+  [windows.md](docs/site/windows.md#winafl-engine).
+- A seed reaches the buffer of a C/C++ harness that decodes fixed-width
+  scalars before it: `bhf auto` (for its mined and `--seed-file`/`--seed-dir`
+  seeds, in the builtin and AFL++ stages) and `bhf fuzz` (for
+  `--seed-file`/`--seed-input`) also give each seed behind as many zero bytes
+  as those scalars take, from the harness's `arg-layout.json`, plus 4 for the
+  length of each other buffer's slice ahead of it (a context pointer before a
+  `(data, len)` pair), which a zero leaves empty. The seed itself is still
+  given byte for byte. A multi-worker `bhf fuzz` makes the prefixed seeds
+  once, and its workers prefix none of the seeds they are handed.
+  `auto/seeds.json` lists the prefixed seeds under an additive
+  `layout_variants` (`harness_id`, `layout_prefix`, `sha256`).
+- `bhf fuzz` and `bhf decode-args` take `--qemu-user` and `--qemu-arg`, as
+  `bhf replay` and `bhf minimize` do.
+- `FidelityFacts` has two more fields, `target_triple` and `runner`, for a
+  cross-built target run under user-mode emulation.
+- The input reachability verdict records what it was inferred from:
+  `finding.json` `input_reachability_basis` `{rule, param, spelled_type,
+  resolved_type, typedefs_resolved}` (`rule` is `const_byte_buffer`,
+  `parser_name_with_length`, `mutable_parser_buffer`, `byte_scalar_parser`,
+  `output_serializer`, `no_input_shape`, `call_graph_provenance` or
+  `internal_linkage`), carried into `results/findings.json` as
+  `reachability.reachability_basis`. `bhf explain` names the parameter and its
+  types (``because parameter `buf` (`const u8_t *`, resolves to `const uint8_t
+  *`) is a read-only byte buffer``), says when an unproven verdict read the
+  types with their typedefs resolved, and says when a `static` entry has
+  internal linkage.
+- `results/findings.json` `fuzz.input_to_state_status`,
+  `fuzz.input_to_state_reason` and `fuzz.input_to_state_search` say whether a
+  comparison-evidence capture ran, why it found no gate, and how far its
+  search for computed operands got; `findings.csv` gains an
+  `input_to_state_status` column at the end, and INDEX.md says why a finding
+  has no compared input bytes. The schema fields are additive and optional.
+- A finding whose input is empty or all zero bytes, or whose method ran on an
+  object bhf's harness constructed (a default constructor, a factory or
+  decoded constructor arguments, now in `finding.json` `decoded_args`'s
+  receiver entry as `decoder`), carries a caveat that real callers may never
+  produce that state, beside the reachability verdict in `bhf explain` and in
+  the results `fidelity.caveats` (INDEX.md `Caveat:`).
+- `bhf build --runner <program>` / `--runner-arg <arg>` and the
+  `toolchain.runner`/`runner-args` keys: a build for a target this host
+  cannot run records the runner beside the binary in `bhf_runner.json`
+  (`bhf.harness_runner.v1`; `build/<id>/`, or `build/<id>/obj/` for an Ada
+  harness) and beside the harness, where `bhf replay`, `bhf minimize`,
+  `bhf fuzz`, `bhf decode-args` and the finding's `replay.py` find it; a
+  native rebuild forgets it, and a runner
+  for a build this host runs natively, C/C++ or Ada, is refused as in `bhf
+  auto` (a compiler that names no target keeps the runner as given). The
+  emulator note is printed whenever the selected compiler builds for another
+  target (a `--toolchain` prefix or a cross `--cc` included), and `[cross.*]`
+  tables in the config are named as applying to `bhf auto` only.
+- `bhf capsule`, `bhf verify-poc` and `bhf env-capsule` support every harness
+  language bhf generates, through per-language lanes: Ada, Rust, Go, Java, C#,
+  Python, JavaScript, TypeScript, Ruby, Perl, PHP, Lua, COBOL and Fortran, as
+  well as C and C++. A capsule ships what its lane's rebuild needs (for Ada the
+  generated `bhf_build.gpr`, the runtime project and sources, the instrumented
+  sources, the harness, the stub packages and the operator projects it extends
+  or `with`s; for Rust, Go and C# the dependencies vendored from the local
+  cargo, module or NuGet cache; for an interpreted lane the launcher, bhf's
+  driver and the scanned tree), relocates every path the build and launch
+  files name into the capsule, and rebuilds offline in a clean copy. The
+  rebuilt PoC is replayed with the input protocol the shared detector reads
+  off it (the Ada stdin event-log protocol for a GNAT binary), and the lane's
+  crash oracle names what fired (an unhandled Ada exception, a runtime's
+  `== bhf <lang> finding:` report, a panic, libcob's runtime check, a
+  sanitizer report). The manifest records the programs the rebuild needs and
+  their versions (`requires`), the protocol (`protocol`, `run`) and the lane's
+  build facts (for Ada the target, runtime, switches and GNAT/gprbuild
+  versions); `verify-poc` checks them first and names each missing program
+  and the variable that overrides it. A program build.sh finds under several
+  names (`lua`, `lua5.4`, `lua5.3`, `luajit`) records the others
+  (`requires[].alternatives`), and any of them meets it. An Ada capsule whose
+  rebuilt PoC raises a different exception than the finding recorded is not
+  counted as reproducing (manifest `finding_signature`, `reproduced: false`,
+  `reproduced_other_crash: true`), and `verify-poc` checks the replay against
+  the finding's exception (`MISMATCH` otherwise). A harness a lane cannot
+  rebuild offline is refused with the reason: a dependency not in the local
+  cache, an Ada project file outside the scanned tree, a harness built for
+  another target, a Java target built by Maven or Gradle, a build file
+  build.sh renders that still names the work dir or the scanned tree after
+  relocation. A text file a relocated capsule ships unchanged but that names
+  them is reported in a warning. env-capsule takes the native lanes (C, C++, Ada, Rust, COBOL,
+  Fortran) and refuses a statically linked harness (Go) or one that runs in a
+  language runtime, with that reason; cartography stays C/C++. `bhf explain`
+  offers capsule and verify-poc for the findings whose lane and harness layout
+  capsule takes; capsule checks dependencies and the size of what it ships
+  when it packages, so it can still refuse one of them, and says why. The new
+  manifest fields are additive; capsules written before them still verify.
+- The Fortran lane records how each Fortran object of a harness link was
+  compiled (`harnesses/<id>/fortran-build.json`), which a capsule uses to
+  rebuild them from source.
+- `bhf replay` writes `<finding>/replay.log` on every run, match or not: the
+  verdict, what ran, the exit status, the harness's raw stderr and stdout
+  (each bounded to its first 256 KiB and last 768 KiB, the cut marked) and any
+  debugger transcript. The summary names it (`log`; `replay_log` in `--json`).
+  It is not an evidence file, and results/ is now rebuilt after a mismatch too,
+  so the attestation covers it.
+- New findings record the generated harness's input format as
+  `harness.format_version` (and `harness.buffer_len_dimension`) in
+  `finding.json`, next to the top-level `harness_format_version` kept for
+  earlier readers, and in the harness's corpus metadata
+  (`corpus/<id>/metadata.json`, `bhf.corpus-metadata.v1`). `bhf replay`,
+  `bhf minimize`, `bhf decode-args` and `bhf capsule` read the format from the
+  finding's `harness` first, then the top-level key, then the harness dir, and
+  `bhf auto` notes a corpus recorded against another format than its harness.
+- `arg-layout.json` beside each generated C/C++ harness (`bhf.arg-layout.v1`,
+  named as `arg_layout` in `generation-metadata.json`): the static decode
+  layout of the harness's arguments, in the order the harness decodes them.
+  Each parameter records its order, input source (cursor, remainder, whole
+  input), decoder kind and primitive, width, endianness, bounds, enum
+  members, length-prefix size, buffer copy or view and pairing, whether the
+  value is a C string read up to its first NUL (`nul_terminated`) and the
+  constant a `fixed` parameter is given (`fixed_value`); it also marks
+  where a call's whole-input parameters take the remaining bytes and any
+  lifecycle loop. `generation-metadata.json` also records `target_function`.
+- `bhf decode-args`: maps a testcase (or `--finding <id>`) to the value each
+  harness parameter receives, through the harness's argument trace when its
+  binary runs, else (or with `--static`) by replaying `arg-layout.json` for
+  scalars, bounded integers, enums, length-prefixed strings, constants and
+  remainder, whole-input and paired buffers, naming each parameter it cannot
+  decode statically and why. Both sources measure a C string up to its first
+  NUL byte. Text table, or `--json` (`bhf.decode-args.v1`).
+- `bhf replay --debugger [gdb|lldb|cdb]` re-runs the testcase under a batch
+  debugger: it breaks at the harness's target function, prints its arguments
+  and full stack, continues to the crash and prints the stack again, with
+  AddressSanitizer's signal handling off so the debugger sees a SEGV. The
+  harness gets the replay's runtime mode and injected variables, and the
+  runtrace shim is preloaded into the harness only. lldb prints the crash
+  site through on-crash (`-k`) commands and stops a sanitizer report at the
+  sanitizer's report function. The session runs without a sandbox, so it is
+  refused with `--sandbox firejail|bubblewrap` or `--sandbox-strict`. It
+  says what to install when no debugger is found.
+- `bhf explain` tags each harness argument whose input bytes a recorded
+  comparison read with the comparison's site (`[compared at bits.c:12]`).
+- `findings.csv` appends `arguments` (`name=value;...`, buffers as
+  `len N hex <first 8 bytes>`, bounded) and `access_parameter`; results
+  `findings.json` carries `exception.access.parameter` as
+  `fuzz.access.parameter` (`{name, offset, basis}`, null when unknown), and
+  INDEX.md names it on the memory-access line. Both are additive.
+- Each token in a harness's `dictionary.txt` is preceded by a
+  `# from <file>:<line>` comment naming up to three places in the target source
+  and its headers where it was found (C, C++, Ada and the managed lanes), so a
+  token can be traced to the comparison or constant it came from. The file
+  stays a valid AFL dictionary.
+- `learned_dictionary.txt` beside a harness's `dictionary.txt`: after each
+  `bhf auto` fuzz pass that recorded comparison operands (`cmplog.jsonl`), bhf
+  writes them there, deduplicated and bounded (at most 256 tokens of at most
+  64 bytes, this run's first, then an earlier run's), under a header saying
+  they were observed at runtime. `bhf fuzz` and later `bhf auto` runs load it
+  after `dictionary.txt`, each token once, and AFL++ mode passes it with `-x`.
+- Windows: Visual Studio and Windows SDK discovery. Without `INCLUDE`/`LIB`
+  (no Developer shell), bhf finds the newest instance with the C++ toolset
+  through `vswhere`, applies the environment its `VsDevCmd.bat` sets, and
+  caches only what VsDevCmd changed (its variables and the `PATH` directories
+  it added, per instance, version and architecture under
+  `%LOCALAPPDATA%\bhf\vs-env`), which later runs apply onto their own
+  environment. It uses a clang on `PATH`, the standalone LLVM, or Visual Studio's bundled
+  clang, and GNU make from its usual install locations. Each command prints
+  what it used; `run.json` records it as `build_environment` and `--dry-run`
+  shows it. `--no-vs-env` (or `BHF_NO_VS_ENV=1`) and `--vs-arch` control it.
+- An MSVC `cl.exe` harness lane: `--cc cl` (or `clang-cl`, or
+  `[toolchain] cc = "cl"`) builds the C/C++ harnesses with Visual Studio's
+  compiler through `bhf-cl`, a front end that runs cl with the equivalent of
+  the generated Makefiles' command lines, `/fsanitize=address`, and MSVC's
+  SanitizerCoverage (`inline-8bit-counters`, `edge`, `trace-cmp`,
+  `trace-div`). The C driver folds inline 8-bit counters into its edge and
+  hit-count maps after each input and implements the division hooks. cl's
+  diagnostics gain their clang spelling for the repair loop, and weak repair
+  stubs become MSVC alternate names. The Makefiles recognise the `msvc`
+  family. The front end is installed in the user's own cache directory and an
+  existing one is reused only when its bytes are this `bhf`'s.
+- The Visual Studio project import runs by default when a tree has a
+  solution or project and no compile database or CMake/Meson build. Off
+  Windows it does so only when the solution is the tree's only build
+  description: a Makefile, autotools inputs (`configure.ac`, `Makefile.am`,
+  `autogen.sh`), Ninja, SCons or Bazel files at the root or on the way to the
+  solution mean that build is followed, unless `--msbuild-solution` names the
+  solution. It runs nothing and writes its database to `<work>/auto/msbuild/`.
+  On Windows each row carries the import libraries its own project links
+  (`bhf_link_libraries`): only libraries found in a `LIB` directory reach that
+  project's harnesses (`BUILD_CONTEXT_LDFLAGS`, now also in the C
+  Makefiles), and the rest (the solution's own outputs, third-party
+  libraries, paths, C runtime libraries) is named and left out. The project
+  reader is bounded (file size, nesting depth, expanded value length and a
+  per-project expansion budget), so a hostile project file cannot hang or
+  exhaust bhf. The default import is the static reading on every host:
+  MSBuild itself evaluates each project (`msbuild -getItem:ClCompile`) when it
+  is installed only with `--msbuild-evaluate` (config key `msbuild-evaluate`,
+  explicit `--config` only), `--probe-build` or `--run-untrusted`. This is a
+  security boundary: evaluation runs the projects' property functions and the
+  `.props`/`.targets` files they import, which is code from the scanned tree,
+  while the static reading only parses the files. New flags:
+  `--msbuild-solution` (relative to the scanned tree; a solution outside the
+  tree is imported, and a missing file is an error), `--msbuild-config`,
+  `--no-msbuild-import`, `--msbuild-evaluate`.
+- `--build-command` on Windows captures the cl invocations of an MSBuild
+  build: the command runs through `cmd.exe`, compilers on `PATH` get
+  executable shims, and MSBuild's CL task is pointed at the `cl.exe` shim
+  through `CLToolPath`/`CLToolExe`. Response files are expanded, and a cl run
+  that compiles several sources yields one database row per source.
+- Findings from a harness that compiled only with headers, macro values or
+  types bhf fabricated for missing build context are marked: `finding.json`
+  gets `build.fidelity` (`{level, context, fabricated: [{kind, name, value}]}`),
+  the normalized finding is low confidence with a caveat in INDEX.md and
+  `bhf explain`, and `run.json` lists the target's `build_fidelity` and counts
+  them in `summary.fabricated_build_context`; the console summary and `run.md`
+  list them too.
+- Comparison evidence per finding: `bhf auto` (after minimization) and
+  `bhf report --backfill` replay each runtime finding's preferred input with
+  the C/C++ driver's comparison capture (`BHF_CMP_EVIDENCE`) and store the
+  result in `finding.json` as `gates` and `gate_capture`, with the runtrace
+  events of that replay in the finding's `runtrace.jsonl`. It reaches
+  `findings.json` (`fuzz.input_to_state`, with the file its offsets index in
+  `fuzz.input_to_state_input`), `findings.csv`, `INDEX.md` and SARIF (the
+  `bhfInputToState` and `bhfInputToStateInput` properties and a related
+  location per comparison site). Under AddressSanitizer `memcmp`/`bcmp`
+  evidence carries no source position, as the interceptor reports itself as
+  the call site. `finding.json` `runtime_mode.shim_armed` records whether the runtrace
+  shim was loaded for the fuzz pass.
+- `bhf.findings.v1` `fuzz.access` and the CSV access columns carry the memory
+  access the sanitizer reported.
+- `BHF_BUFFER_LEN_DIMENSION=1`, set when a C/C++ harness is generated, gives a
+  byte buffer without a length parameter an explicit length: 4 more input
+  bytes after the call's cursor parameters, then that many bytes. It is off by
+  default, because a buffer shorter than the input can make a function with an
+  implicit length contract overflow it. The choice is recorded as an additive
+  `buffer_len_dimension` in `generation-metadata.json`.
+- Generated C and C++ harnesses print each decoded parameter when run with
+  `BHF_TRACE_ARGS=1`: one `BHF_ARG {json}` line per parameter on stderr, after
+  decoding and before the call, with its name, type, decoder, the testcase
+  bytes it came from (`span`) and its value. Buffers and strings carry their
+  address, AddressSanitizer allocation size, length and a hex preview of at
+  most 32 bytes. Output and in-out parameters (non-const references, pointers
+  to scalar storage, writable strings) get a second line with their value
+  after the call. A C++ receiver's constructor arguments and the receiver
+  object are traced too, as are the arguments of sequence-harness operations
+  and C++ lifecycle and protocol steps. Without the variable nothing is
+  printed. The trace helpers are in the new `c_runtime/bhf_trace.h`, which the
+  generated sources include. Harnesses generated by earlier releases have no
+  trace.
+- When the fuzz loop records a new C/C++ crash (builtin engine, persistent
+  fork-server or AFL++ ingestion) it re-runs the testcase once with the trace
+  on, bounded by the per-input timeout (5 to 30 s). `decoded.json` gains a
+  `schema_version` (`bhf.decoded.v1`) and, besides the existing raw-bytes
+  entry, `arguments` (every traced value) with per-argument `provenance`
+  byte ranges, or `arguments_unavailable` with the reason. `finding.json`
+  gains an additive `decoded_args` array (`name`, `type`, `role`, `value`,
+  `len`, `span`, `preview_hex`, `after_call_value`) for the target call and
+  the receiver, and `exception.access.parameter` names the parameter whose
+  traced buffer starts the region a heap access hit (`basis`
+  `region_start`) or points into it (`region_interior`, with the offset from
+  that pointer), or for a wild access the nearest traced pointer below the
+  faulting address (`nearest_pointer`).
+- `bhf replay --show-args` replays with the trace and prints the decoded
+  arguments as a table, and the parameter the access hit; with `--json` they
+  are `arguments`. `bhf explain` shows the table in a HARNESS ARGUMENTS
+  section and names the accessed parameter under its `Access` line, and
+  `bhf cartography` labels each byte with the parameter it was decoded into
+  (`params` in `byte-control.json`, `parameters` listing their spans).
+- docs/site/c-cpp.md documents the decoding layout: cursor order, widths,
+  endianness, bounds, length prefixes, which parameters use the whole input,
+  receivers, constructors and lifecycle loops, the argument trace, and a gdb
+  recipe for reading arguments from harnesses built before it.
+- A `[toolchain]` table, shared by `bhf auto --config` and the new
+  `bhf build --config`, with matching flags: `cc`, `cxx`, `cflags`, `cxxflags`,
+  `ldflags` (appended to bhf's instrumentation), `defines`, `include-dirs`,
+  `target`, `sysroot`, `runner`, `runner-args`, and `[toolchain.ada]` `prefix`,
+  `gprbuild`, `gnat`, `target`, `runtime`, `switches`, `probe-backend`. It is
+  validated before anything builds and, from an auto-loaded `.bhf.toml`, ignored
+  with a note. `bhf auto` gains `--cc`, `--cxx`, `--cflags`, `--cxxflags`,
+  `--ldflags`, `--define`, `--toolchain-include`, `--sysroot`,
+  `--target-triple`, `--runner`, `--runner-arg`, `--ada-prefix`,
+  `--ada-target`, `--ada-runtime`, `--ada-gprbuild`, `--ada-gnat`,
+  `--ada-switch` and `--probe-backend`; `bhf build` gains the C/C++ ones plus
+  `--ada-gprbuild`, `--ada-gnat` and `--ada-switch`.
+- Whole-sweep cross mode: with a `[toolchain] runner` (`--runner`) and a
+  C/C++ toolchain that builds for another target (`target`, or a cross `cc`),
+  every C/C++ candidate is built for the target with coverage and fuzzed under
+  the runner. A runner for a foreign `[toolchain.ada] target` alone runs only
+  the Ada harnesses (with that target's qemu-user `-L` directory) and leaves the
+  C/C++ candidates native. A foreign target or C/C++ compiler (also from
+  `CC`/`CXX`) without a runner, and a runner with nothing foreign to run, are
+  refused before anything builds. The archives a build probe (`--probe-build`,
+  `--build-command`, `--run-untrusted`) builds for the host, in its probe
+  directory or (a plain Makefile) in the tree, are rebuilt for the target
+  member by member from the captured compile commands and linked into the
+  cross-built harnesses; members of the same name from different translation
+  units are told apart by the objects the build left, and an archive that
+  cannot be rebuilt is named with the reason. An archive already built for the
+  target is linked as it is, and a project archive is linked into a cross build
+  only when its objects are for the target's architecture.
+- `[cross.<guard>]` config tables (explicit `--config` only) override the
+  compiler (`cc`, `cxx`), `target`, `sysroot`, `runner` and `runner-args` of a
+  guard-driven cross lane (`mingw`, `aarch64`, `armhf`, `ppc64le`, `ppc64`,
+  `ppc`, `mipsel`, `mips`, `sparc64`) instead of the built-in table. They are
+  validated before anything builds, and bhf prints what each selects. A lane's
+  sysroot reaches every compile and link, bhf's driver object included, and a
+  clang `cc` gets `--target=<triple>`; they replace a `[toolchain]` sysroot or
+  target for the lane's candidates.
+- More `bhf auto` config keys: `extra-source`, `seed-file`, `seed-dir`,
+  `sanitizers`, `engine`, `languages`, `project`, `ada-deps`, `passes`, and
+  `probe-build` (explicit `--config` only).
+- docs/site/custom-harness.md: writing an `LLVMFuzzerTestOneInput` entry
+  point and wrapping it with `generate-harness`, editing a generated
+  `bhf_run_one`, building with `AUTO_EXTRA_SOURCES`/`AUTO_EXTRA_INCLUDES`/
+  `CXX_STD`, fuzzing from byte-exact `--seed-file` seeds, triage, the
+  binary-only route, and what to avoid. The C/C++ and CLI pages now generate
+  manual harnesses into `<work>/harnesses/`.
+- `auto/seeds.json` lists every seed a `bhf auto` run used (path, source
+  `user`/`mined`, size, bytes used, sha256), and `run.json` gains an additive
+  `seeds` summary that points to it. `-v` prints the list. A run that stops
+  before resolving seeds removes a list left by an earlier run in the work dir.
+- `bhf auto --no-seed-mining` and the config key `seed-mining = false` turn off
+  seeding from the tree's own test data.
+- `finding.json` `exception` carries the sanitizer's structured evidence:
+  `location`, UBSan `check`, and ASan `access` (direction, size, address and
+  hint, region kind/size/offset, allocation and free stacks). The fuzz run
+  summary (`fuzz_runs/<harness>-latest.json`) `duplicate_sanitizer_hits`
+  counts later crashes folded into an already-reported root cause, and
+  `unreproduced_sanitizer_hits` the crashes of a root cause that never
+  reproduced in a fresh process. All are additive.
+- Rules BHF-213 (undefined behavior), BHF-214 (missing return), BHF-215
+  (invalid shift), BHF-216 (unreachable reached), BHF-217 (invalid bool/enum
+  load), BHF-218 (out-of-range floating-point conversion), BHF-219 (pointer
+  overflow), BHF-220 (array index out of bounds), BHF-221 (type mismatch),
+  BHF-222 (division by zero), BHF-223 (SEGV on a non-null address), BHF-224
+  (invalid variable-length array size), BHF-225 (value-changing implicit
+  integer conversion), BHF-226 (misaligned access), BHF-227 (access to an
+  undersized object) and BHF-228 (invalid builtin argument).
+- Ada rules BHF-564 (index/range checks suppressed), BHF-565 (overflow check
+  suppressed), BHF-566 (local `'Unchecked_Access` escapes), BHF-567 (address
+  overlay), BHF-568 (unsafe C function imported), BHF-569 (secret logged),
+  BHF-570 (exception escapes a C export), BHF-571 (raise out of `Finalize`), and
+  Ada coverage for BHF-419, 422, 428, 436, 437 and 550. See
+  `docs/designs/2026-10-16-ada-static-rules.md`.
+- `bhf replay --json` prints the result as one `bhf.replay.v1` document for
+  every kind of finding (a non-harness finding's document carries `lane` and
+  `details`, and `harness` only when a binary ran), and `--show-output` also
+  prints the harness's raw output.
+- `bhf report --backfill` replays each C/C++ sanitizer finding without a
+  `sanitizer.log` (such as findings migrated from a 0.2.x work dir) against its
+  harness and, when the replay is the recorded crash, adds `sanitizer.log`, the
+  crash frames, the reported location, check and memory access, and a refreshed
+  sink and explanation to the finding (id and signature unchanged, a `history`
+  entry recorded). Findings whose harness is gone, that now crash elsewhere,
+  or whose replay is unsymbolized, are listed and left as they were. It runs
+  with the LLVM toolchain `bhf auto` uses on `PATH`.
+- `results/INDEX.md`, `bhf report` and the end of each producer run warn when a
+  work dir from an earlier release (migrated from 0.2.x, with a set-aside or
+  reused earlier corpus, or with `bhf auto` state and no
+  `auto/legacy-corpus.json`) holds testcases or corpus entries with several
+  `EF BF BD` sequences, which earlier seed encoding produced from binary seeds.
+  A work dir this release's `bhf auto` started is never flagged, even when the
+  run stopped before writing `auto/seeds.json`. `results::RebuildSummary`
+  gains a `damaged_inputs` field.
+- docs/finding-report-fields.md describes upgrading a 0.2.x work dir.
+- A C or C++ capsule ships `build.ps1`, a Windows build that needs no POSIX
+  shell, and on Windows `bhf capsule` and `bhf verify-poc` rebuild with it.
+  It builds the way the harness Makefile builds there, linking bhf's driver
+  (the capsule now also ships `runtime/bhf_driver.c`), with the compiler
+  family recorded for the harness (`bhf_toolchain.stamp`; for the MSVC lane,
+  the compiler bhf's cl front end ran, now recorded in
+  `coverage-build-recipe.json` as `msvc_compiler`): cl with
+  `/fsanitize=address` and cl's SanitizerCoverage flags (linking
+  `libsancov.lib`) as the bhf-cl front end spells them, with bhf's weak repair
+  stubs compiled from MSVC copies; clang-cl; or clang targeting MSVC.
+  `$CC`/`$CXX` names another compiler. Outside a Developer shell the script
+  takes the environment cl and clang-cl read from Visual Studio, and it
+  copies the sanitizer
+  runtime DLL next to `poc.exe`. The manifest gains `build_windows`,
+  `run_windows`, `requires_windows` and `build_recipe` `windows_compiler`,
+  `windows_compiler_dialect` and `windows_compiler_source` (all additive).
+  Before, a capsule rebuilt only through `sh build.sh`, with clang-style
+  `-fsanitize` flags even for a cl-built harness, and its `./poc` did not run
+  on Windows. A rebuild that fails is reported by MSVC's `error C2065:` /
+  `error LNK2019:` line as well as by an `error:` line.
 
 ### Changed
 - The in-crate lane for private Rust targets (#83) is `bhf auto
@@ -279,6 +1582,293 @@
 - Tests in every crate make their scratch directories with a guard that
   removes them when the test ends, including when it fails, and a lint
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
+- The nightly integration suite installs the Lua, PHP (with pcov), Ruby,
+  Perl, Java, TypeScript (esbuild), Rust-nightly, C# (SharpFuzz) and Cortex-M
+  QEMU toolchains, whose lane tests used to skip and pass there, and fails a
+  shard when a test prints a skip line that `scripts/ci/allowed-skips.txt`
+  does not allow (it starts with the Ada, AFL++, COBOL, Wine and AArch64
+  lanes).
+- CI's nextest runs use a new `ci` profile: a failing test is retried once
+  and reported FLAKY in the job summary if it then passes, a test running
+  past 16 minutes is killed and reported, and each job uploads a JUnit report
+  that keeps every test's output.
+- Pull request CI runs the release and docs contract tests (`m19_*`,
+  `offline_dist_scripts`, `release_bundle_manifest` and the guide checks),
+  which used to run only nightly; a documentation-only change runs them in
+  a new `doc-contracts` job, which `CI acceptance` requires for
+  `PASS_DOCS_ONLY`.
+- The nightly integration suite skips a commit only after a run at that
+  commit passed every shard, instead of whenever the tip commit was over 25
+  hours old: a failed nightly runs again the next day, and a skipped run no
+  longer reports success over a failure. A failed nightly opens or updates
+  one `integration-nightly` tracking issue.
+- The nightly integration suite builds the runtrace shim and the compiler
+  intercept before its tests, which used to fuzz with the runtime audit off
+  and skip the env-capsule tests. With the new `BHF_REQUIRE_TOOLS=1`, which
+  the nightly sets, a test that finds the shim missing fails instead of
+  skipping.
+- Container image CVE blockers no longer fail pull request or branch push
+  CI: the scan still runs and reports them (`release-review.json` gains
+  `enforcement`), and tag, release and container-release runs still fail on
+  them. A daily image scan opens or updates one `image-scan` tracking issue
+  when it finds blockers.
+- `bhf fuzz --engine afl++` with `--target-transport` or `--protocol-profile`
+  now exits `3` with an error, as `--engine winafl` does: those flags run the
+  builtin engine's own loops, so such a run used to fuzz with the builtin
+  engine instead of AFL++ without saying so. Leave out `--engine` (or pass
+  `--engine builtin`) to keep that behavior.
+- Inputs are no longer NUL-terminated: a C/C++ target that reads a `(char *,
+  len)` pair as a C string now reports a heap overflow, as it does under
+  libFuzzer.
+- The integration tests run the `bhf` that cargo built for them (`bhf.exe` on
+  Windows) instead of a path built by hand. 26 tests looked for `bhf` without
+  `.exe` and so skipped on Windows. 12 of them now run there:
+  `auto_c_decoded_args` (2), `auto_c_private_handle`, `auto_config_cli`,
+  `auto_cxx_std_cli` (2), `auto_grammar_cli`, `auto_max_len_cli`,
+  `discovery_memory_ceiling` (2) and two discovery tests of
+  `auto_rust_private_incrate`. The other 14 fuzz the Java, JavaScript or Rust
+  lane, which run under WSL on Windows, or build a tree with a POSIX
+  `build.sh`, and are ignored on Windows with that reason.
+- A JavaScript or TypeScript target whose lane's toolchain is not installed
+  (no `node`, or no esbuild for TypeScript) has its own outcome,
+  `missing_toolchain`, in `run.json` (and `summary.missing_toolchain`, the
+  terminal label, the blocker histogram and `bhf introspect`), instead of
+  `unsupported_params`. The next steps ask for the install instead of offering
+  `--force`, and such a target is not filed in the bug report. `--resume`
+  tries such a target again, so installing the tool and resuming fuzzes it.
+  Tooling that grouped these targets under `unsupported_params` should also
+  read the new outcome. The TypeScript capsule round trip test skips without
+  esbuild.
+- The nightly integration workflow runs 12 hash shards and a shard of its own
+  for `build_recovery_scenarios` instead of 6 shards, so each shard is expected
+  to finish in about 25 minutes, inside its 40-minute timeout. An AFL++ test
+  that assumed AFL++ was installed runs against stand-in `afl-fuzz` and
+  `afl-clang-fast` scripts instead, so it passes on runners without AFL++.
+  Three integration tests that needed the fuzzer to reach a crash within a
+  wall-clock budget (one second, or 30 seconds) reach it on a loaded runner
+  too: each is bounded by executions (`--iterations`) instead of wall time,
+  which the seeded mutator makes deterministic. The static/fuzz join and
+  results tests start from a seed that just fits their target's buffer and
+  check that the crash is an input the fuzzer made from it.
+- A target's repairs (`run.json` `targets[].outcome.repairs`, the harness's
+  `result.json`) can name a new kind, `compiler_compat` (`clang`, `gcc`,
+  `reason`): the compatibility flags its C++ build took.
+- `coverage-build-recipe.json` is schema 2: it adds `extra_compile_flags`,
+  `extra_ldflags`, `compat_flags`, `toolchain`, `compiler_family` and
+  `recorded_by`. Schema 1 recipes are still read by the coverage replay and
+  by `bhf capsule`.
+- The capsule manifest adds `finding_identity`, `identity_comparison`
+  (`verdict: none` with a `reason` for a finding without a sanitizer report),
+  `build_error`, `portable`, `portability` and `other_crash`, and its `sink`
+  names the file as the capsule ships it (relative to the scanned tree or the
+  work dir when it does not ship), not the absolute host path.
+- The Windows CI job runs the integration suites of the native Windows paths
+  (harness lanes, Visual Studio import, quoted build inputs, spaced paths,
+  capsules, explain, cartography, provenance) and every integration test of
+  the other crates, with a 120-minute budget. Tests that hold only on Unix are
+  gated in the source; the Rust lane's capsule round trips are ignored on
+  Windows, where that lane does not build harnesses yet (documented).
+- The C/C++ harness input format is now version 4: a call with several
+  buffers, a count named as above, a pointer-typedef buffer or a parameter
+  named like a harness local decodes differently from format 3. Regenerate
+  such a harness and re-run its corpus. Findings, corpora and capsules
+  recorded against format 3 are flagged by `bhf replay`, `bhf minimize`,
+  `bhf decode-args` and `bhf capsule` as before; a harness whose calls have
+  none of these shapes decodes its inputs as format 3 did.
+- `bhf replay` has a new exit code, 4, for an `UNVERIFIED` replay; scripts
+  that treated every non-zero, non-3 code as an error should treat 4 as "not
+  reproduced".
+- The signature and root-cause key of a fatal signal without a sanitizer
+  report hash the signal, so BHF-210 finding IDs change.
+- The root-cause key (`cluster_key_full`) of a crash without frames or a
+  source position now hashes the harness that found it, and the signature
+  (the finding ID suffix) of a fatal signal the driver printed a pc for hashes
+  that pc. A work dir from an earlier release may record such a crash once
+  more; start from a fresh work dir to compare groups.
+- The Windows CI job runs every crate's unit tests, and clippy with warnings as
+  errors, instead of filtered subsets. Tests that only hold on Unix (POSIX
+  shell-script fakes, `/bin/true`, Unix sockets, bubblewrap) are cfg-gated.
+- `bhf auto` exits 2 (was 1) when the toolchain configuration is refused, as
+  `bhf build` does.
+- `BHF_TOOLCHAIN_CFLAGS`/`BHF_TOOLCHAIN_CXXFLAGS` no longer carry the
+  preprocessor words of the toolchain flags, nor `BHF_TOOLCHAIN_LDFLAGS` its
+  library operands; they moved to the variables above, which every lane
+  takes. A hand-run `make` with only the old variables builds as before.
+- A target refused because a source path, include dir or compile flag holds a
+  character no quoting makes safe in a build recipe now has its own outcome,
+  `unsafe_build_path`, in `run.json` (and `summary.unsafe_build_path`, the
+  terminal label and the blocker histogram), and its own `unsafe-build-path`
+  category in `bug-report.json`/`bug-report.md`, instead of
+  `unsupported_params` / `unsupported-type`. Tooling that grouped these refusals
+  under `unsupported_params` should also read the new outcome.
+- Target ranking (`bhf auto` discovery and `bhf list targets`) reads C and C++
+  parameter types through the file's typedefs and those of the project headers
+  it includes, and through the built-in Windows and stdint spellings. A byte
+  buffer spelled through a typedef (`const u8_t *data`, `u8_t const *`) is
+  recognised as an input buffer, a typedef'd integer (`u32_t len`, `DWORD`)
+  as the integer it aliases, and a typedef'd byte as a stream decoder's
+  byte. Targets taking such parameters now rank as input-taking functions and
+  record `input_reachability: attacker_reachable` where they were
+  `reachability_unproven`, so their rank and reported reachability change.
+- `run.json` `coverage.source` values changed meaning (see Fixed): consumers
+  that matched `sancov-trace-pc-guard` for every edge map should accept
+  `sancov-trace-pc`, `go-cover` and `edge-bitmap`. Additive fields:
+  `passes[].coverage_instrumentation`, `finding.json`
+  `build.binary.coverage_instrumentation` and `gate_capture.runner`, and a
+  `bhf_runner.json` (`bhf.harness_runner.v1`) beside each cross-built harness.
+- `findings.json` gains an optional `reproduce.build.fidelity`, present only
+  for a finding built with fabricated inputs (both schemas describe it), and
+  `findings.csv` a trailing `build_fidelity` column; readers that address
+  columns by position keep working.
+- Visual Studio solutions, projects and property sheets are build-context
+  files: editing one makes `--resume` re-attempt the targets it affects (a
+  work dir from an earlier release re-attempts once).
+- A heap overflow of a buffer the generated harness sized itself, for a pointer
+  parameter it passes without a length, is `lab_only` and reads as
+  "precondition-dependent": whether a real caller can pass a buffer that short
+  is the entry's contract, which bhf cannot see. This covers decoded C strings
+  and input copies whose allocating statement in the harness source has no
+  length companion; a buffer passed with its length (a `(buf, len)` pair, an
+  output buffer with its capacity) keeps the entry's verdict.
+- `bhf.findings.v1` gains four optional `fuzz` keys, written for every fuzz
+  finding: `access` (the sanitizer-reported memory access, without its raw
+  address), `input_to_state` (the comparison evidence; `null` when no capture
+  ran or it could not run), `input_to_state_input` (the file its offsets
+  index, `min_testcase.bin` or `testcase.bin`) and `arguments` (the harness's
+  decoded arguments, when traced), plus the `runtrace` evidence role.
+  Documents written before them still validate against the new schema; a
+  strict validator holding the previous schema rejects the new keys.
+  `findings.csv` appends the columns `access`, `access_size`, `region_size`,
+  `region_offset`, `input_to_state` and `input_to_state_input` after
+  `evidence_dir`.
+- Harness `dictionary.txt` files start with a comment saying their tokens are
+  mined from source, and mark the raw-byte encodings of each integer literal.
+- C/C++ harnesses no longer feed the same input bytes to two parameters of one
+  call. A call's whole-input parameters (a byte buffer without a length
+  parameter, a `(buffer, length)` pair, `const void *`/`void *`, `FILE *`, a
+  loader's temp-file path) are decoded after its cursor parameters and take
+  the bytes those left, in both the C and the C++ lane. Before,
+  `f(const uint8_t *data, uint32_t a, uint32_t b)` read `a` and `b` from bytes
+  0-7, which were also the first bytes of `data`, so mutating one mutated the
+  other. A C++ method's whole-input target parameters are decoded after its
+  receiver's constructor or factory arguments and lifecycle loop. A C++
+  receiver's constructor, factory and step arguments and the calls of a C
+  sequence harness that run after other decoding take the bytes the cursor
+  left, and a sequence-harness call never takes the operation-program block at
+  the end of the input. A direct harness's target call with only one kind of
+  parameter decodes as before.
+- The harness input format is now version 3, and each new finding records the
+  format of the harness that found it (additive `harness_format_version` in
+  `finding.json`). `bhf replay` (a `note`, also in `--json` `notes`), `bhf
+  minimize` (stderr) and `bhf capsule` (a warning, and `harness_format_note`,
+  `harness_format_version` and `finding_harness_format_version` in
+  `manifest.json`) flag a finding recorded against another format than the
+  harness they run, including findings that record none, which come from a
+  format 2 or earlier harness. Regenerate a harness to move to format 3, then
+  re-run its corpus: inputs recorded against format 2 decode differently
+  where a call mixes whole-input and cursor parameters. Ada harnesses, whose
+  decoding did not change, keep format 2. The opt-in buffer-length dimension
+  is part of the format: findings from a harness generated with it record an
+  additive `buffer_len_dimension: true`, and a finding replayed, minimized or
+  packaged against a harness generated with the other setting is flagged the
+  same way.
+- The foreign-guard qemu-user lane of `bhf auto` builds with GCC's
+  `trace-pc,trace-cmp` coverage when the cross compiler accepts it, so emulated
+  arch targets are fuzzed coverage-guided instead of blind.
+- A failed C++ build caused by a member declared with its own class's
+  qualification is retried with `-fms-extensions` (clang) or `-fpermissive`
+  (gcc) from a new work-dir `cxx_compat.mk`, spliced into every C++ Makefile
+  lane and object rule; the fragment is kept only when that error disappears.
+- Toolchain changes are announced: the compilers a `[toolchain]` or `--cc`
+  selects, the environment values they replace, and the compiler a
+  `--sanitizers` build falls back to.
+- `bhf auto --seed-dir` reads a directory's files in name order.
+- Sanitizer finding signatures, IDs and root-cause keys changed. UBSan runs
+  with `print_stacktrace=1` and `report_error_type=1` during fuzzing,
+  minimization, `bhf replay` and in `replay.py`, so UBSan findings now carry a
+  stack. The signature hashes only the crash stack (not the allocation or free
+  stack), plus UBSan's check name and, for UBSan or stackless reports, the
+  reported site: the last two components of the reported path with its line
+  and column (`a/util.c:3:5`). Root-cause keys also hash the rule, kind and
+  check, skip libc and interceptor frames, and key UBSan reports on their
+  site. Existing findings are not rewritten; compare runs in a fresh work dir.
+  See docs/site/sanitizers.md.
+- `bhf explain` explains each root-cause group (findings sharing a
+  `cluster_key_full`, such as one site reached through several harnesses)
+  once, by its first finding, and lists the group's other findings with their
+  harnesses. Every block names its harness and, when the sanitizer recorded
+  one, the memory access: direction, width, the region it hit and where that
+  region was allocated or freed. `--all-members` explains every finding as
+  before.
+- UBSan findings report under a rule, CWE, explanation and fix hint per
+  check instead of BHF-210 / "Incorrect Calculation (CWE-682)": for example
+  missing return is BHF-214 / CWE-758 and an invalid shift BHF-215 /
+  CWE-1335. Only signed and unsigned integer overflow share a rule
+  (BHF-205). UBSan index reports move from BHF-201 to BHF-220, division by
+  zero from BHF-205 to BHF-222, and insufficient object size from BHF-201 to
+  BHF-227. An ASan SEGV outside the first memory page reports under BHF-223
+  instead of the NULL-dereference rule BHF-206. `bhf replay` still matches
+  findings recorded under the earlier rules.
+- SARIF result `properties.cwe` is the finding's computed CWE rather than the
+  rule's catalog CWE; `properties.cwe_top_25` is set only when the two agree.
+- Generated C/C++ harnesses are now input format 2. The version is recorded as
+  `harness_format_version` in `generation-metadata.json` (an additive field) and
+  at the top of `main.c` / `main.cpp`. Inputs whose unsigned values have the
+  top bit set, non-length `size_t` values, and pairs whose integer is not
+  length-named decode differently than under format 1. `bhf generate-harness`
+  warns when it regenerates a harness of another format, and `bhf replay`
+  notes when it replays against one. Re-run existing corpora and re-triage
+  findings recorded against older harnesses.
+- Ada static rules run on a statement and scope model instead of line
+  matching. BHF-409 now reports only Unchecked_Conversion to an access type
+  (and Address_To_Access_Conversions), BHF-410 a double free through an alias,
+  BHF-411 a task writing unprotected package state, and BHF-412 a spawn of a
+  non-constant program or shell command. Plain instantiations, tasking
+  constructs and constant spawns are no longer findings. BHF-402 ignores case
+  statements, `Finalize` handlers and cleanup-only guards. The Ada BHF-405 line
+  heuristic is removed (the taint engine still reports Ada file-open sinks).
+  Test trees, GNAT binder output and predefined-hierarchy runtime units are
+  not scanned. CWE mappings: BHF-409 CWE-704 -> CWE-843, BHF-411
+  CWE-362 -> CWE-567 (Base entries).
+- Capsule layout and `build.sh`: `sources/` keeps the project's directory
+  layout (it was flat), the driver is `harness/main.c` or `harness/main.cpp`,
+  and `build.sh` compiles like the harness Makefile's `main` rule (section
+  garbage collection, `-D_GNU_SOURCE -D_DEFAULT_SOURCE`, `CXX=${CXX:-clang++}`
+  for C++). `manifest.json` stays `bhf.capsule/v1`: `lang` is `c` or `cpp`, and
+  `language`, `toolchain`, `input_source`, `input_minimized`, `build_recipe`
+  and `rebuilt` are additive. A manifest without `lang` is read as C.
+- `byte-control.json` (`bhf.byte-control/v1`) gains additive fields `input`,
+  `crash.fault_address` and `crash.fault_address_stable`, the byte classes
+  `controls_address` and `unknown`, and the primitive kinds
+  `controlled_address_read`, `controlled_address_write`,
+  `controlled_address_access`, `unattributed_crash` and `uncontrolled_crash`
+  (a crash no input byte gates was `gated_crash`). Cartography perturbs the
+  minimized input when it reproduces, and replays with address-space
+  randomization off. The env-capsule manifest gains `lang` and `input_source`.
+  The capsule manifest's `build_recipe` gains `stdlib_include_fallback`.
+- `bhf replay` prints a summary under the `MATCH`/`MISMATCH` line: the
+  compared fields, the replayed crash (rule, kind, sink, top frames, memory
+  access and allocation site), the exit status or signal and duration, the
+  harness (protocol, and whether its sha256 matches the recorded build) and
+  the testcase size and sha256. Binary, session, collector and transport
+  findings get the same summary for what their replay compares (a binary
+  target's exit status and sanitizer report, the session oracle verdict, the
+  collector oracle signature, the transport fault identity), and an Ada replay
+  shows the harness exit status and duration. The first line is unchanged, so
+  scripts that look for it keep working; a collector replay's attributing
+  event and process tree now follow it instead of preceding it.
+- `fixture_path` in new `finding.json` records is relative to the work dir
+  when the harness is inside it (an absolute path otherwise). Readers accept
+  both forms.
+- Test scratch directories are removed when the test ends, including when it
+  fails: the new `TestDir` guard (`crates/cli/src/test_support.rs`) makes
+  `<temp>/bhf-<name>-<random>` and deletes it on drop. The six helpers that
+  made most of the `bhf-*` directories left in the temp dir use it;
+  `BHF_KEEP_TEST_DIRS=1` keeps the directories for inspection.
+- Every unit test in the `bhf` crate now makes its scratch directory with
+  `TestDir`. The GNAT `-gnat2022` probe and the replay directory of
+  `bhf corpus minimize` are `tempfile` directories, so they are also removed
+  when bhf panics.
 
 ### Fixed
 - The all-language container image ships OpenJDK 21.0.13.1+2 (#445). Its
@@ -1937,8 +3527,9 @@
   contents is replaced, never preloaded); with no usable directory bhf warns
   once and runs without it.
   The shim creates its runtrace log when it loads, and `finding.json`
-  `runtime_mode.shim_armed` (and `gate_capture.shim_armed`) is true only when
-  the run produced that log, not merely when `LD_PRELOAD` was set.
+  `runtime_mode.shim_armed` (and `gate_capture.shim_armed`) is true when the
+  run produced that log, and false when `LD_PRELOAD` was set but no log
+  appeared.
 - Source, include, extra-source, runtime and compiler paths containing `&`
   (a `R&D/` directory), and `^` on Windows, are double-quoted in generated
   Makefiles and recipes instead of being refused as `unsafe_build_path`;
@@ -2814,1598 +4405,6 @@
   `skipped_user_seeds` with a `reason`. Mining used to run as if no seed had
   been given.
 
-### Changed
-- The nightly integration suite installs the Lua, PHP (with pcov), Ruby,
-  Perl, Java, TypeScript (esbuild), Rust-nightly, C# (SharpFuzz) and Cortex-M
-  QEMU toolchains, whose lane tests used to skip and pass there, and fails a
-  shard when a test prints a skip line that `scripts/ci/allowed-skips.txt`
-  does not allow (it starts with the Ada, AFL++, COBOL, Wine and AArch64
-  lanes).
-- CI's nextest runs use a new `ci` profile: a failing test is retried once
-  and reported FLAKY in the job summary if it then passes, a test running
-  past 16 minutes is killed and reported, and each job uploads a JUnit report
-  that keeps every test's output.
-- Pull request CI runs the release and docs contract tests (`m19_*`,
-  `offline_dist_scripts`, `release_bundle_manifest` and the guide checks),
-  which used to run only nightly; a documentation-only change runs them in
-  a new `doc-contracts` job, which `CI acceptance` requires for
-  `PASS_DOCS_ONLY`.
-- The nightly integration suite skips a commit only after a run at that
-  commit passed every shard, instead of whenever the tip commit was over 25
-  hours old: a failed nightly runs again the next day, and a skipped run no
-  longer reports success over a failure. A failed nightly opens or updates
-  one `integration-nightly` tracking issue.
-- The nightly integration suite builds the runtrace shim and the compiler
-  intercept before its tests, which used to fuzz with the runtime audit off
-  and skip the env-capsule tests. With the new `BHF_REQUIRE_TOOLS=1`, which
-  the nightly sets, a test that finds the shim missing fails instead of
-  skipping.
-- Container image CVE blockers no longer fail pull request or branch push
-  CI: the scan still runs and reports them (`release-review.json` gains
-  `enforcement`), and tag, release and container-release runs still fail on
-  them. A daily image scan opens or updates one `image-scan` tracking issue
-  when it finds blockers.
-- `bhf fuzz --engine afl++` with `--target-transport` or `--protocol-profile`
-  now exits `3` with an error, as `--engine winafl` does: those flags run the
-  builtin engine's own loops, so such a run used to fuzz with the builtin
-  engine instead of AFL++ without saying so. Leave out `--engine` (or pass
-  `--engine builtin`) to keep that behavior.
-- Inputs are no longer NUL-terminated: a C/C++ target that reads a `(char *,
-  len)` pair as a C string now reports a heap overflow, as it does under
-  libFuzzer.
-- The integration tests run the `bhf` that cargo built for them (`bhf.exe` on
-  Windows) instead of a path built by hand. 26 tests looked for `bhf` without
-  `.exe` and so skipped on Windows. 12 of them now run there:
-  `auto_c_decoded_args` (2), `auto_c_private_handle`, `auto_config_cli`,
-  `auto_cxx_std_cli` (2), `auto_grammar_cli`, `auto_max_len_cli`,
-  `discovery_memory_ceiling` (2) and two discovery tests of
-  `auto_rust_private_incrate`. The other 14 fuzz the Java, JavaScript or Rust
-  lane, which run under WSL on Windows, or build a tree with a POSIX
-  `build.sh`, and are ignored on Windows with that reason.
-- A JavaScript or TypeScript target whose lane's toolchain is not installed
-  (no `node`, or no esbuild for TypeScript) has its own outcome,
-  `missing_toolchain`, in `run.json` (and `summary.missing_toolchain`, the
-  terminal label, the blocker histogram and `bhf introspect`), instead of
-  `unsupported_params`. The next steps ask for the install instead of offering
-  `--force`, and such a target is not filed in the bug report. `--resume`
-  tries such a target again, so installing the tool and resuming fuzzes it.
-  Tooling that grouped these targets under `unsupported_params` should also
-  read the new outcome. The TypeScript capsule round trip test skips without
-  esbuild.
-- The nightly integration workflow runs 12 hash shards and a shard of its own
-  for `build_recovery_scenarios` instead of 6 shards, so each shard is expected
-  to finish in about 25 minutes, inside its 40-minute timeout. An AFL++ test
-  that assumed AFL++ was installed runs against stand-in `afl-fuzz` and
-  `afl-clang-fast` scripts instead, so it passes on runners without AFL++.
-  Three integration tests that needed the fuzzer to reach a crash within a
-  wall-clock budget (one second, or 30 seconds) reach it on a loaded runner
-  too: each is bounded by executions (`--iterations`) instead of wall time,
-  which the seeded mutator makes deterministic. The static/fuzz join and
-  results tests start from a seed that just fits their target's buffer and
-  check that the crash is an input the fuzzer made from it.
-- A target's repairs (`run.json` `targets[].outcome.repairs`, the harness's
-  `result.json`) can name a new kind, `compiler_compat` (`clang`, `gcc`,
-  `reason`): the compatibility flags its C++ build took.
-- `coverage-build-recipe.json` is schema 2: it adds `extra_compile_flags`,
-  `extra_ldflags`, `compat_flags`, `toolchain`, `compiler_family` and
-  `recorded_by`. Schema 1 recipes are still read by the coverage replay and
-  by `bhf capsule`.
-- The capsule manifest adds `finding_identity`, `identity_comparison`
-  (`verdict: none` with a `reason` for a finding without a sanitizer report),
-  `build_error`, `portable`, `portability` and `other_crash`, and its `sink`
-  names the file as the capsule ships it (relative to the scanned tree or the
-  work dir when it does not ship), not the absolute host path.
-- The Windows CI job runs the integration suites of the native Windows paths
-  (harness lanes, Visual Studio import, quoted build inputs, spaced paths,
-  capsules, explain, cartography, provenance) and every integration test of
-  the other crates, with a 120-minute budget. Tests that hold only on Unix are
-  gated in the source; the Rust lane's capsule round trips are ignored on
-  Windows, where that lane does not build harnesses yet (documented).
-- The C/C++ harness input format is now version 4: a call with several
-  buffers, a count named as above, a pointer-typedef buffer or a parameter
-  named like a harness local decodes differently from format 3. Regenerate
-  such a harness and re-run its corpus. Findings, corpora and capsules
-  recorded against format 3 are flagged by `bhf replay`, `bhf minimize`,
-  `bhf decode-args` and `bhf capsule` as before; a harness whose calls have
-  none of these shapes decodes its inputs as format 3 did.
-- `bhf replay` has a new exit code, 4, for an `UNVERIFIED` replay; scripts
-  that treated every non-zero, non-3 code as an error should treat 4 as "not
-  reproduced".
-- The signature and root-cause key of a fatal signal without a sanitizer
-  report hash the signal, so BHF-210 finding IDs change.
-- The root-cause key (`cluster_key_full`) of a crash without frames or a
-  source position now hashes the harness that found it, and the signature
-  (the finding ID suffix) of a fatal signal the driver printed a pc for hashes
-  that pc. A work dir from an earlier release may record such a crash once
-  more; start from a fresh work dir to compare groups.
-- The Windows CI job runs every crate's unit tests, and clippy with warnings as
-  errors, instead of filtered subsets. Tests that only hold on Unix (POSIX
-  shell-script fakes, `/bin/true`, Unix sockets, bubblewrap) are cfg-gated.
-- `bhf auto` exits 2 (was 1) when the toolchain configuration is refused, as
-  `bhf build` does.
-- `BHF_TOOLCHAIN_CFLAGS`/`BHF_TOOLCHAIN_CXXFLAGS` no longer carry the
-  preprocessor words of the toolchain flags, nor `BHF_TOOLCHAIN_LDFLAGS` its
-  library operands; they moved to the variables above, which every lane
-  takes. A hand-run `make` with only the old variables builds as before.
-- A target refused because a source path, include dir or compile flag holds a
-  character no quoting makes safe in a build recipe now has its own outcome,
-  `unsafe_build_path`, in `run.json` (and `summary.unsafe_build_path`, the
-  terminal label and the blocker histogram), and its own `unsafe-build-path`
-  category in `bug-report.json`/`bug-report.md`, instead of
-  `unsupported_params` / `unsupported-type`. Tooling that grouped these refusals
-  under `unsupported_params` should also read the new outcome.
-- Target ranking (`bhf auto` discovery and `bhf list targets`) reads C and C++
-  parameter types through the file's typedefs and those of the project headers
-  it includes, and through the built-in Windows and stdint spellings. A byte
-  buffer spelled through a typedef (`const u8_t *data`, `u8_t const *`) is
-  recognised as an input buffer, a typedef'd integer (`u32_t len`, `DWORD`)
-  as the integer it aliases, and a typedef'd byte as a stream decoder's
-  byte. Targets taking such parameters now rank as input-taking functions and
-  record `input_reachability: attacker_reachable` where they were
-  `reachability_unproven`, so their rank and reported reachability change.
-- `run.json` `coverage.source` values changed meaning (see Fixed): consumers
-  that matched `sancov-trace-pc-guard` for every edge map should accept
-  `sancov-trace-pc`, `go-cover` and `edge-bitmap`. Additive fields:
-  `passes[].coverage_instrumentation`, `finding.json`
-  `build.binary.coverage_instrumentation` and `gate_capture.runner`, and a
-  `bhf_runner.json` (`bhf.harness_runner.v1`) beside each cross-built harness.
-- `findings.json` gains an optional `reproduce.build.fidelity`, present only
-  for a finding built with fabricated inputs (both schemas describe it), and
-  `findings.csv` a trailing `build_fidelity` column; readers that address
-  columns by position keep working.
-- Visual Studio solutions, projects and property sheets are build-context
-  files: editing one makes `--resume` re-attempt the targets it affects (a
-  work dir from an earlier release re-attempts once).
-- A heap overflow of a buffer the generated harness sized itself, for a pointer
-  parameter it passes without a length, is `lab_only` and reads as
-  "precondition-dependent": whether a real caller can pass a buffer that short
-  is the entry's contract, which bhf cannot see. This covers decoded C strings
-  and input copies whose allocating statement in the harness source has no
-  length companion; a buffer passed with its length (a `(buf, len)` pair, an
-  output buffer with its capacity) keeps the entry's verdict.
-- `bhf.findings.v1` gains four optional `fuzz` keys, written for every fuzz
-  finding: `access` (the sanitizer-reported memory access, without its raw
-  address), `input_to_state` (the comparison evidence; `null` when no capture
-  ran or it could not run), `input_to_state_input` (the file its offsets
-  index, `min_testcase.bin` or `testcase.bin`) and `arguments` (the harness's
-  decoded arguments, when traced), plus the `runtrace` evidence role.
-  Documents written before them still validate against the new schema; a
-  strict validator holding the previous schema rejects the new keys.
-  `findings.csv` appends the columns `access`, `access_size`, `region_size`,
-  `region_offset`, `input_to_state` and `input_to_state_input` after
-  `evidence_dir`.
-- Harness `dictionary.txt` files start with a comment saying their tokens are
-  mined from source, and mark the raw-byte encodings of each integer literal.
-- C/C++ harnesses no longer feed the same input bytes to two parameters of one
-  call. A call's whole-input parameters (a byte buffer without a length
-  parameter, a `(buffer, length)` pair, `const void *`/`void *`, `FILE *`, a
-  loader's temp-file path) are decoded after its cursor parameters and take
-  the bytes those left, in both the C and the C++ lane. Before,
-  `f(const uint8_t *data, uint32_t a, uint32_t b)` read `a` and `b` from bytes
-  0-7, which were also the first bytes of `data`, so mutating one mutated the
-  other. A C++ method's whole-input target parameters are decoded after its
-  receiver's constructor or factory arguments and lifecycle loop. A C++
-  receiver's constructor, factory and step arguments and the calls of a C
-  sequence harness that run after other decoding take the bytes the cursor
-  left, and a sequence-harness call never takes the operation-program block at
-  the end of the input. A direct harness's target call with only one kind of
-  parameter decodes as before.
-- The harness input format is now version 3, and each new finding records the
-  format of the harness that found it (additive `harness_format_version` in
-  `finding.json`). `bhf replay` (a `note`, also in `--json` `notes`), `bhf
-  minimize` (stderr) and `bhf capsule` (a warning, and `harness_format_note`,
-  `harness_format_version` and `finding_harness_format_version` in
-  `manifest.json`) flag a finding recorded against another format than the
-  harness they run, including findings that record none, which come from a
-  format 2 or earlier harness. Regenerate a harness to move to format 3, then
-  re-run its corpus: inputs recorded against format 2 decode differently
-  where a call mixes whole-input and cursor parameters. Ada harnesses, whose
-  decoding did not change, keep format 2. The opt-in buffer-length dimension
-  is part of the format: findings from a harness generated with it record an
-  additive `buffer_len_dimension: true`, and a finding replayed, minimized or
-  packaged against a harness generated with the other setting is flagged the
-  same way.
-- The foreign-guard qemu-user lane of `bhf auto` builds with GCC's
-  `trace-pc,trace-cmp` coverage when the cross compiler accepts it, so emulated
-  arch targets are fuzzed coverage-guided instead of blind.
-- A failed C++ build caused by a member declared with its own class's
-  qualification is retried with `-fms-extensions` (clang) or `-fpermissive`
-  (gcc) from a new work-dir `cxx_compat.mk`, spliced into every C++ Makefile
-  lane and object rule; the fragment is kept only when that error disappears.
-- Toolchain changes are announced: the compilers a `[toolchain]` or `--cc`
-  selects, the environment values they replace, and the compiler a
-  `--sanitizers` build falls back to.
-- `bhf auto --seed-dir` reads a directory's files in name order.
-- Sanitizer finding signatures, IDs and root-cause keys changed. UBSan runs
-  with `print_stacktrace=1` and `report_error_type=1` during fuzzing,
-  minimization, `bhf replay` and in `replay.py`, so UBSan findings now carry a
-  stack. The signature hashes only the crash stack (not the allocation or free
-  stack), plus UBSan's check name and, for UBSan or stackless reports, the
-  reported site: the last two components of the reported path with its line
-  and column (`a/util.c:3:5`). Root-cause keys also hash the rule, kind and
-  check, skip libc and interceptor frames, and key UBSan reports on their
-  site. Existing findings are not rewritten; compare runs in a fresh work dir.
-  See docs/site/sanitizers.md.
-- `bhf explain` explains each root-cause group (findings sharing a
-  `cluster_key_full`, such as one site reached through several harnesses)
-  once, by its first finding, and lists the group's other findings with their
-  harnesses. Every block names its harness and, when the sanitizer recorded
-  one, the memory access: direction, width, the region it hit and where that
-  region was allocated or freed. `--all-members` explains every finding as
-  before.
-- UBSan findings report under a rule, CWE, explanation and fix hint per
-  check instead of BHF-210 / "Incorrect Calculation (CWE-682)": for example
-  missing return is BHF-214 / CWE-758 and an invalid shift BHF-215 /
-  CWE-1335. Only signed and unsigned integer overflow share a rule
-  (BHF-205). UBSan index reports move from BHF-201 to BHF-220, division by
-  zero from BHF-205 to BHF-222, and insufficient object size from BHF-201 to
-  BHF-227. An ASan SEGV outside the first memory page reports under BHF-223
-  instead of the NULL-dereference rule BHF-206. `bhf replay` still matches
-  findings recorded under the earlier rules.
-- SARIF result `properties.cwe` is the finding's computed CWE rather than the
-  rule's catalog CWE; `properties.cwe_top_25` is set only when the two agree.
-- Generated C/C++ harnesses are now input format 2. The version is recorded as
-  `harness_format_version` in `generation-metadata.json` (an additive field) and
-  at the top of `main.c` / `main.cpp`. Inputs whose unsigned values have the
-  top bit set, non-length `size_t` values, and pairs whose integer is not
-  length-named decode differently than under format 1. `bhf generate-harness`
-  warns when it regenerates a harness of another format, and `bhf replay`
-  notes when it replays against one. Re-run existing corpora and re-triage
-  findings recorded against older harnesses.
-- Ada static rules run on a statement and scope model instead of line
-  matching. BHF-409 now reports only Unchecked_Conversion to an access type
-  (and Address_To_Access_Conversions), BHF-410 a double free through an alias,
-  BHF-411 a task writing unprotected package state, and BHF-412 a spawn of a
-  non-constant program or shell command. Plain instantiations, tasking
-  constructs and constant spawns are no longer findings. BHF-402 ignores case
-  statements, `Finalize` handlers and cleanup-only guards. The Ada BHF-405 line
-  heuristic is removed (the taint engine still reports Ada file-open sinks).
-  Test trees, GNAT binder output and predefined-hierarchy runtime units are
-  not scanned. CWE mappings: BHF-409 CWE-704 -> CWE-843, BHF-411
-  CWE-362 -> CWE-567 (Base entries).
-- Capsule layout and `build.sh`: `sources/` keeps the project's directory
-  layout (it was flat), the driver is `harness/main.c` or `harness/main.cpp`,
-  and `build.sh` compiles like the harness Makefile's `main` rule (section
-  garbage collection, `-D_GNU_SOURCE -D_DEFAULT_SOURCE`, `CXX=${CXX:-clang++}`
-  for C++). `manifest.json` stays `bhf.capsule/v1`: `lang` is `c` or `cpp`, and
-  `language`, `toolchain`, `input_source`, `input_minimized`, `build_recipe`
-  and `rebuilt` are additive. A manifest without `lang` is read as C.
-- `byte-control.json` (`bhf.byte-control/v1`) gains additive fields `input`,
-  `crash.fault_address` and `crash.fault_address_stable`, the byte classes
-  `controls_address` and `unknown`, and the primitive kinds
-  `controlled_address_read`, `controlled_address_write`,
-  `controlled_address_access`, `unattributed_crash` and `uncontrolled_crash`
-  (a crash no input byte gates was `gated_crash`). Cartography perturbs the
-  minimized input when it reproduces, and replays with address-space
-  randomization off. The env-capsule manifest gains `lang` and `input_source`.
-  The capsule manifest's `build_recipe` gains `stdlib_include_fallback`.
-- `bhf replay` prints a summary under the `MATCH`/`MISMATCH` line: the
-  compared fields, the replayed crash (rule, kind, sink, top frames, memory
-  access and allocation site), the exit status or signal and duration, the
-  harness (protocol, and whether its sha256 matches the recorded build) and
-  the testcase size and sha256. Binary, session, collector and transport
-  findings get the same summary for what their replay compares (a binary
-  target's exit status and sanitizer report, the session oracle verdict, the
-  collector oracle signature, the transport fault identity), and an Ada replay
-  shows the harness exit status and duration. The first line is unchanged, so
-  scripts that look for it keep working; a collector replay's attributing
-  event and process tree now follow it instead of preceding it.
-- `fixture_path` in new `finding.json` records is relative to the work dir
-  when the harness is inside it (an absolute path otherwise). Readers accept
-  both forms.
-- Test scratch directories are removed when the test ends, including when it
-  fails: the new `TestDir` guard (`crates/cli/src/test_support.rs`) makes
-  `<temp>/bhf-<name>-<random>` and deletes it on drop. The six helpers that
-  made most of the `bhf-*` directories left in the temp dir use it;
-  `BHF_KEEP_TEST_DIRS=1` keeps the directories for inspection.
-- Every unit test in the `bhf` crate now makes its scratch directory with
-  `TestDir`. The GNAT `-gnat2022` probe and the replay directory of
-  `bhf corpus minimize` are `tempfile` directories, so they are also removed
-  when bhf panics.
-
-### Added
-- A `rehost` crate runs an unmodified Cortex-M firmware image in an emulator
-  (#351): an ELF, or a raw image at a base address, starts at the reset
-  vector with the stack pointer its vector table names. Each input is
-  written into a fixed buffer in the firmware's memory, with an optional
-  length word, at reset or when the core first reaches a given address (so
-  the start-up code's `.bss` clearing does not wipe it), and every basic
-  block the core enters is counted in a 64 KiB edge map. The emulator is
-  bhf's own ARMv7-M Thumb-2 interpreter: integer instructions, `SVC`
-  exceptions, the System Control Block registers start-up code writes, and
-  semihosting output and exit. Peripheral registers read as zero, and
-  interrupts and floating point are not modelled; an instruction outside
-  the model stops the run as unsupported rather than as a firmware fault,
-  while `UDF` and the encodings ARMv7-M leaves unallocated fault as
-  undefined instructions. Semihosting writes stop reading memory once the
-  64 KiB output is full.
-- `bhf binary rehost <IMAGE>` fuzzes an unmodified Cortex-M firmware image
-  in that emulator (#380): the input goes into a fixed buffer named by
-  address (hex, `0x` optional, as `nm` prints it) or ELF symbol
-  (`--input-buffer`, `--input-size`, `--input-length`, `--inject-at`; the
-  run JSON's `input_not_delivered` counts runs that never reached
-  `--inject-at`, and bhf warns when no seed does), RAM is
-  `--ram BASE:SIZE`, a raw image loads at `--base`, and the edge coverage
-  steers the builtin engine's mutator. A run that faults is a `kind: rehost_fault` finding
-  (`finding_kind: binary`, rule `BHF-501`) classified as `invalid_access`,
-  `bad_pc` or `hard_fault`, with the fault, the registers and the machine
-  setup; `bhf replay` runs its testcase through that setup again and
-  reports `MATCH` on the same fault signature (`--harness` names another
-  copy of the image). The run JSON is `bhf.binary_rehost.run.v1`, and it
-  and every finding carry a `fidelity` block saying peripherals and
-  interrupts are not modelled. In `results/` these findings have producer
-  `binary rehost` (a value added to the `bhf.findings.v1` schema's
-  `producer` enum) and the reproduce command `bhf replay findings/<id>`;
-  they get no `replay.py`.
-- `bhf binary rehost` serves the firmware's peripheral reads from MMIO models
-  (#352): `--mmio ADDR[@PC]=MODEL` names a `passthrough` model (the read's
-  bytes come from the input) or a `constant:VALUE` model for a register, or
-  for one instruction's reads of it; `--mmio-models FILE` loads models a run
-  JSON or finding records; `--mmio-default zero|passthrough` sets what an
-  unmodelled register reads as (`passthrough` without `--input-buffer`,
-  which is now optional, and `zero` with it, as before; a models file that
-  records no `default` leaves it to that rule). Peripheral reads take the
-  input after the buffer's bytes (the buffer then takes at most the first
-  4096); a run that wants more stops as `input_exhausted`. A model for an
-  address `--ram` or an image segment maps is refused, since memory would
-  answer its reads. The setup in the run JSON and in each finding
-  (`rehost.setup.mmio`, absent in older findings, which replay as before)
-  records the models, so `bhf replay` runs the same models again; `input`
-  may now be null, a finding's `input` block gains `mmio_reads` and
-  `mmio_bytes` and modes `rehost-mmio` and `rehost-buffer+mmio`, and the run
-  JSON gains `mmio_reads`, all additive to `bhf.binary_rehost.run.v1` and
-  `bhf.rehost.v1`. The `rehost` crate gains `MmioConfig` and a recorded
-  trace of a run's peripheral reads (`Machine::trace_mmio`).
-- `bhf binary rehost` infers bit-extract MMIO models for status-register
-  polling loops (#381): before the campaign the seeds and an input of zeros
-  run with their peripheral reads recorded, a register one instruction reads
-  8 or more times in a row is a polling loop, and probes that flip one bit
-  of its read at a time find the bits that decide it. The instruction gets
-  a `bitextract` model feeding those bits from the input (a constant that
-  ends the loop when only an input buffer takes input), and inference
-  repeats past each loop to find the next. A loop whose read the
-  `passthrough` default already feeds from the input keeps it whole unless
-  it is shown to be a status poll (a bit ends it, it stores nothing new
-  between reads, and no value of the other bits changes its path), so a
-  data register a getter reads in a dispatch loop is not narrowed. `--mmio`
-  takes `bitextract:MASK`; `--no-mmio-inference` turns inference off. The
-  run JSON gains `mmio_inference` (the loops, masks, exit values, `writes`,
-  `not_a_poll`, rounds and probes), and inferred models carry
-  `"inferred": true` in the recorded setup, which `bhf replay` runs as
-  recorded and a `--mmio-models` rerun keeps; both additive. The `rehost`
-  crate gains `infer_polling_models`, `polling_loops`, `decide` and
-  `NotAPoll`, and its trace of peripheral reads records a digest of the
-  stores between them.
-- `bhf auto` fuzzes the Go native fuzz tests a project ships (#336): each
-  `func FuzzXxx(f *testing.F)` in a `_test.go` file is a target, built
-  against a stand-in for `testing` whose `f.Fuzz` hands bhf's inputs to the
-  fuzz target, with `go build -cover` edge coverage, and started from its
-  `f.Add` seeds and its `testdata/fuzz/FuzzXxx` corpus. A panic, or a failure
-  the fuzz target reports through `t.Error`/`t.Fatal`, is a finding. An
-  external test that calls what its package's `export_test.go` exports
-  builds too. `testdata/` and `_`-prefixed directories are skipped, as the
-  go tool skips them. These
-  provided harnesses rank ahead of generated targets; `run.json` marks each
-  with `targets[].provided_harness` and counts them in
-  `summary.provided_harnesses` (both new, omitted otherwise).
-- `bhf auto` runs the Atheris harnesses a Python project ships (#337): the
-  function a file registers with `atheris.Setup` is a target, run under
-  bhf's Python driver with a stand-in `atheris` module (Atheris need not be
-  installed) whose `FuzzedDataProvider` decodes values from the input, and
-  started from its seed corpus with its `<stem>.dict`. As under Atheris,
-  every exception it lets escape is a finding, located in the code that
-  raised it rather than at the harness's call. `run.json` reports it with
-  `provided_harness.origin` `atheris`; the record gains `dictionaries` and
-  `dictionary_tokens` (omitted when empty).
-- `bhf auto` fuzzes the fuzzers a `bhf project import-ossfuzz` of the tree
-  registered in its work dir (#435): each one linked with bhf's driver is a
-  provided harness, staged from the import's `$OUT` with its unpacked seed
-  corpus, its merged dictionaries and its `.options` limits, and reported in
-  `run.json` with `provided_harness.origin` `ossfuzz-import` and the new
-  `provided_harness.options` (omitted when empty). A generated target in the
-  fuzzer's own source is not fuzzed again. A fresh run keeps the import's
-  `<work>/build/<name>` registrations instead of clearing them, and a run
-  over another tree no longer archives the import with the earlier run. The
-  import now builds with a `-fdebug-prefix-map` from its `$SRC` copy to the
-  tree, so findings name the project's files. The note on what discovery
-  skipped by default no longer counts the provided harnesses' files.
-- `bhf differential --metamorphic-transform` has a transform registry (#330):
-  `append-newline`, `trailing-whitespace` (a space and a tab at the end of
-  every line), `reorder-json-keys` (every JSON object's members in reverse
-  order, every other byte kept) and `utf8-bom` (a byte order mark before the
-  input). Each declares the relation its variant must keep: the same stdout
-  and exit status, or for `utf8-bom` the same exit status only, so a parser
-  that echoes the mark is not flagged and one that rejects it is. The flag
-  takes several transforms, comma-separated or repeated, each applied to
-  every input; a finding's `metamorphic` block names the `relation` it
-  broke. Only `append-newline` existed before.
-- `bhf minimize --strategy grammar --grammar <PATH>` minimizes a grammar
-  finding on its derivation tree (#369), so the minimized input is a smaller
-  sentence of the grammar that still reproduces; byte-wise minimization broke
-  its structure. The testcase is parsed with the grammar (an Earley parse),
-  and each subtree, outermost first, is replaced by its rule's smallest
-  derivation, a same-rule subtree inside it, or a smaller production of its
-  rule that keeps its children, while the finding reproduces, as Nautilus
-  and Perses do. `bhf auto --grammar` minimizes a finding whose testcase the
-  grammar derives the same way.
-- `--grammar` mutates derivation trees (#329), as Nautilus does: the builtin
-  engine keeps the derivation tree of each input it derives from the grammar,
-  and most children of such an input are tree mutations, a subtree derived
-  afresh from its rule, a recursion repeated, or a subtree spliced in from
-  another input's tree of the same rule, so they stay sentences of the
-  grammar. A derivation ends within `--max-len` by taking each rule's
-  smallest production as it nears it, where it was cut off mid-sentence. The
-  `--grammar` help said "a Nautilus-style grammar mutator" when the engine
-  only generated fresh derivations; it now says what the engine does. A
-  grammar whose smallest derivation nests more than 512 rules deep is refused.
-- `bhf fuzz --frame <profile.toml>` fuzzes a single-input harness through a
-  binary frame descriptor (#328): a `bhf.protocol.v1` profile of one message,
-  whose typed fields, lengths, checksums, TLVs and offsets the session lane
-  already reads. The builtin engine decodes each input into the message's
-  fields, edits a field or mutates the frame's bytes, and recomputes every
-  derived field before the harness runs it, as AFL++'s
-  `afl_custom_post_process` does, so a mutant passes a length/CRC gate that
-  byte mutation alone breaks. Seeds are repaired the same way and the
-  message's own frame is a seed. Before, only the session lane used the frame
-  fix-ups.
-- `bhf project import-ossfuzz` imports what OSS-Fuzz keeps beside each
-  fuzzer (#335): `<name>_seed_corpus.zip` is unpacked with the system
-  `unzip` (no zip library) into the manifest target's seeds, with any
-  symlink it restores removed; `<name>.dict` and the dictionary `.options`
-  names are merged into the harness's `dictionary.txt` and are the target's
-  dictionaries; and the `[libfuzzer]` `max_len`, `timeout` and
-  `rss_limit_mb` options set the target's `max-len`, `timeout` and
-  `rss-limit-mb`, with every other option reported as not applied. A seed
-  corpus without `unzip` on PATH stops the import with what to install.
-- The fuzzers `bhf project import-ossfuzz` builds are registered as
-  harnesses of the work dir (#377): each is staged at
-  `<work>/build/<name>/main`, where `bhf fuzz --harness <name>`, replay and
-  minimize find it, with the framed input mode declared beside one linked
-  with bhf's driver, and is a target of the `bhf.project.v1` manifest the
-  import writes to `<work>/ossfuzz/bhf.project.toml` for `bhf project run`
-  (`engine = "builtin"`, or `engine = "binary"` with `input-mode = "file"`
-  for a libFuzzer binary linked without bhf's driver). The import lists them
-  with the commands that fuzz them.
-- `bhf project import-ossfuzz` builds a project's existing OSS-Fuzz or
-  ClusterFuzzLite integration (#334). It runs the project's `build.sh` as
-  OSS-Fuzz does, `bash -eux $SRC/build.sh` from `$SRC/<name>`, with the
-  OSS-Fuzz build variables: `$SRC`, `$WORK` and `$OUT` under
-  `<work>/ossfuzz/`, clang as `$CC`/`$CXX`, OSS-Fuzz's address-sanitizer
-  `$CFLAGS`/`$CXXFLAGS` with the coverage bhf's driver reads, and
-  `$LIB_FUZZING_ENGINE` an archive of bhf's own driver, so every fuzz target
-  the build links is a bhf harness. The build runs in bubblewrap or
-  firejail, with no network and no writes outside `$SRC`, `$WORK` and `$OUT`,
-  and with nothing of bhf's environment beyond the build contract; the
-  import is refused, naming the missing tool or why it failed, when no
-  sandbox works, and `--sandbox none` runs it directly. The fuzzers are
-  collected from `$OUT` by OSS-Fuzz's own rule. The nightly runs the
-  sandbox tests in a job of their own that lets bubblewrap create its
-  namespaces, which the hosted Ubuntu 24.04 image denies.
-- The Fortran lane runs on native Windows (#327). MinGW-w64's gfortran ships
-  no AddressSanitizer, so there the Fortran objects are compiled with
-  gfortran's bounds and pointer checks, a failed check is a crash instead of
-  an `exit(2)`, MinGW's gcc builds the driver and glue, and each finding's
-  `fidelity.sanitizers` says `none (toolchain limit)` with the reason. With
-  it no lane is refused on native Windows any more.
-- The Rust lane runs on native Windows (#326): the harness crate builds as
-  an MSVC staticlib with SanitizerCoverage, AddressSanitizer and the static
-  CRT, and clang links it with the driver and the system libraries rustc's
-  `native-static-libs` note names. The harness sets ASan's
-  `windows_hook_rtl_allocators=1` default, since Rust's allocator calls the
-  Windows heap directly. A Rust capsule's `build.sh` rebuilds the same way
-  on an MSVC host, and its vendored packages are found there.
-- The Perl, Ruby, Lua and PHP lanes run on native Windows (#325): each `main`
-  launcher has a launch spec, `PERL5LIB` and the Ruby load path take the
-  host's separator, and Perl's driver sends the target's output to the
-  platform's null device. Lua reads its standard input in text mode on
-  Windows, so there its driver asks for hex frames: a harness whose ready
-  byte is `H` is sent each input as hex digits.
-  `scripts/ci/install-lua-windows.ps1` builds Lua 5.4 from lua.org's source,
-  and the Windows CI job runs the four lanes' tests.
-- `bhf fuzz --extension` gives the builtin loop the extension's mutation
-  stage (#314): one in four mutated children is the extension's
-  `mutator.mutate` of the base the loop picked, within at most 1000 calls and
-  a quarter of the pass's `--time`; a call that times out cuts the stage off
-  and the campaign goes on. The run summary's `extension.stages` records it.
-- With `codec.decode` and `codec.encode`, a child is the base decoded, one
-  value of it mutated and encoded back, so a framed format keeps its length
-  and checksum right (#373). Codec errors are counted, never findings.
-- The extension's `lifecycle.setup`, `reset` and `teardown` run around the
-  campaign and between its cases (#374). A setup or reset the extension
-  answers as failed stops the campaign with its message.
-- `bhf extension session --session-transport SPEC` drives a real target
-  over the session lane's transport (#313), where it could drive only a
-  built-in toy target: each scenario message goes to the target as the
-  extension framed it, and the target's reply is what the extension observes
-  and binds. `--session-server-cmd` starts the service, waits for its port
-  and stops it after the session, and `--session-reply-timeout` bounds a
-  reply. A target that ends the session or a service that exits is exit `3`
-  with the reason in `extension.json` (a service's sanitizer report included),
-  never an extension fault or a finding.
-- `bhf binary fuzz --engine afl-frida` runs AFL++'s Frida mode (`afl-fuzz
-  -O`) on a binary without source (#322). Both binary-only modes record their
-  engine, the trace program or library, `executions` and a `fidelity` object
-  (coverage source, CmpLog, edges found) in the run JSON, and the container
-  acceptance runs both through bhf.
-- `bhf binary fuzz --persistent-addr <ADDR>` runs the target in AFL++'s
-  persistent loop from that address under QEMU or Frida mode
-  (`AFL_QEMU_PERSISTENT_ADDR` with `AFL_QEMU_PERSISTENT_GPR=1`, or
-  `AFL_FRIDA_PERSISTENT_ADDR`), and `--entrypoint <ADDR>` starts the fork
-  server later (`AFL_ENTRYPOINT`) (#375).
-- QEMU- and Frida-mode runs of `bhf binary fuzz` use CmpLog (`afl-fuzz -c 0`)
-  by default; `--no-cmplog` turns it off (#376).
-- The nightly builds AFL++'s QEMU and Frida modes with
-  `scripts/ci/build-afl-binary-modes.sh`, which the container image's stage
-  now runs too, and runs the binary-only tests against them.
-- The container image ships AFL++'s QEMU and Frida modes (#321):
-  `/usr/bin/afl-qemu-trace` and `/usr/lib/afl/afl-frida-trace.so`, built from
-  the AFL++ release Ubuntu's `afl++` package carries (4.09c), with the qemuafl
-  commit that release pins and a digest-checked Frida GumJS devkit, so
-  `bhf binary fuzz` fuzzes a binary without source with coverage there
-  instead of falling back to the blind builtin loop. The container
-  acceptance runs both modes on an uninstrumented binary, and the image
-  inventory lists them. `bhf binary fuzz --engine afl-qemu` now merges
-  `symbolize=0` into the `ASAN_OPTIONS`, `UBSAN_OPTIONS` and `LSAN_OPTIONS`
-  it passes `afl-fuzz`, which refuses a custom setting without it, as the
-  image's defaults are.
-- Linux aarch64 release binaries (#343): a release publishes
-  `aarch64-unknown-linux-gnu` archives of the CLI, the daemon and both preload
-  shims, and the shell installers install them on a 64-bit ARM host. They are
-  built natively on an `ubuntu-24.04-arm` runner in a digest-pinned
-  `manylinux2014_aarch64` image and held to the same glibc 2.17 ceiling as
-  x86_64; the runtrace shim links with the toolchain's own `rust-lld`. The
-  release job unpacks the aarch64 archives and runs the Linux release smoke on
-  the ARM64 runner before uploading them, and a new CI job,
-  `arm64-release-build`, which CI acceptance and so the release's CI gate
-  require, builds them the same way, installs them through the generated
-  installers and runs the same smoke. The all-in-one signed bundle stays
-  x86_64 only.
-- The MSan corpus replay covers C++ (#323): a C++ harness's `make msan` builds
-  against the MSan-instrumented libc++ `BHF_MSAN_LIBCXX` names, which the full
-  image builds into `/opt/msan-libcxx`. A run whose MSan runtime stops before
-  it runs the input (a refused re-run with address-space randomization off,
-  as in a container on a kernel with 32 bits of mmap randomization) is run
-  again.
-- `bhf export regression [--lang c|ada]` writes a work dir's harnesses,
-  corpora and findings' minimized inputs as a standalone regression suite
-  (#339): `run.sh` builds each harness against the scanned tree and fails
-  when an input crashes, so a finding fails it until its bug is fixed.
-- The Java, JavaScript and TypeScript lanes run on native Windows (#307):
-  their launchers have launch specs (`java` with the agent, `node` on the
-  driver), Java's classpaths take the host's separator, the JVM agent jar is
-  built by `build-agent.ps1` there (cached in `%LOCALAPPDATA%\bhf\jvm`), and
-  the JS lane's load check runs the launch spec.
-- The C# lane runs on native Windows (#306): its `main` and `main_symbols`
-  launchers have launch specs (`dotnet` on the harness assembly), and the
-  driver maps the coverage file and runs the framed protocol through .NET's
-  file mapping and console streams where there is no libc to call
-  (`BHF_CS_PORTABLE_IO=1` takes that path on any host).
-- The Python lane runs on native Windows (#305). Beside its POSIX `main`
-  launcher it writes `main.launch.json` (the interpreter, the driver and the
-  environment), which the harness runner execs directly where the launcher
-  cannot run; `PYTHONPATH` takes the host's separator and the coverage map is
-  mapped without `MAP_SHARED` there. `BHF_LAUNCH_SPEC=1` runs a harness from
-  its launch spec on any host.
-- A GitLab CI template (`ci/gitlab/bhf.gitlab-ci.yml`) and a GitLab SAST
-  report (#320): `bhf ci --gitlab-sast <PATH>` and `bhf report --gitlab-sast`
-  write `gl-sast-report.json` (GitLab's format 15.2.1) for a merge request's
-  security widget. The template fuzzes a merge request's changes, keeps the
-  corpus and stored findings in the cache, and sweeps the whole tree on a
-  schedule.
-- The bhf-pr action takes a `mode` (#319): `pr` (the diff-scoped gate, the
-  default), `batch` (the whole tree), `prune` (rebuild the harnesses and keep
-  each corpus's inputs that add coverage) and `coverage` (the run's line
-  coverage, with `results/coverage/` as an artifact). A scheduled example
-  workflow runs batch, prune and coverage in turn on the shared corpus cache.
-- The bhf-pr action keeps its work between runs (#317): with
-  `corpus-cache` (default on), it restores the corpus, the discovery cache
-  and the stored findings of the newest cache of the PR's branch, else of
-  the base branch, into `corpus-dir` before the run, says what it restored,
-  and saves them after it. Its run step is `scripts/run-bhf.sh`.
-- `bhf ci` replays stored findings against the run's build before it judges
-  the run (#318): a finding that still reproduces fails the gate, and one
-  that no longer does is reported fixed. A work dir restored from a cache
-  keeps its last findings in `regressions/`, one per root cause, and
-  `--regressions <DIR>` adds more; their minimized inputs seed the run, and
-  `--ci-json` lists the ids that reproduced, were fixed or were not
-  replayed.
-- `bhf auto --engine afl++` runs Ada targets under AFL++ (#304). The
-  harness's objects link again with AFL++'s runtime into
-  `build/<id>/main_afl`; the Ada coverage runtime forwards its trace-pc edges
-  into AFL++'s map, an exception that escapes the target aborts it
-  (`BHF_CRASH_ON_FINDING`), and each crash AFL++ saves is replayed with the
-  event log and reported, minimized and replayed as the builtin engine's
-  are. AFL++'s GCC plugin is not used: a distribution's plugin refuses a GCC
-  of another point release.
-- `bhf auto --engine afl++` runs Rust targets under AFL++ (#303). A Rust
-  harness's `build-afl.sh` builds its crate again with bhf's trace-pc-guard
-  instrumentation and links the staticlib with afl-clang-fast and a persistent
-  driver, as cargo-afl links a crate; the same binary is the CmpLog build.
-  The build's target tree is removed after it.
-- `bhf auto --engine afl++` runs COBOL and Fortran targets under AFL++
-  (#302). Their C glue builds with afl-clang-fast and links as the lane's
-  `main` does (`lane-ldflags.txt`), the passthrough driver has an AFL++
-  persistent loop, and gfortran's trace-pc edges reach AFL++'s map through a
-  guard table of the driver's own. A crash AFL++ saves with no sanitizer
-  report, as a COBOL program's libcob error is, is a reachable-crash finding
-  as it is under the builtin engine.
-- `--sanitizers hwasan` (`hwaddress`) builds the fuzzed C/C++ harness with
-  HWAddressSanitizer in place of ASan on an AArch64 host (#333). Its reports
-  are findings under the rule ASan gives the same bug, the kind taken from the
-  report's first specific `Cause:`, and `HWASAN_OPTIONS` is merged as
-  `ASAN_OPTIONS` is. It is refused beside `asan` and, with the reason, on any
-  other host.
-- `bhf auto --sanitizers ...,realtime` replays the corpus of each target that
-  must not block through a RealtimeSanitizer build (`make rtsan`, clang 20+
-  `-fsanitize=realtime`) after the fuzz passes (#298). The marked target runs
-  in a real-time context, and an allocation, lock, sleep or system call made
-  there is a BHF-232 (CWE-1322) finding that `bhf replay` reproduces with that
-  build. `--nonblocking <entry-points | all | NAME>` picks the targets; the
-  default marks interrupt handlers and RTOS task bodies. Without clang 20 the
-  lane is skipped and the run says so.
-- `bhf auto --sanitizers ...,cfi` replays each C/C++ harness's corpus through a
-  control-flow integrity build (`make cfi`, clang `-fsanitize=cfi -flto
-  -fvisibility=hidden`, reporting through the UBSan runtime) after the fuzz
-  passes (#297). A cast to the wrong class or a call through a function
-  pointer or vtable of the wrong type is a BHF-221 finding that `bhf replay`
-  reproduces with that build; a harness whose CFI build fails is named.
-  `run.json` (`summary.unobservable_classes`) and `run.md` list the bug classes
-  no lane of the run could observe in its C/C++ targets, and what would.
-- A protocol profile of `kind = "giop"` drives a CORBA servant (#315):
-  every message is a GIOP 1.2 Request, its fields the operation's `in`
-  parameters at their IDL types (`octet`, `boolean`, `short`, `long`, their
-  unsigned forms, `enum`, `string`, `sequence<octet>`), marshalled in CDR by
-  the `iiop` crate, which no command used before, and sent over the session
-  lane's TCP transport. A `[giop]` table gives the object key and byte
-  order; replies are framed by their GIOP header (`framing = "giop"`) and
-  must answer the request's id, and a capture reads the Reply's
-  `reply_status` or `request_id` or the next value of its body, so a
-  captured handle can be passed to a later operation. The `iiop` crate
-  gains a GIOP 1.2 Reply encoder and a CDR string from raw bytes. A test
-  fixture server built on `iiop` has a servant that crashes on a store into
-  a slot past a bin's, behind an `open_bin` handle; the campaign finds it as
-  a dropped session at that store, which `bhf replay` reproduces.
-- Reference protocol profiles for CoAP and RTPS/DDS over UDP (#372), in
-  `profiles/protocols/coap.toml` and `rtps.toml`, for the session lane's
-  `udp:` backend. The CoAP session discovers `/.well-known/core`, reads
-  `/limit` and updates it with a conditional PUT whose If-Match carries the
-  ETag the read returned; only a piggybacked 2.05 or 2.04 advances it. The
-  RTPS 2.3 session announces a participant (SPDP), heartbeats its SEDP
-  publications writer to the participant that answered, addressed with the
-  GUID prefix that participant announced, and sends the publication at the
-  sequence number the reader's ACKNACK asked for. Each profile is tested
-  against a fixture server over UDP.
-- Reference protocol profiles for Modbus/TCP and MQTT 3.1.1 (#311), in
-  `profiles/protocols/modbus-tcp.toml` and `mqtt-3.1.1.toml`. The Modbus
-  session reads a holding register, writes back the value it read and writes
-  a block of registers; the MQTT session connects, subscribes, publishes at
-  QoS 2, releases the publication with the packet id the broker's PUBREC
-  named, and pings. A state is reached only on the reply that answers the
-  request: a Modbus exception response or a refused CONNECT does not advance
-  the session. A profile's `[framing]` can be `length_field`, for a protocol
-  whose header carries the message's length (Modbus's MBAP length at byte 4,
-  MQTT's Remaining Length, a variable byte integer, at byte 1): a request is
-  written as it is and a reply read by that length, header included. Each
-  profile is tested against a fixture server.
-- Ada harnesses get a coverage report too (#310): the replay records the PC
-  of each trace-pc edge an input reaches (`BHF_COV_PCS`, in the Ada coverage
-  runtime), takes the binary's calls to the callback as the instrumented
-  edges, places both on the original Ada lines (`addr2line` and the
-  instrumented copies' line maps) and writes `lcov.info`, `functions.txt` and
-  `functions.json` per subprogram to `results/coverage/<id>/`, and the covered
-  lines to `covered-lines.txt`.
-- The coverage report lists the comparisons each corpus reached and never
-  passed (#309): `results/coverage/<id>/blockers.{txt,json}` give the file,
-  line and function of each compare whose branch ran one way only, with the
-  operand it wants and values it got instead, from the harness's comparison
-  log placed by `llvm-symbolizer`. The sweep prints how many there are.
-- `bhf auto` writes each C/C++ harness's coverage report to
-  `results/coverage/<id>/` (#308): `lcov.info`, llvm-cov's HTML report under
-  `html/`, and a per-function table (`functions.txt` from
-  `llvm-cov report -show-functions`, `functions.json` with each function's
-  calls and lines), all cut to the files under the sweep's root.
-- Board profiles (#293): `bhf fuzz --board-profile board.toml` takes
-  `--target-transport` and `--transport-coverage-map` from a TOML file of one
-  board's specs, its debug-probe lane (`gdb`, `coverage_map`) or, with
-  `--board-lane serial`, the agent on its UART (`serial`); each spec is
-  checked when the file is read. `docs/hil-boards/nucleo-f411re.toml` is the
-  template and `docs/hil-bringup.md` now lists each bring-up step with its
-  expected output. The `gdb:` transport takes the completion contract of
-  `qemu-system:` (`done=`, `fault=` and their widths and kinds) and
-  `reset=restart|monitor:CMD`, since QEMU's system gdbstub refuses the `R`
-  restart and a board resets by `monitor reset halt`. `tests/hil_board.rs`
-  reads a profile (`BHF_HIL_PROFILE`) and runs against a QEMU stand-in that
-  starts as a board does, and the reference agent's `--pty` mode serves a
-  pseudo-terminal for the serial lane; the hil-emu lane runs both (RV-6).
-- Semihosting coverage for the `gdb` and `qemu-system` transports (#292):
-  with `coverage=semihosting` in `--transport-coverage-map` (and no ring
-  keys), each run's coverage is the event stream the `semihosting` probe
-  backend writes to fd 2. The gdb client now serves the File-I/O requests a
-  debugger-routed semihosting call makes (QEMU's
-  `-semihosting-config target=gdb`, OpenOCD's `semihosting_fileio`): it reads
-  each write's buffer, keeps fd 1 as console output and fd 2 as the
-  semihosting channel, and refuses other calls. A run that used semihosting
-  used to fail on the first such request. Each reply carries the Ctrl-C flag
-  and the client continues the target after it, because QEMU 8.2 sends no
-  stop reply for the rest of a run after a plain File-I/O reply.
-- `bhf fuzz --engine libafl` runs a LibAFL campaign (#296) on the harness's
-  `main`, in a bhf built with the `libafl-engine` feature (another bhf refuses
-  the engine and names the rebuild). LibAFL mutates with havoc and the harness
-  dictionary's tokens, each input runs in a fresh process, and the edge bitmap
-  the harness writes is its coverage map. The inputs that crashed the harness
-  go through the external-engine ingest into findings. CI runs the engine's
-  end-to-end test in its feature build.
-- `bhf fuzz --engine honggfuzz` runs honggfuzz in persistent mode (#295) on the
-  harness's `main_honggfuzz`, a new Makefile target built with honggfuzz's
-  `hfuzz-clang` (with ASan and UBSan) when absent. honggfuzz is found in
-  `BHF_HONGGFUZZ_PATH` or on PATH. The crash files it saves go through the
-  external-engine ingest into findings that replay through `main_honggfuzz`.
-  The nightly builds honggfuzz 2.6 for the gated test.
-- `bhf fuzz --engine libfuzzer` runs the harness's libFuzzer build (#294):
-  `main_libfuzzer`, built with `make libfuzzer` when absent, for `--time`, with
-  the per-input timeout, length and memory limits and the harness dictionary.
-  Its `crash-`, `oom-` and `leak-` artifacts are replayed through it and
-  recorded as findings, and a `timeout-` one that hangs again is a hang finding,
-  through the same external-engine ingest AFL++'s crashes and hangs now go
-  through. The findings replay through `main_libfuzzer`. `--engine` took only
-  builtin, afl++ and winafl.
-- The reference agent runs as a Zephyr module (#291). `c_runtime/zephyr/`
-  serves the agent protocol on the UART the devicetree's chosen
-  `bhf,agent-uart` names (`CONFIG_BHF_AGENT=y`,
-  `bhf_agent_zephyr_run(LLVMFuzzerTestOneInput)`). Zephyr ends a thread that
-  faults, so the module's `k_sys_fatal_error_handler` records the fault for
-  the running input, and the calling thread sends the reply
-  (`bhf_agent_report_fault`, new in `bhf_agent.h`) and starts a new agent
-  thread. Its `qemu_cortex_m3` sample runs clean, fault and clean inputs in one
-  boot and replays the fault (`transport_zephyr_agent_cli`, opt in with
-  `BHF_ZEPHYR_CLI=1`; hil-emu installs Zephyr and runs it). The glue also runs
-  on the host against a stand-in for the Zephyr API, in `agent_loopback`.
-- `bhf auto` fuzzes a Python instance method whose class's `__init__` takes
-  arguments (#286). The harness decodes each required `__init__` argument from
-  the input ahead of the method's own, as it decodes a method parameter of that
-  annotation or name, and builds the receiver from them. An `__init__`
-  parameter annotated with a type bhf cannot decode still skips the target,
-  and the reason names it. Only a receiver whose `__init__` took no required
-  argument was built. A union annotation (`str | Path`, `Optional[str]`) is
-  decoded as its first member bhf can build, a `Path` as a `pathlib.Path` of
-  decoded text, and the Python driver treats an `ImportError` the target
-  raises as the environment, not a finding.
-- `bhf auto` fuzzes Python 2 sources under a `python2` interpreter (#285):
-  `python2`, `python2.7`, or a `python` that is 2.x. The Python runtime (driver,
-  coverage and decoder) runs on Python 2.7 as well as Python 3, and the target is
-  resolved with the Python 2 extractor. Without such an interpreter a Python 2
-  target is report-only, as before, with a reason that says to install one. The
-  nightly builds CPython 2.7.18 for the gated test.
-- `bhf auto` fuzzes Ada 83 units from an Ada 2012 harness (#284). Ada 83 has
-  no child units, so an instrumented Ada 83 unit names the probe through the
-  runtime's library-level `AdaFuzz_Probe83`, which renames the probe's
-  subprograms, and its exception handlers are not rewritten: their probe binds
-  the occurrence, which Ada 83 cannot. The dialect was report-only, and the
-  instrumented unit's `with AdaFuzz.Probe;` did not compile under
-  `pragma Ada_83`.
-- `bhf auto` fuzzes K&R C definitions (#283). The harness declares the
-  prototype the definition's parameter declarations give, with the default
-  argument promotions (`char` and `short` as `int`, `float` as `double`), and
-  passes the arguments it decodes. The modern parse read an old-style
-  definition as taking no parameters, and the dialect was report-only.
-  Pre-C++98 C++ stays report-only.
-- On-target CmpLog for the `gdb` and `qemu-system` transports (#386).
-  `--transport-coverage-map ...,cmplog=ADDR,cmplog_cap=N` names a record the
-  firmware's `-fsanitize-coverage=trace-cmp` callbacks fill, `{u32 count,
-  u32 reserved}` then `{u64 lhs, u64 rhs, u32 width, u32 site}` entries. bhf
-  zeroes the count before each run and reads the entries after it. A mutation
-  of a corpus entry splices the operands its run compared. The summary's
-  `comparisons` counts them. On the mps2-an385 fixture a 4-byte magic is
-  solved within 300 executions with `cmplog=` and not without it. The
-  transport lane had no comparison feedback.
-- `bhf fuzz --target-transport ... --workers N` drives N targets at once
-  (#316). The spec names each worker's with `{worker}` or `{BASE+worker}`
-  (`agent:tcp:127.0.0.1:{9000+worker}`). The workers share one corpus,
-  coverage map, schedule and finding set, the iteration cap and time budget
-  are the campaign's, and a finding's transport profile names the spec of
-  the worker that found it. A spec without a template is refused with
-  `--workers`. The transport lane was single-worker.
-- The reference agent runs as a FreeRTOS task under `qemu-system-arm`
-  (#290). `crates/target_transport/tests/freertos/agent_task.c` serves the
-  agent protocol over UART0 of `mps2-an385`, which `-serial tcp:` makes a
-  socket. Its HardFault handler returns from the exception into a recovery
-  function that reports the fault from the task. `transport_freertos_agent_cli`
-  (opt in with `BHF_RTOS_CLI=1`) runs clean, fault and clean inputs in one
-  boot and replays the fault (`docs/validation/2026-11-18-freertos-agent.md`).
-  The agent lane had not been run against anything but mocks.
-- A reference target-side agent ships for `agent:tcp` and `agent:serial`
-  (#289): `c_runtime/bhf_agent.{h,c}`, freestanding C99 with no heap. It
-  serves the agent protocol over the board's read and write callbacks and
-  collects each input's SanitizerCoverage guards. It reports a fault from
-  the board's vector or signal handler (`bhf_agent_fault`) and goes on with
-  the next input. An input longer than its buffer is refused, a new
-  protocol status (`3`) the host takes as an inconclusive run.
-  `c_runtime/examples/agent_posix.c` runs it over TCP, and a loopback test
-  and a `bhf fuzz` run drive it to a fault that `bhf replay` reproduces.
-  Users had to implement the protocol from its description.
-- The JS lane runs browser-oriented modules (#288). A module that needs
-  `window`, `document` or `navigator`, at load or when called, gets inert
-  stand-ins for the browser globals Node lacks, and for any
-  `HTML…Element`, `SVG…Element` or `…Observer` class it hits. The harness's
-  `browser-globals.txt` records which, and later starts install them before
-  the target loads, as an ES module needs. The target's findings carry them
-  in `fidelity.environment_shim` and `fidelity_caveat`, since a finding may
-  depend on them. A module that tests `typeof window` gets none. These
-  modules were skipped as not loadable (JS-2). Re-running the sweep's 37 JS-2
-  targets built and fuzzed 23 of them
-  (`docs/validation/2026-11-18-js2-browser-globals.md`).
-- `bhf minimize --strategy typed` minimizes a generated C/C++ harness's
-  finding (#279). By the harness's `arg-layout.json`, it reduces each decoded
-  integer or flag to the first of 0, 1, -1 and its type's limits that still
-  crashes, then an integer to the value nearest zero that does, keeping the
-  input's layout. `minimization.typed` records what it tried and kept. A
-  lane without an argument layout, a binary finding and a transport finding
-  are refused by name. The strategy was Ada-only, and it refused every other
-  harness as "C/C++".
-- `bhf minimize` minimizes on-target transport findings (#280). It rebuilds
-  the transport from the finding's profile as `bhf replay` does
-  (`--transport-endpoint` relocates it), then delta-debugs the input,
-  keeping a reduction only when it faults with the same rule at the same
-  site, or for a deadline finding is again a clean run past the deadline.
-  It refused transport findings.
-- The workers of a `bhf fuzz --workers` campaign share their corpus while
-  they run (#277). Every `BHF_SYNC_INTERVAL_MS` (10 s by default, spread
-  over the workers), each writes the entries its pool kept to
-  `fuzz_campaigns/<harness>/sync/worker-<id>/`. It also runs the entries
-  the others wrote that it has not seen, by content hash, and keeps those
-  that add coverage. An entry is written once, and each worker logs its
-  imports to `sync-import.log`. The workers merged their queues only after
-  all of them had exited.
-- `bhf fuzz --engine afl++ --workers N` runs AFL++'s own parallel mode
-  (#276): a `-M main` instance, which runs CmpLog, and N-1 `-S` instances in
-  one output directory. They sync each other's queues at start and every
-  quarter of `--time` (1 to 30 minutes, unless `AFL_SYNC_TIME` is set). All
-  their crashes, hangs and queues are harvested, the summary's
-  `afl.instances` names them, and the stats add up. It ran N bhf workers
-  with an afl-fuzz each, in their own directories, that never synced.
-- The AFL++ lane keeps its session (#275). `afl_out/<harness>/out` is kept
-  between runs, `bhf auto` runs included, and afl-fuzz resumes it
-  (`AFL_AUTORESUME`). Seeds the session was not given before join its queue
-  (`offered-seeds.txt` records the ones it was given). After each run its
-  queue is taken into the bhf corpus (`corpus_persisted`). Inputs afl-fuzz
-  saved as hangs are re-run through `main_afl` with twice its 1 s limit, and
-  one that hangs again is a BHF-230 finding (`hangs` in the summary). The
-  crashes and hangs of a session a resume moved aside are harvested too. A
-  session afl-fuzz cannot resume is started over, once. The out directory
-  was deleted at the start of every run, the queue was never imported, and
-  `hangs/` was never read.
-- The AFL++ lane runs CmpLog (#274). The harness Makefile has an
-  `afl_cmplog` target that builds `main_afl_cmplog` under
-  `AFL_LLVM_CMPLOG=1`. `bhf auto --engine afl++` and `bhf build --c-engine
-  afl++` build it beside `main_afl`, and afl-fuzz runs with `-c
-  main_afl_cmplog -l 2AT`, so AFL++ solves magic values and checksums no
-  dictionary holds. The run's `afl` block records `cmplog_binary`. A CmpLog
-  binary older than `main_afl` is not used. The lane ran without CmpLog,
-  which bhf's own comparison measures AFL++ with.
-- `--session-transport transport:<spec>` drives a protocol session through a
-  `--target-transport` backend (#261): an on-target agent, a debug probe or
-  an emulator, with `--transport-coverage-map` for the gdb and qemu-system
-  backends. Each message is one execution, in order. A fault, crash or hang
-  at a message is a disconnect finding once a second drive confirms it, and
-  `bhf replay` reproduces it. The executions' edges feed the lane's code
-  channel (`coverage_source = "target"`). A reply is the backend's stdout,
-  which the agent backends do not have. The session lane could not reach a
-  protocol on the target.
-- `--session-transport serial:PATH[,baud=N]` drives a protocol session over
-  a UART or a pty (#262), opened raw as the agent's serial transport is, with
-  the profile's framing and every read bounded by the reply deadline.
-  `--session-reset reconnect` reopens the device; `none` keeps it open. The
-  session lane reached only TCP and UDP services, not a device's command
-  set.
-- `bhf fuzz --session-server-cmd ... --runtime-oracles on` runs the service
-  under the runtrace shim (#364). Before each session bhf writes the bytes
-  the session carries where the shim matches its sinks against its input
-  (`BHF_SHIM_INPUT_FILE_SHARED=1`, one file for every process of the
-  service). Each session's events are evaluated as that session's, and the
-  service's start-up is excluded. A command, path, library or query built
-  from a session's bytes is a finding of that session, once per rule and
-  sink API, which `bhf replay` reproduces under the shim. Sessions had only
-  the profile's response and state oracles, and the lane refused
-  `--runtime-oracles`.
-- A service the session lane runs with `--session-server-cmd` reports its
-  code coverage (#363). It gets `BHF_COV_SHM`, an edge map bhf keeps for the
-  campaign, which a service built with SanitizerCoverage and the new
-  `c_runtime/bhf_service_cov.c` fills. A session that reaches new code is
-  kept and scheduled as one that reaches a new state is. The summary's
-  `coverage_edges` counts the service's edges, and `coverage_source` says
-  whether it is `service`, `uninstrumented_service` or `none`. The lane
-  folded an empty edge set, so on a one-state protocol it kept nothing past
-  the seeds.
-- The zoxide harness-parity row is rerun with the in-crate lane (#245,
-  completing #83): with `--rust-private`, auto picks the private
-  `Database::deserialize` and enters and covers it (754 edges), and run at
-  the expert's `Database::open_dir` it materializes `db.zo` and enters and
-  covers that (961 edges)
-  (`docs/validation/2026-11-17-zoxide-incrate-parity.md`). The in-crate lane
-  declares its harness module beside the file that defines the target, so
-  a private associated function of a submodule (zoxide's `deserialize`)
-  compiles; at the crate root it was E0624. The parity runner passes extra
-  `bhf auto` arguments with `--bhf-arg` and records them in each row.
-- `bhf fuzz --session-server-cmd COMMAND` runs the service the session lane
-  fuzzes (#260). bhf starts it with its stderr kept, waits until it serves
-  the transport's port, and after each session checks whether it exited. A
-  session after which it exits, again on a restart, is a finding: from the
-  sanitizer report in its stderr (oracle `session-server-crash`, with
-  `sanitizer.log`), else a BHF-210 exit (`session-server-exit`). The service
-  is started again and the campaign goes on; `server_starts` counts the
-  starts. A service that does not start is exit 2 with its stderr, and
-  `bhf replay` and `bhf minimize` start it for each drive. The lane could not
-  start a service, so it had no sanitizer oracle and stopped once the service
-  crashed.
-- `bhf binary adapter --adapter rizin` runs Rizin's analysis (#264):
-  `rizin -q -c 'aaa; aflj; axlj; izj'`, under `--timeout-secs` (default 900)
-  and a 128 MiB output cap. It maps the functions (with `imported` for an
-  import stub), the call edges, the xrefs and the data-section strings into
-  the report, each array capped, with `truncated` naming one that was cut.
-  The adapter only ran the tool's version probe and wrote empty arrays, and
-  the probe it ran, `rizin --version`, opens a file named `--version` in
-  Rizin's shell and waits; it is `rizin -v`. A failed analysis is `status:
-  error`, exit 1, with `timeout`, `tool_error`, `output_too_large` or
-  `bad_output`.
-- `bhf binary adapter --adapter ghidra` runs Ghidra headless (#265):
-  `analyzeHeadless` imports and analyzes the binary in a throwaway project
-  and the bundled `BhfExport.java` post-script exports its functions, calls,
-  defined strings and references. Addresses are moved back from Ghidra's
-  load base (`0x100000` for a PIE) to the binary's own, so they match
-  Rizin's and `nm`'s; an import's function in Ghidra's EXTERNAL block is
-  left out for its PLT thunk. The version is read from the install's
-  `application.properties`.
-- `bhf binary adapter --adapter angr` runs the bundled `angr_export.py`
-  (#266): CFGFast over the main object, with data and cross references,
-  moved back from angr's load base (`0x400000` for a PIE). A Python that
-  cannot import angr is `skipped`, exit 1; the adapter ran `python3
-  --version` and reported a successful analysis without angr.
-- The nightly's binary-analyzers job installs Rizin 0.9.1, Ghidra 12.2 with
-  a JDK 25, and angr 10.0.7, pinned by digest
-  (`scripts/ci/install-binary-analyzers.sh`), and runs each adapter on a
-  fixture with `BHF_REQUIRE_TOOLS=1`: the fixture's functions at the
-  addresses `nm` gives, its call edges, its magic string and a call xref.
-- `bhf binary fuzz` and `bhf binary scan` take `--adapter-report` (#267).
-  The strings the binary's code references seed the mutation dictionary
-  (the builtin engine's, and afl-fuzz's `-x`), and its own functions are
-  ranked as fuzz entry points by the input-handling imports they call, the
-  strings they reference and their calls, the first being the candidate
-  persistent address. `binary fuzz` records them in the run JSON's
-  `adapter_report`; `binary scan` adds them as `adapter` to the entry of the
-  binary whose SHA-256 the report records (its new `target_sha256`).
-  Nothing read the report before.
-- The Rust lane harnesses more targets (#338,
-  `docs/validation/2026-11-17-rust-trait-and-param-classes.md`):
-  - A static method of a dependency's trait impl (`impl heed::BytesDecode
-    for Codec`) is called by UFCS: the trait is resolved through the impl
-    file's `use` declarations or its full spelling, and the harness crate
-    depends on the trait's crate with the target's spec. `From<&[u8]>` and
-    `From<&str>` join the standard conversions.
-  - An owned parameter of a crate type with `Default` is built from
-    `T::default()`, as a `&T` one was; `Option<T>` of a decodable `T` and
-    `i128`/`u128` decode.
-  - The harness crate's `Cargo.lock` starts as the target's, so an offline
-    build resolves a git dependency with no rev and the versions the target
-    was built with.
-
-  A trait-impl method that takes no input, or one on a generic type, is
-  refused with its own reason instead of as an outside trait.
-- `bhf-daemon --security-config FILE` runs the JSON-RPC daemon with
-  workspace-scoped security (#273): `workspace_shared` or `multi_tenant`
-  tenants, each with a token read from its own `token_file`, a workspace
-  root and a role. A token file its group or others can read or write, a
-  short or shared token, or an unknown field stops the daemon at start with
-  exit 2 and the reason. The shipped daemon always ran single-user, so a
-  shared deployment that followed daemon.md ran with no authentication.
-- `bhf-daemon --jobs-dir DIR` runs the continuous fuzzing scheduler behind
-  the `submitJob`, `listJobs` and `cancelJob` JSON-RPC methods (#271), with
-  `--job-workers` and `--bhf`. A tenant submits, sees and cancels only jobs
-  for projects inside its workspace root; a viewer only lists them. The
-  scheduler gained `Scheduler::cancel` and a `cancelled` state: a queued
-  job never starts, and a running one's process tree is killed. It had no
-  consumer at all.
-- A protocol profile's response captures take TLV records (#259): a `tlv`
-  capture walks the records from its offset to the one with its `tag` and
-  binds the value, which a later request echoes from a `bytes` or `tlv`
-  reference field. A profile with a TLV capture did not compile, and a
-  reference field could only be an integer.
-- The session lane has a UDP backend (#258): `--session-transport
-  udp:HOST:PORT` sends each message as one datagram, framed as the profile
-  says, from a socket of its own per session, and waits for one reply
-  datagram. `--session-reply-timeout` sets how long a reply may take, over
-  TCP (5s by default) or UDP (1s); a UDP reply that does not come, or a
-  datagram the host refuses, ends the session as a dropped TCP connection
-  does. The lane accepted only `tcp:HOST:PORT`.
-- The Java lane fuzzes a target that takes a JDK collection (#236):
-  `List<String>`, `Map<String, Object>`, `Set<Integer>`, a sorted map, a
-  nested collection, a wildcard, and an `int[]`, `long[]` or `double[]`. The
-  harness declared every local with `var`, which infers the wrong element
-  type for a collection built from the input, so these were skipped as
-  unsupported. A collection local is declared with its parsed type, spelled
-  fully qualified, and filled with a fuzzed number of elements (0 to 8),
-  each decoded by its type: a string, a boxed scalar, an `Object`, a
-  `byte[]`, an enum constant, a default instance of a tree type, or another
-  collection. A sorted collection is used only for elements that compare with
-  each other. A collection of strings ranks as a byte channel, as a string
-  does, and a `java.util.Random` parameter is seeded from the input.
-  Of the 57 targets the 2026-07-28 sweep skipped as Java-1, 7 now pass the
-  parameter they were skipped on and none builds: five need the project's
-  Maven or Gradle build, which fails, one fails javac on the tree, and one
-  stops at its next parameter
-  (`docs/validation/2026-11-16-java1-collections.md`). `go1_rerun.py` re-runs
-  Java targets (`--lang java`), several projects at once (`--jobs`), and can
-  let bhf run a project's build (`--run-untrusted`).
-- The Go lane fuzzes a package outside every Go module (#237): a GOPATH-era
-  tree, or a dir of `.go` files. Its harness imports the target through a
-  module `replace`, which needs a dir with a `go.mod`, so these were skipped.
-  bhf copies the package into the harness dir (`bhf_target/`) with a `go.mod`
-  of its own, and the scanned tree is not written to. A `package main` is
-  renamed in the copy so it can be imported. From a dir of `go run` scripts,
-  each with its own `main`, only the target's file is copied. Each copied
-  file opens with a `//line` directive, so a finding names the project's
-  file and line, and the capsule ships the copy with the harness. Of the 17
-  targets the 2026-07-28 sweep skipped this way, 15 now build and fuzz; the
-  other 2 are SWIG bindings, which need `swig`
-  (`docs/validation/2026-11-16-go3-loose-packages.md`). `go1_rerun.py`
-  re-runs any Go class by name (`--class`), across every lane's rows
-  (`--all-lanes`).
-- The engine trade study records coverage over time and retained findings
-  (#256). It snapshots each engine's corpus at 10, 25, 50 and 75% of the
-  budget and replays each through the shared coverage binary, so a row has a
-  coverage curve and the summary its distribution per checkpoint; and it
-  replays every crash input an engine kept through the oracle, so a row
-  counts the kept, confirmed and distinct findings and the summary gives
-  their distributions. `BHF_LIVE_CORPUS_DIR` makes bhf's built-in engine
-  write each input it keeps there as it keeps it, since its queue is written
-  when the pass ends.
-- Pinned build recipes for the trade study's libpng and re2 targets
-  (#371), so all six real-code targets are runnable: libpng's library
-  sources with its prebuilt `pnglibconf.h`, linked with the zlib recipe, and
-  RE2 2023-06-01 (re-pinned: the latest release that builds with a
-  distribution Abseil) against the system Abseil. A recipe can name
-  libraries to link, which bhf's lane passes as `--ldflags`; adapters are
-  named `<target>_adapter`, and two sources with one file name are refused.
-- Pinned build recipes for the trade study's zlib and libyaml targets
-  (#370): zlib's core translation units with its checked-in `zconf.h`, and
-  libyaml's `src/*.c` with the `config.h` its configure writes for 0.2.5,
-  each with an adapter. The dry run lists four of the six real-code targets
-  as runnable.
-- Pinned, checksum-verified build recipes for the trade study's cjson and
-  sqlite real-code targets (#255). `recipes.py` turns a checkout fetched at
-  its pin into the sources, include dirs and flags to compile: cjson is
-  `cJSON.c`; sqlite is the amalgamation its own `make sqlite3.c` generates out
-  of tree. Each recipe checks the SHA-256 of the files it takes or generates,
-  and each target has an adapter under `adapters/`. The dry run lists both as
-  runnable, and a smoke build (`BHF_TRADE_STUDY_SOURCES`) builds and runs both
-  harnesses.
-- The engine trade study's bhf lane fuzzes a provided harness (#254): with
-  `bhf_harness_mode=provided` it wraps the same `harnesses/libfuzzer.c` every
-  other engine builds, with the target's sources, include dirs and flags
-  (`bhf generate-harness ... --target LLVMFuzzerTestOneInput`, then
-  `bhf build --cflags`), and runs the same `bhf fuzz` budget and seeds. The
-  dry run lists the lane as runnable, and `--bhf-harness-mode` sets the mode
-  for every target. It was a hard-coded unsupported row. CI runs the study's
-  unit tests.
-- `bhf pack import-nvd INPUT... --out cve-db.json` builds an advisory
-  database from NVD CVE JSON 2.0 files (#387), with the OSV importer's
-  writer. Each vulnerable CPE match becomes a record identified by its CPE,
-  with its version bounds as a range (or the CPE's own version) and the
-  CVE's CVSS base severity, so a C or C++ library named by CPE matches by
-  CPE and version range. Malformed records are reported and skipped.
-- `bhf pack import-osv INPUT... --out cve-db.json` builds an advisory
-  database for `bhf sbom --vuln-db` from OSV records (#223): an unzipped OSV
-  ecosystem export or single record files. Each affected package becomes a
-  record with bhf's ecosystem name, explicit versions, version ranges and a
-  severity (the GitHub advisory rating, else the CVSS v3 base score's
-  rating). Malformed records are reported and skipped. The database format
-  takes `affected_ranges` (version bounds) beside `affected_versions`, and
-  `docs/site/inventory-assurance.md` documents it. No command built a
-  database from a public feed.
-- The persistent built-in engine calibrates the inputs it adds to the corpus
-  (#232), as AFL++ does. It re-runs each one four times, each from a zeroed
-  edge bitmap, and counts an edge that one run hit and another did not as
-  variable. An input whose only new coverage was variable edges is left out,
-  and the re-runs' edges count as seen. The run summary's `stability` gives
-  `stability_pct`, `variable_edges`, `calibrated_entries` and
-  `unstable_entries_dropped`; the status line shows the stability, and below
-  90% bhf says the harness keeps state between executions and suggests
-  `--no-fork-server`. A target that switches on a static call counter filled
-  the corpus with an entry per counter value, with no warning.
-- The runtime comparison log records integer comparison constants (#221):
-  the C/C++ driver writes the constant of each comparison the compiler
-  emitted against one as an `"int"` record, with its own size budget, and
-  the learned dictionary takes it as a constant from one record, in
-  little- and then big-endian bytes. A constant computed at build time that
-  no source literal spells now carries to the next run and to the AFL++ and
-  WinAFL dictionaries; it was solved again by every run. Constants of at
-  most 0xff, and all ones, are not recorded.
-- Stack depth is a coverage channel of the C/C++ driver (#220): it records
-  the deepest stack each execution reached, and the built-in engine keeps an
-  input that recursed a quarter deeper again than every input before it,
-  though it ran no new edge. A new mutator doubles the longest run of a
-  nesting opener (`[`, `{`, `(`, `<`) in an input. An unbounded recursion now
-  reaches the end of the stack and is reported as a BHF-207 stack overflow;
-  edge coverage kept none of the deeper inputs, so it was not found.
-  `BHF_DISABLE_STACK_DEPTH=1` turns the channel off.
-- `bhf auto --collector SPEC` (and `--collector-window-ms`) observes each
-  fuzzed target with the runtime-event collector: after its passes, the
-  target's retained inputs are replayed one by one under it, as
-  `bhf fuzz --collector` does, and run.json records each target's
-  `collector` observation with each replay's testcase, input SHA-256 and PID.
-  `bhf auto` had no collector: its fuzz runs left it off.
-- The FreeRTOS reference profile has an interrupt-driven entry point: its
-  `-DBHF_ISR_ENTRY` image takes its input from a receive interrupt whose
-  handler posts it to the consumer task with `xQueueSendFromISR`. A CLI test
-  finds the planted fault through it. `task_id=ADDR` on a `qemu-system:` or
-  `gdb:` transport reads the firmware's task identity word after each run, and
-  a fault finding records it as `target_task.id`; `bhf_task_id` was written but
-  never read. on-target-fuzzing.md lists the five validation levels (host
-  stubs, ISA emulation, full-system bare metal, an actual RTOS, silicon) and
-  which ones BHF has validated.
-- On-target deadlines can be timed by the target: `cycles=dwt` on a `gdb:` or
-  `qemu-system:` transport reads the Cortex-M DWT cycle counter around each
-  run, `cycles=ADDR` a free-running 32-bit counter, and with `cpu_hz=N`
-  `--deadline` uses the target's time instead of the host's round-trip time.
-  The run summary's `target_cycles` gives the fewest and most cycles a run
-  took, the transport profile records the timing basis, and replay judges a
-  deadline finding by it. QEMU does not count `DWT_CYCCNT`, which the run
-  reports; the FreeRTOS profile's test reads the MPS2 FPGAIO counter.
-- `bhf replay --stability-runs N` re-drives an on-target transport finding's
-  input N times, each from the transport's reset, and reports how many runs
-  reproduced it. A finding some runs reproduce and others do not is
-  `MISMATCH nondeterministic, K of N runs reproduced the finding` (exit 3);
-  transport replay ran once and could not tell a flaky fault from a fixed one.
-- Seed lineage: the built-in engine records what each input it keeps was
-  mutated from (`corpus/<harness-id>/lineage.jsonl`, one line per queue
-  entry, beside the queue), and each finding's `finding.json` gains
-  `lineage`: whether its input descends from a mined seed, a user seed, a
-  queue entry with no record or an input bhf generated, that seed's sha256 and
-  path, how many mutation generations down it is, and its immediate parent.
-  Later passes, `--resume` and multi-worker campaigns keep the chain (each
-  worker starts from the campaign's records and names the seeds it was
-  given, not bhf's copies of them); the file is trimmed to twice the queue's
-  entry limit or twice the files the queue holds, whichever is more (a
-  multi-worker merge can leave the shared queue holding more than the
-  limit), keeping what the queue needs first. A queue entry with no record
-  is a `corpus` root whatever its file is named. A corpus saved without the
-  file still loads, and what it cannot say is `unknown` with a reason, as is
-  the lineage of a crash AFL++ found (`bhf fuzz --engine afl++`, `bhf
-  binary-fuzz --engine afl-qemu`), whose queue bhf does not track. The
-  corpus replays (MSan, TSan, the memory profile, `--differential`) record
-  the lineage of the queue entry they ran, and `bhf binary-fuzz`'s
-  seed-replay engine and `bhf differential` name the operator's input as a
-  user seed. `bhf explain` prints it as one line, also for an MSan or TSan
-  finding, which saves no testcase and names its input by sha256, and
-  `bhf.findings.v1` carries it as the optional `fuzz.lineage`.
-- Windows: a WinAFL engine, `--engine winafl` on `bhf fuzz` and `bhf auto`
-  (native Windows only; refused on other hosts before anything is built).
-  WinAFL fuzzes `main_winafl.exe`, the harness's sources built without
-  AddressSanitizer or SanitizerCoverage by the new `make winafl` lane (`bhf
-  build --c-engine winafl`), in persistent mode through the driver's exported
-  `bhf_winafl_fuzz(path)` entry, with DynamoRIO coverage of the harness
-  (`--winafl-coverage-module` adds target DLLs) or Intel PT
-  (`--winafl-instrumentation intel-pt`). An ASan binary does not run under
-  DynamoRIO (it hangs at start-up under `drrun`, and WinAFL counts ASan's
-  shadow-memory access violations as crashes), so the crashes and hangs WinAFL
-  saves, and the seeds its dry run found crashing, are replayed through the
-  sanitized `main.exe`, and each report becomes a finding through the same
-  dedupe and `results/` flow as an AFL++ crash; `bhf replay`, `explain`,
-  `capsule` and `verify-poc` work on it, its `finding.json` says how it was
-  found (`discovery`), and its fidelity record that WinAFL's build had no
-  sanitizer. The replay is bounded: each distinct input once, at most half the
-  time budget (30 s to 10 min), half of that kept for the hangs however many
-  crashes come first, and hangs until 8 time out again with no report in
-  between (a hang that replays clean does not count); an input that fails to
-  replay is a warning. The WinAFL build checks the heap after every input,
-  and `--winafl-page-heap` runs it under full PageHeap for the run, so a heap
-  overflow faults as a crash rather than ending in a fail-fast WinAFL records
-  as a hang. PageHeap is set for a copy of the build
-  under a name only that run uses, so no other run or campaign gets it; bhf
-  tags the key with its owner and the copy with a marker file, prints the
-  key, and removes only what it wrote when the run ends or is stopped with
-  Ctrl-C, Ctrl-Break or a closed console (then stopping the targets first and
-  deleting the copy), and a later run, or `make clean`, removes what a killed
-  one left. `page_heap` in `run.json` and the finding is the setting actually
-  in effect. It needs an elevated shell and is refused up front without one.
-  `--rss-limit-mb` becomes WinAFL's `-m` (for an x86 harness only while it is
-  below what a 32-bit process can address, else `-m none`). Seeds are handed
-  over byte for byte, the harness dictionaries are merged into WinAFL's one `-x`
-  file, and WinAFL's queue returns to the corpus. bhf enforces the time budget
-  (WinAFL has none), stops afl-fuzz, drrun and the target together through a
-  job object, restarts WinAFL on its queue when it stops early (and still
-  replays what a session that stopped early saved, failing only when nothing
-  was). A run stopped by Ctrl-C before its replay prints where WinAFL's saved
-  inputs are, and the next WinAFL run of that harness in the work dir replays
-  them (`earlier_inputs`). bhf records WinAFL's own coverage, executions and
-  the replay outcomes in `run.json` (`winafl`). WinAFL and DynamoRIO are found
-  from
-  `--winafl-path`/`--dynamorio-path` (config keys `winafl-path`/
-  `dynamorio-path`, explicit `--config` only), `BHF_WINAFL_PATH`,
-  `BHF_DYNAMORIO_PATH`/`DYNAMORIO_HOME`, or `PATH`, and a missing one, a
-  `winafl.dll` of the wrong architecture, or an ARM64 target, is an error
-  naming what to do (`bhf auto` exits 2 before its sweep; `bhf fuzz` exits 1,
-  as for a missing `afl-fuzz`, and 3 on a host other than Windows or for
-  `--winafl-page-heap` outside an elevated shell). `bhf fuzz` refuses
-  `--engine winafl` with `--target-transport` or `--protocol-profile`, which
-  only the builtin engine runs. Validated with WinAFL master `fd85f38` and
-  DynamoRIO 11.91.20763 on a Windows Server 2022 VM; see
-  [windows.md](docs/site/windows.md#winafl-engine---engine-winafl).
-- A seed reaches the buffer of a C/C++ harness that decodes fixed-width
-  scalars before it: `bhf auto` (for its mined and `--seed-file`/`--seed-dir`
-  seeds, in the builtin and AFL++ stages) and `bhf fuzz` (for
-  `--seed-file`/`--seed-input`) also give each seed behind as many zero bytes
-  as those scalars take, from the harness's `arg-layout.json`, plus 4 for the
-  length of each other buffer's slice ahead of it (a context pointer before a
-  `(data, len)` pair), which a zero leaves empty. The seed itself is still
-  given byte for byte. A multi-worker `bhf fuzz` makes the prefixed seeds
-  once, and its workers prefix none of the seeds they are handed.
-  `auto/seeds.json` lists the prefixed seeds under an additive
-  `layout_variants` (`harness_id`, `layout_prefix`, `sha256`).
-- `bhf fuzz` and `bhf decode-args` take `--qemu-user` and `--qemu-arg`, as
-  `bhf replay` and `bhf minimize` do.
-- `FidelityFacts` has two more fields, `target_triple` and `runner`, for a
-  cross-built target run under user-mode emulation.
-- The input reachability verdict records what it was inferred from:
-  `finding.json` `input_reachability_basis` `{rule, param, spelled_type,
-  resolved_type, typedefs_resolved}` (`rule` is `const_byte_buffer`,
-  `parser_name_with_length`, `mutable_parser_buffer`, `byte_scalar_parser`,
-  `output_serializer`, `no_input_shape`, `call_graph_provenance` or
-  `internal_linkage`), carried into `results/findings.json` as
-  `reachability.reachability_basis`. `bhf explain` names the parameter and its
-  types (``because parameter `buf` (`const u8_t *`, resolves to `const uint8_t
-  *`) is a read-only byte buffer``), says when an unproven verdict read the
-  types with their typedefs resolved, and says when a `static` entry has
-  internal linkage.
-- `results/findings.json` `fuzz.input_to_state_status`,
-  `fuzz.input_to_state_reason` and `fuzz.input_to_state_search` say whether a
-  comparison-evidence capture ran, why it found no gate, and how far its
-  search for computed operands got; `findings.csv` gains an
-  `input_to_state_status` column at the end, and INDEX.md says why a finding
-  has no compared input bytes. The schema fields are additive and optional.
-- A finding whose input is empty or all zero bytes, or whose method ran on an
-  object bhf's harness constructed (a default constructor, a factory or
-  decoded constructor arguments, now in `finding.json` `decoded_args`'s
-  receiver entry as `decoder`), carries a caveat that real callers may never
-  produce that state, beside the reachability verdict in `bhf explain` and in
-  the results `fidelity.caveats` (INDEX.md `Caveat:`).
-- `bhf build --runner <program>` / `--runner-arg <arg>` and the
-  `toolchain.runner`/`runner-args` keys: a build for a target this host
-  cannot run records the runner beside the binary in `bhf_runner.json`
-  (`bhf.harness_runner.v1`; `build/<id>/`, or `build/<id>/obj/` for an Ada
-  harness) and beside the harness, where `bhf replay`, `bhf minimize`,
-  `bhf fuzz`, `bhf decode-args` and the finding's `replay.py` find it; a
-  native rebuild forgets it, and a runner
-  for a build this host runs natively, C/C++ or Ada, is refused as in `bhf
-  auto` (a compiler that names no target keeps the runner as given). The
-  emulator note is printed whenever the selected compiler builds for another
-  target (a `--toolchain` prefix or a cross `--cc` included), and `[cross.*]`
-  tables in the config are named as applying to `bhf auto` only.
-- `bhf capsule`, `bhf verify-poc` and `bhf env-capsule` support every harness
-  language bhf generates, through per-language lanes: Ada, Rust, Go, Java, C#,
-  Python, JavaScript, TypeScript, Ruby, Perl, PHP, Lua, COBOL and Fortran, as
-  well as C and C++. A capsule ships what its lane's rebuild needs (for Ada the
-  generated `bhf_build.gpr`, the runtime project and sources, the instrumented
-  sources, the harness, the stub packages and the operator projects it extends
-  or `with`s; for Rust, Go and C# the dependencies vendored from the local
-  cargo, module or NuGet cache; for an interpreted lane the launcher, bhf's
-  driver and the scanned tree), relocates every path the build and launch
-  files name into the capsule, and rebuilds offline in a clean copy. The
-  rebuilt PoC is replayed with the input protocol the shared detector reads
-  off it (the Ada stdin event-log protocol for a GNAT binary), and the lane's
-  crash oracle names what fired (an unhandled Ada exception, a runtime's
-  `== bhf <lang> finding:` report, a panic, libcob's runtime check, a
-  sanitizer report). The manifest records the programs the rebuild needs and
-  their versions (`requires`), the protocol (`protocol`, `run`) and the lane's
-  build facts (for Ada the target, runtime, switches and GNAT/gprbuild
-  versions); `verify-poc` checks them first and names each missing program
-  and the variable that overrides it. A program build.sh finds under several
-  names (`lua`, `lua5.4`, `lua5.3`, `luajit`) records the others
-  (`requires[].alternatives`), and any of them meets it. An Ada capsule whose
-  rebuilt PoC raises a different exception than the finding recorded is not
-  counted as reproducing (manifest `finding_signature`, `reproduced: false`,
-  `reproduced_other_crash: true`), and `verify-poc` checks the replay against
-  the finding's exception (`MISMATCH` otherwise). A harness a lane cannot
-  rebuild offline is refused with the reason: a dependency not in the local
-  cache, an Ada project file outside the scanned tree, a harness built for
-  another target, a Java target built by Maven or Gradle, a build file
-  build.sh renders that still names the work dir or the scanned tree after
-  relocation. A text file a relocated capsule ships unchanged but that names
-  them is reported in a warning. env-capsule takes the native lanes (C, C++, Ada, Rust, COBOL,
-  Fortran) and refuses a statically linked harness (Go) or one that runs in a
-  language runtime, with that reason; cartography stays C/C++. `bhf explain`
-  offers capsule and verify-poc for the findings whose lane and harness layout
-  capsule takes; capsule checks dependencies and the size of what it ships
-  when it packages, so it can still refuse one of them, and says why. The new
-  manifest fields are additive; capsules written before them still verify.
-- The Fortran lane records how each Fortran object of a harness link was
-  compiled (`harnesses/<id>/fortran-build.json`), which a capsule uses to
-  rebuild them from source.
-- `bhf replay` writes `<finding>/replay.log` on every run, match or not: the
-  verdict, what ran, the exit status, the harness's raw stderr and stdout
-  (each bounded to its first 256 KiB and last 768 KiB, the cut marked) and any
-  debugger transcript. The summary names it (`log`; `replay_log` in `--json`).
-  It is not an evidence file, and results/ is now rebuilt after a mismatch too,
-  so the attestation covers it.
-- New findings record the generated harness's input format as
-  `harness.format_version` (and `harness.buffer_len_dimension`) in
-  `finding.json`, next to the top-level `harness_format_version` kept for
-  earlier readers, and in the harness's corpus metadata
-  (`corpus/<id>/metadata.json`, `bhf.corpus-metadata.v1`). `bhf replay`,
-  `bhf minimize`, `bhf decode-args` and `bhf capsule` read the format from the
-  finding's `harness` first, then the top-level key, then the harness dir, and
-  `bhf auto` notes a corpus recorded against another format than its harness.
-- `arg-layout.json` beside each generated C/C++ harness (`bhf.arg-layout.v1`,
-  named as `arg_layout` in `generation-metadata.json`): the static decode
-  layout of the harness's arguments, in the order the harness decodes them.
-  Each parameter records its order, input source (cursor, remainder, whole
-  input), decoder kind and primitive, width, endianness, bounds, enum
-  members, length-prefix size, buffer copy or view and pairing, whether the
-  value is a C string read up to its first NUL (`nul_terminated`) and the
-  constant a `fixed` parameter is given (`fixed_value`); it also marks
-  where a call's whole-input parameters take the remaining bytes and any
-  lifecycle loop. `generation-metadata.json` also records `target_function`.
-- `bhf decode-args`: maps a testcase (or `--finding <id>`) to the value each
-  harness parameter receives, through the harness's argument trace when its
-  binary runs, else (or with `--static`) by replaying `arg-layout.json` for
-  scalars, bounded integers, enums, length-prefixed strings, constants and
-  remainder, whole-input and paired buffers, naming each parameter it cannot
-  decode statically and why. Both sources measure a C string up to its first
-  NUL byte. Text table, or `--json` (`bhf.decode-args.v1`).
-- `bhf replay --debugger [gdb|lldb|cdb]` re-runs the testcase under a batch
-  debugger: it breaks at the harness's target function, prints its arguments
-  and full stack, continues to the crash and prints the stack again, with
-  AddressSanitizer's signal handling off so the debugger sees a SEGV. The
-  harness gets the replay's runtime mode and injected variables, and the
-  runtrace shim is preloaded into the harness only. lldb prints the crash
-  site through on-crash (`-k`) commands and stops a sanitizer report at the
-  sanitizer's report function. The session runs without a sandbox, so it is
-  refused with `--sandbox firejail|bubblewrap` or `--sandbox-strict`. It
-  says what to install when no debugger is found.
-- `bhf explain` tags each harness argument whose input bytes a recorded
-  comparison read with the comparison's site (`[compared at bits.c:12]`).
-- `findings.csv` appends `arguments` (`name=value;...`, buffers as
-  `len N hex <first 8 bytes>`, bounded) and `access_parameter`; results
-  `findings.json` carries `exception.access.parameter` as
-  `fuzz.access.parameter` (`{name, offset, basis}`, null when unknown), and
-  INDEX.md names it on the memory-access line. Both are additive.
-- Each token in a harness's `dictionary.txt` is preceded by a
-  `# from <file>:<line>` comment naming up to three places in the target source
-  and its headers where it was found (C, C++, Ada and the managed lanes), so a
-  token can be traced to the comparison or constant it came from. The file
-  stays a valid AFL dictionary.
-- `learned_dictionary.txt` beside a harness's `dictionary.txt`: after each
-  `bhf auto` fuzz pass that recorded comparison operands (`cmplog.jsonl`), bhf
-  writes them there, deduplicated and bounded (at most 256 tokens of at most
-  64 bytes, this run's first, then an earlier run's), under a header saying
-  they were observed at runtime. `bhf fuzz` and later `bhf auto` runs load it
-  after `dictionary.txt`, each token once, and AFL++ mode passes it with `-x`.
-- Windows: Visual Studio and Windows SDK discovery. Without `INCLUDE`/`LIB`
-  (no Developer shell), bhf finds the newest instance with the C++ toolset
-  through `vswhere`, applies the environment its `VsDevCmd.bat` sets, and
-  caches only what VsDevCmd changed (its variables and the `PATH` directories
-  it added, per instance, version and architecture under
-  `%LOCALAPPDATA%\bhf\vs-env`), which later runs apply onto their own
-  environment. It uses a clang on `PATH`, the standalone LLVM, or Visual Studio's bundled
-  clang, and GNU make from its usual install locations. Each command prints
-  what it used; `run.json` records it as `build_environment` and `--dry-run`
-  shows it. `--no-vs-env` (or `BHF_NO_VS_ENV=1`) and `--vs-arch` control it.
-- An MSVC `cl.exe` harness lane: `--cc cl` (or `clang-cl`, or
-  `[toolchain] cc = "cl"`) builds the C/C++ harnesses with Visual Studio's
-  compiler through `bhf-cl`, a front end that runs cl with the equivalent of
-  the generated Makefiles' command lines, `/fsanitize=address`, and MSVC's
-  SanitizerCoverage (`inline-8bit-counters`, `edge`, `trace-cmp`,
-  `trace-div`). The C driver folds inline 8-bit counters into its edge and
-  hit-count maps after each input and implements the division hooks. cl's
-  diagnostics gain their clang spelling for the repair loop, and weak repair
-  stubs become MSVC alternate names. The Makefiles recognise the `msvc`
-  family. The front end is installed in the user's own cache directory and an
-  existing one is reused only when its bytes are this `bhf`'s.
-- The Visual Studio project import runs by default when a tree has a
-  solution or project and no compile database or CMake/Meson build. Off
-  Windows it does so only when the solution is the tree's only build
-  description: a Makefile, autotools inputs (`configure.ac`, `Makefile.am`,
-  `autogen.sh`), Ninja, SCons or Bazel files at the root or on the way to the
-  solution mean that build is followed, unless `--msbuild-solution` names the
-  solution. It runs nothing and writes its database to `<work>/auto/msbuild/`.
-  On Windows each row carries the import libraries its own project links
-  (`bhf_link_libraries`): only libraries found in a `LIB` directory reach that
-  project's harnesses (`BUILD_CONTEXT_LDFLAGS`, now also in the C
-  Makefiles), and the rest (the solution's own outputs, third-party
-  libraries, paths, C runtime libraries) is named and left out. The project
-  reader is bounded (file size, nesting depth, expanded value length and a
-  per-project expansion budget), so a hostile project file cannot hang or
-  exhaust bhf. The default import is the static reading on every host:
-  MSBuild itself evaluates each project (`msbuild -getItem:ClCompile`) when it
-  is installed only with `--msbuild-evaluate` (config key `msbuild-evaluate`,
-  explicit `--config` only), `--probe-build` or `--run-untrusted`. This is a
-  security boundary: evaluation runs the projects' property functions and the
-  `.props`/`.targets` files they import, which is code from the scanned tree,
-  while the static reading only parses the files. New flags:
-  `--msbuild-solution` (relative to the scanned tree; a solution outside the
-  tree is imported, and a missing file is an error), `--msbuild-config`,
-  `--no-msbuild-import`, `--msbuild-evaluate`.
-- `--build-command` on Windows captures the cl invocations of an MSBuild
-  build: the command runs through `cmd.exe`, compilers on `PATH` get
-  executable shims, and MSBuild's CL task is pointed at the `cl.exe` shim
-  through `CLToolPath`/`CLToolExe`. Response files are expanded, and a cl run
-  that compiles several sources yields one database row per source.
-- Findings from a harness that compiled only with headers, macro values or
-  types bhf fabricated for missing build context are marked: `finding.json`
-  gets `build.fidelity` (`{level, context, fabricated: [{kind, name, value}]}`),
-  the normalized finding is low confidence with a caveat in INDEX.md and
-  `bhf explain`, and `run.json` lists the target's `build_fidelity` and counts
-  them in `summary.fabricated_build_context`; the console summary and `run.md`
-  list them too.
-- Comparison evidence per finding: `bhf auto` (after minimization) and
-  `bhf report --backfill` replay each runtime finding's preferred input with
-  the C/C++ driver's comparison capture (`BHF_CMP_EVIDENCE`) and store the
-  result in `finding.json` as `gates` and `gate_capture`, with the runtrace
-  events of that replay in the finding's `runtrace.jsonl`. It reaches
-  `findings.json` (`fuzz.input_to_state`, with the file its offsets index in
-  `fuzz.input_to_state_input`), `findings.csv`, `INDEX.md` and SARIF (the
-  `bhfInputToState` and `bhfInputToStateInput` properties and a related
-  location per comparison site). Under AddressSanitizer `memcmp`/`bcmp`
-  evidence carries no source position, as the interceptor reports itself as
-  the call site. `finding.json` `runtime_mode.shim_armed` records whether the runtrace
-  shim was loaded for the fuzz pass.
-- `bhf.findings.v1` `fuzz.access` and the CSV access columns carry the memory
-  access the sanitizer reported.
-- `BHF_BUFFER_LEN_DIMENSION=1`, set when a C/C++ harness is generated, gives a
-  byte buffer without a length parameter an explicit length: 4 more input
-  bytes after the call's cursor parameters, then that many bytes. It is off by
-  default, because a buffer shorter than the input can make a function with an
-  implicit length contract overflow it. The choice is recorded as an additive
-  `buffer_len_dimension` in `generation-metadata.json`.
-- Generated C and C++ harnesses print each decoded parameter when run with
-  `BHF_TRACE_ARGS=1`: one `BHF_ARG {json}` line per parameter on stderr, after
-  decoding and before the call, with its name, type, decoder, the testcase
-  bytes it came from (`span`) and its value. Buffers and strings carry their
-  address, AddressSanitizer allocation size, length and a hex preview of at
-  most 32 bytes. Output and in-out parameters (non-const references, pointers
-  to scalar storage, writable strings) get a second line with their value
-  after the call. A C++ receiver's constructor arguments and the receiver
-  object are traced too, as are the arguments of sequence-harness operations
-  and C++ lifecycle and protocol steps. Without the variable nothing is
-  printed. The trace helpers are in the new `c_runtime/bhf_trace.h`, which the
-  generated sources include. Harnesses generated by earlier releases have no
-  trace.
-- When the fuzz loop records a new C/C++ crash (builtin engine, persistent
-  fork-server or AFL++ ingestion) it re-runs the testcase once with the trace
-  on, bounded by the per-input timeout (5 to 30 s). `decoded.json` gains a
-  `schema_version` (`bhf.decoded.v1`) and, besides the existing raw-bytes
-  entry, `arguments` (every traced value) with per-argument `provenance`
-  byte ranges, or `arguments_unavailable` with the reason. `finding.json`
-  gains an additive `decoded_args` array (`name`, `type`, `role`, `value`,
-  `len`, `span`, `preview_hex`, `after_call_value`) for the target call and
-  the receiver, and `exception.access.parameter` names the parameter whose
-  traced buffer starts the region a heap access hit (`basis`
-  `region_start`) or points into it (`region_interior`, with the offset from
-  that pointer), or for a wild access the nearest traced pointer below the
-  faulting address (`nearest_pointer`).
-- `bhf replay --show-args` replays with the trace and prints the decoded
-  arguments as a table, and the parameter the access hit; with `--json` they
-  are `arguments`. `bhf explain` shows the table in a HARNESS ARGUMENTS
-  section and names the accessed parameter under its `Access` line, and
-  `bhf cartography` labels each byte with the parameter it was decoded into
-  (`params` in `byte-control.json`, `parameters` listing their spans).
-- docs/site/c-cpp.md documents the decoding layout: cursor order, widths,
-  endianness, bounds, length prefixes, which parameters use the whole input,
-  receivers, constructors and lifecycle loops, the argument trace, and a gdb
-  recipe for reading arguments from harnesses built before it.
-- A `[toolchain]` table, shared by `bhf auto --config` and the new
-  `bhf build --config`, with matching flags: `cc`, `cxx`, `cflags`, `cxxflags`,
-  `ldflags` (appended to bhf's instrumentation), `defines`, `include-dirs`,
-  `target`, `sysroot`, `runner`, `runner-args`, and `[toolchain.ada]` `prefix`,
-  `gprbuild`, `gnat`, `target`, `runtime`, `switches`, `probe-backend`. It is
-  validated before anything builds and, from an auto-loaded `.bhf.toml`, ignored
-  with a note. `bhf auto` gains `--cc`, `--cxx`, `--cflags`, `--cxxflags`,
-  `--ldflags`, `--define`, `--toolchain-include`, `--sysroot`,
-  `--target-triple`, `--runner`, `--runner-arg`, `--ada-prefix`,
-  `--ada-target`, `--ada-runtime`, `--ada-gprbuild`, `--ada-gnat`,
-  `--ada-switch` and `--probe-backend`; `bhf build` gains the C/C++ ones plus
-  `--ada-gprbuild`, `--ada-gnat` and `--ada-switch`.
-- Whole-sweep cross mode: with a `[toolchain] runner` (`--runner`) and a
-  C/C++ toolchain that builds for another target (`target`, or a cross `cc`),
-  every C/C++ candidate is built for the target with coverage and fuzzed under
-  the runner. A runner for a foreign `[toolchain.ada] target` alone runs only
-  the Ada harnesses (with that target's qemu-user `-L` directory) and leaves the
-  C/C++ candidates native. A foreign target or C/C++ compiler (also from
-  `CC`/`CXX`) without a runner, and a runner with nothing foreign to run, are
-  refused before anything builds. The archives a build probe (`--probe-build`,
-  `--build-command`, `--run-untrusted`) builds for the host, in its probe
-  directory or (a plain Makefile) in the tree, are rebuilt for the target
-  member by member from the captured compile commands and linked into the
-  cross-built harnesses; members of the same name from different translation
-  units are told apart by the objects the build left, and an archive that
-  cannot be rebuilt is named with the reason. An archive already built for the
-  target is linked as it is, and a project archive is linked into a cross build
-  only when its objects are for the target's architecture.
-- `[cross.<guard>]` config tables (explicit `--config` only) override the
-  compiler (`cc`, `cxx`), `target`, `sysroot`, `runner` and `runner-args` of a
-  guard-driven cross lane (`mingw`, `aarch64`, `armhf`, `ppc64le`, `ppc64`,
-  `ppc`, `mipsel`, `mips`, `sparc64`) instead of the built-in table. They are
-  validated before anything builds, and bhf prints what each selects. A lane's
-  sysroot reaches every compile and link, bhf's driver object included, and a
-  clang `cc` gets `--target=<triple>`; they replace a `[toolchain]` sysroot or
-  target for the lane's candidates.
-- More `bhf auto` config keys: `extra-source`, `seed-file`, `seed-dir`,
-  `sanitizers`, `engine`, `languages`, `project`, `ada-deps`, `passes`, and
-  `probe-build` (explicit `--config` only).
-- docs/site/custom-harness.md: writing an `LLVMFuzzerTestOneInput` entry
-  point and wrapping it with `generate-harness`, editing a generated
-  `bhf_run_one`, building with `AUTO_EXTRA_SOURCES`/`AUTO_EXTRA_INCLUDES`/
-  `CXX_STD`, fuzzing from byte-exact `--seed-file` seeds, triage, the
-  binary-only route, and what to avoid. The C/C++ and CLI pages now generate
-  manual harnesses into `<work>/harnesses/`.
-- `auto/seeds.json` lists every seed a `bhf auto` run used (path, source
-  `user`/`mined`, size, bytes used, sha256), and `run.json` gains an additive
-  `seeds` summary that points to it. `-v` prints the list. A run that stops
-  before resolving seeds removes a list left by an earlier run in the work dir.
-- `bhf auto --no-seed-mining` and the config key `seed-mining = false` turn off
-  seeding from the tree's own test data.
-- `finding.json` `exception` carries the sanitizer's structured evidence:
-  `location`, UBSan `check`, and ASan `access` (direction, size, address and
-  hint, region kind/size/offset, allocation and free stacks). The fuzz run
-  summary (`fuzz_runs/<harness>-latest.json`) `duplicate_sanitizer_hits`
-  counts later crashes folded into an already-reported root cause, and
-  `unreproduced_sanitizer_hits` the crashes of a root cause that never
-  reproduced in a fresh process. All are additive.
-- Rules BHF-213 (undefined behavior), BHF-214 (missing return), BHF-215
-  (invalid shift), BHF-216 (unreachable reached), BHF-217 (invalid bool/enum
-  load), BHF-218 (out-of-range floating-point conversion), BHF-219 (pointer
-  overflow), BHF-220 (array index out of bounds), BHF-221 (type mismatch),
-  BHF-222 (division by zero), BHF-223 (SEGV on a non-null address), BHF-224
-  (invalid variable-length array size), BHF-225 (value-changing implicit
-  integer conversion), BHF-226 (misaligned access), BHF-227 (access to an
-  undersized object) and BHF-228 (invalid builtin argument).
-- Ada rules BHF-564 (index/range checks suppressed), BHF-565 (overflow check
-  suppressed), BHF-566 (local `'Unchecked_Access` escapes), BHF-567 (address
-  overlay), BHF-568 (unsafe C function imported), BHF-569 (secret logged),
-  BHF-570 (exception escapes a C export), BHF-571 (raise out of `Finalize`), and
-  Ada coverage for BHF-419, 422, 428, 436, 437 and 550. See
-  `docs/designs/2026-10-16-ada-static-rules.md`.
-- `bhf replay --json` prints the result as one `bhf.replay.v1` document for
-  every kind of finding (a non-harness finding's document carries `lane` and
-  `details`, and `harness` only when a binary ran), and `--show-output` also
-  prints the harness's raw output.
-- `bhf report --backfill` replays each C/C++ sanitizer finding without a
-  `sanitizer.log` (such as findings migrated from a 0.2.x work dir) against its
-  harness and, when the replay is the recorded crash, adds `sanitizer.log`, the
-  crash frames, the reported location, check and memory access, and a refreshed
-  sink and explanation to the finding (id and signature unchanged, a `history`
-  entry recorded). Findings whose harness is gone, that now crash elsewhere,
-  or whose replay is unsymbolized, are listed and left as they were. It runs
-  with the LLVM toolchain `bhf auto` uses on `PATH`.
-- `results/INDEX.md`, `bhf report` and the end of each producer run warn when a
-  work dir from an earlier release (migrated from 0.2.x, with a set-aside or
-  reused earlier corpus, or with `bhf auto` state and no
-  `auto/legacy-corpus.json`) holds testcases or corpus entries with several
-  `EF BF BD` sequences, which earlier seed encoding produced from binary seeds.
-  A work dir this release's `bhf auto` started is never flagged, even when the
-  run stopped before writing `auto/seeds.json`. `results::RebuildSummary`
-  gains a `damaged_inputs` field.
-- docs/finding-report-fields.md describes upgrading a 0.2.x work dir.
-- A C or C++ capsule ships `build.ps1`, a Windows build that needs no POSIX
-  shell, and on Windows `bhf capsule` and `bhf verify-poc` rebuild with it.
-  It builds the way the harness Makefile builds there, linking bhf's driver
-  (the capsule now also ships `runtime/bhf_driver.c`), with the compiler
-  family recorded for the harness (`bhf_toolchain.stamp`; for the MSVC lane,
-  the compiler bhf's cl front end ran, now recorded in
-  `coverage-build-recipe.json` as `msvc_compiler`): cl with
-  `/fsanitize=address` and cl's SanitizerCoverage flags (linking
-  `libsancov.lib`) as the bhf-cl front end spells them, with bhf's weak repair
-  stubs compiled from MSVC copies; clang-cl; or clang targeting MSVC.
-  `$CC`/`$CXX` names another compiler. Outside a Developer shell the script
-  takes the environment cl and clang-cl read from Visual Studio, and it
-  copies the sanitizer
-  runtime DLL next to `poc.exe`. The manifest gains `build_windows`,
-  `run_windows`, `requires_windows` and `build_recipe` `windows_compiler`,
-  `windows_compiler_dialect` and `windows_compiler_source` (all additive).
-  Before, a capsule rebuilt only through `sh build.sh`, with clang-style
-  `-fsanitize` flags even for a cl-built harness, and its `./poc` did not run
-  on Windows. A rebuild that fails is reported by MSVC's `error C2065:` /
-  `error LNK2019:` line as well as by an `error:` line.
-
 ## 0.3.0 - 2026-10-05
 
 ### Breaking
@@ -4645,7 +4644,7 @@
   `O1` could be "reproduced" — or minimized — via a *different* oracle `O2` firing, falsely
   confirming `O1` and letting delta-debugging shrink away the very structure `O1` depends on.
   Replay and minimize now require the re-driven session to fire the SAME recorded oracle (by
-  name and `rule_id`), not merely *some* finding.
+  name and `rule_id`); another oracle's finding no longer counts.
 - **Explicit enum wire width + overflow guard** (`bhf.protocol.v1`, #58): an `enum` field (and
   response capture) may now set an explicit `width = "u8"|"u16"|"u32"`; when absent the width is
   still inferred from the largest variant code, but an enum that must occupy a wider wire field
@@ -5184,7 +5183,7 @@ causes:
 
 - Per-target `result.json` records live in `harnesses/`, which was treated as
   regenerable — so any refresh (a work dir from a different build, say) deleted
-  every record. `--resume` then honestly reported "no completed targets" and
+  every record. `--resume` then reported "no completed targets" and
   re-ran everything; that run wrote fresh records, so the *next* resume worked. A
   refresh now clears build products and keeps records. Records from a different
   build are kept where they FUZZED and re-attempted otherwise, so a stale "no"
@@ -5245,10 +5244,10 @@ hang.
   watchdog and report a PARTIAL target list rather than dying silently.
   `list targets` parses five lanes itself and defers the other eleven to `auto`,
   so guarding only the shared walk would have left C++ — carbon-lang's own
-  language — unguarded. Honest note: this guard did **not** save carbon-lang on
-  its own, because a single file crossed the ceiling and blew past it between
-  two 500ms samples; the type-resolution fix above is the real one. This is the
-  backstop for trees that grow past memory gradually.
+  language — unguarded. On carbon-lang a single file crossed the ceiling
+  between two 500ms samples, so the type-resolution fix above is what fixed
+  that tree. The watchdog is the backstop for trees that grow past memory
+  gradually.
 
 - **A C++ target in a header that cannot compile standalone is now driven
   through its owner translation unit.** `blocked_by_non_self_contained_header`
@@ -5402,11 +5401,10 @@ built+fuzzed, 354 findings).
   unsuffixed paths keep the v0 spelling, which is what Go wants for a module that
   has not adopted the suffix.
 
-  What this buys is that the REAL blocker becomes visible; it is not a fuzz-count
-  claim. Measured on bubbletea, 7 targets moved off `failed_build` and the
-  manufactured error is gone — and what they hit next is that the module wants a
-  newer Go than the host has, which is an environment limit bhf reports
-  honestly and cannot fix. Do not restate this as +51 fuzzed targets.
+  The fix makes the real blocker visible. On bubbletea, 7 targets moved off
+  `failed_build` and the manufactured error is gone; they now stop because the
+  module wants a newer Go than the host has, an environment limit that bhf
+  reports.
 
 - **A line the interpreter echoed is not the diagnosis.** Node opens every
   module-load failure by echoing the failing statement from its own internals and
@@ -5414,8 +5412,8 @@ built+fuzzed, 354 findings).
   first-line-containing-that-word match and **77 targets reported a line of
   Node's source, and nothing else, as their entire reason**. An echoed line (one
   followed by a caret underline) is now ineligible, and a line that NAMES a
-  diagnostic is preferred over one that merely contains the word. Python, Lua,
-  Perl and Ruby resolve to exactly the line they did before.
+  diagnostic is preferred over one that contains the word in passing. Python,
+  Lua, Perl and Ruby resolve to exactly the line they did before.
 
 - **No Ada target could be built on GNAT 11 at all.** The harness build passed
   `-gnat2022` unconditionally, as "the latest supported standard, which accepts
