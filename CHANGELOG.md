@@ -1973,6 +1973,16 @@
   measurements, and a rerun of meilisearch's 26 heed codec targets in which
   none fails at the link, are in
   `docs/validation/2026-11-20-rust-generic-link.md`.
+- A fuzz pass shorter than its harness's start-up keeps the fork-server
+  (#432). The handshake of a framed harness was cut to the pass's `--time`,
+  so on a loaded host a short `bhf auto` pass missed it and ran every input
+  in a fresh process, about one a second on Windows. It now gets `--timeout`,
+  at least 10 s, whatever the pass's budget, and that wait does not count
+  against the pass. A `--workers` or `--workers-per-target` campaign gives
+  each worker that much more time before it stops it, and a
+  `--differential-harness` build's start never holds a pass past its end. A
+  run that does fall back says at its end how many inputs it ran in a fresh
+  process each, and how many per second while the fork-server was down.
 - A SEGV on a fixed address is taken for a missing device register only when
   the target reads that address as a register: a volatile access that is no
   poison or sentinel value (#437). A fault on a plain pointer constant, such

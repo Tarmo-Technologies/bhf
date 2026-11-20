@@ -344,7 +344,9 @@ pub struct FuzzArgs {
     #[arg(long)]
     pub iterations: Option<usize>,
 
-    /// Wall-clock budget, such as 30s, 5m, 1h or 1.5h.
+    /// Wall-clock budget, such as 30s, 5m, 1h or 1.5h. The builtin engine does
+    /// not count the time a harness built with bhf's driver or launchers takes
+    /// to start its fork-server (see --timeout).
     #[arg(long, value_parser = parse_duration)]
     pub time: Option<Duration>,
 
@@ -368,7 +370,9 @@ pub struct FuzzArgs {
     /// again when re-run with twice the timeout is a hang finding (BHF-230).
     /// `--time` is the whole campaign's budget. Default 10s; `500ms` and
     /// `0.5s` are half a second. An Ada harness is bounded by a CPU-time limit
-    /// instead.
+    /// instead. It is also how long a harness built with bhf's driver or
+    /// launchers gets to start its fork-server, at least 10s, even when
+    /// `--time` is shorter.
     #[arg(long = "timeout", value_parser = parse_duration)]
     pub timeout: Option<Duration>,
 
@@ -2593,7 +2597,7 @@ fn run_programmatic_campaign(mut args: FuzzArgs, workers: u32) -> Result<FuzzRun
         bhf_bin,
         per_worker_env: Vec::new(),
         extra_worker_args: worker_passthrough_args(&args),
-        kill_grace: None,
+        kill_grace: Some(campaign_kill_grace(args.timeout)),
         harness_dirs,
         harness_executable,
         lineage_record_cap: corpus::lineage::record_cap(corpus_limits(args.max_len.max(1)).entries),
@@ -3489,7 +3493,7 @@ fn run_multicore_campaign(mut args: FuzzArgs) -> i32 {
         bhf_bin,
         per_worker_env: multicore_fuzz::sanitizer_envs(sanitizers.runtime_set()),
         extra_worker_args: worker_passthrough_args(&args),
-        kill_grace: None,
+        kill_grace: Some(campaign_kill_grace(args.timeout)),
         harness_dirs,
         harness_executable,
         // The cap each worker's pass trims its lineage to, so the merge
@@ -5537,6 +5541,9 @@ fn run_builtin_with_progress(
     // one call, and the fork-server used to wait its fixed 30s repeatedly even
     // when `--per-target-time` gave the pass only a few seconds.  The outer loop
     // cannot observe its wall-clock budget while blocked in that protocol wait.
+    // The `--timeout` asked for, before the cap: how long a framed harness
+    // gets to start its fork-server (#432).
+    let requested_timeout = prepared.per_input_timeout;
     if let Some(pass_budget) = prepared.time {
         prepared.per_input_timeout = prepared.per_input_timeout.min(pass_budget);
     }
@@ -5853,18 +5860,35 @@ fn run_builtin_with_progress(
     let driver_harness = protocol == HarnessProtocol::BhfFramed;
     let speaks_framed =
         crate::protocol_detect::speaks_framed(prepared.runner.harness_path(), &detection);
-    let handshake_timeout =
-        fork_handshake_timeout(prepared.per_input_timeout, prepared.time, speaks_framed);
+    let handshake_timeout = fork_handshake_timeout(requested_timeout, prepared.time, speaks_framed);
     // #345: with `--differential-harness`, the second build's process runs
     // every input the fuzzed build's persistent process runs.
     let followed = prepared.differential.is_some();
-    let mut fork_server = if prepared.fork_server && !c_libfuzzer_harness {
+    let fork_wanted = prepared.fork_server && !c_libfuzzer_harness;
+    let starting = Instant::now();
+    let mut fork_server = if fork_wanted {
         start_fork_server(&prepared, handshake_timeout, speaks_framed)
             .map(|server| server.followed(followed))
     } else {
         None
     };
     let mut forkserver_started = fork_server.is_some();
+    // #432: the wait for the fork-server is not charged to the pass when it
+    // came up, or when the harness speaks the framed protocol and so was
+    // given the whole handshake. A pass shorter than the start-up (a short
+    // `bhf auto` pass on a loaded host) still fuzzes for its budget once the
+    // harness is ready, or once bhf gave up on it. A campaign's orchestrator
+    // allows each worker this wait ([`campaign_kill_grace`]).
+    let pass_deadline = match pass_deadline {
+        Some(deadline) if fork_wanted && (forkserver_started || speaks_framed) => {
+            Some(deadline + starting.elapsed())
+        }
+        deadline => deadline,
+    };
+    // The inputs run in a fresh process each while a framed harness's
+    // fork-server is down, which the run reports with their rate over the
+    // time it was down.
+    let mut fresh_process_inputs = FreshProcessInputs::default();
     // #345: `--differential-harness`'s second build, which runs every input
     // the loop runs.
     let mut differential = prepared
@@ -6260,10 +6284,7 @@ fn run_builtin_with_progress(
         None => None,
     };
     for iteration in 0..prepared.iterations {
-        if prepared
-            .time
-            .is_some_and(|budget| start.elapsed() >= budget)
-        {
+        if pass_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             break;
         }
         // Near the end, stop issuing inputs once the re-runs still out need
@@ -6457,7 +6478,10 @@ fn run_builtin_with_progress(
             // probes, calibration re-runs), so that both have run the same
             // inputs when they are compared; when the second build's process
             // died, the fuzzed build's starts over too.
-            if peer.follow(fork_server.as_mut(), None, &prepared, handshake_timeout) {
+            // Its fork-server, started on its first input, never waits past
+            // the end of the pass.
+            let peer_handshake = handshake_within(pass_deadline, handshake_timeout);
+            if peer.follow(fork_server.as_mut(), None, &prepared, peer_handshake) {
                 drop(fork_server.take());
                 fork_server = restart_fork_server(
                     &prepared,
@@ -6467,7 +6491,8 @@ fn run_builtin_with_progress(
                     followed,
                 );
                 forkserver_started |= fork_server.is_some();
-                peer.follow(fork_server.as_mut(), None, &prepared, handshake_timeout);
+                let peer_handshake = handshake_within(pass_deadline, handshake_timeout);
+                peer.follow(fork_server.as_mut(), None, &prepared, peer_handshake);
             }
         }
         // The empty input's one run is reused: it ran nothing now.
@@ -6476,6 +6501,9 @@ fn run_builtin_with_progress(
         // per-spawn process). Fork-server findings are replay-validated below so
         // an artifact of accumulated global state never escapes as a finding.
         let mut from_fork_server = false;
+        if fork_wanted && speaks_framed {
+            fresh_process_inputs.observe(fork_server.is_some(), Instant::now());
+        }
         let mut run = if !input.is_empty() && fork_server.is_some() {
             match fork_server
                 .as_mut()
@@ -6526,6 +6554,8 @@ fn run_builtin_with_progress(
             )?;
             if input.is_empty() {
                 empty_input_run = Some(run.clone());
+            } else if fork_wanted && speaks_framed {
+                fresh_process_inputs.record();
             }
             run
         };
@@ -6586,7 +6616,7 @@ fn run_builtin_with_progress(
                     fork_server.as_mut(),
                     from_fork_server,
                     &prepared,
-                    handshake_timeout,
+                    handshake_within(pass_deadline, handshake_timeout),
                 )?;
                 peer_novelty = novelty;
                 diverged = peer.worth_confirming(&primary, &observed);
@@ -6982,6 +7012,7 @@ fn run_builtin_with_progress(
             break;
         }
     }
+    let loop_ended = Instant::now();
 
     // End of pass: wait for the outstanding re-runs while the pass has time
     // left (all of them when it has no `--time`, none once it has its
@@ -7245,6 +7276,9 @@ fn run_builtin_with_progress(
         block
     });
 
+    if let Some(note) = fresh_process_inputs.note(loop_ended) {
+        bhfeprintln!("{note}");
+    }
     let elapsed_secs = start.elapsed().as_secs_f64();
     let coverage = coverage_from_env(&prepared.extra_env, &prepared.harness_path);
     let summary = FuzzRunSummary {
@@ -12570,41 +12604,149 @@ fn announce_deadline_finding(overrun: &str) {
     bhfeprintln!("bhf: input {overrun} - recording BHF-555 finding");
 }
 
-/// How long `ForkServer::spawn` waits for the ready byte: the per-input
-/// timeout, but at least [`FORK_STARTUP_FLOOR`], for a harness known to speak
-/// the framed protocol, and the short [`FORK_HANDSHAKE_PROBE`] for any other.
-/// Never longer than the pass itself.
+/// How long `ForkServer::spawn` waits for the ready byte. A harness known to
+/// speak the framed protocol gets the `--timeout` asked for
+/// (`requested_timeout`, before the loop caps it at the pass), but at least
+/// [`FORK_STARTUP_FLOOR`], however short the pass is (#432): cut to a pass
+/// shorter than its start-up, the handshake failed and every input of the
+/// pass ran in a fresh process, each paying that start-up again. The pass's
+/// deadline does not count that wait (see `run_builtin_with_progress`). Any
+/// other harness gets the short [`FORK_HANDSHAKE_PROBE`], never longer than
+/// the pass (`pass_budget`).
 fn fork_handshake_timeout(
-    run_timeout: Duration,
+    requested_timeout: Duration,
     pass_budget: Option<Duration>,
     speaks_framed: bool,
 ) -> Duration {
-    let wait = if speaks_framed {
-        run_timeout.max(FORK_STARTUP_FLOOR)
+    if speaks_framed {
+        requested_timeout.max(FORK_STARTUP_FLOOR)
     } else {
-        run_timeout.min(FORK_HANDSHAKE_PROBE)
-    };
-    pass_budget.map_or(wait, |budget| wait.min(budget))
+        let probe = requested_timeout.min(FORK_HANDSHAKE_PROBE);
+        pass_budget.map_or(probe, |budget| probe.min(budget))
+    }
 }
 
 #[cfg(test)]
 #[test]
 fn fork_handshake_waits_for_a_slow_start_of_a_framed_harness() {
     let secs = Duration::from_secs;
-    // A known framed harness gets the per-input timeout, at least the floor.
+    // A known framed harness gets the `--timeout` asked for, at least the
+    // floor, whatever the pass's budget.
     assert_eq!(fork_handshake_timeout(secs(10), None, true), secs(10));
     assert_eq!(fork_handshake_timeout(secs(1), None, true), secs(10));
     assert_eq!(fork_handshake_timeout(secs(30), None, true), secs(30));
-    // Never past the pass budget.
     assert_eq!(
-        fork_handshake_timeout(secs(10), Some(secs(4)), true),
-        secs(4)
+        fork_handshake_timeout(secs(20), Some(secs(1)), true),
+        secs(20)
     );
-    // Any other harness keeps the short probe.
+    assert_eq!(
+        fork_handshake_timeout(secs(5), Some(secs(1)), true),
+        secs(10)
+    );
+    // Any other harness keeps the short probe, never past the pass.
     assert_eq!(fork_handshake_timeout(secs(10), None, false), secs(2));
     assert_eq!(
         fork_handshake_timeout(Duration::from_millis(750), None, false),
         Duration::from_millis(750)
+    );
+    assert_eq!(
+        fork_handshake_timeout(secs(10), Some(Duration::from_millis(500)), false),
+        Duration::from_millis(500)
+    );
+}
+
+/// How long past a campaign's `--time` its orchestrator lets a worker run
+/// before it stops it: [`multicore_fuzz::DEFAULT_KILL_GRACE`] for the end of
+/// its pass, plus the wait for its fork-server to start, which a worker's
+/// `--time` does not count (#432). `timeout` is the campaign's `--timeout`.
+fn campaign_kill_grace(timeout: Option<Duration>) -> Duration {
+    let start_up = fork_handshake_timeout(timeout.unwrap_or(PER_INPUT_TIMEOUT), None, true);
+    multicore_fuzz::DEFAULT_KILL_GRACE.saturating_add(start_up)
+}
+
+#[cfg(test)]
+#[test]
+fn a_campaign_lets_its_workers_start_their_fork_servers() {
+    let secs = Duration::from_secs;
+    // The 5 s for the end of a pass, and the 10 s every framed harness may
+    // take to start, or the longer `--timeout` it is given.
+    assert_eq!(campaign_kill_grace(None), secs(15));
+    assert_eq!(campaign_kill_grace(Some(secs(1))), secs(15));
+    assert_eq!(campaign_kill_grace(Some(secs(30))), secs(35));
+}
+
+/// The inputs a run ran in a fresh process each because the fork-server of
+/// its framed harness was not up (#432), and the time of the loop it was down.
+#[derive(Debug, Default)]
+struct FreshProcessInputs {
+    count: usize,
+    /// Since when the fork-server is down, while it is.
+    down_since: Option<Instant>,
+    down: Duration,
+}
+
+impl FreshProcessInputs {
+    /// Note whether the fork-server is `up` `at` this point of the loop: the
+    /// time from a point it was down to the next it is up counts as down.
+    fn observe(&mut self, up: bool, at: Instant) {
+        match (up, self.down_since) {
+            (false, None) => self.down_since = Some(at),
+            (true, Some(since)) => {
+                self.down += at.saturating_duration_since(since);
+                self.down_since = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// One more input ran in a fresh process while the fork-server was down.
+    fn record(&mut self) {
+        self.count += 1;
+    }
+
+    /// What stderr says once the loop ended `at`: how many inputs ran that
+    /// way, and how many per second of the time the fork-server was down.
+    /// `None` when it ran none.
+    fn note(&mut self, at: Instant) -> Option<String> {
+        self.observe(true, at);
+        (self.count > 0).then(|| {
+            let down = self.down.as_secs_f64();
+            let per_sec = self.count as f64 / down.max(1e-3);
+            format!(
+                "bhf: {} input(s) ran in a fresh process each, without the fork-server, \
+                 in the {down:.1}s it was down: {per_sec:.1} per second",
+                self.count
+            )
+        })
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn a_run_without_its_fork_server_reports_its_rate() {
+    let start = Instant::now();
+    let at = |millis| start + Duration::from_millis(millis);
+    assert_eq!(FreshProcessInputs::default().note(at(0)), None);
+    // Down from the start for 2 s, in which it ran 3 inputs, then up for a
+    // second, then down again for 1 s, in which it ran 2 more.
+    let mut inputs = FreshProcessInputs::default();
+    inputs.observe(false, at(0));
+    for millis in [0, 600, 1200] {
+        inputs.observe(false, at(millis));
+        inputs.record();
+    }
+    inputs.observe(true, at(2000));
+    inputs.observe(true, at(2500));
+    inputs.observe(false, at(3000));
+    inputs.record();
+    inputs.observe(false, at(3500));
+    inputs.record();
+    assert_eq!(
+        inputs.note(at(4000)).as_deref(),
+        Some(
+            "bhf: 5 input(s) ran in a fresh process each, without the fork-server, \
+             in the 3.0s it was down: 1.7 per second"
+        )
     );
 }
 /// Convert a run timeout to the bounded millisecond value accepted by `poll(2)`.
@@ -13346,16 +13488,40 @@ fn restart_fork_server(
     speaks_framed: bool,
     followed: bool,
 ) -> Option<ForkServer> {
-    let left = pass_deadline
-        .map_or(handshake_timeout, |deadline| {
-            deadline.saturating_duration_since(Instant::now())
-        })
-        .min(handshake_timeout);
+    let left = handshake_within(pass_deadline, handshake_timeout);
     if left.is_zero() {
         return None;
     }
     start_fork_server(prepared, left, speaks_framed && left == handshake_timeout)
         .map(|server| server.followed(followed))
+}
+
+/// How long a fork-server started now may wait for its ready byte:
+/// `handshake_timeout`, but no longer than the pass has left
+/// (`pass_deadline`), and zero once the pass is over.
+fn handshake_within(pass_deadline: Option<Instant>, handshake_timeout: Duration) -> Duration {
+    pass_deadline
+        .map_or(handshake_timeout, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        })
+        .min(handshake_timeout)
+}
+
+#[cfg(test)]
+#[test]
+fn a_fork_server_started_mid_pass_waits_no_longer_than_the_pass_has_left() {
+    let handshake = Duration::from_secs(10);
+    assert_eq!(handshake_within(None, handshake), handshake);
+    let soon = Instant::now() + Duration::from_secs(3);
+    let left = handshake_within(Some(soon), handshake);
+    assert!(
+        left <= Duration::from_secs(3) && left > Duration::from_secs(2),
+        "{left:?}"
+    );
+    let later = Instant::now() + Duration::from_secs(60);
+    assert_eq!(handshake_within(Some(later), handshake), handshake);
+    let over = Instant::now();
+    assert_eq!(handshake_within(Some(over), handshake), Duration::ZERO);
 }
 
 /// Start the run's fork-server, or `None` to run a fresh process per input. A
@@ -13846,13 +14012,18 @@ impl DifferentialPeer {
     }
 
     /// The second build's fork-server, started when it has none, or `None`
-    /// when it runs a fresh process per input.
+    /// when it runs a fresh process per input. `handshake_timeout` is at most
+    /// what the pass has left ([`handshake_within`]): none left, it starts
+    /// none and this input runs in a fresh process.
     fn fork_server(
         &mut self,
         prepared: &PreparedFuzzRun,
         handshake_timeout: Duration,
     ) -> Option<&mut ForkServer> {
         if self.per_spawn {
+            return None;
+        }
+        if self.fork.is_none() && handshake_timeout.is_zero() {
             return None;
         }
         if self.fork.is_none() {

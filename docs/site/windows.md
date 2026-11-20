@@ -822,9 +822,15 @@ differences.
   Defender added about 100 ms to the first start of a newly built binary,
   once. An oversubscribed CPU did slow the run: with twice as many busy
   processes as cores the same harness ran 0.4 executions/s, and with four
-  times as many its first start took over 2 s, past the fork-server
-  handshake, so the run fell back to one process per input. Give a campaign
-  the cores it fuzzes with (`--jobs`), and do not share them with builds.
+  times as many its first start took over 2 s. The fork-server handshake
+  waits for such a start (`--timeout`, at least 10 s, even in a shorter
+  pass), and the pass's `--time` starts once the harness is ready. A start
+  slower than that still drops the run to a fresh process per input; raise
+  `--timeout` for it. The processes a pass still starts fresh (the empty
+  input's run, a crash's re-run) get `--timeout` cut to the pass's budget, so
+  a start longer than a whole pass times them out too: give such a host a
+  longer `--per-target-time`. Give a campaign the cores it fuzzes with
+  (`--jobs`), and do not share them with builds.
 - The `LD_PRELOAD` runtrace shim is Linux-only (an empty stub on Windows), so
   its behavioral and taint oracles (BHF-405 path control, BHF-304 command
   injection, BHF-417 insecure temp, BHF-305 sensitive env) do not fire on

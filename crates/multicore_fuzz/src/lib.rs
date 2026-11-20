@@ -52,6 +52,10 @@ fn sync_interval() -> Duration {
         .unwrap_or(DEFAULT_SYNC_INTERVAL)
 }
 
+/// How long past `time_budget` a worker may run before the orchestrator
+/// stops it, when [`MulticoreConfig::kill_grace`] is `None`.
+pub const DEFAULT_KILL_GRACE: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MulticoreConfig {
     /// Bhf work directory containing build/<harness_id>/.
@@ -78,7 +82,7 @@ pub struct MulticoreConfig {
     /// SIGKILLs workers that haven't exited. Only enforced when
     /// `time_budget` is non-zero — the worker is supposed to honour
     /// `--time` on its own and this is a backstop for hangs.
-    /// `None` defaults to 5 seconds.
+    /// `None` defaults to [`DEFAULT_KILL_GRACE`].
     pub kill_grace: Option<Duration>,
     /// Every work-dir-relative directory a worker's harness lookup reads (for
     /// example `build/<id>` and `harnesses/<id>`), whether or not the parent has
@@ -440,7 +444,7 @@ pub fn run_multicore(config: &MulticoreConfig) -> Result<MulticoreSummary, Multi
     let mut workers_completed = 0u32;
     let mut per_worker: Vec<WorkerReport> = Vec::new();
     let start = Instant::now();
-    let kill_grace = config.kill_grace.unwrap_or(Duration::from_secs(5));
+    let kill_grace = config.kill_grace.unwrap_or(DEFAULT_KILL_GRACE);
     let enforce_deadline = !config.time_budget.is_zero();
     let mut pending = children;
     while !pending.is_empty() {

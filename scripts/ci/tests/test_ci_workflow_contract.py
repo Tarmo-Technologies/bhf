@@ -185,6 +185,7 @@ class WorkflowContractTests(unittest.TestCase):
         "explain_cli",
         "provenance_cli",
         "winafl_engine",
+        "fork_server_slow_start",
     )
 
     def test_windows_runs_the_windows_integration_suites(self):
