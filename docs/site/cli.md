@@ -498,6 +498,15 @@ the trace program or library, `executions` and a `fidelity` object: the
 coverage source, `cmplog`, `edges_found` and the persistent and entry
 addresses.
 
+afl-fuzz normally binds itself to a free CPU core. When bhf runs on only some
+CPUs (`taskset`), bhf sets `AFL_NO_AFFINITY=1` so afl-fuzz stays on them.
+When other CPU-locked processes hold every core, afl-fuzz refuses to start
+(`No more free CPU cores`), and bhf runs it again once with
+`AFL_NO_AFFINITY=1`. The run JSON's `no_affinity` records why afl-fuzz ran
+unbound: `pinned`, `no_free_core`, or `requested` (`AFL_NO_AFFINITY` was
+already set). It is absent when afl-fuzz bound a core itself. The AFL++ lane
+for source builds does the same; see [C and C++](c-cpp.md#findings).
+
 The two AFL++ modes also take:
 
 - `--persistent-addr <ADDR>` — run the target in a persistent loop from this

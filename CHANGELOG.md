@@ -285,6 +285,24 @@
   Ubuntu archive snapshot moves to 20261120T000000Z, which carries the fixed
   `openjdk-21-jdk-headless` and `openjdk-21-jre-headless` for CVE-2026-114938
   through CVE-2026-114946, so the image scan reports no blockers.
+- The AFL++ lane runs when every CPU core is bound to another fuzzer (#444).
+  afl-fuzz refused to start with `No more free CPU cores`, and the target
+  ended with no AFL pass and no finding. bhf now runs that instance again
+  once with `AFL_NO_AFFINITY=1`. When bhf itself runs on only some CPUs (a
+  `taskset` pin or a cpuset), it sets `AFL_NO_AFFINITY=1` from the start, so
+  afl-fuzz stays on those CPUs instead of binding a core outside them. The
+  run summary's `afl.no_affinity` (`pinned`, `no_free_core` or `requested`)
+  says why a run was unbound. The field is new and is omitted when afl-fuzz
+  bound a core itself. `bhf binary fuzz --engine afl-qemu|afl-frida` (and so
+  `bhf project`'s binary targets) does the same, and its run JSON gains the
+  same reason as `no_affinity`.
+- An AFL++ pass no longer leaves target processes running after it ends
+  (#444). afl-fuzz left the stopped persistent child of its CmpLog fork
+  server (`main_afl_cmplog`) behind. That child kept the session's lock, so
+  the next run could not resume the session and started it over, and it
+  kept its CPU core bound, so a host that ran bhf often ran out of free
+  cores. bhf now kills what is left of `main_afl` and `main_afl_cmplog` once
+  every afl-fuzz instance of the pass has exited.
 - `bhf auto` creates a missing Wine prefix before the first harness runs
   under Wine (#394). It runs `wine wineboot --init`, then `wineserver --wait`,
   with `WINEDEBUG=-all`, and prints `bhf: creating the Wine prefix ...`.

@@ -989,6 +989,27 @@ N` runs a `-M main` instance and N-1 `-S` instances in the one output
 directory, synced as AFL++ syncs them (see `--workers` in the
 [CLI reference](cli.md)).
 
+afl-fuzz normally binds itself to a free CPU core. bhf changes that in two
+cases, and the run summary (`fuzz_runs/<harness>-latest.json`) records the
+reason in `afl.no_affinity`:
+
+- bhf runs on only some of the host's CPUs, for example under
+  `taskset -c 3`. bhf sets `AFL_NO_AFFINITY=1` so afl-fuzz stays on those
+  CPUs instead of moving to one outside them (`pinned`).
+- Other CPU-locked processes, such as other fuzzers on a busy host, hold
+  every core. afl-fuzz refuses to start with `No more free CPU cores`. bhf
+  says so on stderr and runs that instance again once with
+  `AFL_NO_AFFINITY=1` (`no_free_core`).
+
+`requested` means `AFL_NO_AFFINITY` was already set in the environment. The
+field is absent when afl-fuzz bound a core itself.
+
+When every afl-fuzz instance of a pass has exited, bhf kills any `main_afl`
+or `main_afl_cmplog` process still running. afl-fuzz leaves the persistent
+child of its CmpLog fork server stopped when it exits. Left running, that
+child would hold the session's lock, so the next run could not resume the
+session, and it would keep its CPU core bound.
+
 ### Uncaught C++ exceptions
 
 A C++ harness calls the target inside `try`/`catch` (when the build enables

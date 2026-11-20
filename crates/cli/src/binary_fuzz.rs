@@ -1378,37 +1378,64 @@ fn run_afl_binary(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let mut cmd = Command::new(&afl.afl_fuzz);
-    cmd.args(&argv)
-        // afl-fuzz -Q finds afl-qemu-trace, and -O afl-frida-trace.so, via
-        // AFL_PATH (then alongside afl-fuzz).
-        .env("AFL_PATH", &afl_trace_dir)
-        .env("AFL_NO_UI", "1")
-        .env("AFL_SKIP_CPUFREQ", "1")
-        .env("AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES", "1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (key, value) in env {
-        cmd.env(key, value);
-    }
-    for (key, value) in afl_binary_env(afl.mode, args.persistent_addr, args.entrypoint) {
-        cmd.env(key, value);
-    }
-    // afl-fuzz refuses a custom `<SAN>_OPTIONS` without `symbolize=0`
-    // ("Custom ASAN_OPTIONS set without symbolize=0", afl-fuzz-init.c), as
-    // the container image's defaults are: merge it into whatever is set.
-    for key in ["ASAN_OPTIONS", "UBSAN_OPTIONS", "LSAN_OPTIONS"] {
-        let set = env.get(key).cloned().or_else(|| std::env::var(key).ok());
-        if set.is_some() {
-            cmd.env(
-                key,
-                multicore_fuzz::merge_sanitizer_options(set.as_deref(), "symbolize=0"),
-            );
+    // #444: afl-fuzz binds itself to a free core unless told not to. A run
+    // bhf is pinned for keeps its pin; one that finds every core bound to
+    // another fuzzer runs again, once, unbound.
+    let mut no_affinity = crate::fuzz::afl_no_affinity_at_start(env.keys().map(String::as_str));
+    let run_afl_fuzz = |unbound: bool| -> anyhow::Result<std::process::Output> {
+        let mut cmd = Command::new(&afl.afl_fuzz);
+        cmd.args(&argv)
+            // afl-fuzz -Q finds afl-qemu-trace, and -O afl-frida-trace.so, via
+            // AFL_PATH (then alongside afl-fuzz).
+            .env("AFL_PATH", &afl_trace_dir)
+            .env("AFL_NO_UI", "1")
+            .env("AFL_SKIP_CPUFREQ", "1")
+            .env("AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (key, value) in env {
+            cmd.env(key, value);
         }
+        for (key, value) in afl_binary_env(afl.mode, args.persistent_addr, args.entrypoint) {
+            cmd.env(key, value);
+        }
+        // afl-fuzz refuses a custom `<SAN>_OPTIONS` without `symbolize=0`
+        // ("Custom ASAN_OPTIONS set without symbolize=0", afl-fuzz-init.c), as
+        // the container image's defaults are: merge it into whatever is set.
+        for key in ["ASAN_OPTIONS", "UBSAN_OPTIONS", "LSAN_OPTIONS"] {
+            let set = env.get(key).cloned().or_else(|| std::env::var(key).ok());
+            if set.is_some() {
+                cmd.env(
+                    key,
+                    multicore_fuzz::merge_sanitizer_options(set.as_deref(), "symbolize=0"),
+                );
+            }
+        }
+        if unbound {
+            cmd.env("AFL_NO_AFFINITY", "1");
+        }
+        cmd.output()
+            .with_context(|| format!("spawn afl-fuzz '{}'", afl.afl_fuzz.display()))
+    };
+    let mut output = run_afl_fuzz(no_affinity.is_some())?;
+    if no_affinity.is_none()
+        && output.status.code().is_some_and(|code| code != 0)
+        && (crate::fuzz::afl_output_says_no_free_core(&output.stdout)
+            || crate::fuzz::afl_output_says_no_free_core(&output.stderr))
+    {
+        bhfeprintln!(
+            "bhf binary-fuzz: afl-fuzz {} found every CPU core bound to another CPU-locked \
+             process (another fuzzer) and did not start; running it again without binding a \
+             core (AFL_NO_AFFINITY=1)",
+            afl.mode.flag()
+        );
+        // The output directory afl-fuzz gave up on holds no session.
+        fs::remove_dir_all(&out_dir)
+            .and_then(|()| fs::create_dir_all(&out_dir))
+            .with_context(|| format!("reset {}", out_dir.display()))?;
+        output = run_afl_fuzz(true)?;
+        no_affinity = Some(crate::fuzz::AflNoAffinity::NoFreeCore);
     }
-    let output = cmd
-        .output()
-        .with_context(|| format!("spawn afl-fuzz '{}'", afl.afl_fuzz.display()))?;
     // afl-fuzz self-terminates by signal when -V expires (code None) — that's the
     // intended end of a time-boxed run, not a failure. A positive exit is a real
     // error (bad seed, core_pattern, missing afl-qemu-trace, …).
@@ -1547,6 +1574,11 @@ fn run_afl_binary(
         AflBinaryMode::Frida => "afl_frida_trace",
     };
     summary[trace_key] = json!(afl.trace);
+    // Why afl-fuzz ran without binding a core of its choosing; absent when it
+    // bound one.
+    if let Some(reason) = no_affinity {
+        summary["no_affinity"] = json!(reason);
+    }
     Ok(summary)
 }
 
@@ -3587,6 +3619,104 @@ mod afl_qemu_tests {
         };
         assert!(!parsed(&[]).unwrap(), "CmpLog is on by default");
         assert!(parsed(&["--no-cmplog"]).unwrap());
+    }
+
+    /// #444: afl-fuzz refuses to start in QEMU or Frida mode when every core
+    /// is bound to another CPU-locked process, and the pass failed with
+    /// "afl-fuzz -Q exited non-zero". It runs again, once, with
+    /// `AFL_NO_AFFINITY=1`, and the run JSON says why.
+    #[cfg(unix)]
+    #[test]
+    fn an_afl_fuzz_that_finds_no_free_core_runs_again_without_binding_one() {
+        use clap::Parser;
+        use std::os::unix::fs::PermissionsExt;
+        #[derive(clap::Parser)]
+        struct Fuzz {
+            #[command(flatten)]
+            args: BinaryFuzzArgs,
+        }
+        let dir = crate::test_support::TestDir::new("binfuzz-no-free-core");
+        let work = dir.join("work");
+        let calls = dir.join("calls.log");
+        let afl_fuzz = dir.join("afl-fuzz");
+        std::fs::write(
+            &afl_fuzz,
+            format!(
+                "#!/bin/sh\necho \"AFL_NO_AFFINITY=${{AFL_NO_AFFINITY:-unset}}\" >> '{}'\n\
+                 if [ -z \"$AFL_NO_AFFINITY\" ]; then\n\
+                 \x20 echo '[-] PROGRAM ABORT : No more free CPU cores'\n\
+                 \x20 echo '         Location : bind_to_free_cpu(), src/afl-fuzz-init.c:448'\n\
+                 \x20 exit 1\n\
+                 fi\nexit 0\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&afl_fuzz, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let args = Fuzz::try_parse_from([
+            "fuzz".as_ref(),
+            "/bin/true".as_ref(),
+            "--work-dir".as_ref(),
+            work.as_os_str(),
+            "--time".as_ref(),
+            "1s".as_ref(),
+        ])
+        .unwrap()
+        .args;
+        let findings = work.join("findings");
+        std::fs::create_dir_all(&findings).unwrap();
+        let afl = AflBinary {
+            mode: AflBinaryMode::Qemu,
+            afl_fuzz,
+            trace: dir.join("afl-qemu-trace"),
+        };
+        let summary = run_afl_binary(
+            &args,
+            &afl,
+            &[b"seed".to_vec()],
+            None,
+            &BTreeMap::new(),
+            &findings,
+        )
+        .expect("the AFL pass runs");
+        let calls = std::fs::read_to_string(&calls).unwrap();
+        let calls: Vec<&str> = calls.lines().collect();
+        match crate::fuzz::afl_no_affinity_at_start(std::iter::empty()) {
+            // This test runs pinned or with AFL_NO_AFFINITY set: unbound
+            // from the start, so no core is looked for.
+            Some(reason) => {
+                assert_eq!(calls, ["AFL_NO_AFFINITY=1"]);
+                assert_eq!(summary["no_affinity"], json!(reason), "{summary:#}");
+            }
+            None => {
+                assert_eq!(
+                    calls,
+                    ["AFL_NO_AFFINITY=unset", "AFL_NO_AFFINITY=1"],
+                    "run again, once, unbound"
+                );
+                assert_eq!(summary["no_affinity"], "no_free_core", "{summary:#}");
+            }
+        }
+        // A run that binds a core records nothing.
+        let bound = dir.join("bound-afl-fuzz");
+        std::fs::write(&bound, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&bound, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let afl = AflBinary {
+            afl_fuzz: bound,
+            ..afl
+        };
+        let summary = run_afl_binary(
+            &args,
+            &afl,
+            &[b"seed".to_vec()],
+            None,
+            &BTreeMap::new(),
+            &findings,
+        )
+        .unwrap();
+        if crate::fuzz::afl_no_affinity_at_start(std::iter::empty()).is_none() {
+            assert!(summary.get("no_affinity").is_none(), "{summary:#}");
+        }
     }
 
     /// `--persistent-addr` and `--entrypoint` set each mode's variables, and
