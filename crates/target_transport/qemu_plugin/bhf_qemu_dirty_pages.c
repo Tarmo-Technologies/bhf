@@ -165,6 +165,10 @@ static uint64_t hash_page(uint64_t page) {
 }
 
 static void record(uint64_t page, uint64_t epoch) {
+  /* Nothing is recorded before qemu_plugin_install has mapped the log. */
+  if (header == NULL || slot_epoch == NULL) {
+    return;
+  }
   pthread_mutex_lock(&lock);
   uint64_t slot = hash_page(page) & slot_mask;
   for (;;) {
@@ -210,6 +214,9 @@ static void mark_range(uint64_t address, uint64_t size, uint64_t epoch) {
 /* A store to a device: when it is to a bit-band alias, record the RAM word
  * it writes, which QEMU's bit-band device writes without a plugin callback. */
 static void mark_alias(uint64_t address, uint64_t size, uint64_t epoch) {
+  if (header == NULL) {
+    return;
+  }
   for (int i = 0; i < BITBAND_WINDOWS; i++) {
     const struct bitband_window *window = &header->bitband[i];
     uint64_t alias = __atomic_load_n(&window->alias, __ATOMIC_RELAXED);
@@ -234,6 +241,9 @@ static void on_access(unsigned int vcpu_index, qemu_plugin_meminfo_t info,
                       uint64_t vaddr, void *userdata) {
   (void)vcpu_index;
   (void)userdata;
+  if (header == NULL) {
+    return;
+  }
   uint64_t epoch = __atomic_load_n(&header->epoch, __ATOMIC_ACQUIRE);
   /* Any access shows bhf this plugin sees the guest it runs. */
   if (epoch != seen_epoch) {

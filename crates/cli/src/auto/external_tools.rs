@@ -639,6 +639,56 @@ mod tests {
         assert!(!dir.join("out").exists());
     }
 
+    /// #347: a callback that runs before `qemu_plugin_install` has mapped the
+    /// log records nothing, where it dereferenced the unmapped log before.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_plugins_callbacks_record_nothing_before_the_log_is_mapped() {
+        if which::which(plugin_compiler()).is_err() {
+            eprintln!("skipping: no host C compiler");
+            return;
+        }
+        use target_transport::fast_snapshot::DIRTY_PAGE_PLUGIN_SOURCE;
+        let dir = crate::test_support::TestDir::new("qemu-plugin-unmapped");
+        std::fs::write(dir.join("plugin.c"), DIRTY_PAGE_PLUGIN_SOURCE).unwrap();
+        std::fs::write(
+            dir.join("driver.c"),
+            "#include \"plugin.c\"\n\
+             int main(void) {\n\
+             \x20 mark(1, 0);\n\
+             \x20 mark_range(0x20000000u, 8, 0);\n\
+             \x20 mark_alias(0x22000000u, 4, 0);\n\
+             \x20 return 0;\n\
+             }\n",
+        )
+        .unwrap();
+        let driver = dir.join("driver");
+        // The QEMU API the plugin calls is QEMU's own; the driver calls none
+        // of it.
+        let built = Command::new(plugin_compiler())
+            .current_dir(dir.path())
+            .args(["-fsanitize=undefined", "-fno-sanitize-recover=all", "-o"])
+            .arg(&driver)
+            .args([
+                "driver.c",
+                "-lpthread",
+                "-Wl,--unresolved-symbols=ignore-all",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let run = Command::new(&driver).output().unwrap();
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+
     /// #347: the plugin source builds to a shared object exporting what QEMU
     /// looks up when it loads a plugin.
     #[cfg(unix)]
