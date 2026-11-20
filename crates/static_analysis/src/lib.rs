@@ -29659,7 +29659,16 @@ pub fn sloc_report(root: &Path) -> Result<SlocReport, StaticScanError> {
                 let source = read_utf8_source_capped(path, max_bytes).ok()?;
                 let language = language_for_path_and_source(path, &source)?;
                 let (total, comments, blanks, code) = count_source_lines(&source, language);
-                Some((language, total, comments, blanks, code))
+                // TypeScript shares JavaScript's comment parser but has its own SLOC row.
+                let report_language = match path.extension().and_then(|ext| ext.to_str()) {
+                    Some(ext)
+                        if ext.eq_ignore_ascii_case("ts") || ext.eq_ignore_ascii_case("tsx") =>
+                    {
+                        "typescript"
+                    }
+                    _ => language,
+                };
+                Some((report_language, total, comments, blanks, code))
             })
             .collect()
     });
@@ -30156,6 +30165,31 @@ mod tests {
         let (_, comments, _, code) =
             count_source_lines("      * a comment\n       DISPLAY \"X\".\n", "cobol");
         assert_eq!((comments, code), (1, 1));
+    }
+
+    #[test]
+    fn sloc_reports_typescript_separately_from_javascript() {
+        let (_root_guard, root) = temp_dir("sloc-typescript");
+        fs::write(root.join("a.js"), "const x = 1;\n").unwrap();
+        fs::write(root.join("b.ts"), "// comment\nconst y: number = 2;\n").unwrap();
+        fs::write(root.join("c.TSX"), "const element = <div />;\n").unwrap();
+
+        let report = sloc_report(&root).unwrap();
+        let rows: Vec<_> = report
+            .languages
+            .iter()
+            .map(|row| {
+                (
+                    row.language.as_str(),
+                    row.files,
+                    row.code_lines,
+                    row.comment_lines,
+                )
+            })
+            .collect();
+
+        assert_eq!(rows, [("typescript", 2, 2, 1), ("javascript", 1, 1, 0)]);
+        assert_eq!(report.total.code_lines, 3);
     }
 
     #[test]
