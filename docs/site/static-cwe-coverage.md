@@ -1,18 +1,18 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Static-scanner CWE coverage matrix
 
-What bhf's **static** analyzer (`bhf static-scan`, and `auto --static`)
-detects, per language and CWE. This is a bounded map: a checkmark
-means there is implemented core-scanner coverage for that language/CWE pair, not
-that the class is exhaustively covered. The curated precision benchmark remains
-the release gate for representative rule behavior; broader framework and
-configuration rules also ship with focused unit tests and real-project sweeps.
+This page maps what bhf's **static** analyzer (`bhf static-scan`, and
+`bhf auto --static`) detects, by language and CWE. A checkmark means the core
+scanner has at least one rule for that language and CWE; the notes below
+the table say how far each rule reaches. The curated precision
+benchmark (`benchmarks/static/`) is the release gate for representative rule
+behaviour, and the framework and configuration rules also have focused unit
+tests and sweeps over real projects.
 
-The additional column records **fuzz-confirmation**, which pure SAST tools do not provide.
-When `auto --static` runs, a static finding a fuzzer actually reaches at the same
-site is upgraded to `fuzz_confirmed`; one inside a function fuzzing proved is not
-attacker-reachable is downgraded to `lab_only`. A confirmed static finding is not
-a maybe.
+bhf can also **fuzz-confirm** a static finding. When `bhf auto --static`
+runs, a static finding that a fuzzer reaches at the same site is upgraded to
+`fuzz_confirmed`, and one inside a function that fuzzing showed an attacker
+cannot reach is downgraded to `lab_only`.
 
 ## Coverage by language
 
@@ -36,7 +36,7 @@ a maybe.
 | CWE-789 | Uncontrolled allocation size (tainted alloc size) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | | | | |
 | CWE-918 | SSRF (attacker-controlled URL) | | | | ✅ | ✅ | ✅ | ✅ | | ✅ | ✅⁵ |
 | CWE-295 | TLS verification disabled | | | | ✅ | ✅ | ✅ | ✅ | | ✅ | |
-| CWE-319 | Cleartext/downgrade transport controls | | | ✅³ | | | | ✅⁴ | | ✅⁶ | |
+| CWE-319 | Cleartext/downgrade transport controls | | | ✅³ | ✅ | | ✅ | ✅⁴ | ✅ | ✅⁶ | |
 | CWE-22 | Path traversal | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅¹ | ✅ | ✅⁷ | |
 | CWE-327 | Weak cryptography | ✅ | ✅ | ✅ | ✅ | | ✅ | ✅ | ✅ | ✅ | |
 | CWE-338 | Insecure randomness (security context) | ✅ | ✅ | ✅ | ✅ | | ✅ | ✅ | ✅ | ✅ | |
@@ -51,34 +51,37 @@ a maybe.
 | CWE-134 | Uncontrolled format string | | ✅ | ✅ | | | | | | | |
 | CWE-190 | Unchecked integer conversion | | ✅ | ✅ | | | | | | | |
 | CWE-457 | Use of uninitialized variable | | ✅ | ✅ | | | | | | | |
+| CWE-686 | `printf` argument type mismatch | | ✅ | ✅ | | | | | | | |
+| CWE-703 | Exception silently discarded (`except: pass`) | | | | | | | ✅ | | | |
+| CWE-917 | JNDI injection (tainted `Context.lookup` name) | | | | | | ✅ | | | | |
 | CWE-197 | Numeric truncation | | ✅ | ✅ | | | | | | | |
 | CWE-416 | Use-after-free (static, intraprocedural) | ✅ | ✅ | ✅ | | | | | | | |
 | CWE-415 | Double free (static, intraprocedural) | ✅ | ✅ | ✅ | | | | | | | |
 | CWE-15 | External control of setting (env) | | ✅ | ✅ | | | | | | | |
 | CWE-250/266/269/284/668 | Excess privilege / weak isolation | | | | | | | | | | ✅ |
 | CWE-494/829 | Mutable or unverified build inputs | | | | | | | | | | ✅ |
-| CWE-843 | Type confusion (Ada access forged by Unchecked_Conversion, address overlay) | ✅ | | | | | | | | | |
+| CWE-843 | Type confusion (Ada access forged by `Unchecked_Conversion` or an address overlay; Rust `transmute`) | ✅ | | | | ✅ | | | | | |
 | CWE-567 | Unsynchronized shared data (Ada task writes package state) | ✅ | | | | | | | | | |
 | CWE-755 | Improper exception handling (broad Ada handler) | ✅ | | | | | | | | | |
 | CWE-129 | Index/range checks suppressed (Ada `pragma Suppress`) | ✅ | | | | | | | | | |
 | CWE-190 | Overflow check suppressed (Ada `pragma Suppress`) | ✅ | | | | | | | | | |
-| CWE-562 | Local object access escapes its frame (Ada `'Unchecked_Access`) | ✅ | | | | | | | | | |
+| CWE-562 | Local object escapes its frame (Ada `'Unchecked_Access`; C/C++ returned address of a local) | ✅ | ✅ | ✅ | | | | | | | |
 | CWE-676 | Unsafe C function imported (Ada `pragma Import`) | ✅ | | | | | | | | | |
-| CWE-401 | C string never freed (Ada `New_String`) | ✅ | | | | | | | | | |
+| CWE-401 | Resource never released (Ada `New_String`; C/C++ handle not freed or closed on every path) | ✅ | ✅ | ✅ | | | | | | | |
 | CWE-532 | Secret written to a log or console | ✅ | | | | | | | | | |
-| CWE-248 | Exception escapes a subprogram exported to C | ✅ | | | | | | | | | |
+| CWE-248 | Uncaught exception or panic (Ada subprogram exported to C; Rust `unwrap()`/`expect()` in a library) | ✅ | | | | ✅ | | | | | |
 | CWE-460 | Exception propagates out of `Finalize` | ✅ | | | | | | | | | |
 
 ¹ Python path traversal is covered by both the taint/oracle path (`open()` on a
 non-literal path) and `BHF-542`, which flags `tarfile.extract()`/`extractall()`
 calls that omit a safe extraction filter.
 
-² Hardcoded secrets have two layers: `BHF-423` (a name heuristic — a
+² Hardcoded secrets have two layers: `BHF-423` (a name heuristic: a
 `password`/`token`/`api_key` lvalue assigned a literal, all languages) and
-`BHF-429` (**verified formats** — AWS `AKIA…`, GitHub `ghp_…`, GitLab, Google
+`BHF-429` (**verified formats**: AWS `AKIA…`, GitHub `ghp_…`, GitLab, Google
 `AIza…`, Stripe, npm, Slack, SendGrid tokens, and PEM `PRIVATE KEY` blocks that
-carry actual key material). The format layer is near-zero false positive and
-critical/high confidence — a match is almost certainly a live credential.
+carry actual key material). The format layer reports at critical or high
+confidence, because a match has the exact shape of a real credential.
 
 ³ C++ transport coverage includes Qt WebEngine mixed-content settings that allow
 active HTTP content inside HTTPS pages.
@@ -103,8 +106,8 @@ Django/Flask deployment controls.
 
 ## Framework and Embedded-Webview Rules
 
-The release rule pack now includes focused configuration checks that commercial
-SAST tools usually classify as framework or platform hardening:
+The release rule pack includes focused configuration checks of the kind SAST
+tools usually class as framework or platform hardening:
 
 - **Django**: proxy HTTPS state, `SECURE_CONTENT_TYPE_NOSNIFF`,
   `SECURE_SSL_REDIRECT`, referrer policy, HSTS, weak password hashers, frame
@@ -131,172 +134,185 @@ SAST tools usually classify as framework or platform hardening:
 directly above it) drops it; a scoped marker (`// bhf:ignore[BHF-401,CWE-120]`)
 drops only the listed rules/CWEs.
 
-**Triage & remediation.** The report groups findings by **root cause** — a taint
-flow keyed by (CWE, source, sink) collapses its N sink sites into one `issue`, so a
-reviewer sees one row per defect. Each issue carries a composite **priority score**
-(0–10 = exploitability × confidence × reachability; issues sort fix-first) and a
-one-line **remediation** step. `--since <git-rev>` scans only files changed since a
-revision — near-instant repeat-CI on a huge tree.
+**Triage and remediation.** The report groups findings by **root cause**: a
+taint flow keyed by (CWE, source, sink) collapses its sink sites into one
+`issue`, so a reviewer sees one row per defect. Each issue carries a
+composite **priority score** from 0 to 10 (exploitability × confidence ×
+reachability; issues sort fix-first) and a one-line **remediation** step.
+`--since <git-rev>` scans only the files changed since a revision, which
+makes repeat CI scans of a large tree fast.
 
-**Static reachability tier.** Every finding carries a `reachability` tier — the
-static analog of the "attacker-reachable" verdict the commercial tools
-market. A taint flow is `source_reachable` by construction; a pattern finding is
-`source_reachable` when its enclosing function is reached (over the call graph) from
-an input source, `isolated` when the tree has input sources but none reach it, and
-`unknown` otherwise. The tier feeds the priority score so a finding no attacker can
-reach ranks below one on an input-influenced path — without over-claiming a dynamic
-confirmation. When `auto --static` runs, fuzz-confirmation supersedes it.
+**Static reachability tier.** Every finding carries a `reachability` tier,
+the static counterpart of an "attacker-reachable" verdict:
 
-**Durable finding identity.** Alongside the line-based `fingerprint`, every finding
-carries a line-INDEPENDENT `identity` (rule + file + content key + a stable hash of
-the normalized code). A finding that only *moves* — an unrelated edit shifts its
-line — keeps the same identity, so a baseline still recognizes it instead of
-resurfacing it as new. Fingerprint stays the primary baseline key for backward
-compatibility; identity is the resilient fallback for cross-refactor issue tracking.
+- a taint flow is `source_reachable` by construction;
+- a pattern finding is `source_reachable` when an input source reaches its
+  enclosing function over the call graph;
+- it is `isolated` when the tree has input sources and none reaches it;
+- it is `unknown` otherwise.
 
-**Dependency (SCA) reachability.** For Go and Rust, a manifest dependency is promoted
-on the SBOM **evidence ladder** to `source_observed` only when the source actually
-imports it (a Go import path matching the module path; a Rust `use`/`extern crate`).
-A dependency listed in `go.mod`/`Cargo.toml` but never imported stays merely
-`resolved`, so the VEX ladder keeps its CVEs out of the execute path — the
-govulncheck/Snyk "reachability" story at import granularity, offline.
+The tier feeds the priority score, so a finding no attacker can reach ranks
+below one on an input-influenced path. The tier is a static estimate; when
+`bhf auto --static` runs, fuzz-confirmation replaces it.
 
-**The interprocedural taint engine confirms multiple injection classes**, across
-the eight core static-analysis languages (Ada, C, C++, Go, Rust, Java, Python,
-Perl), with sanitizer clearing, return-value summaries, branch-aware
-guards, loop-carried closure, and field/container sensitivity — each superseding
-the lower-confidence pattern heuristic at a confirmed site:
+**Durable finding identity.** Besides the line-based `fingerprint`, every
+finding carries an `identity` that does not depend on the line (rule, file,
+content key and a stable hash of the normalised code). A finding that only
+*moves*, because an unrelated edit shifted its line, keeps its identity, so a
+baseline still recognises it instead of reporting it as new. The
+fingerprint stays the primary baseline key for compatibility; the identity
+is the fallback that survives refactoring.
 
-- **Command injection (CWE-78, `BHF-304`)** — a source reaches `system` /
+**Dependency (SCA) reachability.** For Go and Rust, a manifest dependency
+moves up the SBOM **evidence ladder** to `source_observed` only when the
+source imports it (a Go import path that matches the module path, or a Rust
+`use` or `extern crate`). A dependency listed in `go.mod` or `Cargo.toml`
+that is never imported stays at `resolved`, so the VEX ladder keeps its CVEs
+off the execution path. This is import-level reachability, computed
+offline.
+
+**Interprocedural taint engine.** In the eight core static-analysis
+languages (Ada, C, C++, Go, Rust, Java, Python, Perl), the taint engine
+tracks these injection classes with sanitizer clearing, return-value
+summaries, branch-aware guards, loop-carried closure and field and container
+sensitivity. At a site it confirms, its finding replaces the
+lower-confidence pattern rule:
+
+- **Command injection (CWE-78, `BHF-304`)**: a source reaches `system` /
   `exec.Command` / `Runtime.exec` / `os.system` / backticks / …
-- **Path traversal (CWE-22, `BHF-405`)** — a source reaches a file-open (`fopen`,
-  `os.Open`, `File::open`, `new File`, `open`, …). Naturally precise: it fires
-  only when a *tainted* value is the path argument, so a literal-path open never
-  trips. Python archive extraction adds `BHF-542` for `tarfile.extract()` and
-  `extractall()` calls that rely on no filter or the fully-trusted filter instead
-  of `filter="data"`, `tarfile.data_filter`, or equivalent member validation.
-- **SQL injection (CWE-89, `BHF-419`)** — a source is *built into* a query
-  (`db.Query`, `executeQuery`, `cursor.execute`, …). A parameterized query with a
-  tainted **bound** argument is safe and does not fire (the sink requires
-  concat/format evidence on the line).
-- **GraphQL injection (CWE-943, `BHF-545`)** — a GraphQL operation document is parsed
-  via `gql()` from a dynamically-built string (concat / f-string / `.format(`) that
-  carries GraphQL operation syntax (`query`/`mutation`/`subscription`). A literal
-  document with request data bound through `variable_values` is safe and does not
-  fire; the sink requires both the `gql()` parser call and dynamic-string evidence.
-- **Log injection / log forging (CWE-117, `BHF-544`)** — a source reaches a log
+- **Path traversal (CWE-22, `BHF-405`)**: a source reaches a file-open
+  (`fopen`, `os.Open`, `File::open`, `new File`, `open`, …). It fires only
+  when a *tainted* value is the path argument, so an open of a literal path
+  never trips it. Python archive extraction adds `BHF-542` for
+  `tarfile.extract()` and `extractall()` calls that rely on no filter or the
+  fully-trusted filter instead of `filter="data"`, `tarfile.data_filter`, or
+  equivalent member validation.
+- **SQL injection (CWE-89, `BHF-419`)**: a source is *built into* a query
+  (`db.Query`, `executeQuery`, `cursor.execute`, …). A parameterized query
+  with a tainted **bound** argument is safe and does not fire (the sink
+  requires concat/format evidence on the line).
+- **GraphQL injection (CWE-943, `BHF-545`)**: a GraphQL operation document is
+  parsed via `gql()` from a dynamically-built string (concat / f-string /
+  `.format(`) that carries GraphQL operation syntax
+  (`query`/`mutation`/`subscription`). A literal document with request data
+  bound through `variable_values` is safe and does not fire; the sink requires
+  both the `gql()` parser call and dynamic-string evidence.
+- **Log injection / log forging (CWE-117, `BHF-544`)**: a source reaches a log
   message argument (`syslog`, `spdlog`, Go `log.Print*`, Rust `log::*!` /
-  `tracing::*!`, Java logger APIs, Python `logging`/logger methods). Receiver-only
-  taint and syslog/log-level arguments stay clean, so dependency-injected logger
-  parameters and dynamic priorities do not create findings.
-- **XXE (CWE-611, `BHF-430`), LDAP injection (CWE-90, `BHF-432`), unsafe reflection
-  (CWE-470, `BHF-434`)** — a tainted value reaches an XML parser, an LDAP filter, or
-  a dynamic class/module load. Each fires only on a *tainted* argument (a literal
-  parser input / filter / class name never trips), so precision matches the SQL
-  model.
-- **Uncontrolled allocation size (CWE-789, `BHF-436`)** — a tainted value sizes a
-  heap/stack allocation (`malloc`/`calloc`/`realloc`/`alloca`, `new T[]`, Go `make`,
-  Rust `with_capacity`, Java `new byte[]`). This is the classic Coverity
-  `TAINTED_SCALAR` → allocator finding; naturally precise, since a `sizeof`/constant
-  allocation is never tainted.
+  `tracing::*!`, Java logger APIs, Python `logging`/logger methods).
+  Receiver-only taint and syslog/log-level arguments stay clean, so
+  dependency-injected logger parameters and dynamic priorities do not create
+  findings.
+- **XXE (CWE-611, `BHF-430`), LDAP injection (CWE-90, `BHF-432`), unsafe
+  reflection (CWE-470, `BHF-434`)**: a tainted value reaches an XML parser, an
+  LDAP filter, or a dynamic class/module load. Each fires only on a *tainted*
+  argument (a literal parser input, filter or class name never trips it), as
+  the SQL rule does.
+- **Uncontrolled allocation size (CWE-789, `BHF-436`)**: a tainted value sizes
+  a heap/stack allocation (`malloc`/`calloc`/`realloc`/`alloca`, `new T[]`, Go
+  `make`, Rust `with_capacity`, Java `new byte[]`); Coverity calls this
+  `TAINTED_SCALAR`. A `sizeof` or constant allocation is never tainted, so it
+  never fires.
 
-Because these are taint flows — not line patterns — they cross function
-boundaries, and `auto --static` can fuzz-confirm any of them. Each taint finding's
-SARIF result carries the source→sink path as standard **`codeFlows`** (ordered
-threadFlow steps with per-hop messages and code snippets), so GitHub code scanning
-and IDEs render the dataflow visually — the answer to "why is this a vulnerability?"
-without re-deriving the flow by hand.
+These are taint flows, so they cross function boundaries, and
+`bhf auto --static` can fuzz-confirm any of them. Each taint finding's SARIF
+result carries the source-to-sink path as standard **`codeFlows`** (ordered
+threadFlow steps with a message and code snippet for each hop), so GitHub
+code scanning and IDEs draw the dataflow that makes it a vulnerability.
 
-**Taint sources are real input channels, not just parameter names.** A value read
-from a recognized input-source API — `request.getParameter()` / `os.Getenv()` /
-`input()` / `os.environ` / `std::env::var()` / `$ENV{…}` / `getenv()` — is
-attacker-controlled and seeds taint even when no parameter name hints at it. That
-is what finds bugs in real framework code (an HTTP handler, a CLI, an env-var
-read), not just functions whose arguments happen to be named `userInput`.
+**Taint sources are input APIs.** A value read from a recognised input
+source, such as `request.getParameter()`, `os.Getenv()`, `input()`,
+`os.environ`, `std::env::var()`, `$ENV{…}` or `getenv()`, is treated as
+attacker-controlled and seeds taint whatever the parameter is called. This
+covers framework code such as an HTTP handler, a CLI or an environment
+variable read.
 
-The **CWE-338** row (insecure randomness) is deliberately *context-gated*: a weak
-PRNG (`random.*`, `math/rand`, `java.util.Random`, C `rand`/`srand`, Perl `rand`)
-is flagged only when the value it produces is a secret — the line names a
-`token` / `key` / `nonce` / `salt` / `session` / `csrf` / `otp` / `credential`.
-A blanket rule (bandit's `B311`, gosec's `G404`) flags *every* `random()`, most of
-which are benign jitter, sampling, or test-data uses; bhf reports the
-security-relevant subset and skips the crypto-secure sources (`secrets`,
-`crypto/rand`, `SecureRandom`, `getrandom`, `urandom`) outright.
+The **CWE-338** row (insecure randomness) is *context-gated*. A weak PRNG
+(`random.*`, `math/rand`, `java.util.Random`, C `rand`/`srand`, Perl
+`rand`) is flagged only when the value it produces is a secret, that is,
+when the line names a `token`, `key`, `nonce`, `salt`, `session`, `csrf`,
+`otp` or `credential`. bandit's `B311` and gosec's `G404` flag every
+`random()`, most of which serve jitter, sampling or test data; bhf reports
+the security-relevant subset and never flags the cryptographically secure
+sources (`secrets`, `crypto/rand`, `SecureRandom`, `getrandom`,
+`urandom`).
 
 The Ada rows come from a statement and scope model of each unit
-(`ada_rules.rs`), not line patterns. The rule list, the false-positive patterns
-each rule excludes, and the precision measured on 18 public Ada projects are in
-the Ada rule design (`docs/designs/2026-10-16-ada-static-rules.md`). The Ada CWE-416/415 rows
-are use-after-free and double free through a local alias of a deallocated access
-value (`BHF-437`/`BHF-410`).
+(`crates/static_analysis/src/ada_rules.rs`). The rule list, the
+false-positive patterns each rule excludes and the precision measured on 18
+public Ada projects are in the
+[Ada rule design](../designs/2026-10-16-ada-static-rules.md). The Ada
+CWE-416 and CWE-415 rows are use-after-free and double free through a local
+alias of a deallocated access value (`BHF-437`, `BHF-410`).
 
-The **CWE-457 / CWE-197** rows for C/C++ come from an intraprocedural def-use
-pass (uninitialized-variable read, narrowing numeric cast), not a line pattern —
-it tracks a variable's declaration and definitions across a function body.
+The C/C++ **CWE-457, CWE-197, CWE-562 and CWE-401** rows come from an
+intraprocedural def-use pass that tracks a variable's declaration and
+definitions across a function body: an uninitialised read, a narrowing
+numeric cast, a returned address of a local (`BHF-549`), and a handle not
+released on every path (`BHF-550`).
 
-The **CWE-416 (use-after-free, `BHF-437`) / CWE-415 (double-free, `BHF-438`)** rows are
-the *static, no-runtime* analogs of the AddressSanitizer-reported `BHF-202`/`BHF-204`
-— because you cannot always fuzz. The same def-use machinery tracks a pointer that
-is freed (`free`/`g_free`/`kfree`/`delete`) and then dereferenced (`*p`, `p->`,
-`p[`) or freed again on the same straight-line path, with no reassignment or
-NULL-out between. It is deliberately precision-first: the freed set is scoped by
-brace depth (a guarded free never leaks past its `}`) and cleared at
-switch-case / label / `goto` / `else` boundaries, and indexed frees (`free(a[i])`)
-are not tracked — so freeing array elements and then the array is not a false
-double-free. The cost is missing a cross-function or loop-carried use-after-free
-(the safe direction); `auto` then fuzz-confirms what it can.
+The C/C++ **CWE-416 (use-after-free, `BHF-437`) and CWE-415 (double free,
+`BHF-438`)** rows are the static counterparts of the AddressSanitizer
+findings `BHF-202` and `BHF-204`, for code you cannot fuzz. The same def-use
+pass tracks a pointer that is freed (`free`, `g_free`, `kfree`, `delete`)
+and then dereferenced (`*p`, `p->`, `p[`) or freed again on the same
+straight-line path, with no reassignment or NULL-out between. The rules
+favour precision:
 
-The Rust column is deliberately thin: clippy already covers most Rust lints well,
-so bhf drives clippy (and gosec/Bandit/semgrep/GNATcheck) as a **subprocess
-adapter** (`auto --external-tools`, license-gated) rather than reimplementing
-their rule sets — their findings merge into the report and get fuzz-confirmed too.
+- the freed set is scoped by brace depth, so a guarded free does not reach
+  past its `}`;
+- the set is cleared at `switch` case, label, `goto` and `else`
+  boundaries;
+- indexed frees (`free(a[i])`) are not tracked, so freeing the elements of
+  an array and then the array is not reported as a double free.
 
-## What bhf deliberately limits (and why)
+Use-after-free across functions or loop iterations is left to fuzzing,
+which `bhf auto` runs on what it can reach.
 
-An offline source scanner should not pretend to prove classes it cannot see
-without a running web framework, a request lifecycle, or a rendered DOM. bhf
-does implement focused, framework-specific checks where the source semantics are
-clear, but it deliberately avoids generic claims that would inflate rule counts
-with false positives:
+Beyond the taint classes in the table, the Rust rules cover command taint
+in `build.rs`, unsafe `transmute` (`BHF-552`) and `unwrap()`/`expect()` in
+library code (`BHF-553`). For general Rust lints, run clippy alongside bhf.
 
-- **Generic XSS beyond modeled sinks** — JavaScript/TypeScript raw HTML sinks
-  (`BHF-512`) are covered when request data reaches modeled Express/DOM/React/
-  Vue/Svelte/Angular raw-HTML APIs without visible sanitization. bhf does not
-  claim arbitrary rendered-DOM coverage for every framework/template engine
-  because escaping semantics are framework- and context-specific.
-- **Generic CSRF absence** — explicit CSRF disablement and unsafe framework
-  configuration are covered for modeled stacks (`BHF-446`). Proving that every
-  state-changing route has a valid token/origin lifecycle still requires framework
-  routing, middleware order, and often a live application.
-- **CWE-613 (Insufficient session expiration)** — a runtime session-management
-  property tied to a specific framework's session store and configuration; not a
-  source pattern.
+## Web classes that need a running application
 
-The broader forms are better served by a DAST tool with a live target. bhf's
-remit is the offline source tree plus the fuzz-confirmation layer on top.
+Some web weaknesses depend on a running framework, a request lifecycle or a
+rendered DOM. For these, bhf checks the parts that the source states
+clearly, and a DAST tool against a live target covers the rest:
 
-## Rule breadth without reimplementing it: external adapters
+- **XSS.** `BHF-512` reports request data that reaches a modelled raw-HTML
+  API in Express, the DOM, React, Vue, Svelte or Angular without visible
+  sanitisation. Escaping rules in other template engines depend on the
+  framework and the context.
+- **CSRF.** `BHF-446` reports explicit CSRF disablement and unsafe framework
+  configuration in the modelled stacks. Proving that every state-changing
+  route has a valid token or origin check needs the framework's routing and
+  middleware order, and often a live application.
+- **CWE-613 (insufficient session expiration).** This is a runtime property
+  of a framework's session store and configuration, with no source pattern
+  to match.
 
-bhf's own rules are deliberately focused on the classes it can hold to a
-precision number and fuzz-confirm. For the long tail — framework-specific XSS and
-CSRF variants beyond the modeled stacks, plus the broader catalogs that
-Fortify/Checkmarx/CodeQL ship — it *folds in* the tools that already have them
-rather than reimplementing every framework rule. `static-scan
---external-tools` (and `auto --external-tools`) runs the operator's installed,
-profile-allowed analyzers (**gosec / Bandit / semgrep / GNATcheck**) as
-subprocesses — never linked — and normalizes their SARIF into
-`<out>/external-findings.json`, carrying a CWE pulled from the result *or the rule
-metadata* (where semgrep records it) or an adapter fallback (e.g. gosec `G203`,
-Bandit `B701`/`B308` → CWE-79 XSS). This is breadth **without fuzzing**; under
-`auto` these same findings additionally get fuzz-confirmed. The license profile
-gates which tools run — `strict-permissive` runs none, so the default profile
-never invokes a GPL tool.
+## External analyzers
+
+bhf's own rules cover the classes it can hold to a measured precision and
+fuzz-confirm. For framework-specific XSS and CSRF variants beyond the
+modelled stacks, and the wider catalogues of other SAST tools, bhf runs
+those tools and folds in their results. `bhf static-scan --external-tools`
+(and `bhf auto --external-tools`) runs the installed analyzers the licence
+profile allows (**gosec, Bandit, semgrep, GNATcheck**) as separate
+processes, never linked, and normalises their SARIF into
+`<out>/external-findings.json`. Each finding gets a CWE from the result, from
+the rule metadata (where semgrep records it) or from an adapter mapping (for
+example gosec `G203` and Bandit `B701` and `B308` map to CWE-79, XSS).
+`static-scan` reports these findings as they are; under `bhf auto` they are
+also fuzz-confirmed. The licence profile decides which tools run:
+`strict-permissive` runs none, so the default profile never starts a GPL
+tool.
 
 ## Extending coverage
 
 The taint model (sinks, sources, sanitizers) is a declarative table in
-`crates/static_analysis/src/taint_spec.rs` — adding a sink/source/sanitizer for a
-language is a one-line edit. Pattern rules live in `scan_<lang>` in
-`crates/static_analysis/src/lib.rs`, and every new rule must ship a labeled
-`benchmarks/static/corpus/` case so it counts toward the published precision
-number.
+`crates/static_analysis/src/taint_spec.rs`; a new sink, source or sanitizer
+for a language is a one-line entry. Pattern rules live in the `scan_<lang>`
+functions of `crates/static_analysis/src/lib.rs`. Every new rule ships with a
+labelled case in `benchmarks/static/corpus/`, so it counts toward the
+published precision figure.

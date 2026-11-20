@@ -152,7 +152,7 @@ prints what was missing and the exact fix:
 - Standard-library names used without `std::` (`string`, `map`, `vector`,
   `list`, `pair`, the other containers, `shared_ptr`, `runtime_error`): a
   prelude header and the command that force-includes it. See
-  [Headers that rely on `using namespace std;`](#headers-that-rely-on-using-namespace-std).
+  [Headers that rely on using namespace std](#headers-that-rely-on-using-namespace-std).
 - A member declared with an extra class qualification, which only MSVC
   accepts by default: `-fms-extensions` for clang++ (`-fpermissive` for g++).
 

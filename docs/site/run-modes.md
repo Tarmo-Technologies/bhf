@@ -2,94 +2,99 @@
 
 # Run Modes (Reporting vs Attacking)
 
-`bhf auto` and `bhf fuzz` both accept `--mode reporting|attacking`. The
+`bhf auto` and `bhf fuzz` both take `--mode reporting|attacking`. The
 default is `reporting`.
 
 ```sh
 bhf auto path/to/src --mode attacking
 ```
 
-The mode does **not** change how a finding's verdict is computed — verdicts are
-always derived from the collected evidence (see below). What the mode changes is
-which targets get fuzzed first and which findings the report foregrounds. The
-chosen mode is also stamped into every finding's actionability record so
-downstream tooling can profile a run by it.
+The mode sets which targets `bhf auto` fuzzes first and which findings the
+report puts first. Verdicts come from the collected evidence in both modes
+(see below). Every finding's actionability record carries the mode, so
+other tools can group runs by it.
 
 ## Verdicts Are the Same in Both Modes
 
-Regardless of mode, each finding is classified from evidence into one verdict:
+In either mode, bhf classifies each finding from its evidence into one
+verdict:
 
-- `real_reachable` — reproduced, with a source fix location, on an
-  attacker-reachable entry. A candidate vulnerability.
-- `likely_reachable` — a real failure on a plausible entry, but reachability is
-  not fully proven.
-- `lab_only` — the path depends on generated stubs, fake resources,
-  missing-environment injections, or mocks. Reproducible in the lab; public-API
-  reachability is unproven. Also assigned when the fuzzed entry is positively
-  *not* an attacker-controlled channel (an internal helper or output serializer
-  the harness drove directly).
-- `blocked` — a real resource was missing with no substitution, so the target
-  could not be exercised.
-- `unknown` — reachability was not assessed (e.g. Ada targets, which are ranked
-  structurally, or legacy findings).
+- `real_reachable`: reproduced, with a source fix location, on an
+  attacker-reachable entry point. A candidate vulnerability.
+- `likely_reachable`: a real failure on a plausible entry point whose
+  reachability bhf could not fully prove.
+- `lab_only`: the path depends on generated stubs, fake resources, injected
+  environment values or mocks. It reproduces in the lab, and reachability
+  through the public API is unproven. bhf also assigns `lab_only` when the
+  fuzzed entry point is known to be outside the attacker's control, such as
+  an internal helper or an output serializer that the harness called
+  directly.
+- `blocked`: a real resource was missing and had no substitute, so the
+  target could not run.
+- `unknown`: reachability was not assessed, for example for Ada targets,
+  which are ranked by structure, or for findings from older runs.
 
-Switching modes never moves a finding between these buckets.
-
-LLM output never moves a finding between them either. Optional agent/model
-assistance may explain or prioritize the evidence, but only deterministic run,
-reachability, replay, stub/fake, and oracle fields compute the verdict.
+The mode never moves a finding between these verdicts, and neither does
+model output. Optional agent or model assistance can explain or prioritise
+the evidence; the verdict comes only from the deterministic run,
+reachability, replay, stub and fake, and oracle fields.
 
 ## Reporting Mode (default)
 
-Developer-workflow quality first. Findings are surfaced with replay commands,
-minimized artifacts when available, source fix locations, patch guidance, and
-clear labels for lab-only paths. This is the mode for triaging your own code and
-fixing what comes back.
+Reporting mode serves the developer workflow. Findings come with replay
+commands, minimized inputs when available, source fix locations, patch
+guidance and clear labels for lab-only paths. Use it to triage your own code
+and fix what comes back.
 
 ## Attacking Mode
 
-Foregrounds the externally reachable, security-relevant findings — the
-attacker's view. Two concrete differences:
+Attacking mode puts the externally reachable, security-relevant findings
+first: the attacker's view. It changes two things:
 
-- **Target scheduling (auto only).** The candidate queue is re-sorted so
-  attacker-reachable and dangerous-sink targets are fuzzed first. The attacking
-  score adds to each candidate's base rank: `+50` when the target name contains a
-  reachable-surface keyword (`parse`, `decode`, `read`, `open`, `connect`,
-  `spawn`, `query`, `sql`, `load`), and `+100` for each dangerous-API oracle the
-  source text matches. This is **decisive under a target cap or time budget**
-  (`--max-targets`, `--campaign-time`, `--total-time`) — you fuzz the scary
-  surface before the clock runs out. On an unbounded full sweep it only changes
-  order, not which targets run. `bhf fuzz` drives a single harness, so
-  scheduling does not apply there; only the actionability profile changes.
-- **Report emphasis.** Externally reachable, security-relevant findings are
-  promoted. Findings that depend on stubs, fakes, missing-environment shims, or
-  mocks are still recorded, but stay classified `lab_only` and are excluded from
-  the real-reachable counts.
+- **Target scheduling (`bhf auto` only).** bhf re-sorts the candidate queue
+  so that attacker-reachable targets and targets near dangerous sinks are
+  fuzzed first. To each candidate's base rank it adds `+50` when the target
+  name contains a reachable-surface keyword (`parse`, `decode`, `read`,
+  `open`, `connect`, `spawn`, `query`, `sql`, `load`), and `+100` for each
+  dangerous-API oracle whose API appears in the source text. Under a target
+  cap or time budget (`--max-targets`, `--campaign-time`) this decides which
+  targets run before the budget runs out. On a full sweep with no cap it
+  changes only the order. `bhf fuzz` drives a single harness, so for it the
+  mode changes only the actionability profile.
+- **Report emphasis.** Externally reachable, security-relevant findings
+  come first. Findings that depend on stubs, fakes, injected environment
+  values or mocks are still recorded, stay classified `lab_only`, and are
+  left out of the real-reachable counts.
 
 ## Gating CI on Actionability
 
-The verdict ladder is what `bhf ci` gates on, independent of the run mode:
+`bhf ci` gates on the verdict, whatever the run mode:
 
 ```sh
 bhf ci . --fail-on-actionability likely --min-actionability-confidence medium
 ```
 
-- `real` — strict attacker-reachable gate.
-- `likely` — security gate that accepts strong static entry/sink evidence.
-- `lab` — fail the build on lab-only findings too.
-- `any` — fail on every recorded finding.
+| `--fail-on-actionability` | Fails the build on |
+|---|---|
+| `real` | attacker-reachable findings only (strict) |
+| `likely` | reachable findings, including strong static entry and sink evidence |
+| `lab` | lab-only findings as well |
+| `any` | every recorded finding |
+
+`--min-actionability-confidence` (`high`, `medium` or `low`, default `low`)
+sets the lowest verdict confidence that counts.
 
 ## When To Use Which
 
-- **Reporting** for routine development and self-triage — you want the fix
-  workflow front and center.
-- **Attacking** when prioritizing an audit under a budget: it schedules the
-  reachable, dangerous surface first and foregrounds the findings an external
-  attacker could actually reach. Most impactful combined with `--max-targets` or
+- **Reporting** for routine development and your own triage, with the fix
+  workflow in front.
+- **Attacking** for an audit under a budget: it schedules the reachable,
+  dangerous surface first and puts first the findings an external attacker
+  could reach. It has the most effect with `--max-targets` or
   `--campaign-time` on a large tree.
 
 ## See Also
 
-- [Auto](../auto/) — `--mode` in the full flag table and the actionability
+- [Auto](auto.md): `--mode` in the full option table and the actionability
   section.
-- [CLI](../cli/) — actionability modes and the `bhf ci` gates.
+- [CLI](cli.md): actionability modes and the `bhf ci` gates.

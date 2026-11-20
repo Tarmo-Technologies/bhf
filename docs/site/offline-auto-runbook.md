@@ -2,67 +2,70 @@
 
 # Offline `auto` Runbook for Ada, C, and C++
 
-This runbook gives an offline source drop the best practical chance of reaching
-real fuzz execution. It keeps the evidence-preserving run separate from the
-forced, stub-heavy fallback so the report makes clear which results exercised
-real project behavior.
+This runbook covers fuzzing an Ada, C or C++ source drop on an offline host,
+so that as many targets as possible reach real fuzz execution. It runs the
+evidence-preserving sweep and the forced, stub-heavy fallback separately, so
+the reports show which results exercised the project's real behaviour.
 
 ## Required Offline Content
 
-BHF can recover compile flags, generate harnesses, repair broken build
-closure, synthesize limited dependencies, and bypass a non-working original
-build. Dynamic fuzzing still requires usable compilers and runtimes on the
-offline host. Stage these before the scan:
+bhf recovers compile flags, generates harnesses, repairs an incomplete build
+closure, synthesizes stand-ins for some missing dependencies, and works around
+an original build that does not run. Fuzzing still needs working compilers
+and runtimes on the offline host. Stage these before the scan:
 
-- the complete source drop, including local Git history when exact recovery of
-  deleted tracked files is required;
-- matching GNAT/GPRbuild and C/C++ compiler/runtime toolchains;
-- vendored dependency headers and sources that must retain real semantics;
-- project code generators and their inputs when real generated output is
-  required;
+- the complete source drop, including the local Git history if deleted
+  tracked files must be recovered exactly;
+- matching GNAT/GPRbuild and C/C++ compiler and runtime toolchains;
+- vendored dependency headers and sources whose real behaviour matters;
+- the project's code generators and their inputs, if the real generated
+  output matters;
 - representative input files or corpora for structured formats.
 
-Do not use `--install-deps` on an offline host. Missing compilers, generated
-interfaces, or semantic source files cannot be recovered from no information;
-`auto/run.json` and `auto/missing-deps.txt` record those boundaries.
+`--install-deps` needs the network, so do not use it on the offline host.
+bhf cannot reconstruct a missing compiler, generated interface or source
+file from nothing; `auto/run.json` and `auto/missing-deps.txt` record what is
+missing.
 
-BHF creates `auto/missing-deps.txt` and `auto/missing-deps.json` before the
-first target starts. The first section is the offline handoff list: missing host
-and cross compilers, target runtimes/emulators, generated source/codegen tools,
-unfetched Git submodules, and declared Alire source that is not locally staged.
-Each row says whether it was `declared`, `observed`, or `inferred` and includes
-the metadata or diagnostic that supports it. Configure/CMake templates and
-commands are reported as generated source, rather than as guessed distro header
-packages. Literal C/C++/Ada source paths declared by CMake but absent from the
-drop are listed separately as vendor/project source; BHF does not replace
-those implementation semantics with a claimed equivalent.
+bhf writes `auto/missing-deps.txt` and `auto/missing-deps.json` before the
+first target starts. Their first section is the offline handoff list:
+missing host and cross compilers, target runtimes and emulators, generated
+source and code-generation tools, unfetched Git submodules, and declared
+Alire source that is not staged locally. Each row says whether it was
+`declared`, `observed` or `inferred`, and includes the metadata or diagnostic
+behind it. Configure and CMake templates and commands are reported as
+generated source, not as guessed distribution header packages. C, C++ and
+Ada source paths that CMake declares but the drop lacks are listed
+separately as vendor or project source; bhf does not stand in for their
+implementation.
 
-The files are atomically checkpointed after every completed target, including
-parallel sweeps, and the final terminal line points to `missing-deps.txt` with
-its blocking/substituted counts. Build-probe diagnostics are checkpointed before
-target discovery begins. If the BHF parent is OOM-killed, the latest project
-metadata/build-probe/preflight pass and every previously completed target remain
-in the last valid checkpoint. The actively running target can still be absent because an
-unrecoverable process kill cannot execute its classifier; `complete: false` in
-the JSON and `run still in progress` in the text make that boundary explicit.
+The files are checkpointed atomically after every completed target,
+parallel sweeps included, and the final line of output points to
+`missing-deps.txt` with its blocking and substituted counts. Build-probe
+diagnostics are checkpointed before target discovery begins. If the bhf
+parent process is OOM-killed, the last valid checkpoint keeps the latest
+project metadata, build-probe and preflight pass and every target completed
+before the kill. The target that was running can be missing, because a
+killed process cannot run its classifier; `complete: false` in the JSON and
+`run still in progress` in the text mark that.
 
-"Exact" means exact where the project or toolchain provides evidence: a
-`.gitmodules` path and URL, an `alire.toml` version constraint, a CMake output and
-command, a compiler diagnostic, or a mapped platform guard. When an absent
-proprietary SDK/source has no identifying metadata, BHF records the
-unresolved type/guard and marks it `inferred`; it does not invent a vendor,
-version, ABI, or implementation semantics.
+A row is exact where the project or toolchain provides evidence: a
+`.gitmodules` path and URL, an `alire.toml` version constraint, a CMake
+output and command, a compiler diagnostic, or a mapped platform guard. When
+an absent proprietary SDK or source has no identifying metadata, bhf records
+the unresolved type or guard and marks it `inferred`; it does not invent a
+vendor, version, ABI or implementation.
 
-`--run-untrusted`, `--build-command`, and
+`--run-untrusted`, `--build-command` and
 `--unsafe-search-and-run-build-commands` execute code from the scanned tree.
-Use them only in an isolated scan VM or equivalent sandbox with networking
-disabled.
+Use them only in an isolated scan VM, or an equivalent sandbox, with
+networking disabled.
 
 ## Known Build Command
 
-When the build entry point is known, name it explicitly. `--build-command`
-intercepts the build's compiler invocations and recovers a compile database;
-`--run-untrusted` also enables the Ada build/code-generation probe.
+When you know the build entry point, name it. `--build-command` runs the
+build, intercepts its compiler invocations and recovers a compile database;
+`--run-untrusted` also enables the Ada build and code-generation probe.
 
 ```sh
 bhf auto /src/project \
@@ -79,19 +82,20 @@ bhf auto /src/project \
   --verbose
 ```
 
-For a recognized CMake, Meson, Make, Ninja, Visual Studio, Alire, or GPRbuild
-project that does not need a custom command, omit `--build-command`; keep
-`--run-untrusted` to enable the normal C/C++ and Ada build probes.
+For a recognized CMake, Meson, Make, Ninja, Visual Studio, Alire or GPRbuild
+project that needs no custom command, leave out `--build-command` and keep
+`--run-untrusted`, which enables the normal C/C++ and Ada build probes.
 
-If a legacy compiler rejects the requested sanitizer set, rerun without
-`--sanitizers`. The default coverage-only build gives the target a better
-compatibility chance, while the sanitizer run gives stronger memory-error
-detection when the toolchain supports it.
+`--sanitizers asan,ubsan` builds each C/C++ harness with
+`-fsanitize=address,undefined` and arms the matching `<SAN>_OPTIONS`, so
+UBSan reports become saved crashes. If a legacy compiler rejects the
+sanitizers, rerun with `--sanitizers none`: each harness then builds with
+coverage and no `-fsanitize=`, and only hard faults are detected.
 
 ## Unknown Build Command
 
-When the build entry point is unknown and the source is trusted enough to
-execute in the isolated VM, let BHF find it:
+When you do not know the build entry point and the source is trusted enough
+to execute in the isolated VM, let bhf find it:
 
 ```sh
 bhf auto /src/project \
@@ -107,13 +111,15 @@ bhf auto /src/project \
   --verbose
 ```
 
-The unsafe-search flag finds a custom build entry point when one is present,
-enables recognized build-system probes, and enables the Ada build/codegen
-probe. It already supplies the consent represented by `--run-untrusted`.
+`--unsafe-search-and-run-build-commands` finds and runs a custom build entry
+point when one exists (`build.sh`, an autotools bootstrap, SCons, Waf,
+Bazel), enables the recognized build-system probes, and enables the Ada
+build and code-generation probe. It includes the consent that
+`--run-untrusted` gives.
 
 ## Supply Real Offline Dependencies
 
-Add only the flags that describe content actually staged with the scan:
+Add only the flags that describe content you actually staged:
 
 ```sh
   --extra-include /offline/deps/include \
@@ -123,23 +129,19 @@ Add only the flags that describe content actually staged with the scan:
   --seed-dir /offline/seeds
 ```
 
-- `--extra-include` supplies real C/C++ dependency headers. Repeat it for
-  multiple roots.
-- `--extra-source` links a known sibling translation unit instead of stubbing
-  its symbols. Repeat it for multiple files.
-- `--ada-deps` puts vendored Ada dependency sources on the build path. Repeat
-  it for multiple roots.
-- `--include-dir NAME` restores discovery under a directory that BHF would
-  normally prune.
-- `--seed-file`, `--seed-dir`, and `--grammar FILE` help structured parsers
-  cross format gates and reach deeper code.
-- `--engine builtin,afl++` adds AFL++ for native C/C++, COBOL, Fortran, Rust and Ada when its binaries are
-  already installed offline. The per-target time is split between engines.
+| Flag | Effect |
+|---|---|
+| `--extra-include DIR` | Supplies real C/C++ dependency headers. Repeatable. |
+| `--extra-source FILE` | Links a known sibling translation unit instead of stubbing its symbols. Repeatable. |
+| `--ada-deps DIR` | Puts vendored Ada dependency sources on the build path. Repeatable. |
+| `--include-dir NAME` | Keeps a directory in discovery that bhf would otherwise skip by default. |
+| `--seed-file`, `--seed-dir`, `--grammar FILE` | Help structured parsers pass format checks and reach deeper code. |
+| `--engine builtin,afl++` | Adds AFL++ for native C/C++, COBOL, Fortran, Rust and Ada targets when its binaries are installed offline. The per-target time is split between the engines. |
 
-Leave `--cxx-std` unset unless the required dialect is known; the automatic
-dialect ladder normally gives legacy C++ a better chance. Keep the default
-`--max-repair-rounds 16`: it covered every successful sample in the expanded
-95-run clean/damaged validation population, whose maximum was 14 rounds.
+Leave `--cxx-std` unset unless you know the required dialect: the automatic
+dialect ladder gives legacy C++ a better chance. Keep the default
+`--max-repair-rounds 16`; in validation over clean and damaged trees, no
+successful build needed more than 14 rounds.
 
 ## IDL and Generated Source
 
@@ -148,17 +150,19 @@ resolves cross-directory IDL includes, emits fake CORBA base packages and Ada
 Helper/Skel/Stub mapping units under `bhf_work/fake_corba`, adds that source
 directory to Ada builds, and derives fuzz dictionary tokens.
 
-Real project-specific C/C++ client/server output is a different contract. Use
-`--run-untrusted` or `--build-command` when the actual offline generator is
-present. When the generator or its inputs are absent, BHF can synthesize
-limited header/type scaffolding but cannot promise production-equivalent
-generated behavior.
+Project-specific C/C++ client and server code generated from IDL needs the
+project's own generator. Use `--run-untrusted` or `--build-command` when the
+generator is staged offline. When the generator or its inputs are absent,
+bhf synthesizes header and type scaffolding only, and the generated code's
+behaviour is not reproduced.
 
 ## Forced Fallback
 
-Run the forced sweep into a different work directory. It attempts C/C++/Ada
-targets whose parameters or dependencies could not be driven soundly in the
-first run:
+`--force` runs the normal sweep first, then a second phase over the C/C++ and
+Ada targets whose parameters or dependencies could not be driven: it
+fabricates the parameter and stubs the missing symbols. Run it into a
+different work directory, so the evidence-preserving results stay in their
+own:
 
 ```sh
 bhf auto /src/project \
@@ -178,68 +182,70 @@ bhf auto /src/project \
 For the unknown-build variant, replace `--run-untrusted --build-command ...`
 with `--unsafe-search-and-run-build-commands`.
 
-Forced and stub-heavy findings are deliberately marked Low confidence because
-they can depend on fabricated behavior. Do not combine their success counts
-with the evidence-preserving run.
+Findings from forced and stub-heavy builds are marked low confidence because
+they can depend on fabricated behaviour. Keep their success counts separate
+from the evidence-preserving run's.
 
 ## Flag Combination Rules
 
 - `--force` combines with either known-build or unknown-build recovery.
-- `--run-untrusted` already implies `--probe-build`; specifying both is
-  redundant.
-- An explicit `--build-command` takes precedence over
+- `--run-untrusted` implies `--probe-build`; you need not pass both.
+- An explicit `--build-command` overrides
   `--unsafe-search-and-run-build-commands`; choose one.
-- `--static` complements fuzzing and covers files that still cannot execute.
-- `--resume` is for continuing an interrupted run with the same work directory
-  and unchanged source. Do not use it to turn the real run into a forced run.
-- Size `--jobs` against memory: `jobs * --rss-limit-mb` is the fuzz-child
-  allowance, not total peak. Also reserve RAM for BHF's declaration index,
-  retained target results, compiler processes, and the OS. Use `--jobs 1` on an
-  8 GiB host unless measurement demonstrates safe headroom.
+- `--static` adds static analysis of the whole tree, including files that
+  still cannot run.
+- `--resume` continues an interrupted run with the same work directory and
+  unchanged source. It does not turn the evidence-preserving run into a
+  forced one; start the forced run in its own work directory.
+- Size `--jobs` against memory. `jobs × --rss-limit-mb` is the fuzz-child
+  allowance, not the total peak; also reserve RAM for bhf's declaration
+  index, the retained target results, compiler processes and the OS. Use
+  `--jobs 1` on an 8 GiB host unless you have measured spare headroom.
 
 ## Compact Scrubbed Support Report
 
-If the campaign produces no successful harnesses, run the bundled collector
-instead of copying many ad hoc command results. It works while the campaign is
-still running because each completed target has an atomic result checkpoint:
+If the campaign produces no working harness, run the bundled collector
+instead of copying many command outputs by hand. It also works while the
+campaign is still running, because each completed target has an atomic
+result checkpoint:
 
 ```sh
 bhf-bug-report /results/bhf-real
 ```
 
-The script writes and prints `bhf-support-report.txt`, capped at 4,000 bytes
-by default. It contains version/host/toolchain lines, outcomes by language,
-structured build-error and repair counts, checkpoint health, and a small set of
-the most frequent diagnostic shapes. It does not read or include source,
-generated harness code, or corpus inputs. Project paths, file names, targets,
-variables, types, Ada units, symbols, and macros are replaced with typed
+The script writes and prints `bhf-support-report.txt`, capped at 4,000
+bytes. It holds version, host and toolchain lines, outcomes by language,
+structured build-error and repair counts, checkpoint health, and the most
+frequent diagnostic shapes. It does not read or include source, generated
+harness code or corpus inputs. Project paths, file names, targets,
+variables, types, Ada units, symbols and macros are replaced with typed
 placeholders before the report is written.
 
-The equivalent direct CLI command is:
+The equivalent CLI command is:
 
 ```sh
 bhf bug-report /results/bhf-real \
   --output bhf-support-report.txt \
-  --stdout
+  --stdout --examples 6 --max-bytes 4000
 ```
 
 Send only that scrubbed text file. The raw `result.json`, `run.json`, build
-trees, and source are not required for ordinary build/harness triage.
+trees and source are not needed for ordinary build and harness triage.
 
 ## Acceptance Check
 
-Use `/results/bhf-real/auto/run.json` as the machine-readable evidence.
-A dynamically successful target should report `built_and_fuzzed`, at least one
-execution, and positive coverage. Review these fields and artifacts:
+`/results/bhf-real/auto/run.json` is the machine-readable evidence. A target
+that fuzzed successfully reports `built_and_fuzzed`, at least one execution,
+and positive coverage. Review these fields and files:
 
-- `summary.built_and_fuzzed` and per-target outcomes;
+- `summary.built_and_fuzzed` and the per-target outcomes;
 - per-pass `executions` and `coverage_edges`;
-- repairs and the `needed_for_build` ledger;
+- the repairs and the `needed_for_build` ledger;
 - `fuzzed_stub_only`, forced notes, and stub execution evidence;
-- `auto/missing-deps.txt` for still-blocking offline content;
-- the first `Required toolchains, runtimes, generated and vendor source`
-  section in that file before reviewing lower-level headers/symbols;
-- `auto/bug-report.md` for defects in BHF itself.
+- `auto/missing-deps.txt`, for offline content that still blocks a build;
+  read its first section, `Required toolchains, runtimes, generated and
+  vendor source`, before the lower-level headers and symbols;
+- `auto/bug-report.md`, for defects in bhf itself.
 
-Treat a zero-coverage run, a forced-only result, or a stub-only result as a gap,
-not as proof that the real target was fuzzed.
+A zero-coverage run, a forced-only result or a stub-only result is a gap: it
+does not show that the real target was fuzzed.

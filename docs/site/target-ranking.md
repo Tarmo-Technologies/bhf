@@ -3,22 +3,21 @@
 # Target Ranking
 
 `bhf auto` can discover far more candidate functions than a time-boxed
-campaign can build and fuzz. Target ranking decides attempt order. It is a
-deterministic scheduling heuristic, not a prediction that a function contains a
-vulnerability.
+campaign can build and fuzz. Target ranking is the deterministic scheduling
+heuristic that decides the order in which bhf attempts them.
 
-The objective is to maximize the number and value of targets that reach the
-evidence gate within a fixed campaign budget. A high-priority target should have:
+Its goal is to get as many valuable targets as possible through the
+evidence gate within a fixed campaign budget. A high-priority target has:
 
 1. a credible attacker-controlled input channel;
 2. a broad, meaningful program boundary; and
 3. a signature and lifecycle the current harness generator can reasonably
    construct.
 
-Ranking does not prove any of those properties at runtime. Build viability,
-target-entry checkpoints, real-project coverage, replay, and provenance remain
-authoritative. When a high-ranked target cannot proceed, the campaign backfills
-from the remaining ranked candidates.
+Ranking estimates these properties from source. The runtime checks decide
+them: build viability, target-entry checkpoints, coverage of the real
+project, replay and provenance. When a high-ranked target cannot proceed,
+the campaign backfills from the remaining ranked candidates.
 
 ## Pipeline
 
@@ -34,9 +33,8 @@ parse source
   → attempt highest priorities and backfill around failures
 ```
 
-The score is therefore a campaign priority. It is not a vulnerability
-probability, severity, confidence value, coverage guarantee, or replacement for
-expert target selection.
+The score is a campaign priority: the order of attempts. Severity,
+confidence and coverage come from the evidence each attempt produces.
 
 ## Two classes of evidence
 
@@ -53,8 +51,7 @@ How promising is this target as attack surface? These signals include:
 - call-graph evidence that the function orchestrates broad project behavior
   rather than duplicating a narrow operation already reached through a caller.
 
-“Target value” means expected attack-surface relevance and breadth. It does not
-mean that BHF has predicted the function is vulnerable.
+Target value measures expected attack-surface relevance and breadth.
 
 ### Harness feasibility
 
@@ -69,16 +66,16 @@ signals include:
   construction requirements the generator cannot safely satisfy.
 
 Some features carry both kinds of evidence. A proven byte channel is relevant
-attack surface and also easy input plumbing. The documentation assigns each
-signal to its primary explanatory role and never counts it twice.
+attack surface and also easy input plumbing. This page assigns each signal to
+its main role and counts it once.
 
-The current implementation adds named contributions into one campaign-priority
-score. The two classes above are an explanatory grouping, not two independently
-calibrated values emitted by the CLI.
+bhf adds the named contributions into one campaign-priority score. The two
+classes above group the signals for explanation; the CLI reports the single
+score.
 
 ## Identifier tokens
 
-Function names contain weak but useful semantic evidence. BHF lowercases
+Function names carry weak but useful semantic evidence. bhf lowercases
 identifiers and splits them at:
 
 - underscores and hyphens;
@@ -96,11 +93,11 @@ Reader::readObject  → reader | read | object
 
 Action stems match at the beginning of tokens. This allows related forms such as
 `parse` and `parser`, or `normalize` and `normalization`, to contribute the same
-kind of semantic evidence across naming conventions. A name signal never stands
-alone: parameter types, input direction, call relationships, constructibility,
-and runtime proof are separate checks.
+kind of semantic evidence across naming conventions. A name signal is one
+input among several: parameter types, input direction, call relationships,
+constructibility and runtime proof are separate checks.
 
-Implementation: [`name_semantics.rs`](https://github.com/Tarmo-Technologies/bhf/blob/main/crates/target_rank/src/name_semantics.rs).
+Implementation: `crates/target_rank/src/name_semantics.rs`.
 
 ## C and C++ scoring
 
@@ -137,25 +134,29 @@ evidence, a mutable pointer may instead be destination storage for a serializer.
 This makes the signal more authoritative than a suggestive name (`+15`) or
 convenient arity (`+5`), so it receives one of the largest base bonuses.
 
-The 30 points do not mean that the function is vulnerable, broad, or even a
-complete target. A matching length or self-describing type supplies another 15
-points because the buffer still needs a coherent extent. Name, whole-artifact,
+The 30 points reward the input channel alone. A matching length or
+self-describing type supplies another 15 points because the buffer still
+needs a coherent extent. Name, whole-artifact,
 call-graph, and runtime evidence answer different questions. The implementation
 also recognizes mutable in-place parser buffers, but only after additional
 parser and length evidence classifies them as attacker input; an ordinary output
 buffer does not receive this bonus.
 
-Implementation: [`c_rank.rs`](https://github.com/Tarmo-Technologies/bhf/blob/main/crates/target_rank/src/c_rank.rs).
+Implementation: `crates/target_rank/src/c_rank.rs`.
 
 ### C/C++ call-graph adjustment
 
-Signature evidence cannot always distinguish a public parser from the narrow
-operations below it. BHF therefore constructs an approximate in-tree call
-graph for C and C++ candidates:
+Signature evidence cannot always tell a public parser from the narrow
+operations below it, so bhf builds an approximate in-tree call graph for C
+and C++ candidates:
 
 - an attacker-input target with `fan_out >= 3` gains
   `3 × min(fan_out − 2, 12)`; and
 - a target with `fan_out == 0` and at least one in-tree caller loses 20.
+
+A target whose name marks it as internal (`*Internal`, `*_internal`, argv
+parsers, `main`) gets no fan-out bonus, so a public wrapper stays above the
+deep worker it delegates to.
 
 Fan-out is evidence that a function coordinates several parsing stages. The
 bonus starts at three callees to avoid rewarding incidental delegation, grows
@@ -163,15 +164,15 @@ gradually, and is capped so project size cannot dominate the score.
 
 A called leaf has the opposite shape. It is more likely to be a narrow operation
 already reachable through a broader entry point. Directly fuzzing it can
-duplicate effort and omit state established by its caller. The −20 adjustment is
-a soft demotion, not a filter: the leaf remains available when higher-ranked
-targets fail or the campaign has additional budget.
+duplicate effort and omit state established by its caller. The −20
+adjustment is a soft demotion: the leaf stays in the list and is attempted
+when higher-ranked targets fail or the campaign has budget left.
 
-The graph is approximate. It uses source-level function boundaries and in-tree
-call names rather than a compiler-complete interprocedural graph. Runtime
+The graph is built from source-level function boundaries and in-tree call
+names, which approximates a compiler's interprocedural graph. Runtime
 evidence can override its scheduling decision.
 
-Implementation: [`discovery.rs`](https://github.com/Tarmo-Technologies/bhf/blob/main/crates/cli/src/auto/discovery.rs).
+Implementation: `crates/cli/src/auto/discovery.rs`.
 
 ## Worked comparison
 
@@ -222,16 +223,15 @@ target-value evidence identifies a whole-input boundary that coordinates more
 of the project. Attempting it first may reach `parse_chunk` plus the validation,
 dispatch, and state around it.
 
-The lower score does not mean that `parse_chunk` is safe, unimportant, or less
-vulnerable. It means that, under a limited campaign budget and the available
-source evidence, the broader target should be attempted first. The leaf remains
+The lower score says only that, under a limited budget and the available
+source evidence, the broader target is attempted first. `parse_chunk` stays
 in the ranked list for backfill.
 
 ## Language-specific scoring
 
-The common objective is stable across languages, but each parser exposes
-different evidence. One universal formula would obscure those differences.
-The same target-value versus harness-feasibility distinction still applies. For
+The objective is the same in every language, and each language's parser
+exposes different evidence, so each has its own formula. The same
+target-value and harness-feasibility distinction applies. For
 example, unsafe or security-sink signals primarily describe target value;
 visibility, simple input channels, existing fuzz declarations, and constructible
 receivers primarily describe harness feasibility.
@@ -247,7 +247,8 @@ harness-viability penalty. Smaller signals cover constrained scalars,
 arrays/slices, variants, access types, dispatch, middleware, concurrency,
 accessors, and limited-private inputs.
 
-Implementation: [`score.rs`](https://github.com/Tarmo-Technologies/bhf/blob/main/crates/target_rank/src/score.rs) and [`heuristics.rs`](https://github.com/Tarmo-Technologies/bhf/blob/main/crates/target_rank/src/heuristics.rs).
+Implementation: `crates/target_rank/src/score.rs` and
+`crates/target_rank/src/heuristics.rs`.
 
 ### Rust
 
@@ -257,7 +258,7 @@ surface `+15`; free/associated function `+8`; arity 1–4 `+5`; getter/writer
 `−20`; no byte channel `−20`; and unconstructible trait method `−60`. Private,
 documentation-hidden, and test-only functions are gated out.
 
-Implementation: [`rust_rank.rs`](https://github.com/Tarmo-Technologies/bhf/blob/main/crates/target_rank/src/rust_rank.rs).
+Implementation: `crates/target_rank/src/rust_rank.rs`.
 
 ### Java
 
@@ -272,7 +273,7 @@ The Rust and Java bonuses recognize declarations and methods that other fuzzing
 frameworks already use. These constructs explicitly declare fuzzing intent and
 define an existing mutated-input boundary.
 
-Implementation: [`java_rank.rs`](https://github.com/Tarmo-Technologies/bhf/blob/main/crates/target_rank/src/java_rank.rs).
+Implementation: `crates/target_rank/src/java_rank.rs`.
 
 ### Go
 
@@ -282,7 +283,7 @@ surface `−25`; and no byte channel `−25`. A zero-argument terminal method wi
 same-receiver public byte feeder receives `+105`, allowing the lifecycle pair to
 surface. Unexported functions are gated out.
 
-Implementation: [`go_rank.rs`](https://github.com/Tarmo-Technologies/bhf/blob/main/crates/target_rank/src/go_rank.rs).
+Implementation: `crates/target_rank/src/go_rank.rs`.
 
 ### Python and Perl
 
@@ -294,17 +295,18 @@ Perl uses string sink `+10`, parser name `+25`, callable without receiver `+8`,
 receiver `−10`, getter/writer `−20`, and low-value helper `−35`. Constructors,
 lifecycle hooks, and private subs are gated out.
 
-Implementations: [`python_rank.rs`](https://github.com/Tarmo-Technologies/bhf/blob/main/crates/target_rank/src/python_rank.rs) and [`perl_rank.rs`](https://github.com/Tarmo-Technologies/bhf/blob/main/crates/target_rank/src/perl_rank.rs).
+Implementations: `crates/target_rank/src/python_rank.rs` and
+`crates/target_rank/src/perl_rank.rs`.
 
 ### Name-prior lanes
 
-COBOL, Fortran, C#, JavaScript/TypeScript, Ruby, Lua, and PHP currently use a
+COBOL, Fortran, C#, JavaScript/TypeScript, Ruby, Lua and PHP use a
 semantic name prior. It starts at 50, adds 45 for parser/decoder/validator actions
 or 25 for useful transformation actions, adds 15 for `from_*` and 10 for data-
 format nouns, then demotes low-value helpers `−35`, path names `−25`, lifecycle/
 registry verbs `−20`, and selected framework-host namespaces `−45`.
 
-Implementation: [`discovery.rs`](https://github.com/Tarmo-Technologies/bhf/blob/main/crates/cli/src/auto/discovery.rs).
+Implementation: `crates/cli/src/auto/discovery.rs`.
 
 ## Inspecting a ranking
 
@@ -320,20 +322,19 @@ Use `--languages` to narrow the list without changing the cached discovery:
 bhf auto path/to/src --languages c,cpp --list-targets
 ```
 
-Candidates are ordered by descending score and then deterministic identity
-fields. The Ada listing currently serializes its named per-signal breakdown.
-Other typed rankers calculate named breakdown structures internally, but the
-standalone listing currently exposes only their total score and identity.
-Uniform per-lane score explanations are planned work.
+Candidates are ordered by descending score and then by deterministic
+identity fields. The Ada listing includes the named per-signal breakdown;
+for the other languages the listing shows the total score and the identity
+fields.
 
-`--max-targets N` applies the ranking to campaign admission. It keeps the top N
-candidates after language filtering; `--list-targets` continues to show the full
-ranked list.
+`--max-targets N` applies the ranking to the campaign: `bhf auto` stops once
+N targets have been fuzzed, working down the ranked list after language
+filtering. `--list-targets` shows the full ranked list.
 
 ## Testing and tuning
 
-The weights are engineering priorities, not learned coefficients or calibrated
-probabilities. Validation has four layers:
+The weights are hand-set engineering priorities. Validation has four
+layers:
 
 1. **Unit tests** exercise identifier splitting, individual score fields,
    eligibility gates, deterministic sorting, and language-specific rules.
@@ -348,7 +349,7 @@ probabilities. Validation has four layers:
    semantic boundary and use the score breakdown and coverage evidence to
    explain differences.
 
-The tuning procedure is conservative:
+To tune a weight:
 
 1. classify a recurring ranking failure;
 2. change the smallest relevant feature or weight;
@@ -356,8 +357,9 @@ The tuning procedure is conservative:
 4. rerun the broader fixture and campaign set; and
 5. check that the change did not invert previously correct rankings.
 
-Crash counts are not used as a direct weight-fitting objective. Findings are
-sparse and would encourage overfitting to a small benchmark.
+Weights are tuned on build, entry and coverage outcomes. Crash counts are
+too sparse to fit weights to, and fitting to them would overfit a small
+benchmark.
 
 Useful focused tests include:
 
@@ -366,19 +368,20 @@ cargo test -p target_rank
 cargo test -p bhf callgraph_ranks_orchestrator_entrypoint_above_leaf_helpers
 ```
 
-## Current limitations
+## Scope
 
 - The weights are hand-tuned and language-specific.
-- The source-level C/C++ call graph is approximate and is not applied to every
-  language lane.
-- New frameworks, naming conventions, generated code, and lifecycle patterns
-  continue to produce counterexamples.
-- A high score does not guarantee that the project can be built in the supplied
-  environment.
-- Similar target entry or line coverage does not prove expert-equivalent input
-  modeling or state construction.
-- Score reporting is not yet equally detailed across all language lanes.
+- The call-graph adjustment applies to C and C++.
+- New frameworks, naming conventions, generated code and lifecycle patterns
+  can produce ranking counterexamples; each one found becomes a regression
+  test.
+- Whether a project builds in your environment is decided by the build
+  step, whatever the score.
+- Expert-equivalent input modelling and state construction are measured by
+  the [expert harness parity audit](harness-parity-audit.md), not by
+  target entry or line coverage alone.
+- The `--list-targets` breakdown is most detailed for Ada.
 
-Ranking is intentionally revisable. Later build, target-entry, coverage, replay,
-and expert-evidence gates can override it, and campaign failures should feed back
-into the regression suite rather than be hidden behind a total score.
+Later build, target-entry, coverage, replay and expert-evidence gates can
+override the ranking, and campaign failures feed back into the regression
+suite.

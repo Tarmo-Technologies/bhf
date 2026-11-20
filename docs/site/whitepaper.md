@@ -1,174 +1,174 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # One fuzzer for the whole codebase
 
-### A white paper on bhf — automated, multi-language fuzzing for legacy and mission-critical software
+### A white paper on bhf: automated, multi-language fuzzing for legacy and mission-critical software
 
 ---
 
-## Executive summary
+## Summary
 
-Fuzzing finds the memory-safety and logic bugs that matter, but adopting it is
-expensive: a human writes a harness for every entry point, gets the project
-building under an instrumented toolchain, and does it again for the next
-language. For a legacy C/C++/Ada estate — radar, avionics, RTOS, defense — that
-cost is prohibitive, and for Ada there is simply no off-the-shelf tool at all.
+Fuzzing finds memory-safety and logic bugs, and adopting it takes work: a
+person writes a harness for every entry point, gets the project building
+under an instrumented toolchain, and repeats both for the next language. For
+a legacy C, C++ and Ada estate (radar, avionics, RTOS, defence) that work
+often stops the effort. For Ada, the established option is GNATfuzz, a
+commercial tool that needs a buildable GNAT project.
 
-**bhf removes the cost.** Point it at a source tree and it discovers the
-fuzzable entry points, generates typed harnesses, recovers the build when there
-isn't one, and fuzzes across **sixteen lanes: Ada, C, C++, Rust, Java, Python,
-Perl, Go, COBOL, Fortran, C#, JavaScript, TypeScript, Ruby, Lua, and PHP**, with
-a built-in engine or by driving AFL++ directly on native C/C++, COBOL,
-Fortran, Rust and Ada targets.
+**bhf automates that work.** Point it at a source tree and it discovers the
+fuzzable entry points, generates typed harnesses, recovers the build when
+there is none, and fuzzes across **sixteen languages: Ada, C, C++, Rust,
+Java, Python, Perl, Go, COBOL, Fortran, C#, JavaScript, TypeScript, Ruby, Lua
+and PHP**. It uses its built-in engine, or drives AFL++ on native C, C++,
+COBOL, Fortran, Rust and Ada targets.
 
-In head-to-head measurements against the most popular fuzzer for each language,
-bhf finds the same bugs the specialists find while requiring **zero**
-hand-written harness code (versus 5–13 lines each), covering **eight measured
-languages instead of one**, fuzzing code that has **no working build**, and auto-harnessing
-**185 targets from a single command** where the alternatives need one harness
-apiece. It is the only one of the group that fuzzes Ada.
+Head-to-head against the most-used fuzzer for C, Rust, Java and Ada, bhf
+found the same planted bugs as each specialist tool with **no** hand-written
+harness code (against 5 to 13 lines per target). It also fuzzed a target
+with **no working build**, harnessed **185 targets of the miniz library from
+one command**, and was the one tool in the group that fuzzes Ada.
 
-Full numbers and a reproducible benchmark suite are in the companion
+The full numbers and a reproducible benchmark suite are in the
 [comparison](comparison.md).
 
 ---
 
-## The problem: fuzzing's setup tax
+## The problem: setup cost
 
-A fuzzer is two parts. The **engine** — the mutation strategy and coverage
-feedback — is mature and largely interchangeable across AFL++, libFuzzer, LibAFL,
-and Jazzer. The **plumbing** is everything a human does to point that engine at
-code:
+A fuzzer has two parts. The **engine**, the mutation strategy and coverage
+feedback, is mature in AFL++, libFuzzer, LibAFL and Jazzer. The **plumbing**
+is what a person does to point that engine at code:
 
-1. **Write a harness** for each function you want to fuzz — decode raw bytes into
-   the function's typed arguments, construct any receiver object, call it.
-2. **Get a working, instrumented build** — the right sanitizer-coverage flags, a
-   nightly toolchain for some ecosystems, a `fuzz/` crate for others.
-3. **Repeat per entry point, and per language.**
+1. **Write a harness** for each function to fuzz: decode raw bytes into the
+   function's typed arguments, construct any receiver object, and call it.
+2. **Get a working, instrumented build**: the right sanitizer-coverage
+   flags, a nightly toolchain for some ecosystems, a `fuzz/` crate for
+   others.
+3. **Repeat** for each entry point and each language.
 
-On a greenfield service that is an afternoon. On a 30-year-old radar codebase
-with hundreds of parsers across C, C++, and Ada — often without a build that runs
-on a modern Linux box, sometimes only buildable by a vendor RTOS toolchain — it
-never happens. The bugs stay unfound not because the engines can't find them, but
-because no one can afford the plumbing.
+On a new service that is an afternoon's work. On a 30-year-old radar
+codebase with hundreds of parsers across C, C++ and Ada, often without a
+build that runs on a modern Linux host and sometimes buildable only with a
+vendor RTOS toolchain, the plumbing is the obstacle, not the engine.
 
-And for **Ada**, the lingua franca of safety-critical avionics and defense, the
-plumbing tax is infinite: AFL++ has no Ada mode, and there is no libFuzzer or
-Jazzer for it.
+For **Ada**, the language of much safety-critical avionics and defence
+code, AFL++ has no Ada front end and there is no libFuzzer or Jazzer;
+GNATfuzz needs a GNAT Pro licence and a project that builds.
 
 ---
 
-## The bhf approach: delete the plumbing
+## The bhf approach: automate the plumbing
 
-bhf is a front-end that automates all three steps across sixteen current
-language lanes.
+bhf automates all three steps in sixteen languages.
 
 **Discovery.** It parses the whole tree and ranks fuzzable subprograms by
-attacker-reachability — byte-channel parsers score highest, getters and internal
-helpers are demoted — so it fuzzes the surface that matters first. One command
-surfaced **185** fuzz targets in the miniz library.
+attacker reachability: parsers that take a byte channel score highest, and
+getters and internal helpers rank lower, so the most exposed surface is
+fuzzed first. One command found **185** fuzz targets in the miniz library.
+See [Target Ranking](target-ranking.md).
 
-**Typed harness generation.** For each target it generates the harness a human
-would have written: it decodes fuzz bytes into the real parameter types, and
-**synthesises receiver objects** for instance methods — a C++ class through its
-constructor, a Java object through its builder, an Ada record through its stream.
-No `LLVMFuzzerTestOneInput`, no `fuzz_target!`, no `fuzzerTestOneInput`.
+**Typed harness generation.** For each target, bhf generates the harness a
+person would have written. It decodes fuzz bytes into the real parameter
+types and **constructs receiver objects** for instance methods, for example
+a C++ class through a supported constructor or factory. You write no
+`LLVMFuzzerTestOneInput`, `fuzz_target!` or `fuzzerTestOneInput`.
 
-**Build recovery.** Legacy code rarely hands you a working build. bhf
-recovers the compile context — include paths, defines, generated headers — from
-CMake, Meson, Make/autotools, Ninja, Visual Studio, Bazel, or SCons, and for any
-other build (a bare `build.sh`, a vendor RTOS build) it intercepts the actual
-compiler invocations to learn the flags. When there is no build at all, it
-synthesises one and repairs the gaps. RTOS application code that only a Wind
-River, Green Hills, or QNX toolchain can compile is fuzzed **stub-isolated** on
-the host: bhf fakes the platform headers (`vxWorks.h`, `INTEGRITY.h`,
-`sys/neutrino.h`) so the algorithmic code builds and fuzzes with sanitizers.
+**Build recovery.** Legacy code rarely comes with a working build. With
+`--probe-build`, bhf recovers the compile context (include paths, defines,
+generated headers) from CMake, Meson, Make and autotools, Ninja or Visual
+Studio projects. For any other build, such as Bazel, SCons, a bare
+`build.sh` or a vendor RTOS build, `--build-command` runs it and intercepts
+the actual compiler invocations to learn the flags. Both run the project's
+own build scripts, so they are opt-in. When there is no build at all, bhf
+synthesises one and repairs the gaps. RTOS application code that only a
+Wind River, Green Hills or QNX toolchain can compile is fuzzed
+**stub-isolated** on the host: bhf fakes the platform headers (`vxWorks.h`,
+`INTEGRITY.h`, `sys/neutrino.h`) so the algorithmic code builds and fuzzes
+with sanitizers.
 
-**Engine of your choice.** The built-in engine is coverage-guided with
-cmplog/RedQueen *on by default* — in testing it cracked magic-byte, length, and
-input-to-state gates cold, with no configuration. When you want a specific
-engine's exact behaviour, bhf can drive AFL++ itself instead, on native
-C/C++ targets.
+**Engine choice.** The built-in engine is coverage-guided, with
+cmplog/RedQueen comparison solving *on by default*. In the benchmark it
+solved magic-byte, length and input-to-state gates from a cold start with
+no configuration. `bhf auto --engine afl++` drives AFL++ instead, and
+`bhf fuzz --engine` can also drive libFuzzer, honggfuzz and WinAFL.
 
-**Sixteen languages on one engine.** Ada/C/C++ use typed direct generators and
-the deepest repair loop; Rust and Java use native/JVM builders; Python, Perl,
-JavaScript/TypeScript, Ruby, Lua, and PHP use persistent interpreter drivers;
-and Go, COBOL, Fortran, and C# use their lane-specific compiled/runtime paths.
-The LD_PRELOAD behavioral/taint layer is narrower than the fuzzing surface: it
-runs on native Ada/C/C++/Rust/Go/COBOL/Fortran harnesses. The interpreted and
-managed lanes (Python, Perl, Ruby, Lua, PHP, Java, C#, JavaScript/TypeScript)
-keep their own coverage and crash/exception signals without that shim.
+**Sixteen languages, one engine.** Ada, C and C++ use typed direct
+generators and the deepest build-repair loop. Rust and Java use native and
+JVM builders. Python, Perl, JavaScript, TypeScript, Ruby, Lua and PHP use
+persistent interpreter drivers, and Go, COBOL, Fortran and C# use their own
+compiled or runtime paths. The `LD_PRELOAD` behavioural and taint layer runs
+on the native Ada, C, C++, Rust, Go, COBOL and Fortran harnesses and in the
+Python, Perl, Ruby, Lua and PHP interpreters. Java, C#, JavaScript and
+TypeScript use their own coverage and crash or exception signals. See
+[Vulnerability Coverage](vulnerability-coverage.md).
 
 ---
 
 ## The evidence
 
-We compared bhf against the most-used fuzzer for each language on identical
-planted-bug targets — a parser with a bug reachable only past a gate, so the
-engine's feedback has to work. Competitors ran in their **best** configuration
-(AFL++ with a CMPLOG binary, libFuzzer with value-profile). The methodology and
-every raw number are in the [comparison](comparison.md); the headlines:
+bhf ran against the most-used fuzzer for C, Rust, Java and Ada on identical
+planted-bug targets: a parser with a bug reachable only past a gate, so the
+engine's feedback has to work. The competitors ran in their **best**
+configuration (AFL++ with a CMPLOG binary, libFuzzer with value profile).
+The method and every raw number are in the [comparison](comparison.md). The
+main results:
 
-- **Zero harness, every benchmarked language.** bhf needs **0 lines** of hand-written
-  harness in C, C++, Ada, Rust, Java, Python, Perl, and Go. The alternatives
-  need 5–13 lines *per
-  target* — libFuzzer 6, AFL++ 13, cargo-fuzz 5, Jazzer 5.
-
-- **Same bugs.** On every target, bhf found the same planted bug the
-  specialist tool found. Its built-in engine solved all three C gate classes
-  cold — including the input-to-state gate that requires cmplog, which AFL++
-  needed a special `-c` build and libFuzzer needed `-use_value_profile` to crack.
-
-- **Faster to a crash from cold source.** Counting from raw source to first crash
-  — discovery, build, and fuzzing — bhf reached the bug in **1.2–2.6 s**. The
-  specialists' fuzz-only times (0.5–1.9 s) look comparable, but they start from a
-  pre-built harness a human already wrote; that authoring time is free in their
-  column and still zero in bhf's.
-
-- **Scale by command, not by headcount.** One `bhf auto` harnessed **185**
-  miniz targets. Matching that by hand is ~1,100–2,400 lines of harness code.
-
-- **No special toolchain.** bhf fuzzed Rust on **stable**; cargo-fuzz
-  requires nightly. bhf fuzzed code with **no working build**; every
-  competitor requires one.
-
-- **The only Ada fuzzer.** bhf discovered an Ada subprogram, decoded its
-  `String` parameter, built the GNAT harness, and found a `CONSTRAINT_ERROR` —
-  out of the box. No other tool in the comparison can fuzz Ada at all.
+- **No harness code.** bhf needs **0 lines** of hand-written harness in each
+  measured language. The alternatives need 5 to 13 lines *per target*:
+  libFuzzer 6, AFL++ 13, cargo-fuzz 5, Jazzer 5.
+- **Same bugs.** On every target, bhf found the planted bug the specialist
+  tool found. Its built-in engine solved all three C gate classes from a
+  cold start, including the input-to-state gate that needs cmplog, for which
+  AFL++ needed a separate `-c` build and libFuzzer needed
+  `-use_value_profile`.
+- **Time to first crash from source.** From raw source to first crash,
+  including discovery, build and fuzzing, bhf took **1.2 to 2.6 s**. The
+  specialists' fuzz-only times were 0.5 to 1.9 s, starting from a pre-built
+  harness that a person had already written.
+- **Targets per command.** One `bhf auto` run harnessed **185** miniz
+  targets. Writing those by hand is about 1,100 to 2,400 lines of harness
+  code.
+- **No working build needed.** bhf fuzzed code with **no working build**;
+  each competitor needs one.
+- **Ada.** bhf discovered an Ada subprogram, decoded its `String`
+  parameter, built the GNAT harness and found a `CONSTRAINT_ERROR` with no
+  options beyond the time budget. It was the one tool in the comparison that
+  fuzzes Ada.
 
 | | bhf | best alternative |
 |---|---|---|
-| Hand-written harness / target | **0 lines** | 5–13 lines |
-| Current product languages | **16** (the 8 named above were measured here) | one each |
+| Hand-written harness per target | **0 lines** | 5 to 13 lines |
+| Languages | **16** (C, Rust, Java and Ada measured here) | one each |
 | Targets per command | **all (185 on miniz)** | one |
 | Fuzzes with no working build | **yes** | no |
 | Fuzzes Ada | **yes** | no |
-| Finds the planted bug | **yes, every language** | yes |
+| Finds the planted bug | **yes, in each measured language** | yes |
 
 ---
 
-## Where it matters: legacy, defense, RTOS
+## Where it matters: legacy, defence, RTOS
 
-bhf targets legacy Ada, C, and C++ code, including projects built for RTOS
-platforms such as VxWorks, Green Hills INTEGRITY, and QNX that a Linux lab host
-cannot execute directly. Its build recovery, vendor-toolchain interception, and
-RTOS platform stubs reduce the manual work required to create a host-side fuzz
-target. It operates offline, treats scanned trees and child-process output as
-untrusted, and emits JSON, SARIF, JUnit, Markdown, and CSV reports.
+bhf targets legacy Ada, C and C++ code, including projects built for RTOS
+platforms such as VxWorks, Green Hills INTEGRITY and QNX that a Linux lab
+host cannot run directly. Its build recovery, vendor-toolchain interception
+and RTOS platform stubs cut the manual work of making a host-side fuzz
+target. It runs offline, treats scanned trees and child-process output as
+untrusted, and writes JSON, SARIF, JUnit, Markdown and CSV reports.
 
 ---
 
 ## Measured scope
 
-Across the eight lanes measured here, bhf found the same planted bugs as AFL++,
-libFuzzer, cargo-fuzz, and Jazzer without a handwritten harness. In this
-comparison, bhf was the only tool that exercised the Ada target. The result is
-a bounded comparison of the pinned fixtures and budgets listed below; it does
-not establish a general ranking across projects or fuzzing engines.
-
-One CLI coordinates the language lanes that this benchmark exercised.
+On the C, Rust, Java and Ada fixtures measured here, bhf found the same
+planted bugs as AFL++, libFuzzer, cargo-fuzz and Jazzer without a
+hand-written harness, and it was the one tool that exercised the Ada
+target. The results hold for the pinned fixtures and budgets in the
+[comparison](comparison.md). For bhf's engine against AFL++, libFuzzer and
+honggfuzz on identical targets, see the
+[Engine Benchmark](engine-parity-benchmark.md).
 
 ---
 
-*Reproduce every figure: `benchmarks/` in the bhf repository. Measurements on
-clang/libFuzzer 18, AFL++, cargo-fuzz 0.13 (Rust nightly), Jazzer, GNAT/gprbuild;
-6 vCPU / 13 GB.*
+*Reproduce every figure with the scripts in
+[benchmarks/](../../benchmarks/README.md). Measurements used
+clang/libFuzzer 18, AFL++, cargo-fuzz 0.13 (Rust nightly), Jazzer and
+GNAT/gprbuild on 6 vCPUs and 13 GB of RAM.*

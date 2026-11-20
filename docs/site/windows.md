@@ -2,61 +2,64 @@
 
 # Running bhf on Windows
 
-bhf builds and runs natively on Windows in addition to Linux. This page is
-the full install + run guide for native Windows. (To fuzz Windows targets *from
-Linux* without a Windows host, see the wine cross-fuzzing path in
-[cross-compilation.md](./cross-compilation.md).)
+bhf runs natively on 64-bit Windows. This page covers installing and running
+it, the WinAFL engine, Visual Studio solutions, Windows-only (MSVC/Win32)
+code, and how each language lane behaves on Windows. To fuzz Windows targets
+from Linux without a Windows host, see the wine cross-fuzzing path in
+[cross-compilation.md](cross-compilation.md).
 
 ## Supported Windows versions
 
-The published release supports 64-bit Windows 11 Enterprise 25H2, Windows 11
-Enterprise LTSC 2024 (the 24H2 codebase), Windows Server 2019, Windows Server
-2022, and Windows Server 2025. The compatibility floor is Windows Server 2019;
-Windows Server 2022 and Windows Server 2025 are continuously exercised by
-native CI jobs, while both Windows 11 client baselines and Windows Server 2019
-are covered by Proxmox VM validation. Windows 10 and Windows Server 2016 are not
-in the supported matrix.
+| Windows release (64-bit) | Tested by |
+|---|---|
+| Windows Server 2022, Windows Server 2025 | native CI jobs |
+| Windows 11 Enterprise 25H2, Windows 11 Enterprise LTSC 2024 (24H2 codebase), Windows Server 2019 | validation on VMs |
 
-Microsoft lists Windows 11 26H1 only for select new-device silicon and says it
-is not a feature update for existing 24H2/25H2 devices. It also does not provide
-a general-purpose x64 Enterprise evaluation ISO for that hardware-specific
-release. BHF therefore treats 25H2 as the latest broadly deployable Windows
-11 Enterprise release and states the tested versions explicitly; see
-[Microsoft's Windows 11 release information](https://learn.microsoft.com/windows/release-health/windows11-release-information).
+Windows Server 2019 is the oldest supported release. Windows 10 and Windows
+Server 2016 are outside the supported set. Windows 11 26H1 ships only on
+select new devices, is not a feature update for 24H2 or 25H2 devices, and has
+no general x64 Enterprise evaluation image, so 25H2 is the newest Windows 11
+release tested (see
+[Microsoft's Windows 11 release information](https://learn.microsoft.com/windows/release-health/windows11-release-information)).
 
-The Windows package contains native MSVC CLI and daemon executables. The
-PowerShell installer installs those executables, but it does not install target
-language toolchains. For native C/C++ scan/build/fuzz coverage, install all three
-items in the prerequisite table below: LLVM, VS Build Tools/Windows SDK, and GNU
-make.
+The Windows release has native MSVC builds of the CLI (`bhf.exe`) and of the
+daemon, in separate packages. The PowerShell installer installs the
+executable and no language toolchains. To scan, build and fuzz C/C++ on
+Windows, install the first three tools in the table below: VS Build Tools
+with the Windows SDK, clang, and GNU make.
 
 ## Prerequisites
 
-Install these (e.g. with [Chocolatey](https://chocolatey.org), `winget`, or the
-direct installers linked below):
+Install these with [Chocolatey](https://chocolatey.org), `winget`, or the
+direct installers linked below:
 
 | Tool | Why | Install |
 |------|-----|---------|
-| **VS Build Tools (MSVC + Windows SDK)** | The CRT, linker and SDK every harness links against; `cl.exe` for the MSVC lane; MSBuild for solutions. | [`vs_buildtools.exe`](https://aka.ms/vs/17/release/vs_buildtools.exe) `--quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended` |
+| **VS Build Tools (MSVC + Windows SDK)** | The CRT, linker and SDK every harness links against; `cl.exe` for the MSVC lane; MSBuild for solutions. | [vs_buildtools.exe](https://aka.ms/vs/17/release/vs_buildtools.exe) `--quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended` |
 | **clang** | The default harness compiler (edge coverage + cmplog + ASan). Either Visual Studio's "C++ Clang tools for Windows" component (`Microsoft.VisualStudio.Component.VC.Llvm.Clang`) or a standalone LLVM. | `--add Microsoft.VisualStudio.Component.VC.Llvm.Clang` on the Build Tools installer, or `choco install llvm` / the [LLVM release](https://github.com/llvm/llvm-project/releases) (`LLVM-*-win64.exe`). |
 | **GNU make** | bhf builds each C/C++ harness through a generated Makefile (same as Linux). | [w64devkit](https://github.com/skeeto/w64devkit/releases) unpacked to `C:\w64devkit`, or `choco install make`. |
 | **git** | Cloning target projects (optional). | `choco install git` or [Git for Windows](https://gitforwindows.org). |
 | **Rust** (optional) | Only to build bhf from source; you can also use a prebuilt `bhf.exe`. | [rustup](https://rustup.rs). |
 
-**No Developer shell is needed.** When `INCLUDE` and `LIB` are not already set,
-bhf finds the newest Visual Studio or Build Tools instance with the C++
+### The Visual Studio environment
+
+You do not need a Developer shell. When `INCLUDE` and `LIB` are not already
+set, bhf finds the newest Visual Studio or Build Tools instance with the C++
 toolset (`vswhere -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64`),
 runs its `VsDevCmd.bat -arch=x64` once, and applies the environment it sets
-(`PATH`, `INCLUDE`, `LIB`, `LIBPATH`, `VCToolsInstallDir`, `WindowsSdkDir`, ...)
-to its own process before any build starts; every `make`, harness and
-reproducer bhf starts inherits it. Only what VsDevCmd changed (the variables
-it set and the `PATH` directories it added) is cached, per instance, version
-and architecture, in `%LOCALAPPDATA%\bhf\vs-env\`, and later runs apply that
-change onto their own environment, so a variable or `PATH` entry you changed
-since is kept, and nothing else from the first run's environment is written to
-disk. A Visual Studio update causes a new capture. bhf then locates the tools it needs
-when they are not on `PATH`: clang (a clang on `PATH` wins, then
-`%ProgramFiles%\LLVM\bin`, then Visual Studio's bundled
+(`PATH`, `INCLUDE`, `LIB`, `LIBPATH`, `VCToolsInstallDir`, `WindowsSdkDir`,
+...) to its own process before any build starts. Every `make`, harness and
+reproducer bhf starts inherits it.
+
+bhf caches only what VsDevCmd changed (the variables it set and the `PATH`
+directories it added), per instance, version and architecture, in
+`%LOCALAPPDATA%\bhf\vs-env\`. Later runs apply that change onto their own
+environment, so a variable or `PATH` entry you changed since is kept, and
+nothing else from the first run's environment is written to disk. A Visual
+Studio update causes a new capture.
+
+bhf then finds the tools it needs when they are not on `PATH`: clang (a clang
+on `PATH` wins, then `%ProgramFiles%\LLVM\bin`, then Visual Studio's bundled
 `VC\Tools\Llvm\x64\bin`) and make (`C:\w64devkit\bin`,
 `%USERPROFILE%\w64devkit\bin`, Chocolatey's `bin`, GnuWin32, MSYS2). Every
 command prints one line saying what it used:
@@ -67,8 +70,9 @@ bhf: build environment: Visual Studio Build Tools 2022 17.14.37906.3 (x64, cache
 
 `bhf auto` records the same in `run.json` (`build_environment`) and in its
 `--dry-run` plan. Inside a Developer shell (`INCLUDE`/`LIB` set) the shell's
-environment is used as it is. `--no-vs-env` (or `BHF_NO_VS_ENV=1`) turns
-discovery off; `--vs-arch x86|x64|arm64` picks another target architecture.
+environment is used as it is. Two global options, shown in `bhf --help` on
+Windows only, control discovery: `--no-vs-env` (or `BHF_NO_VS_ENV=1`) turns it
+off, and `--vs-arch x86|x64|arm64` picks another target architecture.
 For one that is not this machine's, clang is given `--target=` for it
 (`i686-pc-windows-msvc` for x86) and must carry that architecture's
 AddressSanitizer runtime: the standalone LLVM and Visual Studio's x64 clang
@@ -82,7 +86,7 @@ never as recipe text, so `Program Files (x86)` needs no quoting.
 
 ### One-shot setup on a stock Windows 11 VM
 
-Windows 11 ships [`winget`](https://learn.microsoft.com/windows/package-manager/),
+Windows 11 ships [winget](https://learn.microsoft.com/windows/package-manager/),
 so from a fresh VM (an elevated PowerShell):
 
 ```powershell
@@ -90,14 +94,14 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools -e `
   --override "--quiet --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.VC.Llvm.Clang --includeRecommended"
 winget install --id Git.Git -e                          # optional: clone targets
 winget install --id Rustlang.Rustup -e                  # build bhf from source
-# GNU make: w64devkit is not in winget — download the release zip and unpack it
+# GNU make: w64devkit is not in winget. Download the release zip and unpack it
 # to C:\w64devkit (bhf finds C:\w64devkit\bin\make.exe itself):
 #   https://github.com/skeeto/w64devkit/releases
 ```
 
-Optional per-lane toolchains are needed only for a lane you actually run. See
-the limitations below before installing them: the Fortran lane runs without
-sanitizers on native Windows.
+Install another language's toolchain only for a lane you run.
+[Notes and limitations](#notes-and-limitations) lists what each lane needs on
+Windows; the Fortran lane, for example, runs without sanitizers there.
 
 ## Getting `bhf.exe`
 
@@ -109,10 +113,12 @@ installer:
   CLI ZIP automatically, so you do not need both files.
 - Add `bhf-daemon-installer.ps1` (or the daemon ZIP and sidecar) only for
   IDE, JSON-RPC, or read-only MCP use. The CLI does not require the daemon.
-- Ignore `bhf_runtrace_shim-*` and `bhf_cc_intercept-*`; those are
-  Linux-only `LD_PRELOAD` components and have no Windows archives.
-- `source.tar.gz`, `dist-manifest.json`, and checksum files are for source audit,
-  automation, or manual verification—not additional programs to install.
+- Ignore `bhf_runtrace_shim-*` and `bhf_cc_intercept-*`: they are Linux-only
+  `LD_PRELOAD` components with no Windows archives.
+- `source.tar.gz`, `dist-manifest.json` and the checksum files are for source
+  audit, automation or manual verification; they are not programs to install.
+
+Set `$Version` to the release tag you want:
 
 ```powershell
 $Version = "0.3.0"
@@ -120,13 +126,13 @@ irm "https://github.com/Tarmo-Technologies/bhf/releases/download/$Version/bhf-in
 bhf.exe --version
 ```
 
-The PowerShell installer is also safe to run through Windows OpenSSH:
-it suppresses `Expand-Archive`'s console progress access, which otherwise fails
-in a non-interactive Server 2019 session. The installer adds
-`%USERPROFILE%\.cargo\bin` to the user `PATH`; start a new shell if the command
-is not visible immediately.
+The PowerShell installer also runs over Windows OpenSSH: it turns off
+`Expand-Archive`'s console progress display, which fails in a non-interactive
+Server 2019 session. The installer puts `bhf.exe` in
+`%USERPROFILE%\.cargo\bin` and adds that directory to the user `PATH`; start
+a new shell if the command is not found at once.
 
-The release binary does not require Rust. Alternatively, build it natively:
+The release binary does not need Rust. To build it natively instead:
 
 ```powershell
 rustup target add x86_64-pc-windows-msvc   # or -gnu
@@ -134,7 +140,8 @@ cargo build --release -p bhf
 # -> target\release\bhf.exe
 ```
 
-…or cross-build it on Linux and copy it over (see cross-compilation.md):
+Or cross-build it on Linux and copy it over (see
+[cross-compilation.md](cross-compilation.md)):
 
 ```sh
 rustup target add x86_64-pc-windows-gnu
@@ -151,11 +158,11 @@ bhf.exe auto C:\path\to\source --work-dir C:\Temp\bhf-work `
   --jobs 1 --max-targets 1 --per-target-time 10
 ```
 
-`auto` discovers fuzzable functions, generates typed harnesses, builds them with
-clang (edge coverage + cmplog + ASan), fuzzes with the built-in engine, and
-writes JSON/Markdown findings — the same core fuzzing pipeline as on Linux. A harness fault is
-detected through ASan or the driver's unhandled-exception filter (Windows has no
-POSIX signals).
+`auto` runs the same pipeline as on Linux: it discovers fuzzable functions,
+generates typed harnesses, builds them with clang (edge coverage, CmpLog and
+ASan), fuzzes them with the builtin engine, and writes JSON and Markdown
+findings. Windows has no POSIX signals, so a harness fault is detected through
+ASan or the driver's unhandled-exception filter.
 
 ### Verify the install
 
@@ -176,10 +183,10 @@ count. Read `C:\Temp\bhf-work\results\INDEX.md` for findings and
 A sanitized harness needs the AddressSanitizer runtime DLL
 (`clang_rt.asan_dynamic-x86_64.dll`), which lives outside `PATH` (in clang's
 resource directory, or beside `cl.exe` for the MSVC lane). After each harness
-build bhf puts that DLL — the one from the toolchain that built the harness —
-next to `main.exe`, where Windows looks first, and lists its directories in
+build, bhf puts the DLL from the toolchain that built the harness next to
+`main.exe`, where Windows looks first, and lists its directories in
 `harnesses\<id>\bhf-runtime-path.txt`. So `main.exe testcase.bin`,
-`bhf replay --finding ...` and the finding's reproducer work from any shell:
+`bhf replay --finding <id>` and the finding's reproducer work from any shell:
 
 ```powershell
 python C:\Temp\bhf-work\results\findings\<id>\replay.py
@@ -207,9 +214,8 @@ and the same SanitizerCoverage flags as the cl lane, spelled by the bhf-cl
 front end's translation, and bhf's weak repair stubs compile from MSVC copies.
 `$env:CC`/`$env:CXX` names another compiler. Outside a Developer shell the
 script takes the environment cl and clang-cl read from Visual Studio itself,
-and it copies the
-sanitizer runtime DLL next to `poc.exe`, so a capsule rebuilds and replays
-from a plain PowerShell on a machine without bhf:
+and it copies the sanitizer runtime DLL next to `poc.exe`, so a capsule
+rebuilds and replays from a plain PowerShell on a machine without bhf:
 
 ```powershell
 bhf.exe capsule --work-dir C:\Temp\bhf-work --finding-id <id>
@@ -222,7 +228,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
 `bhf explain` quotes the work dir and capsule paths it prints, so a path
 with spaces (`C:\Users\a b\work`) pastes as one argument.
 
-## WinAFL engine (`--engine winafl`)
+## WinAFL engine
 
 [WinAFL](https://github.com/googleprojectzero/winafl) is a third engine for
 C/C++ targets on native Windows, beside the builtin engine and AFL++.
@@ -239,9 +245,9 @@ bhf.exe auto C:\path\to\source --engine builtin,winafl --per-target-time 240
 
 ### Installing WinAFL and DynamoRIO
 
-WinAFL no longer ships prebuilt binaries, so build it with CMake against a
-DynamoRIO package. The versions bhf is validated with (Windows Server 2022, VS
-2022 Build Tools 17.14):
+WinAFL publishes no prebuilt binaries, so build it with CMake against a
+DynamoRIO package. bhf is validated with these versions (Windows Server 2022,
+VS 2022 Build Tools 17.14):
 
 | Tool | Version | Where |
 |------|---------|-------|
@@ -399,8 +405,8 @@ An AddressSanitizer harness does not run under DynamoRIO, which is why WinAFL
 gets its own build. Measured on the validation VM (clang 23 `-fsanitize=address`,
 DynamoRIO 11.3.0 and 11.91.20763): the ASan binary hangs at start-up under
 `drrun` even with no client, while the same source without ASan runs WinAFL's
-persistent loop at 1,500 to 4,600 executions a second. And WinAFL's client
-treats every first-chance access violation as a crash, while 64-bit Windows
+persistent loop at 1,500 to 4,600 executions a second. WinAFL's client also
+treats every first-chance access violation as a crash, and 64-bit Windows
 ASan commits its shadow memory on demand from access violations.
 
 Without ASan, WinAFL sees a memory error only when it faults. A heap overflow
@@ -496,7 +502,7 @@ mode.
 
 ## Visual Studio solutions (.sln / .vcxproj)
 
-`bhf auto` imports a Visual Studio solution by default — no flag — when the
+`bhf auto` imports a Visual Studio solution by default, with no flag, when the
 tree has a `.sln`, `.slnx` or `.vcxproj` and no `compile_commands.json` or
 CMake/Meson build. On a Linux host it does so only when the solution is the
 tree's only build description: a tree that also ships a Makefile, autotools
@@ -583,7 +589,7 @@ then prints `msbuild evaluation` instead of `static evaluation`; under
 `--probe-build` it writes `compile_commands.json` to the work dir's probe home
 (`<work>\probe\<tree>-<hash>\.bhf-build\`) like the other probe tiers.
 
-Why evaluation is opt-in: evaluating a project runs code the scanned tree
+Evaluation is opt-in because evaluating a project runs code the scanned tree
 chooses. MSBuild calls the property functions the project files contain
 (`$([System.IO.File]::ReadAllText(...))`, `$([MSBuild]::...)`, and more),
 reads and evaluates every file they import (a `Directory.Build.props` or
@@ -600,22 +606,23 @@ Example (lz4's bundled solution): `bhf.exe auto C:\src\lz4` imports
 `build\VS2022\lz4.sln`, then builds and fuzzes the `LZ4_decompress_*` parsers.
 
 Notes:
-- Headers produced by a custom pre-build/codegen step are not materialized by
-  the import — run that step first, use `--build-command` (below), or use the
-  CMake probe if the project also ships CMake.
-- Coverage is instrumented by compiling the target's sources with bhf's
-  harness compiler (not the project's cl-built objects), so findings carry real
-  edge coverage.
-- A target whose signature bhf cannot yet auto-harness is skipped/reported as
-  a failed build; the rest of the solution still fuzzes.
+- The import does not run a custom pre-build or code-generation step, so the
+  headers it produces do not exist yet. Run that step first, use
+  `--build-command` (below), or use the CMake probe if the project also ships
+  CMake.
+- bhf compiles the target's sources with its own harness compiler, rather
+  than linking the project's cl-built objects, so findings carry edge
+  coverage.
+- A target whose signature bhf cannot harness is reported as a failed build
+  and skipped; the rest of the solution is still fuzzed.
 
 ## Software that only builds on Windows (MSVC / Win32)
 
-This is the reason to run bhf on a Windows host rather than cross-fuzzing from
-Linux: a target that calls Win32 APIs (`<windows.h>`, `CreateFileW`, sockets via
-`ws2_32`), uses MSVC-only language constructs (`__declspec`, `__try/__except` SEH,
-MSVC intrinsics), or only ships a Visual Studio build cannot be built anywhere but
-Windows. bhf harnesses it natively there.
+A target that calls Win32 APIs (`<windows.h>`, `CreateFileW`, sockets through
+`ws2_32`), uses MSVC-only language constructs (`__declspec`, `__try/__except`
+SEH, MSVC intrinsics), or ships only a Visual Studio build builds only on
+Windows. Run bhf on a Windows host to harness and fuzz it there; cross-fuzzing
+from Linux cannot build it.
 
 **MSVC-only source compiles.** On Windows clang defaults to the
 `x86_64-pc-windows-msvc` target, so it accepts the MSVC dialect: `__declspec`,
@@ -691,8 +698,8 @@ cl); the build itself is not altered. Each cl run compiles several sources, and
 each becomes its own row. The rows are cl-style and are read as described in
 [c-cpp.md](c-cpp.md). A tool that starts a compiler by absolute path without
 going through MSBuild's CL task is not captured (the Linux-only `LD_PRELOAD`
-exec shim has no Windows equivalent). `--build-command` executes the project's
-own (untrusted) build — only run trees you trust.
+exec shim has no Windows equivalent). `--build-command` runs the project's own
+build, which is untrusted code: use it only on trees you trust.
 
 **Generated headers.** If the build generates headers via a codegen/pre-build step
 (`midl`, a `.tt` template, a custom tool), run that step (or a full `msbuild`) once
@@ -714,38 +721,41 @@ prerequisites. A path containing `$`, `#`, `%`, a backtick, a double quote or
 another shell operator (`;`, `|`, `<`, `>`) is still refused, and the message
 names the character. The Visual Studio environment bhf applies (or a Developer
 PowerShell) sets `INCLUDE` and `LIB`, which clang and cl read, so the Visual
-Studio and Windows SDK system include dirs never need `--extra-include` — and
-should not be passed that way.
+Studio and Windows SDK system include dirs never need `--extra-include`; do
+not pass them that way.
 
-**What you give up vs. Linux.** Only the LD_PRELOAD behavioral/taint oracles (see
-the limitations below) — they are Linux-only. Crash detection (a fault becomes a
-distinctive exit via the driver's structured-exception handler), edge coverage,
-cmplog, and ASan all work natively on Windows.
+**Differences from Linux.** Crash detection (the driver's structured-exception
+handler turns a fault into a distinctive exit), edge coverage, CmpLog and ASan
+work natively on Windows. The `LD_PRELOAD` behavioral and taint oracles are
+Linux-only; the notes below list them and each lane's other Windows
+differences.
 
-## Notes / current limitations
+## Notes and limitations
 
 - bhf itself runs on Linux, Windows and, built from source, macOS on Apple
   Silicon ([install.md](./install.md#macos-apple-silicon-from-source)).
-- The **C/C++ lane** (including Visual Studio solutions) is the primary,
-  most-exercised native-Windows path. It builds with clang or cl: GCC
-  (MinGW-w64's, Cygwin's, MSYS2's) ships no AddressSanitizer or UBSan runtime
-  on Windows, and the harness links both, so a C or C++ target whose `CC` or
-  `CXX` is gcc is refused there, naming the compiler, and reported static-only
-  (discovered and statically analyzed, not fuzzed), unless `--sanitizers none`
-  asks for a crash-only build without them. Go emits a native binary
-  and works with `go` installed; a Go capsule rebuilds through `build.sh`, so
-  `bhf verify-poc` needs a POSIX `sh` on `PATH` (Git for Windows' will do).
-  Ada and COBOL also produce native binaries but their Windows toolchain
-  combinations are less exercised; validate them on a representative target
-  before relying on a campaign. The Rust lane runs on native Windows with a
-  nightly Rust for `x86_64-pc-windows-msvc` and LLVM's clang: the harness
-  crate builds as an MSVC staticlib (`bhf_rust_harness.lib`) with
-  SanitizerCoverage, AddressSanitizer and the static CRT clang links an
-  ASan program with, and clang links it with the driver and the system
-  libraries rustc names for it. Rust's allocator calls the Windows heap directly, so the
-  harness sets ASan's `windows_hook_rtl_allocators=1` default; without it
-  ASan would see no Rust heap block's bounds.
-- The Fortran lane runs on native Windows with MinGW-w64's gfortran and gcc
+- The **C/C++ lane** (including Visual Studio solutions) has the most
+  Windows test coverage. It builds with clang or cl. GCC (MinGW-w64's,
+  Cygwin's, MSYS2's) ships no AddressSanitizer or UBSan runtime on Windows,
+  and the harness links both, so a C or C++ target whose `CC` or `CXX` is gcc
+  is refused there with a message naming the compiler, and reported
+  static-only (discovered and statically analyzed, not fuzzed), unless
+  `--sanitizers none` asks for a crash-only build without sanitizers.
+- The **Go** lane builds a native binary and needs `go` installed. A Go
+  capsule rebuilds through `build.sh`, so `bhf verify-poc` needs a POSIX `sh`
+  on `PATH` (Git for Windows' works).
+- The **Ada** and **COBOL** lanes also build native binaries. bhf's Windows
+  CI does not run them, so check them on a representative target before you
+  rely on a campaign.
+- The **Rust** lane runs with a nightly Rust for `x86_64-pc-windows-msvc` and
+  LLVM's clang. The harness crate builds as an MSVC staticlib
+  (`bhf_rust_harness.lib`) with SanitizerCoverage, AddressSanitizer and the
+  static CRT that clang links an ASan program with, and clang links it with
+  the driver and the system libraries rustc names for it. Rust's allocator
+  calls the Windows heap directly, so the harness sets ASan's
+  `windows_hook_rtl_allocators=1` default; without it ASan would see no Rust
+  heap block's bounds.
+- The **Fortran** lane runs on native Windows with MinGW-w64's gfortran and gcc
   on `PATH` (Strawberry Perl's `C:\Strawberry\c\bin`, or MSYS2's
   `mingw-w64-ucrt-x86_64-gcc-fortran`). MinGW-w64's GCC ships no sanitizer
   runtime, so the lane builds without AddressSanitizer there: the Fortran
@@ -754,10 +764,10 @@ cmplog, and ASan all work natively on Windows.
   instead of gfortran's `exit(2)`. The gcc beside gfortran builds bhf's
   driver and the glue, and the harness links gfortran's runtime statically.
   Each finding's `fidelity.sanitizers` says `none (toolchain limit)` with the
-  reason: an overflow the checks do not cover (a write through an
-  assumed-size array, a C buffer) is not found there, as it is under ASan on
-  Linux. `bhf capsule` does not yet rebuild such a harness: its objects
-  link only with MinGW's gcc, which a capsule's build does not drive.
+  reason. An overflow the checks do not cover (a write through an
+  assumed-size array, a C buffer) goes unreported on Windows; ASan reports
+  it on Linux. `bhf capsule` refuses such a harness, with the reason: its
+  objects link only with MinGW's gcc, which a capsule build does not drive.
 - The Python lane runs on native Windows with a Python 3 on `PATH` (`python`
   or `python3`). Its `main` is a POSIX launcher, so it also writes
   `main.launch.json` beside it: the interpreter, the driver and the environment
@@ -786,30 +796,30 @@ cmplog, and ASan all work natively on Windows.
   `scripts\ci\install-lua-windows.ps1 -Dest C:\tools\lua54` builds Lua 5.4
   from lua.org's source with clang. PHP's coverage comes from the `pcov`
   extension, as on Linux; without it the lane fuzzes without coverage.
-- The persistent fork-server + coverage-guided engine run on Windows the same as
-  on Linux (shared-memory coverage via Win32 file mapping).
-- Microsoft Defender's real-time scanning does not slow fuzzing down, and a
-  Defender exclusion for the work dir is not needed for speed. Measured on a
-  Windows Server 2022 VM (6 cores) with a small C harness under `bhf fuzz`:
-  2483 executions/s with the work dir scanned and 2432 with it excluded
-  (persistent fork server); 7.0 and 7.2/s when every input starts a new
-  process (`--no-fork-server`, about 140 ms per ASan process start). Defender
-  adds about 100 ms to the first start of a newly built binary, once. What
-  does slow a run down is an oversubscribed CPU: with twice as many busy
+- The persistent fork-server and the coverage-guided engine work on Windows
+  as on Linux, with shared-memory coverage through Win32 file mapping.
+- **Microsoft Defender.** On a Windows Server 2022 VM (6 cores), Defender's
+  real-time scanning made no measurable difference to `bhf fuzz` on a small C
+  harness: 2483 executions/s with the work dir scanned and 2432 with it
+  excluded (persistent fork server); 7.0 and 7.2/s when every input starts a
+  new process (`--no-fork-server`, about 140 ms per ASan process start).
+  Defender added about 100 ms to the first start of a newly built binary,
+  once. An oversubscribed CPU did slow the run: with twice as many busy
   processes as cores the same harness ran 0.4 executions/s, and with four
   times as many its first start took over 2 s, past the fork-server
   handshake, so the run fell back to one process per input. Give a campaign
   the cores it fuzzes with (`--jobs`), and do not share them with builds.
-- The LD_PRELOAD runtrace shim is Linux-only (an empty stub on Windows), so the
-  behavioral and taint oracles (BHF-405 path control, BHF-304 command injection,
-  BHF-417 insecure temp, BHF-305 sensitive env) do not fire on native Windows via
-  that path. Crash detection and coverage-guided fuzzing are unaffected.
-- The **runtime-event collector** (`--collector`, #60) is the native-Windows path
-  to clean-exit semantic findings. `--collector auto` selects the native ETW
-  provider (`bhf-collector-win`). It starts a BHF-owned system-logger real-time
-  session (never the global NT Kernel Logger) with the process, file-I/O and
-  image-load flags, runs `ProcessTrace` over it, and emits the
-  platform-neutral `bhf.collector-event.v1` JSONL contract.
+- The `LD_PRELOAD` runtrace shim is Linux-only (an empty stub on Windows), so
+  its behavioral and taint oracles (BHF-405 path control, BHF-304 command
+  injection, BHF-417 insecure temp, BHF-305 sensitive env) do not fire on
+  native Windows. Crash detection and coverage-guided fuzzing work as on
+  Linux; the runtime-event collector below covers some clean-exit findings.
+- The **runtime-event collector** (`--collector`, #60) produces clean-exit
+  semantic findings on native Windows. `--collector auto` selects the native
+  ETW provider (`bhf-collector-win`). It starts a system-logger real-time
+  session of its own (never the global NT Kernel Logger) with the process,
+  file-I/O and image-load flags, runs `ProcessTrace` over it, and writes
+  events in the platform-neutral `bhf.collector-event.v1` JSONL format.
   - **Decoding.** Each live `EVENT_RECORD` is decoded by the pure
     `win_etw_decode` module, the MOF decode of the three kernel providers:
     - process creation and the descendant tree (a `ShellExecuteEx` call shows
@@ -841,17 +851,17 @@ cmplog, and ASan all work natively on Windows.
       the command line gets a controlled-process-execution finding (BHF-431);
     - the same target with a constant command line is observed and gets none.
 
-    The file and image-load classes are decoded and unit-tested against
-    ETW-shaped records, but no live control covers a BHF-405 or BHF-435
-    finding yet. `bhf fuzz --collector` replays the harness the same way, on
-    each of the campaign's retained inputs (its crash findings, then its
-    persisted corpus, at most 16), launched as `bhf replay` runs the harness.
+    The file and image-load classes (BHF-405, BHF-435) are decoded and
+    unit-tested against ETW-shaped records; the live controls cover BHF-431.
+    `bhf fuzz --collector` replays the harness the same way, on each of the
+    campaign's retained inputs (its crash findings, then its persisted
+    corpus, at most 16), launched as `bhf replay` runs the harness.
   - **Rights.** Starting an ETW session needs session rights (an elevated
-    prompt). Without them the provider records `fidelity.permission_denied`
-    instead of reporting a silent clean run.
-- The native-Windows harness build uses GNU `make` + clang (same as Linux), or
-  cl through `bhf-cl` with `--cc cl`; the drive-letter colon + backslash quirks
-  are handled by emitting forward-slash paths into the recipe.
+    prompt). Without them the provider records `fidelity.permission_denied`,
+    so the run is not reported as clean.
+- The native-Windows harness build uses GNU `make` and clang (as on Linux),
+  or cl through `bhf-cl` with `--cc cl`. bhf writes forward-slash paths into
+  the recipe, so drive-letter colons and backslashes need no escaping.
 - GNU make runs a harness recipe through `sh` when one is on `PATH`
   (w64devkit, MSYS2) and through `cmd` otherwise, so a compile flag that needs
   quoting there (a space, parenthesis, apostrophe or shell operator, as in

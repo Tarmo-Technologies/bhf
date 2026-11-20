@@ -1,9 +1,10 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Fuzzing JavaScript / Node.js with bhf
 
-bhf fuzzes JavaScript with **no harness to write** — point it at a Node source
-tree and it discovers exported functions, generates the harness, and fuzzes them
-coverage-guided with **real V8 block coverage**, on a warm Node process.
+bhf fuzzes JavaScript with **no harness to write**. Point it at a Node source
+tree: it discovers exported functions, generates the harness and fuzzes each
+function with coverage guidance from **V8's own block coverage**, in a warm
+Node process.
 
 ```sh
 bhf auto path/to/js-src --languages javascript
@@ -11,197 +12,206 @@ bhf auto path/to/js-src --languages javascript
 
 ## How it works
 
-An **exported** function taking at least one argument is the fuzzable unit. bhf:
+The fuzzable unit is an **exported** function that takes at least one
+argument. bhf:
 
-1. **Discovers** each exported function across both module systems — CommonJS
-   (`module.exports = { parse }`, `exports.parse = …`, `module.exports = fn`) and
-   ESM (`export function parse`, `export const parse = …`, `export default`) — plus
-   the **public instance methods of exported classes** (`class Parser { parse(x) }`;
-   the driver `new`s a no-argument-constructible class and calls the method). The
-   first argument is inferred as a `Buffer` or UTF-8 `string` from its name
-   (`buf`/`data`/`bytes` → Buffer; `str`/`text`/`source`/`html` → string), or
-   from its TypeScript annotation when it has one (see below).
-2. **"Builds"** it with a `node -c` syntax check (interpreted — there is no native
-   binary) and emits a launcher.
-3. **Fuzzes** it on bhf's builtin fork-server engine driving **one warm Node
-   process** over the framed protocol (amortizing interpreter + `require` startup).
-   Per input the driver records **real V8 precise block coverage** via the inspector
-   Profiler and folds it — keyed on `(script, block span, taken/not-taken)` — into
-   bhf's cumulative `BHF_COV_SHM` edge bitmap, so the engine gets genuine
-   branch feedback, not black-box guessing.
+1. **Discovers** each exported function in both module systems, CommonJS
+   (`module.exports = { parse }`, `exports.parse = …`, `module.exports = fn`)
+   and ESM (`export function parse`, `export const parse = …`,
+   `export default`), plus the **public instance methods of exported
+   classes** (`class Parser { parse(x) }`; the driver constructs a class that
+   takes no constructor arguments and calls the method). It infers the first
+   argument from its name: `buf`, `data` or `bytes` get a `Buffer`; `str`,
+   `text`, `source` or `html` get a UTF-8 `string`; a path-like name
+   (`filePath`, `filename`) gets a temporary file holding the input. A
+   TypeScript annotation takes precedence (see below).
+2. **Checks** the module with `node -c` (a syntax check; there is no native
+   binary to build) and writes a launcher.
+3. **Fuzzes** it with bhf's built-in fork-server engine, which drives **one
+   warm Node process** over the framed protocol, so the interpreter and
+   `require` start once. For each input the driver records **V8 precise
+   block coverage** through the inspector Profiler and folds it, keyed on
+   `(script, block span, taken/not-taken)`, into bhf's cumulative
+   `BHF_COV_SHM` edge bitmap. The engine gets branch feedback from the code
+   that ran.
 
 ### Browser globals
 
-A module written for a browser may reference `window`, `document` or
-`navigator`, which Node lacks: it fails to load (`ReferenceError: window is
-not defined`), or throws on its first input. When it does, the driver installs
-inert stand-ins for the browser globals Node does not define (`window` and
-`self` as the global object, `document` with elements that do nothing,
-`navigator`, `location` on `http://localhost/`, in-memory
-`localStorage`/`sessionStorage`, `history`, `screen`), then loads or runs
-again. A class it needs (`HTMLFormElement`, `customElements`, a
-`MutationObserver`) gets a stand-in too, as the module hits it, at load or as
-its receiver is constructed. A module that only tests `typeof window` gets
-none. The driver records the globals it stood in for in the harness's
-`browser-globals.txt` and installs them before the target loads, since an ES
-module that threw as it loaded keeps its error in that process. Each
-of the target's findings carries them in `fidelity.environment_shim` and its
-`fidelity_caveat`. A finding may depend on the stand-ins rather than on a real
-browser, so check it in one.
+A module written for a browser can reference `window`, `document` or
+`navigator`, which Node does not define. It then fails to load
+(`ReferenceError: window is not defined`) or throws on its first input.
+When that happens, the driver installs inert stand-ins for the browser
+globals Node lacks and loads or runs the module again:
+
+- `window` and `self` as the global object;
+- `document`, with elements that do nothing;
+- `navigator`, `location` on `http://localhost/`, `history` and `screen`;
+- in-memory `localStorage` and `sessionStorage`.
+
+A class the module needs (`HTMLFormElement`, `customElements`,
+`MutationObserver`) gets a stand-in as the module reaches it, at load or
+when its receiver is constructed. A module that only tests `typeof window`
+gets none.
+
+The driver records the globals it stood in for in the harness's
+`browser-globals.txt` and installs them before the target loads, because an
+ES module that threw while loading keeps that error in the process. Each of
+the target's findings lists them in `fidelity.environment_shim` and in its
+`fidelity_caveat`. Such a finding can depend on the stand-ins, so reproduce
+it in a real browser.
 
 ### Oracle
 
-An **uncaught exception** that is not input rejection is the finding signal (the
-driver hard-halts with exit 86). The error is classified into a BHF rule + CWE:
+An **uncaught exception** that is not input rejection is a finding; the
+driver halts with exit code 86. bhf classifies the error into a rule and a
+CWE:
 
 | Error | Rule | CWE |
 |---|---|---|
 | `RangeError: Maximum call stack size exceeded` | BHF-207 | CWE-674 (uncontrolled recursion) |
-| `RangeError: Invalid array/string length`, out-of-memory | BHF-209 | CWE-789 (resource exhaustion) |
-| `ReferenceError`, an explicit `throw new Error(...)`, and other ECMAScript built-in error types | BHF-210 | reachable crash |
+| `RangeError: Invalid array/string length`, out of memory | BHF-209 | CWE-789 (resource exhaustion) |
+| `ReferenceError`, an explicit `throw new Error(...)`, and the other ECMAScript built-in error types not listed below | BHF-210 | reachable crash |
 
-The finding's sink and fix location are the first frame of the target's own
-code: a V8 builtin frame (`at get length [as length] (<anonymous>)`, `native`,
-`node:internal/...`) has no source file to fix and is skipped.
+The finding's sink and fix location are the first frame in the target's own
+code. bhf skips V8 builtin frames (`at get length [as length]
+(<anonymous>)`, `native`, `node:internal/...`), which have no source file to
+fix.
 
-Errors whose `.name` is not an ECMAScript built-in — Node's `AssertionError`, a
-library's `ValidationError`, and similar — are treated as ordinary input
-rejection and suppressed, as are the `TypeError`/`SyntaxError` artifacts of the
-untyped lane synthesizing only the first argument, so they do not become BHF-210
-findings.
+**Input rejection.** These errors count as the target rejecting the input
+and do not become findings:
 
-Beyond uncaught exceptions, the driver runs **taint-confirmed bug detectors** (the
-JS analog of bhf's native oracles, and of Jazzer.js's bug detectors):
+- `TypeError`, `SyntaxError`, `URIError` and a validating `RangeError`;
+- errors whose `.name` is not an ECMAScript built-in, such as Node's
+  `AssertionError` or a library's `ValidationError`.
 
-- **Command injection** (**BHF-431 / CWE-78**) — it hooks
-  `child_process.exec`/`execSync` and reports when a shell-metacharacter-bearing
-  substring of the fuzz input reaches the command (the input controls shell
-  *syntax*, not just data). The command is **never executed** (a benign stub is
-  returned), so the fuzzer can't run arbitrary shell, and an input whose
-  metacharacters never reach a command is not flagged.
-- **Prototype pollution** (**BHF-509 / CWE-1321**) — the top JS injection class. The
-  driver snapshots `Object.prototype` / `Array.prototype` at startup and, after any
-  input carrying a `__proto__`/`constructor`/`prototype` vector, reports a new
-  own-property that appeared on them. Complete `{"__proto__":{…}}` payloads are
-  seeded into the dictionary so an unsafe `JSON.parse`+merge is reachable, and the
-  vector-token gate keeps benign `JSON.parse` (which never pollutes) from being
-  flagged.
+In this untyped lane bhf synthesises only the *first* argument, so a
+`TypeError` ("Cannot read properties of undefined", "x is not a function")
+almost always comes from the harness calling the function without a later
+argument or with the wrong first shape. In the 30-project campaign below,
+every `TypeError` was of that kind. The Python lane treats `TypeError` and
+`AttributeError` the same way. Injection classes are caught by the
+detectors below.
 
-`TypeError`, `SyntaxError`, `URIError`, and a validating `RangeError` are treated as
-intended input rejection and swallowed. This mirrors the Python lane, which
-suppresses the exact analogs (`TypeError`/`AttributeError`): in an untyped lane
-bhf synthesizes only the *first* argument, so a `TypeError` ("Cannot read
-properties of undefined", "x is not a function") is dominated by us calling a
-function with a missing later argument or the wrong first shape — our fault, not a
-target defect. A 30-project campaign confirmed every `TypeError` was such an
-artifact, so suppressing the class is the key to a low false-positive rate. Real
-memory-safety / injection classes are caught by the behavioral oracles, not this
-exception policy.
+**Taint-confirmed detectors.** Beyond uncaught exceptions, the driver runs
+bug detectors, the JavaScript counterpart of bhf's native oracles and of
+Jazzer.js's bug detectors:
 
-## Where bhf stands vs the field
+- **Command injection** (**BHF-431, CWE-78**). The driver hooks
+  `child_process.exec` and `execSync` and reports when a substring of the
+  fuzz input that holds a shell metacharacter reaches the command, which
+  means the input controls shell syntax. The command is **never run**: the
+  hook returns a benign stub. An input whose metacharacters never reach a
+  command is not flagged.
+- **Prototype pollution** (**BHF-509, CWE-1321**). The driver snapshots
+  `Object.prototype` and `Array.prototype` at start-up and, after any input
+  carrying a `__proto__`, `constructor` or `prototype` token, reports a new
+  own property on them. Complete `{"__proto__":{…}}` payloads are added to
+  the dictionary so an unsafe `JSON.parse` and merge is reachable. The token
+  gate keeps a plain `JSON.parse`, which never pollutes, from being flagged.
 
-JavaScript has two notable fuzzers, both of which bhf's zero-harness,
-auto-discovery model improves on:
+## Compared with other JavaScript fuzzers
 
 - **[Jazzer.js](https://github.com/CodeIntelligenceTesting/jazzer.js)** (Code
-  Intelligence) — the strongest JS fuzzer. It instruments source with a Babel/hook
-  plug-in and drives libFuzzer, but you write a `fuzz(data)` entry per target, wire
-  it into a Jest/standalone runner, and manage the toolchain.
-- **[jsfuzz](https://github.com/fuzzitdev/jsfuzz)** — Istanbul-coverage,
-  coverage-guided, but likewise one hand-written `fuzz(buf)` function per target and
-  now largely unmaintained.
+  Intelligence) instruments source with a Babel hook plug-in and drives
+  libFuzzer. You write a `fuzz(data)` entry per target, wire it into a Jest
+  or standalone runner, and manage the toolchain. It ships bug detectors for
+  command injection, path traversal and prototype pollution.
+- **[jsfuzz](https://github.com/fuzzitdev/jsfuzz)** uses Istanbul coverage
+  and also needs one hand-written `fuzz(buf)` function per target. Its
+  repository has seen little maintenance.
 
-On the static side, ESLint, SonarJS, and CodeQL flag candidate issues but don't
-confirm them with real input. Jazzer.js additionally ships *bug detectors*
-(command injection, path traversal, prototype pollution); bhf's JS driver
-carries taint-confirmed **command-injection** and **prototype-pollution** detectors
-(see the oracle section) in the same fuzz-confirming style as its native lanes.
+ESLint, SonarJS and CodeQL flag candidate issues statically; they do not run
+the code with inputs.
 
 | | Jazzer.js / jsfuzz | **bhf `auto --languages javascript`** |
 |---|---|---|
-| Fuzz entry to write | one per target | **none — auto-discovered** |
-| Coverage | Babel/Istanbul instrumentation | **V8 precise block coverage (no source rewrite)** |
+| Fuzz entry to write | one per target | **none; discovered** |
+| Coverage | Babel or Istanbul instrumentation | **V8 precise block coverage, no source rewrite** |
 | Multi-target sweep | scripted by hand | **one command over the whole tree** |
-| Warm process reuse | per-runner | **framed fork-server (one warm V8)** |
-| Findings → CWE / SARIF / CSV | — | built-in |
-
-In the documented comparison, bhf fuzzes JavaScript from source with **zero harness**,
-using the V8 engine's own coverage (no Babel/Istanbul source transform) folded into
-a shared edge map.
+| Warm process reuse | per runner | **framed fork-server (one warm V8)** |
+| Findings to CWE, SARIF, CSV | n/a | built in |
+| Bug detectors | command injection, path traversal, prototype pollution (Jazzer.js) | command injection, prototype pollution |
 
 ## TypeScript
 
-`bhf auto --languages typescript` fuzzes `.ts`/`.tsx` the same way. Discovery
-runs directly on the TypeScript source — the parser reads a signature like
-`parse(input: string, opts?: Options): Result`; `interface`/`type`
-declarations and `private`/`protected`/`abstract` members are ignored. The
-first parameter's annotation decides what it is passed: `string` gets a
-string, and `Buffer`, `Uint8Array`, `ArrayBuffer`, `DataView` or a union
-holding one gets a `Buffer`, whatever the parameter is called (so
+`bhf auto --languages typescript` fuzzes `.ts` and `.tsx` files the same way.
+Discovery reads the TypeScript source directly, so it sees a signature such
+as `parse(input: string, opts?: Options): Result`, and it skips `interface`
+and `type` declarations and `private`, `protected` and `abstract` members.
+
+The first parameter's annotation decides what it receives, whatever the
+parameter is called: `string` gets a string, and `Buffer`, `Uint8Array`,
+`ArrayBuffer`, `DataView` or a union holding one gets a `Buffer` (so
 `decode(data: string)` gets a string). A path-like name (`filePath`,
 `filename`) still gets a temporary file, and an unannotated parameter or
-another type falls back to the name rules above. The target is then
-transpiled to CommonJS with [esbuild](https://esbuild.github.io/) (bundling local
-imports, leaving `node_modules` external) and driven by the identical warm-Node
-framed driver — same V8 block coverage, dictionary, exception oracle, and
-command-injection detector as the JavaScript lane. esbuild writes a source
-map beside the transpiled module and the harness runs node with
-`--enable-source-maps`, so a finding's stack, `finding.json` and SARIF name the
-`.ts` file and line (`src/codec.ts:7`), not the transpiled `target.js`. A plain
-JavaScript harness runs node without it.
+another type falls back to the name rules above.
+
+bhf then transpiles the target to CommonJS with
+[esbuild](https://esbuild.github.io/), bundling local imports and leaving
+`node_modules` external, and drives it with the same warm-Node framed
+driver: the same V8 block coverage, dictionary, exception oracle and
+detectors as the JavaScript lane. esbuild writes a source map next to the
+transpiled module, and the harness runs node with `--enable-source-maps`, so
+a finding's stack, `finding.json` and SARIF name the `.ts` file and line
+(`src/codec.ts:7`) rather than the transpiled `target.js`. A plain
+JavaScript harness runs node without that flag.
 
 ```sh
-bhf auto path/to/ts-src --languages typescript   # needs node + esbuild
+bhf auto path/to/ts-src --languages typescript   # needs node and esbuild
 ```
 
-Requirements: Node.js and `esbuild` (`npm i -g esbuild`, or the project's own
-`node_modules/.bin/esbuild`). bhf looks for esbuild on `PATH`, then in
-`node_modules/.bin` of the target's directory and of each directory above it up
-to and including the directory `bhf auto` scans, the nearest first. It never
-looks above that directory: a `node_modules` there belongs to no scanned
-project, and in a directory other users can write, such as `/tmp`, anyone could
-plant the esbuild bhf would run. A single scanned file has no project directory,
-so only `PATH` is searched. The run-start toolchain check resolves esbuild the
-same way for each TypeScript target, so a project's own esbuild satisfies it.
-bhf never runs `npx` to find esbuild: since npm 7 that looks the package up in
-the registry. Absent either tool the lane skips cleanly, and the target's
-outcome is `missing_toolchain` (the reason names the tool; the next steps ask
-for the install). `bhf auto --resume` tries such a target again, so installing
-the tool and resuming fuzzes it. `.d.ts` declaration files (no runtime code) are
-not fuzzed.
+**Finding esbuild.** Install it with `npm i -g esbuild`, or use the
+project's own `node_modules/.bin/esbuild`. bhf looks on `PATH` first, then
+in `node_modules/.bin` of the target's directory and of each directory above
+it, up to and including the directory `bhf auto` scans, nearest first. It
+never looks above the scanned directory: a `node_modules` there belongs to
+no scanned project, and in a directory other users can write, such as
+`/tmp`, anyone could plant the esbuild bhf would run. When you scan a single
+file there is no project directory, so bhf searches only `PATH`. The
+toolchain check at the start of the run resolves esbuild the same way for
+each TypeScript target, so a project's own esbuild satisfies it. bhf never
+runs `npx` to find esbuild, because npm 7 and later look the package up in
+the registry.
+
+When node or esbuild is missing, the lane skips the target with outcome
+`missing_toolchain`; the reason names the tool and the next steps say what
+to install. `bhf auto --resume` tries such a target again, so install the
+tool and resume. `.d.ts` declaration files hold no runtime code and are not
+fuzzed.
 
 ## Validation (campaign)
 
-A 30-project campaign over the most-depended-on npm libraries — express, lodash,
-axios, moment, validator.js, node-semver, marked, joi, qs, node-fetch, and more:
+A 30-project campaign ran over widely depended-on npm libraries, including
+express, lodash, axios, moment, validator.js, node-semver, marked, joi, qs
+and node-fetch:
 
-- **2,018 JS files scanned, 531 fuzzable functions discovered, 0 bhf panics** —
-  the corpus included CommonJS and ESM, minified and hand-written code
-  (validator.js alone → 111 targets, moment → 162). The first-argument name filter
-  keeps internal array/options helpers (`multilineRegexp(parts)`) out of the fuzz
-  set.
-- **End-to-end** on a parser: real V8 branch coverage drove the engine to an
-  uncontrolled-recursion crash (`RangeError: Maximum call stack size exceeded`,
-  BHF-207 / CWE-674) with the V8 stack, from **zero hand-written harness** — and with
-  the `TypeError` suppression policy, **0 false positives** across the campaign's
-  built-and-fuzzed validators.
+- **2,018 JavaScript files scanned, 531 fuzzable functions discovered, 0 bhf
+  panics.** The corpus held CommonJS and ESM, minified and hand-written code
+  (validator.js alone gave 111 targets, moment 162). The first-argument name
+  filter keeps internal array and options helpers
+  (`multilineRegexp(parts)`) out of the fuzz set.
+- **End to end** on a parser, V8 branch coverage drove the engine to an
+  uncontrolled-recursion crash (`RangeError: Maximum call stack size
+  exceeded`, BHF-207, CWE-674) with the V8 stack, from **no hand-written
+  harness**. With the `TypeError` rejection policy, the campaign's built and
+  fuzzed validators gave **0 false positives**.
 
-## Requirements & licensing
+## Requirements and licensing
 
-- **Node.js** on the host — no npm packages are installed for the lane itself; the
-  target is `require`d as-is. Absent `node`, the lane skips cleanly (the
-  GNAT-less rule).
-- The driver uses only Node built-ins (`inspector`, `fs`) — no third-party fuzzing
-  dependency, nothing linked into bhf.
+- **Node.js** on the host. The lane installs no npm packages; the target is
+  `require`d as it is. Without `node`, the lane skips the target with a
+  reason.
+- The driver uses only Node built-ins (`inspector`, `fs`); it has no
+  third-party fuzzing dependency and nothing is linked into bhf.
 
-## Limits
+## Scope
 
-- The fuzzable surface is the **first argument** (Buffer/string); a function whose
-  behavior needs a second structured argument (an options object) is driven with
-  the first arg only, so bhf feeds the primitive it can and relies on the
-  rejection policy to suppress our-fault `TypeError`s.
-- CommonJS/ESM modules that require a bundler/transpile step (TypeScript source,
-  `import`-only ESM without a `.mjs`/`package.json type`) may not `require` as-is —
-  point bhf at the built/published `lib/` in that case.
-- One function is fuzzed at a time; the target's own `require`d dependencies load
-  but coverage is scoped to the module under test.
+- The fuzzed input is the **first argument** (a Buffer, string or file). A
+  function whose behaviour depends on a second structured argument, such as
+  an options object, is called with the first argument only, and the
+  rejection policy above absorbs the `TypeError`s that causes.
+- An `import`-only ESM package without `.mjs` or a `package.json` `"type"`
+  can fail to load with `require`; point bhf at the built or published
+  `lib/` directory instead.
+- bhf fuzzes one function at a time. The target's own `require`d
+  dependencies load, and coverage is scoped to the module under test.

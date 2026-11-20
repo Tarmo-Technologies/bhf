@@ -1,86 +1,79 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
-# bhf vs leading SAST tools — a 50-project measurement
+# bhf vs leading SAST tools: a 50-project measurement
 
-*How bhf's static scanner compares to the standard open-source SAST tool for
-each language, measured on 50 real GitHub projects across the eight core
-languages in this campaign. The current static rule matrix also includes
-JavaScript/TypeScript and selected config/IaC checks; the current fuzzing
-surface is sixteen lanes.*
+*bhf's static scanner (`bhf static-scan`) compared with the standard
+open-source SAST tool for each language, on 50 GitHub projects across the
+eight languages the campaign covered. The static rule matrix today also
+includes JavaScript/TypeScript and selected config and IaC checks, and bhf
+fuzzes sixteen languages.*
 
-## TL;DR
+## Summary
 
 We cloned 50 well-known open-source projects (Ada, C, C++, Rust, Go, Java,
-Python, Perl) and ran bhf's static scanner alongside the leading open-source
-SAST tool(s) for each language. The result:
+Python, Perl) and ran bhf's static scanner beside the leading open-source
+SAST tool or tools for each language. The results:
 
-- **bhf finds the security-relevant classes the other tools find** — command
-  injection, path traversal, unsafe deserialization, SSRF, disabled TLS, weak
-  crypto, hardcoded secrets, buffer/format/integer bugs — and in Go and Java it
-  reports **more** real security findings than `semgrep`'s language packs because
-  its taint engine crosses function boundaries.
-- **with far less noise.** On the same code, `flawfinder` reports 8320 findings
-  in C where bhf reports 1051; `bandit` reports 10822 in Python where bhf
-  reports 155; `perlcritic` reports 8570 in Perl where bhf reports 36.
-- **and more usable output:** every bhf finding carries a CWE, a severity and
-  a confidence, and — for the taint classes — a cross-function data-flow trace.
-  The finding a fuzzer actually reaches is upgraded to `fuzz_confirmed`; no other
-  tool here has that.
+- **Security classes.** bhf reported the security-relevant classes the other
+  tools reported: command injection, path traversal, unsafe deserialization,
+  SSRF, disabled TLS, weak crypto, hardcoded secrets, and buffer, format and
+  integer bugs. In Go and Java it reported more security findings than
+  `semgrep`'s language packs, because its taint engine follows data across
+  function boundaries.
+- **Volume.** On the same code, `flawfinder` reported 8320 findings in C
+  where bhf reported 1051; `bandit` 10822 in Python where bhf reported 155;
+  `perlcritic` 8570 in Perl where bhf reported 36.
+- **Output.** Every bhf finding carries a CWE, a severity and a confidence,
+  and the taint classes carry a cross-function data-flow trace. Under
+  `bhf auto --static`, a static finding at the site of a fuzz finding is
+  upgraded to `fuzz_confirmed`; no other tool in the study has that step.
 
 ![Finding volume: bhf vs competitors](img/sast-volume.png)
 
 ![Signal density: share of findings that are security-relevant](img/sast-signal.png)
 
-## Scale & performance — 10M+ SLOC
+## Scale and performance on 10M+ SLOC
 
-Enterprise SAST is judged as much on how fast and how safely it scans a giant tree
-as on what it finds. bhf's static scanner is built for it:
-
-- **The Linux kernel — 37.2M SLOC of C — scans in 40 seconds** on a 6-core box,
-  at **924,000 SLOC/s**, holding **648 MB RSS**. RocksDB (0.9M SLOC) in 2.4s,
-  Postgres (0.8M) in 2.8s. Across all 49 scanned projects: **zero crashes, zero
-  hangs, bounded memory.**
-- That is after a **~600× engine speedup**: the interprocedural taint pass used to
-  be O(functions²) — it tested every source line against every function name in the
-  whole-project index. Inverting that to extract call names *from* each line
-  (O(tokens · log N)) took a mid-size C repo from 100s to 1.6s single-threaded;
-  the Linux kernel, quadratic, would previously have taken **hours**.
-- Scanning is **data-parallel** on a pool bounded to `cores − 1` (never pins the
-  machine at 100%), reading and **dropping each file's source right after parse**
-  so steady-state memory is O(workers · file-size), not O(total SLOC). Output is
-  deterministic — byte-identical regardless of thread count.
-- A **memory watchdog** samples RSS against a ceiling (the smaller of 80% of host
-  available memory and 70% of a cgroup limit) and degrades gracefully — workers
-  stop pulling new files and the report records a truncation gap, substantially
-  reducing OOM-kill risk. A per-file size cap skips a pathological
-  generated/minified blob before reading it, and dependency/build
-  trees such as virtualenvs, `node_modules`, `dist`, vendored deps, and generated
-  JS `compiled/` bundles are pruned before analysis.
-
-No open-source competitor in this study scans at that rate within a hard memory
-ceiling; this is the axis on which bhf competes with the commercial tools
-(Coverity, Fortify, CodeQL) rather than the OSS ones.
+- **The Linux kernel, 37.2M SLOC of C, scans in 40 seconds** on a 6-core
+  machine, at about 924,000 SLOC/s and 648 MB RSS. RocksDB (0.9M SLOC) scans
+  in 2.4 s and Postgres (0.8M) in 2.8 s. Across the 49 scanned projects the
+  scanner did not crash or hang, and its memory stayed bounded.
+- The interprocedural taint pass extracts the call names from each source
+  line and looks them up in the whole-project index, which costs
+  O(tokens · log N).
+- Scanning runs in parallel on a worker pool of `cores − 1` (`--jobs` sets
+  it), and each file's source is dropped right after parsing, so
+  steady-state memory grows with workers × file size, not with total SLOC.
+  The output is byte-identical whatever the thread count.
+- A memory watchdog samples RSS against a ceiling: by default the smaller of
+  80% of available host memory and 70% of a cgroup limit, or
+  `--max-memory-mb`. At the ceiling, workers stop taking new files and the
+  report records a truncation gap instead of the process being OOM-killed. A
+  per-file size cap skips a generated or minified blob before reading it,
+  and dependency and build trees (virtualenvs, `node_modules`, `dist`,
+  vendored dependencies, generated JS `compiled/` bundles) are pruned before
+  analysis.
 
 ## Method
 
 | | |
 |---|---|
-| Projects | 50 repos pulled from GitHub (shallow clone), spanning small single-file libraries to large trees (libarchive, mitmproxy, gnatcoll-core, alire). 49 scanned; one Ada repo failed to clone. |
-| bhf | `bhf static-scan <repo> --debug` (this repo, campaign build). |
+| Projects | 50 repositories cloned shallowly from GitHub, from small single-file libraries to large trees (libarchive, mitmproxy, gnatcoll-core, alire). 49 were scanned; one Ada repository failed to clone. |
+| bhf | `bhf static-scan <repo> --debug` (the campaign build of this repository). |
 | Python | `bandit` 1.9.3; `semgrep` 1.168 (`p/python`). |
 | Go | `gosec` 2.19; `semgrep` (`p/golang`). |
-| Java | `semgrep` (`p/java`). (SpotBugs/Find-Sec-Bugs need compiled bytecode; out of scope for a source-only run.) |
+| Java | `semgrep` (`p/java`). SpotBugs and Find-Sec-Bugs need compiled bytecode, so this source-only run left them out. |
 | C / C++ | `flawfinder` 2.0.19; `cppcheck` 2.13; `semgrep` (`p/c`). |
 | Rust | `cargo clippy`. |
 | Perl | `perlcritic` (Perl::Critic). |
-| Ada | *no readily-installable open-source SAST* — GNATcheck/CodePeer are GPL/commercial. bhf is the only tool in this comparison that covers Ada. |
+| Ada | No readily installable open-source SAST tool (GNATcheck and CodePeer are GPL or commercial), so bhf's Ada results have no comparison. |
 
-"Security-relevant" means the finding maps to a CWE in the injection / memory /
-crypto / secret / SSRF / TLS / path / randomness families a security reviewer
-triages — as opposed to a style or generic-correctness lint. Each tool's native
-CWE mapping is used where it provides one.
+"Security-relevant" means the finding maps to a CWE in the injection,
+memory, crypto, secret, SSRF, TLS, path or randomness families a security
+reviewer triages, as opposed to a style or generic-correctness lint. Each
+tool's own CWE mapping is used where it has one.
 
-Every finding count below is reproducible; the harness and the per-repo raw
-outputs are described under [Reproduction](#reproduction).
+Every finding count below can be reproduced; the harness and per-repository
+raw outputs are described under [Reproduction](#reproduction).
 
 ## Volume and signal, per language
 
@@ -109,148 +102,155 @@ outputs are described under [Reproduction](#reproduction).
 | Perl | perlcritic | 4 | 8570 | 0 | 0% |
 
 † gosec resolves types through `go/packages`, which needs the module to build
-with the installed Go toolchain. Most modern repos in the set require Go ≥ 1.23
-(installed: 1.22), so gosec returned 0 on them; the one repo it fully analyzed
-(cobra) is shown. semgrep — which is AST-only and needs no build — is the
-reliable Go comparator here.
+with the installed Go toolchain. Most modern repositories in the set require
+Go 1.23 or later (1.22 was installed), so gosec returned 0 findings on them;
+the table shows the one repository it fully analyzed (cobra). semgrep is
+AST-only and needs no build, so it carries the Go comparison.
 
-The two linters in the set that are **not** security tools — `perlcritic`
-(style) and `clippy` (correctness/idiom) — report 8570 and 465 findings with
-zero security-CWE content. They are excellent at what they do; the point is that
-neither Perl nor Rust has a widely-installed *security* scanner, and bhf
-fills that gap (and drives clippy as a subprocess adapter so its lints merge into
-the same report).
+`perlcritic` (style) and `clippy` (correctness and idiom) are linters, not
+security tools: they reported 8570 and 465 findings with no security-CWE
+content. Neither Perl nor Rust has a widely installed security scanner;
+bhf's Perl and Rust rules report security findings. Run clippy beside bhf
+for Rust lints: `bhf static-scan --external-tools` folds in gosec, Bandit,
+semgrep and GNATcheck, and does not run clippy or cppcheck.
 
 ## Does bhf find what the others find?
 
-Per language, mapping every tool's findings to CWE classes, bhf covers the
-security classes the competitors report — and adds the interprocedural taint
-classes the pattern tools miss:
+Mapping every tool's findings to CWE classes, per language, bhf covers the
+security classes the other tools report, and adds interprocedural taint
+classes that single-pattern rules do not see:
 
-- **Command injection (CWE-78), path traversal (CWE-22), unsafe deserialization
-  (CWE-502), SQL injection (CWE-89), log injection (CWE-117):** bhf's taint engine confirms these as
-  cross-function flows. In Go and Java it reported *more* real instances (path
-  traversal, disabled TLS, `ObjectInputStream` deserialization, secret exposure)
-  than semgrep's packs, which match single-line patterns.
-- **Buffer/format/integer/uninitialized bugs (CWE-120/787/134/190/457/197):**
-  bhf and flawfinder/cppcheck overlap here. flawfinder reports ~8× more
-  because it flags *every* call to a banned function (`memcpy`, `strncpy`,
-  `strcpy`, `sprintf`) regardless of whether the source is bounded; bhf grades
-  by source danger (a string-literal `strcpy` is low, a variable-source `strcpy`
-  medium, `gets` high) and reports the def-use-tracked uninitialized read rather
-  than a blanket pattern.
-- **Weak crypto (CWE-327), hardcoded secrets (CWE-798), disabled TLS (CWE-295),
-  SSRF (CWE-918):** covered across the languages where they apply.
+- **Command injection (CWE-78), path traversal (CWE-22), unsafe
+  deserialization (CWE-502), SQL injection (CWE-89), log injection
+  (CWE-117):** bhf's taint engine reports these as cross-function flows. In
+  Go and Java it reported more instances (path traversal, disabled TLS,
+  `ObjectInputStream` deserialization, secret exposure) than semgrep's
+  packs, which match single-line patterns.
+- **Buffer, format, integer and uninitialized bugs
+  (CWE-120/787/134/190/457/197):** bhf overlaps with flawfinder and cppcheck
+  here. flawfinder reports about 8× more because it flags every call to a
+  banned function (`memcpy`, `strncpy`, `strcpy`, `sprintf`) whether or not
+  the source is bounded. bhf grades by source (a string-literal `strcpy` is
+  low, a variable-source `strcpy` medium, `gets` high) and reports a
+  def-use-tracked uninitialized read rather than a blanket pattern.
+- **Weak crypto (CWE-327), hardcoded secrets (CWE-798), disabled TLS
+  (CWE-295), SSRF (CWE-918):** covered in the languages where they apply.
 
-Two classes the competitors reported that bhf **did not** have going in — and
-now does, added during this campaign:
+Two classes the other tools reported were added to bhf during this
+campaign:
 
-- **Insecure randomness (CWE-338, new rule `BHF-428`)** — a non-crypto PRNG feeding
-  a secret. bandit (`B311`), gosec (`G404`), semgrep and flawfinder all flag weak
-  randomness. bhf's version is *context-gated*: it fires only when the value
-  is a `token`/`key`/`nonce`/`salt`/`session`/`csrf`/`otp`/`credential`, so it
-  reports the security-relevant subset rather than every `random()` used for
-  jitter or test data — and skips the CSPRNG sources.
-- **Weak crypto in C/C++ (CWE-327)** — `MD5`/`SHA1`/`MD4`/`DES`/`RC4`/`crypt`. The
-  interpreted-lane rule was extended to C/C++.
+- **Insecure randomness (CWE-338, rule `BHF-428`):** a non-cryptographic
+  PRNG feeding a secret. bandit (`B311`), gosec (`G404`), semgrep and
+  flawfinder all flag weak randomness. bhf's rule fires only when the value
+  is a `token`, `key`, `nonce`, `salt`, `session`, `csrf`, `otp` or
+  `credential`, so it reports that security-relevant subset rather than
+  every `random()` used for jitter or test data, and it skips CSPRNG
+  sources.
+- **Weak crypto in C/C++ (CWE-327):** `MD5`, `SHA1`, `MD4`, `DES`, `RC4` and
+  `crypt`. The interpreted-language rule was extended to C/C++.
 
-The classes bhf still declines are documented in
-[the coverage matrix](static-cwe-coverage.md): XSS, CSRF and session-lifetime
-issues need a live framework/DOM and belong to DAST; cppcheck's null-dereference
-and generic-correctness findings are a different tool category (bug-finding, not
-security), which bhf leaves to cppcheck/clippy as adapters.
+[The coverage matrix](static-cwe-coverage.md) lists the classes bhf's static
+rules do not cover. XSS, CSRF and session-lifetime issues need a live
+framework or DOM and belong to DAST. cppcheck's null-dereference and
+generic-correctness findings belong to a bug-finding tool rather than a
+security scanner; run cppcheck or clippy alongside bhf for them.
 
-## Why the noise gap is this large
+## Why the volume gap is this large
 
-The competitor totals are dominated by low-signal rules:
+Low-signal rules make up most of the other tools' totals:
 
-- **bandit:** 9882 of its 10822 Python findings (91%) are `B101 assert_used` —
-  "don't use `assert` in production." Another large share is `B404`/`B603`
-  ("you imported/called `subprocess`"). These are informational, not
-  vulnerabilities. bandit's security-relevant output is ~589 findings;
-  bhf's 155 are the higher-severity, taint-confirmed subset with less
+- **bandit:** 9882 of its 10822 Python findings (91%) are
+  `B101 assert_used` ("don't use `assert` in production"). Another large
+  share is `B404`/`B603` ("you imported or called `subprocess`"). These are
+  informational. bandit's security-relevant output is about 589 findings;
+  bhf's 155 are the higher-severity, taint-traced subset, with less
   duplication.
-- **flawfinder:** flags every occurrence of a dangerous function name. On zlib
-  alone it reports 296 findings (mostly bounded `memcpy`/`strncpy`); bhf
-  reports 130, graded by source.
-- **perlcritic / clippy:** style and idiom linters — valuable, but 0% of their
-  output is a security finding.
+- **flawfinder:** flags every occurrence of a dangerous function name. On
+  zlib alone it reports 296 findings, mostly bounded `memcpy`/`strncpy`
+  calls; bhf reports 130, graded by source.
+- **perlcritic and clippy:** style and idiom linters; none of their output
+  is a security finding.
 
-Less noise is not achieved by finding less: it is achieved by **grading by
-danger** (source-controlled vs literal), **crossing function boundaries** (so a
-tainted flow is one finding with a trace, not a scatter of pattern hits), and
-**not emitting a finding for a construct that is merely present** (an import, a
-`with` clause, a banned function on a constant argument).
+bhf's lower count comes from three choices: it grades by danger
+(source-controlled versus literal), it follows flows across function
+boundaries (so a tainted flow is one finding with a trace, not a scatter of
+pattern hits), and it reports no finding for a construct that is only
+present (an import, a `with` clause, a banned function on a constant
+argument).
 
-## More usable output
+## Output attributes
 
 | Attribute | bhf | flawfinder | bandit | semgrep | cppcheck | gosec | perlcritic | clippy |
 |---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
-| CWE on every finding | ✅ | ✅ | ✅ | partial | partial | ✅ | ❌ | ❌ |
-| Severity + confidence | ✅ | level | severity | severity | severity | ✅ | severity | level |
-| Cross-function data-flow trace | ✅ | ❌ | ❌ | pro-only | ❌ | ❌ | ❌ | ❌ |
-| Remediation guidance | ✅ | ✅ | ✅ | ✅ | partial | ✅ | ✅ | ✅ |
-| SARIF / baseline diff | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
-| **Fuzz-confirmation** | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| CWE on every finding | yes | yes | yes | partial | partial | yes | no | no |
+| Severity and confidence | yes | level | severity | severity | severity | yes | severity | level |
+| Cross-function data-flow trace | yes | no | no | Pro only | no | no | no | no |
+| Remediation guidance | yes | yes | yes | yes | partial | yes | yes | yes |
+| SARIF / baseline diff | yes | yes | yes | yes | yes | yes | no | yes |
+| Fuzz confirmation | yes | no | no | no | no | no | no | no |
 
-The last row is the one no pure SAST tool has. When `bhf auto --static` runs,
-a static finding that the fuzzer reaches at the same site is upgraded to
-`fuzz_confirmed`, and one inside a function fuzzing proves is not
-attacker-reachable is downgraded to `lab_only`. A confirmed finding is not a
-maybe — it is a bug with an input that triggers it.
+When `bhf auto --static` runs, bhf matches each static finding's file and
+line against the sink site of every runtime finding (a fuzz crash or an
+oracle hit). A static finding at the same site is upgraded to
+`fuzz_confirmed`, with high confidence and the ids of the runtime findings
+that confirmed it, so it comes with an input that reaches the flagged line.
+A static finding inside a function whose fuzzing marked its input
+reachability `reachability_unproven` or `output_serializer` is demoted to
+`lab_only`. A static finding the fuzzer did not reach stays `static`.
 
-## Bugs this measurement found in bhf
+## Scanner bugs this measurement found
 
-Running against 50 uncurated real trees is also the best test of the scanner
-itself. The campaign found and fixed a series of bhf false-positive sources —
-each with a regression case added to the precision benchmark:
+Running against 50 uncurated trees also tested the scanner. The campaign
+found and fixed a series of bhf false-positive sources, each with a
+regression case added to the precision benchmark:
 
-- `for (i = 0; …)` loop variables and `&out` parameters wrongly reported as
+- `for (i = 0; …)` loop variables and `&out` parameters reported as
   uninitialized reads (BHF-424);
-- `fgets`/`archive_strcpy` matched as `gets`/`strcpy` for want of a word boundary
-  (BHF-401); literal paths and function *definitions* matched as file-open sinks
-  (BHF-405);
+- `fgets`/`archive_strcpy` matched as `gets`/`strcpy` for want of a word
+  boundary (BHF-401); literal paths and function definitions matched as
+  file-open sinks (BHF-405);
 - Ada `with`/`use` imports and `Selected`/`Selection` matched as hazards
   (BHF-409/410/411/412);
 - Perl POD documentation and heredoc prose analyzed as code; `clap::Command`
-  matched as a shell spawn; Python doctests and keyword-argument defaults matched
-  as hardcoded secrets;
-- crypto-library primitives (`encrypt`, `mg_random`, a `CMD5` macro) matched as
-  weak crypto/PRNG for want of a word boundary.
+  matched as a shell spawn; Python doctests and keyword-argument defaults
+  matched as hardcoded secrets;
+- crypto-library primitives (`encrypt`, `mg_random`, a `CMD5` macro) matched
+  as weak crypto or PRNG for want of a word boundary.
 
-Net effect on the 50-repo corpus: **3511 → 1907 findings (a 46% cut), entirely
-false-positive removal**, with the precision benchmark's 0.90 floor and
-full-recall gate holding throughout, and **zero scanner crashes or hangs** across
-all 49 trees.
+On the 50-repository corpus these fixes took the total from 3511 to 1907
+findings (46% fewer), all of them false positives removed, while the
+precision benchmark's 0.90 floor and full-recall gate held. The scanner did
+not crash or hang on any of the 49 trees.
 
-## Limitations (stated plainly)
+## Measurement scope
 
-- **gosec** needs a buildable module; the installed Go toolchain (1.22) is older
-  than several repos require, so its Go numbers are partial. semgrep carries the
-  Go comparison.
-- **Java** is compared only against semgrep; SpotBugs/Find-Sec-Bugs need compiled
-  bytecode and were out of scope for a source-only sweep.
-- **Rust:** bhf deliberately keeps a thin Rust rule set and defers to clippy
-  (as a subprocess adapter). The 2-vs-465 gap is by design, not a coverage claim.
-- **Ada** has no open-source SAST to compare against; bhf's Ada numbers stand
-  alone.
-- This measures *finding classes and volume*, not a labeled ground-truth
-  precision/recall on every site — that is what the curated
-  [precision benchmark](https://github.com/Tarmo-Technologies/bhf/tree/main/benchmarks) is for (bhf holds ≥ 0.90 precision at
-  full recall there).
+- **gosec** needs a buildable module, and the installed Go toolchain (1.22)
+  was older than several repositories require, so its Go numbers are
+  partial; semgrep carries the Go comparison.
+- **Java** is compared with semgrep only; SpotBugs and Find-Sec-Bugs need
+  compiled bytecode, which this source-only sweep did not build.
+- **Rust:** bhf keeps a small Rust rule set, and clippy covers most Rust
+  lints. The 2-versus-465 count reflects that split.
+- **Ada** has no open-source SAST tool to compare with; bhf's Ada numbers
+  stand alone.
+- This measurement compares finding classes and volume. Labeled
+  ground-truth precision and recall per site is what the curated
+  [precision benchmark](../../benchmarks/static/README.md) measures: bhf
+  holds precision of at least 0.90 at full recall on its curated set.
 
 ## Reproduction
 
-The scan is one command per tool per repo; bhf's is:
+The scan is one command per tool per repository. bhf's is:
 
 ```sh
 bhf static-scan <repo> --out out --sarif
 ```
 
-Every bhf rule in the tables carries a labeled case in
-`benchmarks/static/corpus/`, so the precision claim is a number the CI gate
-enforces on every push, not a one-off. The competitor invocations and the
-category-normalization used for the tables are standard tool defaults
-(`bandit -r`, `semgrep --config p/<lang>`, `flawfinder --csv`,
-`cppcheck --enable=warning,portability`, `gosec ./...`, `perlcritic --severity 3`,
-`cargo clippy`).
+Every bhf rule in the tables has a labeled case in
+`benchmarks/static/corpus/`, and the precision benchmark
+(`cargo test -p static_analysis --test precision_benchmark`) fails when a
+rule drops below the floor. The other tools ran with their standard
+defaults, and the same category normalization was applied to every tool:
+`bandit -r`, `semgrep --config p/<lang>`, `flawfinder --csv`,
+`cppcheck --enable=warning,portability`, `gosec ./...`,
+`perlcritic --severity 3` and `cargo clippy`.
