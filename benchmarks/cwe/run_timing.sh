@@ -14,11 +14,11 @@ RES="$ROOT/results/timing.tsv"
 echo -e "bug\tbhf_run1_cold_s\tbhf_run2_warm_s\tlibFuzzer_s\tnote" > "$RES"
 
 bhf_ttfc() {  # $1=src-dir(contains one .c) $2=workdir : echo seconds to first finding (no build on warm if WD exists)
-  local src="$1" wd="$2"; rm -rf "$wd/findings"
+  local src="$1" wd="$2"; rm -rf "$wd/results/findings"
   local s=$(date +%s.%N)
   "$BHF" auto --per-target-time "$BUDGET" --reuse-discovery --work-dir "$wd" "$src" >/dev/null 2>&1 &
   local pid=$!; local t="NF"
-  while kill -0 "$pid" 2>/dev/null; do compgen -G "$wd/findings/*" >/dev/null 2>&1 && { t=$(echo "$(date +%s.%N) - $s"|bc -l); break; }; sleep 0.02; done
+  while kill -0 "$pid" 2>/dev/null; do compgen -G "$wd/results/findings/*" >/dev/null 2>&1 && { t=$(echo "$(date +%s.%N) - $s"|bc -l); break; }; sleep 0.02; done
   kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; echo "$t"
 }
 lf_ttfc() {  # $1=function : echo seconds to crash, or NF

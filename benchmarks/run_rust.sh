@@ -19,7 +19,7 @@ s=$(now)
 "$BHF" auto --per-target-time "$BUDGET" --work-dir "$SCRATCH/bhf/gw" "$SCRATCH/bhf" >"$SCRATCH/bhf.log" 2>&1 &
 pid=$!; ttfc="-"; crash=0
 while kill -0 "$pid" 2>/dev/null; do
-  if [ "$crash" = 0 ] && compgen -G "$SCRATCH/bhf/gw/findings/*" >/dev/null 2>&1; then ttfc=$(elapsed "$s"); crash=1; fi
+  if [ "$crash" = 0 ] && compgen -G "$SCRATCH/bhf/gw/results/findings/*" >/dev/null 2>&1; then ttfc=$(elapsed "$s"); crash=1; fi
   sleep 0.2
 done
 wait "$pid" 2>/dev/null

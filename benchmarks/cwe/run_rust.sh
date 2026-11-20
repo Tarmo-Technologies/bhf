@@ -13,7 +13,7 @@ echo -e "metric\tbhf\tcargo-fuzz" > "$RES"
 # bhf: auto-harness the whole lib (no fuzz/ dir), count distinct buggy functions found.
 mkdir -p "$SCRATCH/bhf"; cp "$ROOT/targets/rust/Cargo.toml" "$SCRATCH/bhf/"; cp -r "$ROOT/targets/rust/src" "$SCRATCH/bhf/"
 "$BHF" auto --per-target-time "$BUDGET" --seed-dir "$ROOT/seeds_rust" --work-dir "$SCRATCH/gw" "$SCRATCH/bhf" >"$SCRATCH/bhf.log" 2>&1
-bhf_fns=$(python3 - "$SCRATCH/gw/findings" <<'PY'
+bhf_fns=$(python3 - "$SCRATCH/gw/results/findings" <<'PY'
 import json,os,sys
 root=sys.argv[1]; ids=set()
 if os.path.isdir(root):

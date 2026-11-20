@@ -117,11 +117,7 @@ runs a harness you write; bhf generates its own.
 | Jazzer (standalone) | 5 (`fuzzerTestOneInput`) | yes | 1.85 s (fuzz-only) |
 | **bhf** | **0** | **yes** | 2.62 s (end-to-end) |
 
-bhf discovers the method, **synthesises the receiver object** and drives a
-generated harness through its own JVM agent, with no `fuzzerTestOneInput`
-and no classpath wiring. `benchmarks/run_java.sh` and the recorded row in
-`benchmarks/results/java.tsv` still label the bhf run `bhf(jazzer)`; the
-script runs `bhf auto`, which uses bhf's own agent.
+bhf discovers the method, **synthesises the receiver object** and drives a generated harness through its own JVM agent, with no `fuzzerTestOneInput` and no classpath wiring. `benchmarks/run_java.sh` labels the bhf run `bhf(builtin)`; the row recorded in `benchmarks/results/java.tsv` predates that label and reads `bhf(jazzer)`.
 
 ### Ada: vs GNATfuzz and AFL++
 

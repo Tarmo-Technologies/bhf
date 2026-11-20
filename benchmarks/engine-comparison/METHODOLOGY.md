@@ -78,6 +78,8 @@ python3 -B benchmarks/engine-comparison/analyze_trade_study.py \
   --output benchmarks/engine-comparison/results/trade-study-report-<date>.md
 ```
 
+A new report gets the methodology and scope prose, with the results between two `<!-- analyze_trade_study.py: generated results ... -->` markers. Rendering into an existing report replaces only what is between the markers, so prose edited after the first render stays. A report without them, such as `results/trade-study-report-20260927.md`, was written by hand, and the renderer leaves it as it is and exits non-zero.
+
 Real-code targets via a manifest (see the schema below and
 `experiment1-real-code.example.json`):
 

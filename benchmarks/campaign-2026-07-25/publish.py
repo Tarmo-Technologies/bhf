@@ -4,10 +4,13 @@
 
 Keeping this a script rather than hand-edited prose means the published
 numbers cannot drift from `results/`: re-run the sweep, re-run this, and the
-page is current.
+page is current. The section counts the repositories pinned in `corpus.tsv`
+only; a results directory also holds rows for repositories the lane check
+later replaced from the pool. Its wording is the page's reviewed wording, so
+re-running this over the same rows leaves the page unchanged.
 
 Usage:
-  publish.py [--results results] [--page ../../docs/site/sweep-500.md]
+  publish.py [--results results] [--corpus corpus.tsv] [--page ../../docs/site/sweep-500.md]
 """
 
 from __future__ import annotations
@@ -37,6 +40,13 @@ STATUSES = [
     "skipped",
 ]
 
+# The blocker table ranks why bhf could not drive a discovered target, which
+# the hand-written "Reading the blocker table" interprets (packages that are
+# not installed, and bhf's own limits). A build failure (`failed_build`) is
+# the project's build stopping; that reading does not cover it, so it stays
+# out of the table, and the Attempted column still counts it.
+TABLE_LEAVES_OUT = {"failed_build"}
+
 LANE_NAMES = {
     "c": "C", "cpp": "C++", "rust": "Rust", "go": "Go", "python": "Python",
     "java": "Java", "js": "JavaScript", "ts": "TypeScript", "csharp": "C#",
@@ -53,6 +63,17 @@ def load(results: Path) -> list[dict]:
         except json.JSONDecodeError:
             continue
     return rows
+
+
+def load_corpus(corpus: Path) -> set[tuple[str, str]]:
+    """The (lane, repository) pairs pinned in `corpus.tsv`."""
+    pinned = set()
+    for line in corpus.read_text().splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        lane, repo = line.split("\t")[:2]
+        pinned.add((lane, repo))
+    return pinned
 
 
 def summarize(rows: list[dict]) -> tuple[dict, dict]:
@@ -93,7 +114,8 @@ def summarize(rows: list[dict]) -> tuple[dict, dict]:
     return dict(per_lane), dict(totals)
 
 
-def render(per_lane: dict, totals: dict, rows: list[dict]) -> str:
+def render(per_lane: dict, totals: dict, rows: list[dict], pinned: int) -> str:
+    """The results section for the pinned `rows`, `pinned` the corpus size."""
     # One vendored or generated monster can dominate a corpus-wide line count,
     # so name it rather than letting it quietly carry the headline.
     biggest = max(
@@ -105,30 +127,33 @@ def render(per_lane: dict, totals: dict, rows: list[dict]) -> str:
     )
     lines = [
         "",
-        f"{totals['projects']} projects measured, "
+        f"{totals['measured']} projects measured out of {pinned} pinned, "
         f"{totals['sloc']:,} lines of code, "
         f"{totals['discovered']:,} fuzzable targets discovered, "
-        f"**zero harnesses written by hand**.",
+        "with no harness written by hand.",
         "",
-        "| Language | Projects | SLOC | Targets found | Attempted | Fuzzed | Rate | Findings |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|",
+        "`Projects` counts pinned repositories that produced a result row; `Measured` counts "
+        "those that produced an `auto` run to roll up. `Rate` is fuzzed over attempted.",
+        "",
+        "| Language | Projects | Measured | SLOC | Targets found | Attempted | Fuzzed | Rate | Findings |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for lane in sorted(per_lane, key=lambda k: -per_lane[k]["discovered"]):
         b = per_lane[lane]
         rate = f"{b['built_and_fuzzed'] / b['attempted'] * 100:.0f}%" if b["attempted"] else "—"
         lines.append(
-            f"| {LANE_NAMES.get(lane, lane)} | {b['projects']} | {b['sloc']:,} | "
+            f"| {LANE_NAMES.get(lane, lane)} | {b['projects']} | {b['measured']} | {b['sloc']:,} | "
             f"{b['discovered']:,} | {b['attempted']} | {b['built_and_fuzzed']} | "
             f"{rate} | {b['findings']} |"
         )
     rate = (
-        f"{totals['built_and_fuzzed'] / totals['attempted'] * 100:.0f}%"
+        f"{totals['built_and_fuzzed'] / totals['attempted'] * 100:.1f}%"
         if totals["attempted"]
         else "—"
     )
     lines.append(
-        f"| **All 16** | **{totals['projects']}** | **{totals['sloc']:,}** | "
-        f"**{totals['discovered']:,}** | **{totals['attempted']}** | "
+        f"| **All {len(per_lane)}** | **{totals['projects']}** | **{totals['measured']}** | "
+        f"**{totals['sloc']:,}** | **{totals['discovered']:,}** | **{totals['attempted']}** | "
         f"**{totals['built_and_fuzzed']}** | **{rate}** | **{totals['findings']}** |"
     )
     if totals["sloc"] and biggest[0] > totals["sloc"] * 0.1:
@@ -136,32 +161,26 @@ def render(per_lane: dict, totals: dict, rows: list[dict]) -> str:
         lines += [
             "",
             f"One repository, `{biggest[1]}`, contributes {biggest[0]:,} of those lines "
-            f"({share:.0f}% of the corpus) at roughly 46,000 lines per file — generated "
+            f"({share:.0f}% of the corpus) at roughly 46,000 lines per file: generated "
             f"or amalgamated content rather than written code. Without it the corpus is "
             f"{totals['sloc'] - biggest[0]:,} lines, which is the figure to reason about; "
             f"it is left in because the corpus is star-ranked, not curated.",
         ]
 
-    panics = sum(
-        1
+    surfaces = [
+        surface
         for row in rows
         for surface in (row.get("surfaces") or {}).values()
-        if isinstance(surface, dict) and surface.get("panic")
-    )
-    timeouts = sum(
-        1
-        for row in rows
-        for surface in (row.get("surfaces") or {}).values()
-        if isinstance(surface, dict) and surface.get("timed_out")
-    )
+        if isinstance(surface, dict)
+    ]
+    panics = sum(1 for surface in surfaces if surface.get("panic"))
+    timeouts = sum(1 for surface in surfaces if surface.get("timed_out"))
     lines += [
         "",
         "### Robustness",
         "",
-        f"Across {totals['projects']} projects and "
-        f"{totals['projects'] * 6} surface invocations: **{panics} panics**, "
-        f"**{timeouts} timeouts**. A tool that is run unattended over an estate has "
-        "to survive every tree in it, including the malformed ones.",
+        f"Across the {totals['projects']} pinned projects and {len(surfaces):,} surface "
+        f"invocations: **{panics} panics**, **{timeouts} timeouts**.",
         "",
         "### What blocked the rest",
         "",
@@ -170,6 +189,8 @@ def render(per_lane: dict, totals: dict, rows: list[dict]) -> str:
     for row in rows:
         auto = (row.get("surfaces") or {}).get("auto") or {}
         for entry in auto.get("blockers") or []:
+            if entry.get("category") in TABLE_LEAVES_OUT:
+                continue
             blockers[(entry.get("language", "?"), (entry.get("detail") or "")[:70])] += entry.get(
                 "count", 0
             )
@@ -183,15 +204,17 @@ def render(per_lane: dict, totals: dict, rows: list[dict]) -> str:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--results", type=Path, default=HERE / "results")
+    ap.add_argument("--corpus", type=Path, default=HERE / "corpus.tsv")
     ap.add_argument("--page", type=Path, default=HERE.parent.parent / "docs/site/sweep-500.md")
     args = ap.parse_args()
 
-    rows = load(args.results)
+    pinned = load_corpus(args.corpus)
+    rows = [row for row in load(args.results) if (row.get("lane"), row.get("repo")) in pinned]
     if not rows:
-        print("no results yet")
+        print("no results for the pinned corpus yet")
         return
     per_lane, totals = summarize(rows)
-    section = render(per_lane, totals, rows)
+    section = render(per_lane, totals, rows, len(pinned))
 
     text = args.page.read_text()
     start = text.index(MARKER) + len(MARKER)

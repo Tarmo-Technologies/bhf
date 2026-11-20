@@ -12,6 +12,7 @@ reproducible from the files in this directory. The written comparison is
 export BHF_BIN=/path/to/pinned/bhf  # the binary every project runs
 sh launch_full.sh                   # run the sweep in the background
 python3 aggregate.py --blockers 25  # the tables below
+python3 publish.py                  # the Results section of docs/site/sweep-500.md
 python3 charts.py                   # the figures
 python3 surfaces.py --project <dir> # 22 command checks against one project
 python3 compare.py sloc|static|sbom|fuzz  # against cloc/tokei, cppcheck/..., syft
@@ -24,6 +25,8 @@ Copy the binary once and point `BHF_BIN` at the copy: rebuilding during a
 sweep would mix bhf versions across the corpus. `compare.py` reads its clones
 from `--projects` (default `/home/ubuntu/bhf-corpus-500`); its results on
 twelve projects are in [compare-section.md](compare-section.md).
+
+`publish.py` counts only the repositories pinned in `corpus.tsv` and writes the page's reviewed wording, so run over the same rows it leaves `docs/site/sweep-500.md` unchanged. Its blocker table ranks why bhf could not drive a target and leaves out build failures (`failed_build`), which the page's reading of the table does not cover; `aggregate.py --blockers` ranks every category.
 
 `python3 build_corpus.py select` rebuilds the corpus from a fresh GitHub
 search. It needs network access and the `gh` CLI, and it overwrites the

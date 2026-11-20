@@ -102,6 +102,8 @@ python3 -B benchmarks/engine-comparison/analyze_trade_study.py \
 The JSON holds every trial row, the aggregated summary, tool versions, and
 the hashes of the sources, the oracle and the coverage binary.
 
+Rendering into an existing report replaces only its generated results, between the `<!-- analyze_trade_study.py: generated results ... -->` markers, and keeps the prose around them; a report without the markers is left as it is.
+
 | Option | Default | Meaning |
 |---|---|---|
 | `--engines` | `bhf aflpp libfuzzer honggfuzz` | Engines to run |

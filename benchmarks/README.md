@@ -57,10 +57,7 @@ bash benchmarks/run_java.sh             # Java -> benchmarks/results/java.tsv
 bash benchmarks/run_ada.sh              # Ada  -> benchmarks/results/ada.tsv
 ```
 
-The scripts run `target/debug/bhf`. `BUDGET` is the per-tool budget in seconds
-(default 25 for C, 20 for the other languages). `run_java.sh` reads Jazzer
-from `JAZZER` and `JAZZER_JAR` (default `/opt/jazzer/`); it labels the bhf
-row `bhf(jazzer)`, but `bhf auto` runs bhf's own JVM agent.
+The scripts run `target/debug/bhf` and count its findings in `<work>/results/findings/`, where `bhf auto` writes them. `BUDGET` is the per-tool budget in seconds (default 25 for C, 20 for the other languages). `run_java.sh` reads Jazzer from `JAZZER` and `JAZZER_JAR` (default `/opt/jazzer/`) and labels the bhf row `bhf(builtin)`, since `bhf auto` runs bhf's own engine and JVM agent; the row recorded in `results/java.tsv` predates that label and reads `bhf(jazzer)`.
 
 The planted-bug targets are under `targets/<lang>/`, each with the entry point
 `target_one_input(bytes)`. The hand-written C and Java harnesses for the other

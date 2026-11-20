@@ -116,6 +116,13 @@ def read_json(path: Path) -> dict | list | None:
         return None
 
 
+def findings_dir(work: Path) -> Path:
+    """Where the `auto` run wrote its findings: ``results/findings/``, or the
+    ``findings/`` beside ``auto/`` of a bhf before that layout."""
+    current = work / "results" / "findings"
+    return current if current.is_dir() or not (work / "findings").is_dir() else work / "findings"
+
+
 def distil_run(work: Path) -> dict:
     """Pull the target histogram, blockers, and per-target outcomes out of a run."""
     out: dict = {}
@@ -157,12 +164,9 @@ def distil_run(work: Path) -> dict:
     if blockers is not None:
         out["blockers"] = blockers
     findings = []
-    # A current bhf writes findings under results/; an older one beside auto/.
-    findings_dir = work / "results" / "findings"
-    if not findings_dir.is_dir():
-        findings_dir = work / "findings"
-    if findings_dir.is_dir():
-        for entry in sorted(findings_dir.iterdir())[:200]:
+    found = findings_dir(work)
+    if found.is_dir():
+        for entry in sorted(found.iterdir())[:200]:
             meta = read_json(entry / "finding.json") or read_json(entry / "meta.json")
             if isinstance(meta, dict):
                 # The CWE, severity and confidence live under `actionability`;
@@ -348,11 +352,11 @@ def run_project(row: dict, args: argparse.Namespace) -> dict:
             r.update(distil_run(work))
             result["surfaces"]["auto"] = r
 
-        if "report" in surfaces and (work / "findings").is_dir():
+        if "report" in surfaces and findings_dir(work).is_dir():
             r = sh(
                 [
                     str(BHF), "report",
-                    "--findings", str(work / "findings"),
+                    "--findings", str(findings_dir(work)),
                     "--out", str(work / "reports"),
                     "--sarif", "--junit", "--csv",
                 ],  # fmt: skip
