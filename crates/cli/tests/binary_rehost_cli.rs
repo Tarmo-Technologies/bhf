@@ -593,3 +593,72 @@ fn an_rx_interrupt_handler_bug_is_found_and_replays_as_a_match() {
     let refused = campaign(&root.join("zero"), &["--interrupt-interval", "0"]);
     assert_eq!(refused.status.code(), Some(2), "{}", text(&refused));
 }
+
+#[test]
+fn an_svd_restricts_the_modelled_windows_and_the_finding_carries_the_fidelity_label() {
+    let root = TestDir::new("binary-rehost-svd");
+    let work = root.join("work");
+    // A read between two of the SVD's peripherals: zero without the SVD.
+    let seed = record(&root, b'R', 0x4002_0000);
+    let seed_args = ["--seed-file", seed.to_str().unwrap(), "--iterations", "1"];
+    let guessed = summary(&rehost(
+        &root.join("guessed"),
+        &fixture("faults.elf"),
+        &seed_args,
+    ));
+    assert_eq!(guessed["findings"], serde_json::json!([]), "{guessed:#}");
+    let mut with_svd = seed_args.to_vec();
+    let svd = fixture("irq.svd");
+    with_svd.extend(["--svd", svd.to_str().unwrap()]);
+    let run = summary(&rehost(&work, &fixture("faults.elf"), &with_svd));
+    assert_eq!(run["fidelity"]["label"], "rehosted, peripheral-modelled");
+    let findings = run["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1, "{run:#}");
+    let id = findings[0].as_str().unwrap();
+    let dir = work.join("results/findings").join(id);
+    let finding: Value =
+        serde_json::from_slice(&fs::read(dir.join("finding.json")).unwrap()).unwrap();
+    assert_eq!(finding["rehost"]["fault"]["kind"], "read_unmapped");
+    assert_eq!(
+        finding["rehost"]["setup"]["peripheral_windows"]["svd"]["device"],
+        "WIDGET_M4"
+    );
+    assert_eq!(
+        finding["rehost"]["fidelity"]["label"],
+        "rehosted, peripheral-modelled"
+    );
+    // The normalized results carry the label as the finding's caveat.
+    let index: Value =
+        serde_json::from_slice(&fs::read(work.join("results/findings.json")).unwrap()).unwrap();
+    let normalized = index["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == id)
+        .unwrap_or_else(|| panic!("{id} not in findings.json: {index:#}"));
+    let caveats = normalized["fidelity"]["caveats"].as_array().unwrap();
+    assert!(
+        caveats.iter().any(|caveat| caveat
+            .as_str()
+            .is_some_and(|text| text.starts_with("rehosted, peripheral-modelled:"))),
+        "{normalized:#}"
+    );
+    // bhf replay runs the recorded windows, with no copy of the SVD.
+    let replay = bhf().arg("replay").arg(&dir).output().unwrap();
+    assert_eq!(replay.status.code(), Some(0), "{}", text(&replay));
+    assert!(
+        String::from_utf8_lossy(&replay.stdout).starts_with("MATCH"),
+        "{}",
+        text(&replay)
+    );
+    // A model the SVD's windows do not hold is refused before anything runs.
+    let mut outside = with_svd.clone();
+    outside.extend(["--mmio", "0x40020000=passthrough"]);
+    let refused = rehost(&root.join("outside"), &fixture("faults.elf"), &outside);
+    assert_eq!(refused.status.code(), Some(1), "{}", text(&refused));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("peripheral windows"),
+        "{}",
+        text(&refused)
+    );
+}

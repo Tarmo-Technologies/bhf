@@ -92,8 +92,11 @@ Build / fuzz / replay:
   Thumb-2 interpreter, feeds each input through a fixed buffer in its
   memory or through its peripheral reads (per-register MMIO models:
   passthrough from the input, constant, or bit-extract, which it infers for
-  status-register polling loops by probing a recorded trace of the reads),
-  and counts the basic blocks it enters into a 64 KiB edge map.
+  status-register polling loops by probing a recorded trace of the reads)
+  in the peripheral windows a CMSIS-SVD file gives (`svd.rs`, its own XML
+  reader), raises the interrupts the firmware enables on a schedule the
+  input chooses (`nvic.rs`), and counts the basic blocks it enters into a
+  64 KiB edge map.
   `bhf binary rehost` (`crates/cli/src/binary_rehost.rs`) fuzzes with it and
   writes its faults as findings `bhf replay` reproduces.
 

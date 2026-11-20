@@ -8,7 +8,7 @@ use crate::cpu::{executable_region, Core, Saved, Trap, PERIPHERAL_BASE, PERIPHER
 use crate::fault::Fault;
 use crate::image::Image;
 use crate::memory::{Checkpoint, Memory};
-use crate::mmio::{Mmio, MmioAccess, MmioConfig, MmioMark, MmioModelKind, Probe};
+use crate::mmio::{Mmio, MmioAccess, MmioConfig, MmioMark, MmioModelKind, Probe, Windows};
 use crate::nvic::{InterruptConfig, InterruptEvent, Nvic};
 use std::collections::HashSet;
 use thiserror::Error;
@@ -69,6 +69,9 @@ pub struct MachineConfig {
     pub max_instructions: u64,
     /// What peripheral registers read as.
     pub mmio: MmioConfig,
+    /// Where the peripheral registers are; `None` is the Cortex-M peripheral
+    /// region, `0x40000000`-`0x5fffffff`, all of it.
+    pub peripheral_windows: Option<Vec<crate::PeripheralWindow>>,
     /// The interrupt schedule; `None` models no interrupts: the NVIC's
     /// registers hold what is written to them, and nothing is ever taken.
     pub interrupts: Option<InterruptConfig>,
@@ -83,6 +86,7 @@ impl Default for MachineConfig {
             exit_at: Vec::new(),
             max_instructions: DEFAULT_MAX_INSTRUCTIONS,
             mmio: MmioConfig::default(),
+            peripheral_windows: None,
             interrupts: None,
         }
     }
@@ -125,6 +129,16 @@ pub enum SetupError {
         "the MMIO model for {address:#010x} is outside the peripheral window 0x40000000-0x5fffffff"
     )]
     MmioOutsidePeripherals { address: u32 },
+    #[error(
+        "the MMIO model for {address:#010x} is in none of the peripheral windows the device \
+         description gives"
+    )]
+    MmioOutsideWindows { address: u32 },
+    #[error(
+        "the peripheral window {name} at {base:#010x} of {size:#x} bytes is empty or runs past \
+         the end of the address space"
+    )]
+    BadPeripheralWindow { name: String, base: u32, size: u32 },
     #[error(
         "the MMIO model for {address:#010x} would never be used: RAM or an image segment holds that \
          address, and memory answers its reads"
@@ -319,10 +333,31 @@ impl Machine {
         for &address in &config.exit_at {
             check_code(&memory, "the exit address", address)?;
         }
+        let windows = match &config.peripheral_windows {
+            None => Windows::region(),
+            Some(windows) => {
+                for window in windows {
+                    if window.size == 0 || u64::from(window.base) + u64::from(window.size) > 1 << 32
+                    {
+                        return Err(SetupError::BadPeripheralWindow {
+                            name: window.name.clone(),
+                            base: window.base,
+                            size: window.size,
+                        });
+                    }
+                }
+                Windows::described(windows)
+            }
+        };
         let mut sites = HashSet::new();
         for model in &config.mmio.models {
-            if !(PERIPHERAL_BASE..PERIPHERAL_END).contains(&model.address) {
+            if !(PERIPHERAL_BASE..PERIPHERAL_END).contains(&model.address) && windows.guessed() {
                 return Err(SetupError::MmioOutsidePeripherals {
+                    address: model.address,
+                });
+            }
+            if !windows.serves(model.address, 1) {
+                return Err(SetupError::MmioOutsideWindows {
                     address: model.address,
                 });
             }
@@ -349,7 +384,7 @@ impl Machine {
         Ok(Self {
             core: Core::new(
                 memory,
-                Mmio::new(&config.mmio),
+                Mmio::new(&config.mmio, windows),
                 vector_table,
                 config.interrupts.map(Nvic::new),
             ),
@@ -388,6 +423,12 @@ impl Machine {
     /// [`crate::INTERRUPT_LOG_LIMIT`] of them.
     pub fn interrupt_log(&self) -> &[InterruptEvent] {
         self.core.irq.as_ref().map_or(&[], |nvic| &nvic.log)
+    }
+
+    /// The peripheral whose window holds `address`, when the machine's
+    /// windows come from a device description that names it.
+    pub fn peripheral_at(&self, address: u32) -> Option<&str> {
+        self.core.mmio.windows.name_of(address)
     }
 
     /// The peripheral reads of the last run, as far as its trace holds them.

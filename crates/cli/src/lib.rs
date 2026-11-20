@@ -393,7 +393,7 @@ enum BinaryCommand {
     Adapter(binary_adapter::BinaryAdapterArgs),
     /// Fuzz a standalone executable with no source (stdin/seed inputs, sandbox, timeouts, black-box)
     Fuzz(binary_fuzz::BinaryFuzzArgs),
-    /// Fuzz an unmodified Cortex-M firmware image (ELF or raw) in bhf's emulator: input in a fixed buffer or through MMIO-modelled peripheral reads, interrupts on an input-chosen schedule, edge coverage, invalid access / bad PC / HardFault findings
+    /// Fuzz an unmodified Cortex-M firmware image (ELF or raw) in bhf's emulator: input in a fixed buffer or through MMIO-modelled peripheral reads (windows from an SVD file), interrupts on an input-chosen schedule, edge coverage, invalid access / bad PC / HardFault findings labelled rehosted, peripheral-modelled
     Rehost(binary_rehost::BinaryRehostArgs),
 }
 

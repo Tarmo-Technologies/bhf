@@ -5,6 +5,20 @@
 ## Unreleased
 
 ### Added
+- `bhf binary rehost --svd FILE` takes the peripheral windows from the
+  part's CMSIS-SVD file (#354): only its peripherals' address blocks
+  (inherited through `derivedFrom`, arrays expanded, reserved blocks and the
+  system space left out) are registers the MMIO models serve, so a load or
+  store between them is an invalid-access finding, and an `--mmio` model
+  outside them is refused. The rehost crate gains `Svd` (its own XML
+  reader, no new dependency) and `MachineConfig::peripheral_windows`. The
+  setup records the windows and the SVD's path, digest, device and interrupt
+  names (`rehost.setup.peripheral_windows`; older findings replay with the
+  whole region). Every rehosted run and finding carries the fidelity label
+  `rehosted, peripheral-modelled` (`fidelity.label`, and a finding's
+  `fidelity_caveat`, which `results/findings.json` lists in
+  `fidelity.caveats`), and with an SVD inferred loops and interrupts are
+  named by peripheral.
 - `bhf binary rehost` raises the interrupts the firmware enables on a
   schedule stored in the testcase (#353): every tick
   (`--interrupt-interval`, default 1000 instructions) takes one input byte

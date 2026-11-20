@@ -528,11 +528,15 @@ firmware's peripheral reads through MMIO models (`--mmio ADDR[@PC]=MODEL`,
 `passthrough` from the input, `constant:VALUE` or `bitextract:MASK`;
 `--mmio-models FILE`; `--mmio-default zero|passthrough`), or both. Polling
 loops on a status register get bit-extract models inferred before the
-campaign (`--no-mmio-inference` turns that off). The core starts from the
+campaign (`--no-mmio-inference` turns that off). `--svd FILE` takes the
+peripheral windows from the part's CMSIS-SVD file, so an access between its
+peripherals is an invalid access rather than a modelled read. The core starts from the
 reset vector, and basic-block edge coverage steers the mutation. Addresses are
 hex, `0x` optional, as `nm` prints them. An invalid memory access, a bad PC
 or a HardFault is a `kind: rehost_fault` finding, which `bhf replay`
-reproduces through the recorded machine setup and MMIO models. Interrupts
+reproduces through the recorded machine setup and MMIO models; each carries
+the fidelity label `rehosted, peripheral-modelled` (its `fidelity_caveat`
+in `results/`). Interrupts
 the firmware enables are raised on a schedule the input chooses: each tick
 (`--interrupt-interval`, default 1000 instructions) takes one input byte
 that picks the interrupt and the wait to the next tick, and a sleeping core

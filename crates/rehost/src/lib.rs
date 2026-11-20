@@ -51,7 +51,10 @@
 //! status poll ([`NotAPoll`]). Peripheral reads take the input as a stream
 //! (after the bytes an [`InputBuffer`] holds), and a read the input has no
 //! bytes left for ends the run as [`Stop::InputExhausted`]. Peripheral
-//! writes are dropped.
+//! writes are dropped. Which addresses are peripheral registers is the
+//! machine's windows ([`MachineConfig::peripheral_windows`]): the whole
+//! Cortex-M peripheral region, or the address blocks a part's CMSIS-SVD
+//! file gives ([`Svd::windows`]), outside which an access faults.
 //!
 //! Interrupts come from a schedule in the input ([`InterruptConfig`]): every
 //! tick takes one byte of the same stream and pends one of the interrupts
@@ -83,6 +86,7 @@ mod machine;
 mod memory;
 mod mmio;
 mod nvic;
+mod svd;
 mod thumb16;
 mod thumb32;
 
@@ -97,7 +101,8 @@ pub use machine::{
     Execution, IdleReason, InputBuffer, Machine, MachineConfig, MemoryRange, SetupError, Stop,
     DEFAULT_MAX_INSTRUCTIONS, DEFAULT_RAM_BASE, DEFAULT_RAM_SIZE,
 };
-pub use mmio::{MmioAccess, MmioConfig, MmioDefault, MmioModel, MmioModelKind};
+pub use mmio::{MmioAccess, MmioConfig, MmioDefault, MmioModel, MmioModelKind, PeripheralWindow};
 pub use nvic::{
     schedule_wait, InterruptConfig, InterruptEvent, DEFAULT_INTERRUPT_INTERVAL, INTERRUPT_LOG_LIMIT,
 };
+pub use svd::{AddressBlock, BlockUsage, Svd, SvdError, SvdInterrupt, SvdPeripheral};

@@ -61,7 +61,7 @@ binary release.
 | An on-device agent (TCP/serial) | **On-target agent** | Real device; coverage over the agent protocol | ⛔ unproven: the host side ships; no target-side agent does yet ([#289](https://github.com/Tarmo-Technologies/bhf/issues/289)), so you write one to the frame format in §3c |
 | A physical board | **HIL** (hardware-in-the-loop) | Silicon | ⛔ unproven (`BHF_HIL_GDB`) |
 | A Linux driver's source, and syzkaller | **syzkaller descriptions and crash import** (`bhf kernel syzlang`, `bhf kernel import`, §10) | syzkaller runs the kernel and its KCOV coverage; bhf describes the driver's ioctls and triages the crashes | ✅ snapshot of the widget fixture's description, and the import of a crash directory in syz-manager's layout; ⛔ syz-sysgen acceptance and a fresh syz-manager workdir gated (need syzkaller) |
-| Only a firmware image (ELF or flash dump), no source | **Rehosting** (`bhf binary rehost`, §9) | bhf's own Cortex-M interpreter: the real instructions; peripheral reads from per-register models (input-fed, constant, or bit-extract inferred from polling loops); interrupts the firmware enables, raised on a schedule the input chooses | ✅ fixture images in `crates/rehost/tests/fixtures/`: edge coverage that grows with the input, invalid-access, bad-PC and HardFault findings, a parser fed through a peripheral data register, a polled UART's parser bug reached through inferred models, an RX-interrupt handler's bug reached through the interrupt schedule, `bhf replay` MATCH |
+| Only a firmware image (ELF or flash dump), no source | **Rehosting** (`bhf binary rehost`, §9) | `rehosted, peripheral-modelled`: bhf's own Cortex-M interpreter runs the real instructions; peripheral reads come from per-register models (input-fed, constant, or bit-extract inferred from polling loops) in the windows the part's SVD file gives (or the whole peripheral region); interrupts the firmware enables are raised on a schedule the input chooses | ✅ fixture images in `crates/rehost/tests/fixtures/`: edge coverage that grows with the input, invalid-access, bad-PC and HardFault findings, a parser fed through a peripheral data register, a polled UART's parser bug reached through inferred models, an RX-interrupt handler's bug reached through the interrupt schedule, a read between an SVD's peripherals found as an invalid access (Arm's CMSIS example SVD parsed), `bhf replay` MATCH |
 
 ---
 
@@ -958,6 +958,10 @@ bhf binary rehost firmware.bin --base 0x08000000 --work-dir bhf_work \
 bhf binary rehost firmware.elf --work-dir bhf_work \
   --mmio 0x40013000=constant:0x4c31a5c3 --seed-file seed.bin
 
+# The part's SVD file: only its peripherals' address blocks are registers.
+bhf binary rehost firmware.elf --work-dir bhf_work \
+  --svd STM32F407.svd --seed-file seed.bin
+
 # Firmware that sleeps until its UART interrupts it: interrupts are raised
 # on the input's schedule by default, here a tick every 500 instructions:
 bhf binary rehost firmware.elf --work-dir bhf_work \
@@ -1007,6 +1011,34 @@ bhf binary rehost firmware.elf --work-dir bhf_work \
   the default to the rule above. The run JSON's `mmio_reads` counts the peripheral
   reads of the campaign, and a finding's `input` block says how many bytes
   its peripheral reads took (`mmio_bytes`).
+- **Peripheral windows (`--svd FILE`).** Without a device description
+  every address in the peripheral region (`0x40000000`-`0x5fffffff`) is
+  taken for a register, so a wild pointer into it reads as the default
+  model and the bug goes unseen. `--svd` reads the part's CMSIS-SVD file
+  (the vendor's `.svd`, as debuggers and header generators use) and takes
+  only its peripherals' address blocks for registers: each `addressBlock`
+  at `baseAddress` plus its `offset`, `size` bytes long, other than
+  `reserved` ones. A peripheral `derivedFrom` another with no blocks of its
+  own takes that one's, and a peripheral array (`dim`, `dimIncrement`,
+  `dimIndex`, `%s` in its name) is each of its elements. A load or store
+  anywhere else, between peripherals or in a reserved block, is an invalid
+  access (`read_unmapped` or `write_unmapped`), as on the part's bus; the
+  peripheral bit-band alias follows the windows, and a window may lie
+  outside the region (an nRF part's `FICR` at `0x10000000`, say) when
+  memory does not hold it. Blocks in the system space are the core's own
+  (the System Control Block, the NVIC) and give no window; a peripheral with
+  no block gets a warning on stderr, and a file that gives no window is
+  refused. An `--mmio` model for an address no window holds is refused
+  before anything runs. The setup records the windows and the file they
+  came from (`rehost.setup.peripheral_windows`: `source`, the SVD's `path`,
+  `sha256`, `device` and its interrupt names, and each window's `name`,
+  `base`, `size`), so `bhf replay` needs no copy of the file; a setup
+  recorded before windows existed takes the whole region. With an SVD the
+  run JSON's `mmio_inference` names each loop's `peripheral`, and a
+  finding's `rehost.interrupts` names each interrupt (`USART1`). Only the
+  blocks, the interrupts and the device's name are read; registers, fields
+  and the rest of the file are skipped, so a vendor file of a few megabytes
+  reads in a fraction of a second.
 - **Polling loops (inferred bit-extract models).** Firmware that waits for a
   status bit (`while (!(USART->SR & RXNE)) {}`) stalls on a zero read and,
   fed whole from the input, eats several input bytes a poll on a bit the
@@ -1123,7 +1155,15 @@ bhf binary rehost firmware.elf --work-dir bhf_work \
   `results/INDEX.md` and `findings.json` give for these findings (producer
   `binary rehost`); they get no `replay.py`, which runs a host harness.
 
-**Fidelity.** The run JSON and every finding carry a `fidelity` block. The
+**Fidelity.** The run JSON and every finding carry a `fidelity` block whose
+`label` is `rehosted, peripheral-modelled`: the firmware ran in bhf's
+emulator, its peripherals' reads served by models, not on the device. Every
+finding also carries it as its `fidelity_caveat`, with where its peripheral
+windows came from (`peripheral windows from the SVD STM32F407`, or
+`peripheral windows guessed, no SVD`), so `results/findings.json` lists it
+in the finding's `fidelity.caveats` and a report never reads a rehosted
+fault as one seen on hardware. The block's `peripheral_windows` says where
+the windows came from. The
 CPU runs the real instructions: the Cortex-M3/M4 integer set with the M4's
 halfword multiplies and saturation, the banked stack pointers, `SVC` and
 interrupt exception entry and return, the NVIC, and the System Control

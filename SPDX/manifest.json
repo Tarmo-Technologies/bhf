@@ -4639,6 +4639,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/rehost/src/svd.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/rehost/src/thumb16.rs",
       "license": "Apache-2.0"
     },
@@ -4664,6 +4668,10 @@
     },
     {
       "path": "crates/rehost/tests/fixture_mmio.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/rehost/tests/fixture_svd.rs",
       "license": "Apache-2.0"
     },
     {

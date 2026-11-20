@@ -609,7 +609,7 @@ impl Core {
         if (PPB_BASE..PPB_END).contains(&address) {
             return Ok(self.ppb_read(address, size));
         }
-        if (PERIPHERAL_BASE..PERIPHERAL_END).contains(&address) {
+        if self.mmio.windows.serves(address, size) {
             return self
                 .mmio
                 .read(address, self.pc, size, self.instructions)
@@ -656,7 +656,7 @@ impl Core {
         if (PPB_BASE..PPB_END).contains(&address) {
             return self.ppb_write(address, size, value);
         }
-        if (PERIPHERAL_BASE..PERIPHERAL_END).contains(&address) {
+        if self.mmio.windows.serves(address, size) {
             // Peripheral writes go nowhere.
             return Ok(());
         }
