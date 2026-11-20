@@ -2,16 +2,28 @@
 
 # Fuzzing Landscape Research - 2026-05-20
 
-This is a dated research snapshot and backlog record, not current product
-documentation. Several “later” items below—including additional language lanes
-and bounded LLM assistance—have since shipped. Use
-[`site/llm.md`](site/llm.md), [`site/auto.md`](site/auto.md), and live CLI help
-for current workflows and limitations.
+This memo records a review, dated 2026-05-20, of fuzzing tool capabilities,
+recurring user pain points, and the feature backlog BHF drew from them. Its
+scope at the time was Ada, C and C++. The sections below describe BHF as it
+was then; [Status since this memo](#status-since-this-memo) maps the backlog
+to the commands that now cover it. For current behavior, read
+[`site/auto.md`](site/auto.md), [`site/llm.md`](site/llm.md), and
+`bhf <command> --help`.
 
-This memo summarizes current fuzzing tool capabilities, recurring user pain
-points, and feature opportunities for BHF. Scope is Ada and C/C++ first.
-Other languages should stay behind this backlog until BHF is clearly
-feature-rich in those three languages.
+## Status since this memo
+
+| Backlog item | Now |
+|---|---|
+| 1. Fuzz introspection | `bhf introspect` compares discovered targets with a prior `auto/run.json` to show coverage blockers. |
+| 2. Structure-aware input | `bhf auto --grammar` and `bhf fuzz --grammar`; source-mined dictionaries (`dictionary.txt`) and runtime comparison constants (`learned_dictionary.txt`, `bhf cmplog`). |
+| 3. Executable oracles | Runtime sink oracles ([sink-oracles](site/sink-oracles.md)), `bhf differential`, and `bhf relational`. |
+| 4. Reproducibility | `bhf capsule`, `bhf verify-poc` and `bhf env-capsule`. |
+| 5. CI budget | `bhf ci`, with `--changed-since` and `--changed-paths-from` for changed-code runs. |
+| 6. Multi-engine backends | `bhf fuzz --engine` `builtin`, `afl++`, `libfuzzer`, `honggfuzz`, `winafl`, and `libafl` (in a build with the `libafl-engine` feature); `bhf corpus` converts corpora. |
+| 7. Hybrid fuzzing | `bhf auto --symcc` (SymCC, `external-tools` profile). |
+| 9. Sanitizer matrix | `bhf auto --sanitizers`. |
+| 11. LLM-assisted harnesses | In builds with the `llm` feature; see item 11 below. |
+| 13. Language expansion | Sixteen languages: Ada, C, C++, Rust, Java, Python, Perl, Go, COBOL, Fortran, C#, JavaScript, TypeScript, Ruby, Lua and PHP. |
 
 ## Sources Reviewed
 
@@ -75,12 +87,12 @@ Research and community signals:
 - AFL++ persistent-mode support discussion:
   https://github.com/AFLplusplus/AFLplusplus/discussions/1871
 
-Community sources are anecdotal. They are useful for product direction, not as
-population-level evidence.
+The community sources are anecdotes: they informed product direction and do
+not measure how common a problem is.
 
 ## Current BHF Baseline
 
-BHF already has a differentiated base:
+In May 2026 BHF had:
 
 - Ada, C, and C++ source discovery and harness generation, with C/C++
   direct-call support for common byte-oriented API shapes.
@@ -93,9 +105,8 @@ BHF already has a differentiated base:
   import/export, CI command, differential replay, cmplog ingestion, and oracle
   metadata.
 
-The strongest current discriminator is not "another fuzzer engine." It is the
-ability to create a fuzz lab for code that does not build cleanly and does not
-have its real runtime environment available.
+What set it apart from other fuzzers was the ability to build a fuzz lab for
+code that does not build cleanly and lacks its real runtime environment.
 
 ## Ecosystem Pattern
 
@@ -123,9 +134,9 @@ Mature fuzzing stacks cluster around five capabilities:
 
 5. CI and triage.
    ClusterFuzzLite focuses on pull-request fuzzing, longer batch fuzzing,
-   crash testcase download, and coverage reports. The developer pain is not
-   only finding a crash; it is reproducing, handling duplicates, interpreting, and
-   deciding whether it matters.
+   crash testcase download, and coverage reports. After a crash is found,
+   developers still have to reproduce it, handle duplicates, interpret it,
+   and decide whether it matters.
 
 ## Recurring Pain Points
 
@@ -152,13 +163,13 @@ The same problems show up across papers, project issues, and forum threads:
 - CI fuzzing needs budget allocation. Short PR fuzzing is useful, but deeper
   bugs need long-running jobs and a reusable corpus. Users need help deciding
   what to fuzz first after a code change.
-- Tooling fragmentation matters. LibFuzzer has a low barrier to entry but is
-  not where major new feature work is expected; AFL++ is powerful but has more
-  setup friction; FuzzTest is active but C++-only and integration details still
-  matter for CMake/OSS-Fuzz users.
+- Tooling is fragmented. LibFuzzer has a low barrier to entry but receives
+  little new feature work; AFL++ has more features and more setup friction;
+  FuzzTest is active but C++-only, and its integration details matter for
+  CMake and OSS-Fuzz users.
 - Evaluation claims are hard to trust. Fuzzing is stochastic and sensitive to
-  environment, target, seeds, time budget, and instrumentation. BHF needs
-  internal benchmarking discipline before claiming superiority.
+  environment, target, seeds, time budget, and instrumentation, so comparing
+  BHF with other tools needs a repeatable benchmark first.
 
 ## Feature Opportunities
 
@@ -173,8 +184,8 @@ The same problems show up across papers, project issues, and forum threads:
    target here" suggestions, missing seed/dictionary hints, and a per-target
    harness quality score.
 
-   Why this matters: Fuzz Introspector is one of the clearest mature-platform
-   gaps BHF does not yet close, and Ada has no comparable open tooling.
+   Why this matters: Fuzz Introspector was one of the clearest mature-platform
+   features BHF lacked in May 2026, and Ada has no comparable open tooling.
 
 2. Structure-aware input layer.
 
@@ -185,8 +196,8 @@ The same problems show up across papers, project issues, and forum threads:
    length/checksum repair hooks so inputs can pass common parser gates.
 
    Why this matters: AFL++ grammar mutators and CmpLog exist because raw byte
-   mutation is not enough for structured formats. BHF can make this
-   automatic from Ada/C/C++ source models.
+   mutation stalls on structured formats. BHF can derive this input structure
+   from Ada/C/C++ source models.
 
 3. Oracle SDK v0.2 with executable oracles.
 
@@ -202,8 +213,8 @@ The same problems show up across papers, project issues, and forum threads:
    - Contract/assertion promotion for Ada exceptions, SPARK-like pre/post
      expectations when visible, C assertions, and C++ invariants.
 
-   Why this matters: "does not crash" misses many real bugs. Oracles are the
-   path to security-relevant and correctness-relevant findings.
+   Why this matters: many real bugs do not crash. Oracles turn security and
+   correctness violations into findings.
 
 4. Reproducibility and flake control.
 
@@ -224,8 +235,8 @@ The same problems show up across papers, project issues, and forum threads:
    first, then fuzz impacted high-value targets, then spend spare time on
    coverage blockers.
 
-   Why this matters: ClusterFuzzLite proves PR fuzzing is valuable, but BHF
-   can specialize it for partial Ada/C/C++ codebases and generated harnesses.
+   Why this matters: ClusterFuzzLite shows the value of PR fuzzing; BHF can
+   apply it to partial Ada/C/C++ codebases and generated harnesses.
 
 ### P1: Parity And Power Features
 
@@ -269,12 +280,15 @@ The same problems show up across papers, project issues, and forum threads:
 
 11. LLM-assisted harness proposals with validation.
 
-   Use LLM-generated harnesses only as candidates. Accept only if they compile,
-   reach the target, improve coverage, and preserve deterministic replay.
-   **Current status:** shipped as optional `bhf llm prompt|assist` workflows
-   and five read-only `bhf-daemon --mcp` tools. Structural preflight is
-   Ada/C/C++ only and never substitutes for compile, link, target-reachability,
-   coverage, replay, or minimization evidence. See `site/llm.md`.
+   Treat a harness an LLM proposes as a candidate. Accept it only if it
+   compiles, reaches the target, improves coverage, and replays
+   deterministically.
+   **Status:** a bhf built with the `llm` feature has the `bhf llm prompt` and
+   `bhf llm assist` workflows. `bhf-daemon --mcp` exposes three read-only
+   tools in a default build and five in an `llm` build. The structural
+   preflight covers Ada, C and C++, and a harness still has to compile, link,
+   reach the target, gain coverage, replay and minimize. See
+   [`site/llm.md`](site/llm.md).
 
 12. Team triage dashboard.
 
@@ -330,9 +344,8 @@ The same problems show up across papers, project issues, and forum threads:
 ## Recommended Implementation Order
 
 1. Build `bhf introspect` v0.1.
-   It would turn existing BHF runs
-   into actionable "what is missing" guidance and gives Ada users something
-   the mainstream stack does not provide.
+   It turns existing BHF runs into guidance on what is missing, which the
+   mainstream tools do not offer for Ada.
 
 2. Implement executable Oracle SDK v0.2.
    Start with path traversal/file/network/env oracles and differential oracles.
@@ -351,8 +364,8 @@ The same problems show up across papers, project issues, and forum threads:
 
 ## Product Thesis
 
-BHF should not compete by being a faster clone of AFL++ or libFuzzer. It
-should compete by fuzzing code those tools do not reach without expert setup:
+BHF should not try to be a faster AFL++ or libFuzzer. It should fuzz code
+those tools do not reach without expert setup:
 partial Ada/C/C++ trees, missing runtime environments, legacy CORBA, generated
 harnesses, build-recovered projects, stateful package APIs, and semantic
 oracles. The technical discriminator is an Ada/C/C++ fuzz lab generator with

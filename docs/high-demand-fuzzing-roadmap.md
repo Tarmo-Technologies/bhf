@@ -1,29 +1,33 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
-# High-demand fuzzing roadmap — RTOS, radar, and embedded targets
+# High-Demand Fuzzing Roadmap: RTOS, Radar and Embedded Targets
 
 Objective: extend BHF from a host-process, argument-shape-driven memory-safety
 fuzzer into a tool that can build, harness, and fuzz the "high-demand" targets
-common in government/defense work — radars, RTOS images (VxWorks, Green Hills
-INTEGRITY, QNX, RTEMS, FreeRTOS), and other systems whose execution model
+common in government and defense work: radars, RTOS images (VxWorks, Green
+Hills INTEGRITY, QNX, RTEMS, FreeRTOS), and other systems whose execution model
 (shared memory, DMA/MMIO peripherals, interrupt- and message-driven entry
 points, non-x86 big-endian ISAs, hard real-time timing, and rich concurrency)
-breaks the assumptions standard fuzzers — and BHF as it stands today — are
+breaks the assumptions that standard fuzzers, and bhf before this work, are
 built on.
 
-Status: **planning + phased implementation.** This roadmap was produced from a
-read-only capability audit of the tree (2026-09-25). Authorization for the work
-is recorded in [`Authorization.md`](../Authorization.md) (defensive tooling
-development on this repository). This document is the work list; each phase
-below carries its own acceptance criteria and an explicit split between what is
-implementable and testable in-tree versus what is gated on external resources
-(hardware, full-system emulators, proprietary vendor toolchains, or licensed
-RTOS images) that this repository cannot itself provide.
+Status: **phased implementation.** The plan starts from a capability review of
+the tree on 2026-09-25. This document is the work list. Each track below has
+its own acceptance criteria, split between what is implemented and tested
+in-tree and what needs external resources (hardware, full-system emulators,
+proprietary vendor toolchains or licensed RTOS images) that the repository
+does not provide. §1a gives the delivered status of every track.
 
-Related reading: [`docs/cross-compilation.md`](cross-compilation.md) (current
-Ada/C/C++ cross + embedded probe backends), [`docs/expected-gaps.md`](expected-gaps.md)
-(honest gap inventory), [`docs/site/runtime-virtualisation.md`](site/runtime-virtualisation.md)
-(the runtrace shim), and [`ROADMAP.md`](../ROADMAP.md) §§5–13 (discovery,
-harness generation, engines).
+Related reading:
+
+- [Ada cross-compilation and probe backends](cross-compilation.md) and
+  [Cross-Compilation](site/cross-compilation.md) (C and C++);
+- [On-Target Fuzzing](site/on-target-fuzzing.md) and
+  [Hardware-in-the-Loop Bring-Up](hil-bringup.md) (the shipped transports);
+- [Measured gaps](expected-gaps.md);
+- [Runtime virtualisation](site/runtime-virtualisation.md) (the runtrace
+  shim);
+- [`ROADMAP.md`](../ROADMAP.md) §§5–13 (discovery, harness generation,
+  engines).
 
 ---
 
@@ -32,9 +36,9 @@ harness generation, engines).
 > **Superseded (2026-09-27).** The "back half missing" baseline in this section
 > is the pre-`rtos-radar-fuzzing` starting point, kept for context. The back
 > half is now built (§1a) **and** its emulator-in-the-loop lane was run live on
-> QEMU 8.2.2 — RV-1/RV-2/RV-3 all passed
-> (`docs/validation/2026-09-27-hil-emu-live-qemu.md`). Read §1 as history, not
-> as current capability.
+> QEMU 8.2.2, where RV-1, RV-2 and RV-3 passed
+> ([record](validation/2026-09-27-hil-emu-live-qemu.md)). Read §1 as history,
+> not as current capability.
 
 BHF's embedded/RTOS support today is a **host-side stub-isolation lane**: for a
 target guarded by (or including) a vendor platform header, BHF defines the
@@ -51,8 +55,8 @@ not the **back half**:
 
 - **Front half present.** Transport-agnostic Ada source-rewrite instrumentation
   (`crates/instrumenter/src/breadcrumbs.rs:53-56`); two embedded coverage
-  *emitters* — semihosting (`ada_runtime/adafuzz-probe-semihosting.adb`) and an
-  in-RAM ring buffer (`ada_runtime/adafuzz-probe-memory_buffer.adb`) selected by
+  *emitters*, semihosting (`ada_runtime/adafuzz-probe-semihosting.adb`) and an
+  in-RAM ring buffer (`ada_runtime/adafuzz-probe-memory_buffer.adb`), selected by
   `bhf build --probe-backend {semihosting,memory_buffer}`
   (`crates/cli/src/probe_backend.rs`); cross/embedded build flags
   `--target/--runtime/--toolchain` incl. `ravenscar-full`, `light-cortex-m3`,
@@ -67,12 +71,12 @@ not the **back half**:
 - **Back half missing.** No host-side *reader* consumes the semihosting or
   memory-buffer coverage channels. No off-host *runner* exists (no
   `qemu-system`, Renode, avatar2, Unicorn, JTAG/OpenOCD, gdbserver, or
-  serial/TCP on-target agent) — only qemu-**user**/wine argv-prefix
-  (`crates/cli/src/runner.rs:13-56`) and a host-only `afl-fuzz -Q` shell-out
+  serial/TCP on-target agent); the runners are the qemu-**user**/wine
+  argv-prefix (`crates/cli/src/runner.rs:13-56`) and a host-only `afl-fuzz -Q` shell-out
   (`crates/cli/src/binary_fuzz.rs`). The Nyx snapshot backend was a stub
   that returned `NotImplemented`, and the AFL-protocol `fork_server` crate was
   wired into nothing; both crates have since been removed with the other
-  unused ones. Crash detection is `#[cfg(unix)]` on
+  unused crates. Crash detection is `#[cfg(unix)]` on
   `ExitStatus::signal()` (`crates/cli/src/fatal_signal.rs:38-58`). The `iiop`
   decoder and `ada_state_machine` extractor are not wired into the engine.
 
@@ -80,36 +84,35 @@ The consequence: as shipped, a target must run as a **host Linux child
 process** (natively, sandboxed, or under qemu-user/wine) to be fuzzed with
 feedback. A VxWorks image, a Cortex-M board, or a `qemu-system` guest cannot be.
 
-## 1a. Delivered status (branch `rtos-radar-fuzzing`, 2026-09-25)
+## 1a. Delivered status
 
-This reconciles the plan below to what is **actually built on this branch**. A
-track is **software-complete** when its in-tree acceptance criteria pass under
-`cargo test` (against mocks/fixtures, no external resources); its **gated
-validation** — the step that needs real hardware, a live emulator, or a
-proprietary toolchain — is listed separately, with the evidence recorded under
-`docs/validation/` (see §5, §6). The emulator-in-the-loop lane was run live on
-2026-09-27 — RV-1/RV-2/RV-3 passed on QEMU 8.2.2
-(`docs/validation/2026-09-27-hil-emu-live-qemu.md`); the steps still *unproven
-until run* are real silicon, proprietary RTOS images, and the TCP/serial agent
-transport. Software-complete is **never** a claim of validated
-on-target capability.
-Where a track has a purely *library* capability that is not yet reachable from a
-`bhf` command, that is called out explicitly rather than counted as a live
-feature.
+This section maps the plan to what is built. A track is
+**software-complete** when its in-tree acceptance criteria pass under
+`cargo test`, against mocks and fixtures with no external resources. Its
+**gated validation**, the step that needs real hardware, a live emulator or a
+proprietary toolchain, is listed separately, with the evidence under
+`docs/validation/` (see §5 and §6). The two are separate states.
+
+The emulator-in-the-loop lane ran live on 2026-09-27: RV-1, RV-2 and RV-3
+passed on QEMU 8.2.2 ([record](validation/2026-09-27-hil-emu-live-qemu.md)).
+The reference agent ran over `agent:tcp` under QEMU on 2026-11-18. Real
+silicon, proprietary RTOS images and the agent on a real serial line have not
+been run. A track whose capability is a library with no `bhf` command says so
+in its row.
 
 | Track | Commit | Software-complete (in-tree) | Evidence — crate · representative test | Gated / follow-up (emulator lane validated 2026-09-27; real HW / images still gated) |
 |---|---|---|---|---|
 | CC-1 | `a0ca452` | yes | `crates/actionability/src/fidelity.rs`; JSON schema `docs/finding-report-fields.md` (`fidelity` block) | — (in-tree only) |
 | HDF-1 | `80d5df3` | yes | `crates/target_transport` — `agent::tests::agent_session_delivers_input_and_surfaces_monotonic_edges_and_fault`; `coverage.rs` Semihosting/MemoryBuffer readers (incl. wrap case); `host::HostChildTransport` | real board via `GdbRemoteTransport` still gated (`hil_board.rs` / `BHF_HIL_GDB`); the live-gdbstub coverage path **validated 2026-09-27** (RV-2 `live_gdb`, qemu-arm); the `agent:tcp` lane against the reference agent as a FreeRTOS task **validated 2026-11-18** (`transport_freertos_agent_cli`, qemu-arm; [record](validation/2026-11-18-freertos-agent.md)) |
-| HDF-1b | `307a42e` | yes | `crates/cli/src/transport_fuzz.rs` — `transport_path_is_off_by_default_and_opt_in` + spec-parser tests, driven over `target_transport::testsupport` mocks | The gdbstub and `qemu-system` backends **validated 2026-09-27** (RV-2 `live_gdb`, RV-3 `live_fullsystem`); the shipped CLI drives them live (`crates/cli/tests/transport_fuzz_qemu_cli.rs`), and the FreeRTOS emulator profile (`crates/target_transport/tests/freertos/`, #84) passes clean → fault → clean through the CLI. The memory-read transports take the staging buffer's capacity (`input_cap=`, #162). Open: a target-side agent for the TCP/serial lane ([#289](https://github.com/Tarmo-Technologies/bhf/issues/289)), and virtual time; `agent:serial` opens its port raw with a read deadline (#164) |
+| HDF-1b | `307a42e` | yes | `crates/cli/src/transport_fuzz.rs` — `transport_path_is_off_by_default_and_opt_in` + spec-parser tests, driven over `target_transport::testsupport` mocks | The gdbstub and `qemu-system` backends **validated 2026-09-27** (RV-2 `live_gdb`, RV-3 `live_fullsystem`); the shipped CLI drives them live (`crates/cli/tests/transport_fuzz_qemu_cli.rs`), and the FreeRTOS emulator profile (`crates/target_transport/tests/freertos/`, #84) passes clean → fault → clean through the CLI. The memory-read transports take the staging buffer's capacity (`input_cap=`, #162). The reference target-side agent (`c_runtime/bhf_agent.c`, [#289](https://github.com/Tarmo-Technologies/bhf/issues/289)) runs over `agent:tcp` as a FreeRTOS task and a Zephyr module under QEMU ([record](validation/2026-11-18-zephyr-agent.md)). Open: virtual time; `agent:serial` opens its port raw with a read deadline (#164) |
 | HDF-2 | `229105a` | yes | `crates/cli/src/transport_fault.rs` — backend-neutral `Fault`→finding mapping; cross-build compiler guards | on-emulator Cortex-M hard-fault reporting **validated 2026-09-27** (RV-3 `live_fullsystem`: input `0xF7` → `udf` → `HardFault_Handler`, distinct fault breadcrumb); on-silicon vectors still gated |
 | HDF-3 | `dbebbf7` | partial: decoded arguments get typed values little-endian, as `bhf_decode.h` reads them on every target ([#299](https://github.com/Tarmo-Technologies/bhf/issues/299)); the ABI model's target-byte-order struct images are not used in production | `crates/type_model/src/abi.rs` — `struct_image_is_emitted_in_target_byte_order`, `host_abi_matches_the_x86_64_lab_host`; `crates/cli/src/auto/cross_target.rs` PPC/MIPS/SPARC triples | BE-only branch reached under `qemu-ppc64` but not on the LE host **validated 2026-09-27** (RV-1, `powerpc64-linux-gnu-gcc` + qemu-ppc64) |
-| HDF-4 | `89b9fb8` | yes | `crates/target_transport/src/fullsystem.rs` — `arm_performs_qmp_handshake_gdb_attach_and_baseline_snapshot`, `run_input_loads_snapshot_delivers_input_and_reads_ring_coverage`, `same_input_twice_is_deterministic` (scripted QMP + gdbstub mocks) | live `qemu-system-*` (BHF-authored image) **validated 2026-09-27** (RV-3 `live_fullsystem`, `qemu-system-arm -M mps2-an385`: savevm/loadvm reset + coverage-ring readback + planted HardFault). The Renode lane (`renode:`, #340) ran against Renode 1.17.0 (RV-7); proprietary RTOS images remain a follow-up; Nyx stub **retired** (`nyx_adapter` — `not_implemented_error_names_the_full_system_replacement`) |
+| HDF-4 | `89b9fb8` | yes | `crates/target_transport/src/fullsystem.rs` — `arm_performs_qmp_handshake_gdb_attach_and_baseline_snapshot`, `run_input_loads_snapshot_delivers_input_and_reads_ring_coverage`, `same_input_twice_is_deterministic` (scripted QMP + gdbstub mocks) | live `qemu-system-*` (BHF-authored image) **validated 2026-09-27** (RV-3 `live_fullsystem`, `qemu-system-arm -M mps2-an385`: savevm/loadvm reset + coverage-ring readback + planted HardFault). The Renode lane (`renode:`, #340) ran against Renode 1.17.0 (RV-7); proprietary RTOS images remain a follow-up; the Nyx stub was retired and its `nyx_adapter` crate later removed |
 | HDF-5 | `d31a824` | yes | `crates/target_rank/src/c_rank.rs` — `intconnect_isr_and_msgqueue_consumer_ranked_reachable_not_unproven`, `mmio_polled_register_reader_is_a_channel_consumer`; `crates/harness_gen/src/c_generate.rs` — `peripheral_reader_harness_drives_a_fuzz_controlled_read_sequence` | — (in-tree only) |
 | HDF-6 | `94ad2c4` | yes | `crates/c_stub_gen/src/lib.rs` — `fuzz_driven_stub_reaches_a_return_value_gated_branch_e2e`; `crates/bhf_runtrace_shim/src/{fakes/fuzz_input.rs,hooks/rtos.rs}` (fuzz-driven RTOS channels + MMIO fill) | bare-metal MMIO interception on a real cross build (the host stub-isolation lane is in-tree) |
 | HDF-7 | `dc47e31` / #58 | yes | `crates/fuzz_engine/builtin/src/binframe.rs` — `fixup_reaches_past_crc_gate_but_naive_mutation_does_not`, `length_and_crc_are_computed_on_encode`; `crates/protocol_session/` — profile parse / model compile / encode+repair+ref-resolution / graph-gated mutation / drive+replay+minimize (38 tests); `crates/cli/tests/session_fuzz_cli.rs` — `bhf fuzz --protocol-profile` drives a live-TCP toy `OPEN`/`WRITE` service to the clean-exit boundary, then replays after a fresh reset and minimizes | **CLI-wired (#58):** `bhf fuzz --protocol-profile` drives a response-dependent multi-message session over a TCP `SessionTransport`, with separate code vs state/transition novelty, a `session.json` finding artifact, and replay/minimize. IIOP/GIOP dispatch and a live DDS transport remain documented follow-ups |
 | HDF-8 | `86aa8e6` | yes | `crates/cli/src/fuzz.rs` — `deadline_oracle_reports_a_slow_input_as_a_bhf555_finding_but_not_a_fast_one` (BHF-555); `crates/bhf_runtrace_shim/src/hooks/sched.rs` + `crates/bhf_runtrace_shim/tests/schedule_perturbation.rs` (cooperative perturbation + pinned replay) | exhaustive interleaving is intractable — claims bounded to "found within budget" (§5) |
-| CC-2 | this branch (uncommitted) | yes | Honesty audit: `crates/fork_server/src/lib.rs` documented as an unused reference impl (superseded by `AgentTransport` + the engine `BHF_FRAMED` loop); `crates/iiop/src/lib.rs` + `crates/ada_state_machine/src/lib.rs` crate docs state library-vs-CLI reachability honestly; `ada_runtime/adafuzz-probe-memory_buffer.adb` documented as reader-consumed and `adafuzz-probe-semihosting.adb` as not read by any transport yet (#292); `ROADMAP.md` IIOP note reconciled; this table | — (documentation reconciliation; no new capability) |
+| CC-2 | — | yes | Documentation reconciliation: `crates/iiop/src/lib.rs` and `crates/ada_state_machine/src/lib.rs` crate docs state which capability is library-only and which a command reaches; `ada_runtime/adafuzz-probe-memory_buffer.adb` and `adafuzz-probe-semihosting.adb` name their readers (#292); `ROADMAP.md` IIOP note reconciled; this table. The unused `fork_server` and `nyx_adapter` crates were later removed | — (documentation; no new capability) |
 
 **Deferred surface.**
 
@@ -124,14 +127,14 @@ feature.
   transport remain the named follow-ups, not blockers of the shipped capability.
 - **HDF-1 / 1b / 2 / 3 / 4 emulator lane validated; real HW still gated.** The
   transports build and are mock-proven in-tree, and their emulator-in-the-loop
-  lane was run live on 2026-09-27 — RV-1 (big-endian ppc64), RV-2 (qemu-arm
-  gdbstub), RV-3 (`qemu-system-arm` full-system) all passed
-  (`docs/validation/2026-09-27-hil-emu-live-qemu.md`). Still unproven until run
-  against their resource (§5, §6): a real board/probe (`hil_board.rs` /
-  `BHF_HIL_GDB`), proprietary RTOS images, and the TCP/serial agent transport.
-- **HDF-4 Nyx is retired, not finished.** `nyx_adapter` is scaffolding
-  superseded by `FullSystemTransport`; it collects zero coverage and is on no
-  live path (CC-2).
+  lane ran live on 2026-09-27: RV-1 (big-endian ppc64), RV-2 (qemu-arm
+  gdbstub) and RV-3 (`qemu-system-arm` full-system) passed
+  ([record](validation/2026-09-27-hil-emu-live-qemu.md)). Not yet run
+  against their resource (§5, §6): a real board or probe (`hil_board.rs` /
+  `BHF_HIL_GDB`), proprietary RTOS images, and the agent on a real serial
+  line.
+- **HDF-4 Nyx is retired.** `FullSystemTransport` replaced the `nyx_adapter`
+  stub, and the crate has been removed (CC-2).
 
 ## 2. Design principles and non-goals
 
@@ -149,22 +152,25 @@ feature.
 4. **Evidence gate.** Software is implemented and unit/integration-tested
    in-tree; validation that requires hardware, a full-system emulator image, or
    a proprietary vendor toolchain is written to self-skip when the resource is
-   absent (repo convention), and its unproven status is recorded, never faked.
+   absent (repo convention), and its status is recorded as not yet run.
 5. **No proprietary redistribution.** BHF ships no VxWorks/INTEGRITY headers,
    no vendor toolchains, and no RTOS images. Vendor-API models are BHF-authored
    scaffolding (as the existing stubs already are).
 
 **Non-goals (this roadmap).** Bundling or cracking proprietary toolchains;
-shipping RTOS images; live testing of third-party fielded systems (the
-authorization is for local development fixtures and permitted public source);
-becoming a general-purpose full-system emulator (we integrate qemu-system /
-Renode, we do not write one).
+shipping RTOS images; live testing of third-party fielded systems (the work
+uses local development fixtures and permitted public source); becoming a
+general-purpose full-system emulator (bhf integrates qemu-system and Renode).
 
 ## 3. Capability gap inventory
 
-Verdicts follow `docs/expected-gaps.md`: **GAP** = BHF's own limitation,
-fixable here; **DEPENDENCY** = needs an external resource not in the tree
-(implemented behind a seam, validated when the resource is present).
+Verdicts follow [Measured gaps](expected-gaps.md): **GAP** = a limitation in
+bhf, fixable in bhf; **DEPENDENCY** = needs an external resource not in the
+tree (implemented behind a seam, validated when the resource is present).
+
+The "Current evidence" paragraph of each track below records the tree as of
+the 2026-09-25 review, with the file and line references of that date. §1a
+gives the delivered status.
 
 | Track | Gap | Priority | Verdict |
 |---|---|---|---|
@@ -207,7 +213,7 @@ transport.
 
 **Goal.** A single `TargetTransport` seam through which the builtin engine
 delivers an input, triggers one execution, and receives coverage + status +
-faults — regardless of whether the target is a host child, an on-target agent
+faults, whether the target is a host child, an on-target agent
 over serial/TCP, a debug probe, or a full-system emulator.
 
 **Current evidence.** Execution/harvest is hardcoded to a host child:
@@ -268,7 +274,7 @@ against a real board or a live `qemu-system` gdbstub is DEPENDENCY (gated).
 ## HDF-2 — Fault detection without host POSIX signals
 
 **Goal.** Detect and classify target faults that never produce a host
-`SIGSEGV`/exit status — on-target CPU exceptions, MMU/MPU traps, watchdog
+`SIGSEGV`/exit status: on-target CPU exceptions, MMU/MPU traps, watchdog
 resets, stack/guard-region violations.
 
 **Current evidence.** `fatal_signal::classify` is `#[cfg(unix)]` on
@@ -300,7 +306,7 @@ fault does not reach `waitpid`.
 ## HDF-3 — Big-endian and multi-arch fidelity (PowerPC, MIPS, SPARC)
 
 **Goal.** Faithful fuzzing for the architectures that dominate fielded
-RTOS/radar systems — big-endian PowerPC first — both for cross-execution and
+RTOS/radar systems, big-endian PowerPC first, both for cross-execution and
 for the host stub-isolation lane's input generation.
 
 **Current evidence.** `resolve_cross_target` maps only aarch64/armhf (LE Linux)
@@ -333,7 +339,7 @@ generator is hardcoded little-endian (`crates/fuzz_engine/builtin/src/typed.rs:1
 ## HDF-4 — Full-system and snapshot fuzzing
 
 **Goal.** Fuzz code that only runs meaningfully in privileged/full-system
-context — RTOS images, BSPs, drivers, ISRs — via full-system emulation with
+context (RTOS images, BSPs, drivers, ISRs) through full-system emulation with
 snapshot/reset, feeding the HDF-1 transport.
 
 **Current evidence.** Nyx adapter is a stub (`NotImplemented`; zero-coverage
@@ -385,12 +391,10 @@ against Renode 1.17.0 with a bare-metal Cortex-M3 image on a minimal board
 Vendor board scripts and an RTOS under Renode are unvalidated.
 
 *Deliverable 3 (Nyx)* resolves roadmap **CC-2** for nyx by **retiring** the
-`nyx_adapter` stub: it has no consumers, does not implement the transport seam,
-and its software replay collects zero coverage (strictly weaker than
-`HostChildTransport`). Rather than route a misleading zero-coverage backend
-through the seam, its crate docs now mark it as scaffolding superseded by
-`FullSystemTransport`, and `NyxError::NotImplemented` names `FullSystemTransport`
-(HDF-4) as the replacement (asserted by a test). No coverage is fabricated.
+`nyx_adapter` stub. It had no consumers, did not implement the transport seam,
+and its software replay collected zero coverage, less than
+`HostChildTransport`. `FullSystemTransport` (HDF-4) replaces it, and the crate
+has since been removed.
 
 ## HDF-5 — Non-buffer entry-point discovery and environment/peripheral harness synthesis
 
@@ -406,9 +410,9 @@ fields nulled to no-op trampolines (`crates/harness_gen/src/c_generate.rs:1313-1
 
 **Deliverables.**
 
-1. Discovery recognizers for registration/consumer idioms — `intConnect`,
+1. Discovery recognizers for registration/consumer idioms (`intConnect`,
    `taskSpawn`, `msgQReceive`/`msgQReceive`-loops, MMIO map+read, cFS
-   `CFE_SB_*`, DDS `take`/`read` — that mark the *registered/consuming* function
+   `CFE_SB_*`, DDS `take`/`read`) that mark the *registered/consuming* function
    as the fuzz unit regardless of its parameter signature, feeding
    `InputReachability` a new provenance class at rank time (not only the
    post-run `IpcChannelReachable` relabel).
@@ -465,7 +469,7 @@ then resolved as inert `return 0` (`crates/c_stub_gen/src/lib.rs:544-636`);
 ## HDF-7 — Binary-framed and on-the-wire stateful protocol input
 
 **Goal.** Generate structurally valid binary protocol frames (length-prefixed /
-TLV / checksummed) and drive stateful, on-the-wire protocol sessions — radar/
+TLV / checksummed) and drive stateful, on-the-wire protocol sessions: radar/
 telemetry formats and defense middleware (IIOP/GIOP, DDS).
 
 **Current evidence.** Input is always one flat buffer; the grammar
@@ -476,8 +480,8 @@ engine.
 
 **Deliverables.**
 
-1. A structured/binary input model with **computed fields** — length, checksum/
-   CRC, tag-length-value, offsets, back-references — either as grammar semantic
+1. A structured/binary input model with **computed fields** (length, checksum/
+   CRC, tag-length-value, offsets, back-references), either as grammar semantic
    actions or a typed message-descriptor format, so a mutated frame stays
    internally consistent.
 2. Wire the `iiop` GIOP/CDR decoder into an actual IIOP fuzzer: add an encoder +
@@ -498,9 +502,8 @@ engine.
 
 ## HDF-8 — Concurrency-schedule exploration and real-time/timing oracles
 
-**Goal.** Find the dominant RTOS/radar bug classes — races, priority inversion,
-deadlock, ISR-vs-task races, missed deadlines — rather than catching them by
-luck.
+**Goal.** Find the dominant RTOS/radar bug classes (races, priority inversion,
+deadlock, ISR-vs-task races, missed deadlines) by systematic search.
 
 **Current evidence.** `multicore_fuzz` is throughput sharding only. The sole
 concurrency capability is TSan corpus-replay: C-only, host-only, observational,
@@ -514,8 +517,8 @@ deterministic-only.
    (or a controlled scheduler under emulation) so a specific interleaving can be
    forced and searched.
 2. Deterministic/virtual-time injection and a **deadline oracle** ("must respond
-   within D"), so watchdog/timing-dependent behavior is testable, not just
-   "it hung."
+   within D"), so a watchdog or timing failure is reported as a finding
+   rather than as a hang.
 3. Multi-run + schedule-pinned replay so a concurrency/timing crash reproduces.
 
 **Acceptance criteria.**
@@ -530,8 +533,9 @@ deterministic-only.
 
 ## CC-1 — Structured fidelity labeling (do first)
 
-**Goal.** Replace the coarse per-target "reduced-fidelity" text caveat
-(`crates/cli/src/auto/report.rs:3200-3208`) with a structured record, on every
+**Goal.** Replace the coarse per-target "reduced-fidelity" text note (the
+`fidelity_caveat` string, `crates/cli/src/auto/report.rs:3200-3208` in the
+2026-09-25 tree) with a structured record, on every
 finding and every campaign summary, of the dimensions exercised vs not:
 `{arch, endianness, rtos_runtime, hardware/peripherals, concurrency,
 sanitizers}`. A clean host-stub run must read as "portable logic fuzzed on host;
@@ -539,9 +543,10 @@ target ISA / RTOS runtime / hardware / concurrency NOT exercised," never as
 target assurance.
 
 **Acceptance criteria.** In-tree: the RTOS stub fixture's report explicitly
-enumerates the un-exercised dimensions; a fully-native host target does not
-carry spurious caveats; the JSON finding schema (`docs/finding-report-fields.md`)
-gains the fidelity block.
+enumerates the un-exercised dimensions; a fully native host target carries
+no `fidelity_caveat`; the JSON finding schema
+([`docs/finding-report-fields.md`](finding-report-fields.md)) gains the
+fidelity block.
 
 ## CC-2 — Finish or retire dead capabilities
 
@@ -557,9 +562,9 @@ users and the roadmap are not misled.
 it does not have; each formerly-dead component is either wired (with a test
 proving reachability) or documented as scaffolding with the tracking track named.
 
-**Delivered (2026-09-25).** Each of the five is resolved by the honest,
-low-risk option — three are now wired with a reachability test, two
-are documented as scaffolding naming the completing track:
+**Delivered (2026-09-25).** Each of the five is resolved: three are wired with
+a reachability test, and two were retired (both crates have since been
+removed):
 
 - **`iiop`** — *wired (library); a candidate second session backend.* HDF-7 added
   an encoder + servant dispatch, so the decoder is reachable: fuzz bytes → GIOP
@@ -577,16 +582,13 @@ are documented as scaffolding naming the completing track:
   2 got during each run through `SemihostingReader`
   (`crates/target_transport/src/gdb.rs`; a live QEMU test checks the coverage
   each path adds).
-- **Nyx `nyx-engine` stub** — *retired* in favor of `FullSystemTransport`
-  (HDF-4): `nyx_adapter` crate docs mark it superseded scaffolding, and
-  `NyxError::NotImplemented` names the replacement
-  (`not_implemented_error_names_the_full_system_replacement`).
-- **`fork_server` crate** — *documented as scaffolding.* Confirmed to have **no**
-  consumers (no `Cargo.toml` dep, no `use fork_server`; the CLI's own
-  `ForkServer` in `crates/cli/src/fuzz.rs` is a separate framed-stdin
-  implementation). Superseded by `target_transport::AgentTransport` (framed) and
-  the engine's `BHF_FRAMED` loop; its `lib.rs` now says so and advertises no
-  end-to-end capability. Kept as an AFL wire-format reference rather than removed.
+- **Nyx `nyx-engine` stub**: *retired* in favor of `FullSystemTransport`
+  (HDF-4). The `nyx_adapter` crate has since been removed.
+- **`fork_server` crate**: *retired.* It had no consumers (no `Cargo.toml`
+  dependency, no `use fork_server`); the CLI's own `ForkServer` in
+  `crates/cli/src/fuzz.rs` is a separate framed-stdin implementation.
+  `target_transport::AgentTransport` and the engine's `BHF_FRAMED` loop
+  replace it, and the crate has since been removed.
 - **`ada_state_machine` extractor** — *typed API, now engine-consumed.* HDF-7
   added the `ProtocolStateGraph` adapter (tested projection); the
   `bhf extract-state-machines` JSON subcommand consumes inference, and as of #58
@@ -603,22 +605,24 @@ See §1a for the full per-track delivered-status table.
 
 - **Hardware/emulator/toolchain dependence.** HDF-1 (probe/agent), HDF-3
   (PPC/MIPS/SPARC toolchains + emulators), and HDF-4 (qemu-system/Renode/images)
-  have validation steps that need external resources. The emulator/cross-toolchain
-  steps were run on 2026-09-27 (QEMU 8.2.2 + `arm-none-eabi` / `powerpc64` /
-  `armhf` cross gcc) and passed — RV-1/RV-2/RV-3
-  (`docs/validation/2026-09-27-hil-emu-live-qemu.md`). Still unproven until run
-  against their resource: a real board (`hil_board.rs` / `BHF_HIL_GDB`), the
-  TCP/serial agent transport, and proprietary RTOS images. Completion of
-  a track's *software* is not a claim of validated on-target capability.
-- **Proprietary RTOS fidelity.** BHF's vendor-API models are scaffolding; they
-  make code build and fuzz on the host, they do not reproduce Wind River /
-  Green Hills runtime semantics. HDF-4 (real images under emulation) is the only
-  path to true RTOS-semantic fidelity, and depends on the user supplying a
-  lawfully-obtained image.
-- **Concurrency completeness.** HDF-8 schedule exploration reduces but does not
-  eliminate the luck factor; exhaustive interleaving search is intractable for
-  real targets. Claims are bounded to "found within budget under exploration,"
-  with preserved no-repro trials.
+  have validation steps that need external resources. The emulator and
+  cross-toolchain steps ran on 2026-09-27 (QEMU 8.2.2 with `arm-none-eabi`,
+  `powerpc64` and `armhf` cross gcc) and passed: RV-1, RV-2 and RV-3
+  ([record](validation/2026-09-27-hil-emu-live-qemu.md)). The reference agent
+  ran over `agent:tcp` as a FreeRTOS task and as a Zephyr module under QEMU on
+  2026-11-18 ([FreeRTOS](validation/2026-11-18-freertos-agent.md),
+  [Zephyr](validation/2026-11-18-zephyr-agent.md)). Not yet run against their
+  resource: a real board (`hil_board.rs` / `BHF_HIL_GDB`), the agent on a
+  real serial line, and proprietary RTOS images.
+- **Proprietary RTOS fidelity.** bhf's vendor-API models make code build and
+  fuzz on the host; they model the API's declarations, not Wind River or
+  Green Hills runtime semantics. Those semantics come from running a real
+  image under emulation (HDF-4), which the user supplies from a lawful
+  source.
+- **Concurrency coverage.** HDF-8 schedule exploration searches interleavings
+  within a budget; exhaustive interleaving search is intractable for real
+  targets. Results are stated as "found within budget under exploration",
+  with no-repro trials kept.
 - **Scope.** This is a multi-wave program. Each track lands independently behind
   the HDF-1 transport seam; partial adoption (e.g. HDF-1+HDF-2+CC-1 only) is a
   coherent, shippable increment.
@@ -630,5 +634,4 @@ A track is *software-complete* when its in-tree acceptance criteria pass under
 fidelity record, and `cargo clippy`/`fmt` are clean. A track is *validated* only
 when its gated acceptance criteria have been run against the real resource and
 the evidence (versions, commands, coverage/exec counts, artifacts) is recorded
-in `docs/validation/`. The two states are reported separately and never
-conflated.
+in `docs/validation/`. The two states are reported separately.

@@ -2,24 +2,23 @@
 
 # Differential Fuzzing
 
-BHF ships a `bhf differential` subcommand: it replays each input
-through two already-built harness executables (or one harness under a metamorphic
-transform) and flags behavioural divergences. Inside a fuzz campaign, `bhf fuzz
---differential-harness` runs every input through two builds and makes their
-disagreement a finding ([In the fuzz loop](#in-the-fuzz-loop)). It is language-agnostic — the
-executables can come from any of the sixteen current lanes as long as they obey
-the normal one-input harness contract; the language is fixed by the target
-source, not by this tool.
+Differential fuzzing runs the same input through two builds of a target, or
+through one build with a transformed copy of the input, and reports the inputs
+on which the results disagree. bhf does this in two places:
 
-Automated comparison *across Ada compilers* — toolchain discovery and
-multi-compiler matrix orchestration — remains a v1.1+ research boundary.
-BHF does not bundle compilers and does not depend on proprietary or
-copyleft-linked compiler libraries in the strict-permissive core profile.
+- `bhf differential` replays a directory of inputs through two built
+  executables, or through one executable under metamorphic transforms.
+- `bhf fuzz --differential-harness` runs every input of a fuzz campaign
+  through a second build ([In the fuzz loop](#in-the-fuzz-loop)).
 
-Run it over a directory of inputs:
+You build each side yourself, with whatever compiler, flags or target version
+you want to compare. bhf takes the built executables; it does not install
+or select compilers.
+
+## Replaying a corpus: `bhf differential`
 
 ```sh
-# two compilers / two harness builds
+# two builds of one harness
 bhf differential --harness-a ./harness_a --harness-b ./harness_b \
   --inputs ./corpus --work-dir ./bhf_work
 
@@ -29,13 +28,26 @@ bhf differential --harness ./harness \
   --inputs ./corpus --work-dir ./bhf_work
 ```
 
-The CLI compares observable behaviour — stdout bytes and exit code/timeout —
-and emits findings on divergence:
+Each executable receives the input file's path as `argv[1]`, with an empty
+stdin, so it can be a harness from any language lane. bhf compares the stdout
+bytes and the exit status (or timeout) of the two runs and records:
 
-- `BHF-301` (differential output divergence) when two harnesses disagree on the
-  same input;
+- `BHF-301` (output divergence) when two harnesses disagree on the same input;
 - `BHF-307` (metamorphic relation violation) when one harness breaks the
-  relation a metamorphic transform declares between an input and its variant.
+  relation a transform declares between an input and its variant.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--harness-a`, `--harness-b` | none | The two executables to compare |
+| `--harness` | none | The one executable for metamorphic mode |
+| `--metamorphic-transform` | none | Transforms to apply; comma-separated or repeated |
+| `--inputs` | required | Directory of input files |
+| `--work-dir` | `bhf_work` | Where findings are written |
+| `--timeout-secs` | `5` | Timeout for each side of each input |
+
+`--out DIR` is a deprecated spelling of `--work-dir DIR`.
+
+### Metamorphic transforms
 
 Each transform declares the relation its variant must keep:
 
@@ -43,60 +55,68 @@ Each transform declares the relation its variant must keep:
 | --- | --- | --- |
 | `append-newline` | a `\n` after the input | same output: stdout bytes and exit status |
 | `trailing-whitespace` | a space and a tab at the end of every line, before its `\r\n` or `\n` | same output |
-| `reorder-json-keys` | every JSON object's members in reverse order, every other byte (whitespace, separators, values' spelling) kept | same output |
-| `utf8-bom` | a UTF-8 byte order mark (`EF BB BF`) before the input | same exit status; stdout may differ, as a parser that echoes its input echoes the mark |
+| `reorder-json-keys` | every JSON object's members in reverse order, every other byte (whitespace, separators, the spelling of values) kept | same output |
+| `utf8-bom` | a UTF-8 byte order mark (`EF BB BF`) before the input | same exit status; stdout may differ, because a parser that echoes its input echoes the mark |
 
-`--metamorphic-transform` takes several, comma-separated or the flag repeated;
-each is applied to every input, the input itself runs once, and each variant
-is checked against its own relation. A finding's `metamorphic` block names its
-`transform` and `relation`, and the variant is `testcase_transformed.bin`.
-A transform that does not apply to an input (no JSON text or no object with two
-members for `reorder-json-keys`, a byte order mark already there for
-`utf8-bom`) leaves it out, and the summary line counts the variants left out.
+The original input runs once, and each selected transform is applied to it and
+checked against its own relation. A transform skips an input it does not apply
+to: `reorder-json-keys` needs JSON text with an object of two or more
+members, and `utf8-bom` needs an input without a byte order mark. The summary
+line counts the skipped variants.
 
-Each divergence is written to `<work-dir>/results/findings/F-DIFF-NNNN/` as a
-JSON finding with stdout/exit-code previews and oracle metadata, and
-`results/` is rebuilt (`--timeout-secs` bounds each side, default 5). A rerun
-on the same work dir adds the next free `F-DIFF-` ids and never overwrites
-earlier findings. `--out DIR` is a deprecated spelling of `--work-dir DIR`.
+### Output
+
+Each divergence becomes a JSON finding in
+`<work-dir>/results/findings/F-DIFF-NNNN/`, with previews of both sides'
+stdout and exit codes and the oracle metadata. bhf then rebuilds `results/`.
+A rerun on the same work directory takes the next free `F-DIFF-` ids and
+keeps earlier findings. In metamorphic mode, the finding's `metamorphic` block
+names the `transform` and the `relation`, and the variant input is saved as
+`testcase_transformed.bin`.
 
 ## In the fuzz loop
 
 `bhf fuzz --differential-harness <PATH>` makes divergence a finding of the
-builtin engine's own campaign rather than of a replay afterwards: every input
-the loop runs (each seed and mutant) runs through the fuzzed harness and
-through a second build of it, so the search reaches inputs the primary
-build's corpus never would.
+builtin engine's own campaign. Every input the loop runs, seeds and mutants,
+runs through the fuzzed harness and through the second build. The search can
+therefore reach inputs that a replay of the primary build's corpus would
+miss.
 
 ```sh
-# the same harness built twice: the fuzzed build and gcc's
+# build the same harness a second time with gcc, then fuzz both
 make -C bhf_work/harnesses/H-X diff DIFF_CC=gcc
-bhf fuzz bhf_work --harness H-X --time 5m   --differential-harness bhf_work/harnesses/H-X/main_diff
+bhf fuzz bhf_work --harness H-X --time 5m \
+  --differential-harness bhf_work/harnesses/H-X/main_diff
 ```
 
 The second build is any executable linked with bhf's driver
 (`c_runtime/bhf_driver.c`): another compiler, other flags or defines, or
-another version of the target. It runs on a fork-server of its own, with its
-own coverage maps; an input that grows either build's coverage is kept, so
-the campaign explores both. Its persistent process stays in step with the
-fuzzed build's, so that a target that keeps state from one input to the next
-(a counter, a cache, an allocator) holds the same state in both when they are
-compared: it also runs every input the fuzzed build's process runs outside the
-comparison (the CmpLog and colorization probes, the calibration re-runs of a
-new corpus entry), and when either process dies (a crash, a hang) or is
-restarted, both start over. The two runs of an input are compared on:
+another version of the target. It runs on its own fork server with its own
+coverage maps. An input that grows either build's coverage is kept, so the
+campaign explores both.
 
-- how each ended: clean, rejected (a non-zero exit), crashed (a sanitizer
-  report or fatal signal) or hung;
-- for two clean runs, what each observed: a hash the driver keeps of the bytes
-  the target hands `bhf_diff_observe(ptr, len)`, of the target's return value
-  in a bhf-generated harness (an integer, character, enum, boolean or floating
-  value; a pointer only as null or not, since two builds' addresses differ;
-  a struct not at all), and of `bhf_run_one`'s return value.
+The second build's process stays in step with the fuzzed build's, so that a
+target that keeps state between inputs (a counter, a cache, an allocator)
+holds the same state in both when they are compared. It also runs the inputs
+the fuzzed build runs outside the comparison (the CmpLog and colorization
+probes, the calibration re-runs of a new corpus entry). When either process
+dies (a crash, a hang) or is restarted, both start over.
 
-A target observes what it computed (a decoded value, a canonical form, a
-serialized output) with the driver's hook, declared weak where the target is
-also built without bhf's driver:
+### What is compared
+
+- How each run ended: clean, rejected (a non-zero exit), crashed (a sanitizer
+  report or fatal signal) or hung.
+- For two clean runs, what each observed. The driver keeps a hash of:
+  - the bytes the target passes to `bhf_diff_observe(ptr, len)`;
+  - the target's return value in a bhf-generated harness (an integer,
+    character, enum, boolean or floating value; a pointer only as null or
+    non-null, because two builds' addresses differ; a struct is not
+    compared);
+  - `bhf_run_one`'s return value.
+
+A target reports what it computed (a decoded value, a canonical form, a
+serialized output) through the driver's hook. Declare the hook weak when the
+target is also built without bhf's driver:
 
 ```c
 extern void bhf_diff_observe(const void *data, size_t len) __attribute__((weak));
@@ -104,74 +124,94 @@ extern void bhf_diff_observe(const void *data, size_t len) __attribute__((weak))
 if (bhf_diff_observe) bhf_diff_observe(out, out_len);
 ```
 
-An input on which the builds disagree is re-run in a fresh process of each,
-with twice the per-input timeout, so that a build that is only slower than
-`--timeout` (an `-O0` or MemorySanitizer build) is not taken to hang: the rule
-the fuzzed build's own hangs follow. When they disagree there, each is re-run
-once more, and the disagreement holds only when each build does what it did
-the first time: a build whose observation changes from one process to the
-next (it observes an address, the time or a random value) is
-nondeterministic, not divergent. A disagreement that holds is a BHF-301
-finding through the usual fuzz findings pipeline (`classification:
-oracle_hit`, oracle `differential-output-runtime`, whose `stdout_equal`
-evidence here stands for the observations), one per kind of disagreement (the
-observations, or each pair of outcomes and crash kinds, against one second
-build), at most 16 per run. A later run on the work dir that finds a kind of
-disagreement already recorded for the harness does not record it again: it
-lists that finding in the run summary's `duplicates_of_existing`, as it does a
-crash it found before. The finding's `differential` block records `mode:
-in_loop`, both builds (`harness_a`, `harness_b`), `divergence` (`outcome` or
-`observation`), each build's `outcome_a`/`outcome_b` and
-`observation_a`/`observation_b` (`{hash, observations}`, or `null` for a run
-that did not return), `report_a`/`report_b` (`{kind, rule_id}`) for a build
-that crashed, whose sanitizer report is the finding's `sanitizer.log`,
-`confirmed: fresh_process`, and `timeout_ms`, the timeout the fresh-process
-runs had.
+### Confirming a divergence
 
-The run summary's `differential` block gives the second build (`harness`),
-its `executions`, the `divergences` seen in the loop, and what became of
-each: `confirmed` (it held in fresh processes), `unconfirmed` (the builds
-agreed there: the difference depended on what ran before), `nondeterministic`
-(a build disagreed with itself) or `not_rerun` (its kind of disagreement was
-recorded already, the run has its 16 findings, or four re-runs of that kind
-did not hold, past which a kind is only counted); the four add up to
-`divergences`. `findings` counts the BHF-301 findings recorded.
+1. An input on which the builds disagree is re-run in a fresh process of each
+   build, with twice the per-input `--timeout`. A build that is only slower
+   than `--timeout` (an `-O0` or MemorySanitizer build) is therefore not
+   reported as a hang. The fuzzed build's own hangs follow the same rule.
+2. When they still disagree, each build runs the input once more. The
+   disagreement holds only when each build repeats what it did the first
+   time. A build whose observation changes from one process to the next (it
+   observes an address, the time or a random value) is counted as
+   nondeterministic.
 
-`bhf replay` of an in-loop divergence runs its input through both builds, each
-in a fresh process with the finding's `timeout_ms`, and reports `MATCH` (exit
-`0`) when they disagree the way the finding records and each run ends as
-recorded, and `MISMATCH` (exit `3`) with what differs otherwise. The replay
-summary's `lane` is `differential`, with both builds and what each did. When
-the second build is no longer at `harness_b`, the replay cannot tell and
-reports `UNVERIFIED` (exit `4`), naming the missing build. `--harness` names
-the fuzzed build; the second build is always the one the finding records.
+A disagreement that holds is a `BHF-301` finding in the usual fuzz findings
+pipeline (`classification: oracle_hit`, oracle `differential-output-runtime`;
+its `stdout_equal` evidence stands for the observations). bhf records one
+finding per kind of disagreement (the observations, or each pair of outcomes
+and crash kinds, against one second build), up to 16 per run. A later run on
+the same work directory that finds a kind already recorded for the harness
+lists the existing finding in the run summary's `duplicates_of_existing`, as
+it does for a crash found before.
 
-The second build runs only in the builtin engine's single-worker loop:
-`--differential-harness` with another `--engine`, `--workers`, a sanitizer
-matrix, `--target-transport` or `--protocol-profile` is refused (exit `2`), as
-is a fuzzed harness that does not speak bhf's framed protocol (exit `3`).
+The finding's `differential` block records:
 
-The internal `replay_min` library offers a narrower, signature-based path for
-control-flow diagnostics:
+| Field | Meaning |
+|---|---|
+| `mode` | `in_loop` |
+| `harness_a`, `harness_b` | The fuzzed build and the second build |
+| `divergence` | `outcome` or `observation` |
+| `outcome_a`, `outcome_b` | How each build's run ended |
+| `observation_a`, `observation_b` | `{hash, observations}`, or `null` for a run that did not return |
+| `report_a`, `report_b` | `{kind, rule_id}` for a build that crashed; its sanitizer report is the finding's `sanitizer.log` |
+| `confirmed` | `fresh_process` |
+| `timeout_ms` | The timeout the fresh-process runs used |
+
+The run summary's `differential` block gives the second build (`harness`), its
+`executions`, the `divergences` seen in the loop, and the `findings` recorded.
+Each divergence is counted in exactly one of:
+
+| Counter | Meaning |
+|---|---|
+| `confirmed` | It held in fresh processes |
+| `unconfirmed` | The builds agreed in fresh processes; the difference depended on what ran before |
+| `nondeterministic` | A build disagreed with itself |
+| `not_rerun` | Its kind was already recorded, the run already has 16 findings, or four re-runs of that kind failed to hold (later ones of that kind are only counted) |
+
+### Replaying an in-loop finding
+
+`bhf replay` of an in-loop divergence runs the input through both builds,
+each in a fresh process with the finding's `timeout_ms`. It reports:
+
+| Verdict | Exit | When |
+|---|---|---|
+| `MATCH` | `0` | The builds disagree the way the finding records and each run ends as recorded |
+| `MISMATCH` | `3` | Anything differs; the output says what |
+| `UNVERIFIED` | `4` | The second build is no longer at `harness_b`; the output names the missing build |
+
+The replay summary's `lane` is `differential`, with both builds and what each
+did. `--harness` names the fuzzed build; the second build is always the one
+the finding records.
+
+### Requirements
+
+The second build runs in the builtin engine's single-worker loop.
+`bhf fuzz --differential-harness` exits with code `2` when combined with
+another `--engine`, `--workers`, a sanitizer matrix (several `--sanitizers`),
+`--target-transport` or `--protocol-profile`. It exits with code `3` when the
+fuzzed harness does not speak bhf's framed protocol, that is, when it is not
+linked with `c_runtime/bhf_driver.c`.
+
+## Comparing Ada compilers
+
+The comparison works the same for any language and compiler. For Ada, each
+compiler is a user-installed subprocess, and bhf's strict-permissive core
+profile links no Ada compiler library. You can compare:
+
+- two FSF GNAT versions, by building the harness once with each;
+- FSF GNAT against AdaCore GNAT Pro, where you hold a GNAT Pro installation
+  (bhf does not ship or require it);
+- any other Ada compiler that can build bhf's generated harness.
+
+## The `replay_min` library
+
+The `replay_min` crate offers a signature-based comparison for control-flow
+diagnostics:
 
 - each side is tagged with a `CompilerIdentity`;
-- `replay_min::run_differential_harnesses` executes the same input through both
+- `replay_min::run_differential_harnesses` runs the same input through both
   harness runners;
-- event streams are reduced to BHF exception signatures;
+- each event stream is reduced to bhf exception signatures;
 - differing signature sets produce a serializable `DifferentialMismatch` that
   carries both compiler identities and both signature lists.
-
-The comparison itself is language- and compiler-agnostic; what limits *Ada
-compiler* matrices specifically is which compilers users can install and
-license:
-
-| Pair | Boundary | Status |
-| --- | --- | --- |
-| FSF GNAT version A vs FSF GNAT version B | external user-installed subprocesses | Feasible for validation and nightly matrices. |
-| FSF GNAT vs AdaCore GNAT Pro | user/customer environment only | Product can compare outputs, but cannot require or redistribute GNAT Pro. |
-| FSF GNAT vs another open Ada frontend | external subprocesses | Deferred until another frontend can compile generated harnesses. |
-| Compiler libraries or front-end APIs linked into BHF | not allowed in core | Keep behind research-lab boundaries if ever explored. |
-
-The subcommand intentionally starts from built harnesses. Toolchain discovery,
-multi-compiler project synthesis, and automated matrix orchestration can layer on
-top without changing the comparison contract.

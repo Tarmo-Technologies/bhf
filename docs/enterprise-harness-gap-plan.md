@@ -1,138 +1,111 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
-# Next harness-driving gap: typed Go data parameters
+# Typed Go data parameters
 
-Resumed checkpoint, 2026-09-24: a narrow data-only implementation now parses
-package-local struct declarations, rejects private fields, embedded fields,
-method-bearing and opaque types, and seeds complete JSON documents in both
-`auto` and `fuzz`. A real `auto` fixture reached a planted branch through
-nested pointer, slice, map and tagged fields. The full before/after sweep and
-harness-origin finding audit ran on 2026-11-16
-([Go re-sweep](validation/2026-11-16-go-resweep.md)): of the 59 targets in the
-historical bucket, 7 now build and fuzz and 52 still skip (acceptance test 5).
+`bhf auto` and `bhf fuzz` drive a Go target whose parameters are plain data:
+exported, package-local structs built from scalars, strings, pointers,
+slices, arrays and string-keyed maps. The generated harness decodes the fuzz
+input into a typed local with the standard-library JSON decoder and calls the
+target, with no `--force`. This page describes the eligibility rules, the
+evidence, and the acceptance tests. The `Go-1` class in
+[expected-gaps.md](expected-gaps.md) tracks the Go targets bhf still skips for
+an unsupported parameter type.
 
-A targeted public-source check at frp revision
-`5c6d761c1287e6153f07b824fb6d71b96ee598fe` built and entered
-`DecodeProxyConfigurerJSON` without `--force`. It first exposed a separate Go
-coverage defect: `-coverpkg` excluded the generated harness module, leaving
-`runtime/coverage.WriteCounters` in an invalid mode. After including both the
-target package and harness module, the same five-second target run recorded
-21 coverage edges, 69,009 executions and no finding. That is one resolved
-historical skip with measured feedback; it is not a full 58-target re-sweep or
-proof of deep parser-state coverage. That run's raw output was kept only on the
-validation host; the 2026-11-16 re-run of the bucket built and fuzzed the same
-target at the same revision (`results-1116-go1-go1.27/go__fatedier__frp.json`
-under `benchmarks/campaign-2026-07-25/`).
-The subsequent full-workspace test sweep found that targets taking `[]byte`
-followed by a JSON data argument need separate input fields: a length-prefixed
-raw field and a trailing JSON document. Paired starting seeds now populate
-both fields; a Go force fixture passed 2/2 while confirming only its method
-receiver still needs `--force`. The same pinned frp target repeated with this
-layout entered unforced, recorded 27 edges and 58,833 executions in five
-seconds, and reported no finding or forced repair; that log, too, stayed on the
-validation host. Parser depth beyond that measured feedback remains unverified.
+## How it works
 
-## Scope recommendation
+- bhf parses the package-local struct declarations and accepts a parameter
+  only when every reachable field is proven plain data (rules below).
+- `auto` and `fuzz` seed complete JSON documents as starting inputs, so the
+  first executions reach the target's parser logic instead of failing to
+  decode.
+- A target that takes `[]byte` followed by a JSON data argument gets two input
+  fields: a length-prefixed raw field and a trailing JSON document. Paired
+  starting seeds fill both.
+- A Go parser of the shape `Unmarshal(in []byte, out interface{})` (or `any`)
+  is driven with a fresh `*interface{}` as the output argument.
+- For any other nameable type, `--force` declares a zero value (`var z T`,
+  through `harness_visible_go_type()` in `crates/cli/src/auto/go_build.rs`)
+  and does not fill it from the fuzz input. Without `--force`, such a target
+  is skipped with `unsupported Go parameter type`.
 
-The sweep records 58 Go targets skipped for unsupported parameter types
-(`docs/expected-gaps.md`, Go-1). This is a heterogeneous bucket, not a single
-58-target fix. The recommended first feature slice is only *plain data* Go
-parameters whose local type declaration can be inspected and whose values can
-be constructed without invoking target code: exported structs composed of
-supported scalars, strings, pointers, slices, arrays, and maps. Decode input
-into a typed local via a standard-library JSON decoder, then call the discovered
-target. Do not claim support for all Go structs, interfaces, or dependency
-types.
+The code is in `decode_for_type()`, `generate_call()` and
+`is_plain_json_parameter()` in `crates/cli/src/auto/go_build.rs`.
 
-This is distinct from the existing `--force` fallback in
-`crates/cli/src/auto/go_build.rs`: force currently declares a zero value for a
-nameable type. That may compile but usually does not make attacker-controlled
-bytes reach fields or exercise parser logic. The proposed normal path must only
-be enabled when static evidence establishes a safe, data-only shape.
+## Eligibility rules
 
-## Evidence and representative targets
+bhf builds a JSON-backed value only when the parsed declarations show that
+every reachable field is plain data:
 
-The reported sweep failures are real skip decisions, not failed builds:
+- the parameter and every nested named type can be named in the generated
+  harness, and their declarations and field types are parsed;
+- every reachable field is exported; one unsupported field rejects the whole
+  type, so no field is silently left out;
+- leaves are scalar and string types, and compositions are pointers, slices,
+  arrays and string-keyed maps of allowed types;
+- interfaces, channels, functions, unexported or embedded fields, custom
+  `UnmarshalJSON` or `UnmarshalText` hooks, `unsafe.Pointer`, synchronization
+  primitives, handles, readers and writers, loggers, clients, file
+  descriptors, and types whose declaration cannot be read are rejected;
+- bhf never calls a guessed `New*`, `Open*`, `Connect*` or other constructor.
 
-- XTLS/v2ray has `*protocol.RequestHeader` targets in
-  `benchmarks/campaign-2026-07-25/results-0728/go__XTLS__Xray-core.json`.
-- frp has repeated `DecodeOptions` targets in
-  `.../go__fatedier__frp.json`.
-- Cobra has `*pflag.FlagSet` in `.../go__spf13__cobra.json`.
-- etcd has `*zap.Logger` in `.../go__etcd-io__etcd.json`.
+## Evidence
 
-The first two are plausible data-shaped cases, subject to declaration
-inspection. `FlagSet` and `Logger` are deliberately excluded from this first
-slice: their invariants and behavior are lifecycle/API-defined, and a zero
-value or arbitrary field synthesis can create harness-origin crashes or
-side-effects. The 58 count therefore remains a measured upper bound; only
-re-running the sweep can show the actual effect of the narrower feature.
+- A local `auto` fixture reached a planted branch through nested pointer,
+  slice, map and tagged fields.
+- At frp revision `5c6d761c1287e6153f07b824fb6d71b96ee598fe`, bhf built and
+  entered `DecodeProxyConfigurerJSON` without `--force`. This run also found a
+  Go coverage defect: `-coverpkg` left out the generated harness module, so
+  `runtime/coverage.WriteCounters` ran in an invalid mode. With both the
+  target package and the harness module in `-coverpkg`, a five-second run
+  recorded 21 coverage edges and 69,009 executions, with no finding. With the
+  two-field `[]byte` plus JSON layout, the same target recorded 27 edges and
+  58,833 executions in five seconds, with no finding and no forced repair.
+  The raw logs of these two runs are not in the repository; the 2026-11-16
+  re-run built and fuzzed the same target at the same revision
+  (`benchmarks/campaign-2026-07-25/results-1116-go1-go1.27/go__fatedier__frp.json`).
+- The [Go re-sweep](validation/2026-11-16-go-resweep.md) of 2026-11-16 re-ran
+  the 59 targets the 2026-07-28 sweep skipped as Go-1: 7 now build and fuzz
+  and 52 still skip.
 
-The implementation boundary is visible in `decode_for_type()` and
-`generate_call()` in `crates/cli/src/auto/go_build.rs`. Today unknown types
-cleanly produce `unsupported Go parameter type` in normal mode. `--force`
-uses `harness_visible_go_type()` and `var z T`; it does not populate data from
-the fuzz input.
+## Representative targets
 
-## Static eligibility contract
+These are skip decisions recorded by the 2026-07-28 sweep
+(`benchmarks/campaign-2026-07-25/results-0728/`):
 
-Only synthesize JSON-backed values when parsed declarations prove every
-reachable field is safe plain data. Specifically:
+| Project | Parameter | Fits the rules |
+|---|---|---|
+| XTLS/Xray-core | `*protocol.RequestHeader` (`go__XTLS__Xray-core.json`) | Data-shaped; depends on its declaration. |
+| frp | `DecodeOptions` (`go__fatedier__frp.json`) | Data-shaped; depends on its declaration. |
+| Cobra | `*pflag.FlagSet` (`go__spf13__cobra.json`) | No: a lifecycle handle. |
+| etcd | `*zap.Logger` (`go__etcd-io__etcd.json`) | No: a lifecycle handle. |
 
-- the parameter and all nested named types are nameable in the generated
-  harness, and parser metadata confirms their declarations and field types;
-- every reachable field is exported (or otherwise addressable by the
-  generated code); unsupported fields reject the whole type rather than being
-  silently omitted;
-- recursively allowed leaves are a bounded set of scalar/string types and
-  pointer/slice/array/map compositions of allowed data types;
-- reject interfaces, channels, functions, unexported fields, custom
-  unmarshaler hooks, `unsafe.Pointer`, synchronization primitives, handles,
-  readers/writers, loggers, clients, file descriptors, and types whose
-  declaration cannot be inspected;
-- never call a guessed `New*`, `Open*`, `Connect*`, or other constructor. A
-  future explicit user-provided constructor can be a separate opt-in feature.
-
-Plain JSON decoding is not enough by itself: the engine must provide or receive
-valid structured starting inputs that reach the target's parser logic. Keep
-binary-only mutation as-is and add structured seeds through an explicit
-dictionary/corpus initialization path; do not report an unsupported parameter
-as supported just because `json.Unmarshal` compiles.
+`FlagSet` and `Logger` are excluded because their invariants are defined by
+their APIs and lifecycles; a zero value or synthesized fields can produce
+crashes that come from the harness, not the target. Receiver construction
+(Go-2) and the no-`go.mod` lane (Go-3) are separate classes in
+[expected-gaps.md](expected-gaps.md).
 
 ## Acceptance tests
 
-Before implementation is considered complete, add a local fixture and tests
-that establish all of the following:
-
-1. A package-local fixture target takes an exported nested data struct, has a
-   parser-like validation branch, and is generated in normal (not `--force`)
-   mode. The generated harness compiles and a valid JSON seed reaches an
-   observable branch/reachability oracle.
-2. Mutated valid JSON can exercise a planted, deterministic safe finding in
-   that fixture; malformed JSON is rejected/ignored as input and is not
-   misclassified as a harness crash.
-3. A pointer field and a collection/map field are populated; `null`, empty,
-   absent, and malformed-field cases have intentional documented semantics.
-4. A custom `UnmarshalJSON` implementation, private field, interface,
-   `*zap.Logger`-like lifecycle type, and `*pflag.FlagSet`-like handle remain
-   cleanly skipped in normal mode. `--force` retains its existing documented
-   best-effort zero-value behavior without changing finding classification.
-5. The unsupported 58-target Go sweep is re-run with before/after residual
-   histograms, build/fuzz counts, findings, and any new harness-origin crash
-   audit. Report the actual resolved count rather than assigning all 58 to this
-   feature. **Done 2026-11-16** ([Go re-sweep](validation/2026-11-16-go-resweep.md)):
-   7 of the 59 resolved and 52 still skip; the audit found no crash in generated
-   harness code, and two input-independent causes of false findings (#398,
-   #399).
-
-## Non-goals
-
-This slice does not add universal Go reflection, infer constructors, initialize
-dependency-managed resources, synthesize private fields with `unsafe`, or
-promise all Go parser-like inputs can be represented as JSON. It does not
-address Go receiver construction (Go-2) or the no-`go.mod` lane (Go-3).
-
-**Recommended next wave:** implement only after reviewing the real declarations
-for the XTLS/v2ray and frp exemplars, and after the engine comparison smoke
-runner has a valid baseline. The static parser's ability to prove field
-eligibility is a prerequisite; if that evidence is not available, keep the
-existing safe skip rather than guessing from exported type names.
+1. A package-local fixture target takes an exported nested data struct, has
+   a parser-like validation branch, and is generated in normal (not
+   `--force`) mode. The generated harness compiles and a valid JSON seed
+   reaches an observable branch or reachability oracle.
+2. Mutated valid JSON reaches a planted, deterministic finding in that
+   fixture; malformed JSON is rejected as input and is not reported as a
+   harness crash.
+3. A pointer field and a collection or map field are populated; `null`,
+   empty, absent and malformed fields have documented behavior.
+4. A custom `UnmarshalJSON` implementation, a private field, an interface, a
+   `*zap.Logger`-like lifecycle type and a `*pflag.FlagSet`-like handle are
+   skipped in normal mode (unit tests
+   `data_struct_decoder_rejects_private_state_custom_json_and_unknown_handles`
+   and `data_decoder_allows_only_plain_recursively_proven_field_types`).
+   `--force` keeps its zero-value behavior without changing finding
+   classification.
+5. The Go-1 sweep is re-run with before/after residual histograms,
+   build/fuzz counts, findings, and an audit for crashes that originate in
+   the harness; the result reports the resolved count measured.
+   **Done 2026-11-16** ([Go re-sweep](validation/2026-11-16-go-resweep.md)):
+   7 of the 59 resolved and 52 still skip. The audit found no crash in
+   generated harness code and two input-independent causes of false findings
+   (#398, #399).

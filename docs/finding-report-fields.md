@@ -4,8 +4,9 @@
 
 Every command that produces or changes findings writes into one self-contained
 directory, `<work-dir>/results/` (default `bhf_work/results/`), and rebuilds its
-index when it finishes. This doc describes that layout, the `bhf.findings.v1` /
-`bhf.finding.v1` contracts, the CSV columns, and what changed from bhf ≤ 0.2.x.
+index when it finishes. This page describes that layout, the `bhf.findings.v1`
+and `bhf.finding.v1` formats, the CSV columns, and what changed from bhf 0.2.x.
+For a first look at a run, read [Quick reading guide](#quick-reading-guide).
 
 ## Layout
 
@@ -22,10 +23,10 @@ index when it finishes. This doc describes that layout, the `bhf.findings.v1` /
 | `results/static/` | Native `static-scan` output (`static-report.{json,md,sarif}`) |
 | `results/sbom/` | Native `sbom` output (`cyclonedx.json`, `sbom.spdx.json`, `openvex.json`, `vulnerabilities.json`, ...) |
 
-`static-scan` (`S-*`) and SCA (`F-SCA-*`) findings carry no evidence
-directory — their evidence (a location, or a component) is inline in
+`static-scan` (`S-*`) and SCA (`F-SCA-*`) findings have no evidence
+directory; their evidence (a location, or a component) is inline in
 `findings.json`. The static findings `auto` writes as directories
-(`F-STATIC-*`, `F-RO-*`, `F-EXT-*`) keep them, same as any dynamic finding.
+(`F-STATIC-*`, `F-RO-*`, `F-EXT-*`) have one, as dynamic findings do.
 
 ### ID family → `kind`
 
@@ -46,30 +47,33 @@ the first time any command opens it; see [Migration from 0.2.x](#migration-from-
 
 `schemas/bhf.findings.v1.schema.json` is the normative definition; this is a
 field summary. `findings.json` always starts with `schema_version`, then
-`generated_at`, `tool`, so an importer can detect the format from the first
-few bytes. Every key is present (`null` where a value does not apply — never
-omitted), and unknown keys are rejected. Keys added to v1 after its first
-release (`fuzz.access`, `fuzz.access.parameter`, `fuzz.input_to_state`,
-`fuzz.input_to_state_input`, `fuzz.input_to_state_status`,
-`fuzz.input_to_state_reason`, `fuzz.input_to_state_search`, `fuzz.arguments`,
-`verdict_reason`, `fuzz.access.allocated_by_harness`, the `runtrace`
-evidence role)
-are optional in the schema, so documents written
-before them still validate; bhf always writes them. A validator holding the
-older schema rejects them. The `binary rehost` value of `producer` came
-later too, and an older schema rejects it, as it rejects the `kernel import`
-producer and the `console_log`, `repro_syz` and `repro_c` evidence roles of
-an imported syzkaller crash, and the `kernel fuzz` producer of a crash bhf
-found in a kernel guest. `reproduce.build.fidelity` is optional the same
-way, but written only for a finding whose harness build used fabricated
-inputs (below).
+`generated_at` and `tool`, so an importer can detect the format from the
+first few bytes. Every key is present (`null` where a value does not apply),
+and unknown keys are rejected.
+
+Some keys and values were added to v1 after its first release. The schema
+marks the keys optional, so older documents still validate; bhf always writes
+them, and a validator holding an older copy of the schema rejects them:
+
+- keys: `fuzz.access`, `fuzz.access.parameter`,
+  `fuzz.access.allocated_by_harness`, `fuzz.input_to_state`,
+  `fuzz.input_to_state_input`, `fuzz.input_to_state_status`,
+  `fuzz.input_to_state_reason`, `fuzz.input_to_state_search`,
+  `fuzz.arguments`, `verdict_reason`;
+- `producer` values: `binary rehost`, `kernel import` (an imported syzkaller
+  crash), `kernel fuzz` (a crash bhf found in a kernel guest);
+- evidence roles: `runtrace`, and `console_log`, `repro_syz` and `repro_c`
+  for kernel crashes.
+
+`reproduce.build.fidelity` is optional the same way, and is written only for
+a finding whose harness build used fabricated inputs (below).
 
 Document-level fields: `schema_version`, `generated_at`, `tool` (`{name,
 version, build}`), `source` (`{root, vcs}`), `producers[]` (the last 50
 producer-history entries; `manifest.json` keeps the last 1000), `counts`
 (`{total, by_kind, by_severity, by_confirmation}`), `findings[]`, `groups[]`
 (`{key, representative, members, observations}`), and `errors[]` (`{path,
-reason}` for records that failed to load — a bad record never aborts the
+reason}` for records that failed to load; a bad record does not stop the
 rebuild).
 
 A root-cause group is the findings of one defect. A fuzz or runtime finding
@@ -114,7 +118,7 @@ lines). INDEX.md says "Reached through N call stacks".
 | `reachability` | object \| null | entry path for fuzz (`{kind, source, target}`: `harness`, its `testcase.bin`, the fuzzed function; for a `kernel import` finding `syscall`, the program syzkaller reached it with, `repro.syz`, else `repro.c`, else `console.log`, and the crashing function; for a `kernel fuzz` finding `syscall`, `repro.c`); fuzz reachability for SCA. Its `attacker_reachable` is the entry's signature verdict, so it can be `true` while the finding's `verdict` is `lab_only` for the reason in `verdict_reason` (such as `harness_sized_buffer`) |
 | `fidelity` | `{stubs_used, forced, caveats[]}` | `forced` when the target ran forced-and-stub-heavy under `--force` |
 | `remediation` | string \| null | |
-| `patch_hints` | `[{title, guidance}]` | advisory, not a literal diff |
+| `patch_hints` | `[{title, guidance}]` | advice in prose, not a diff |
 | `reproduce` | `{harness_id, command, build}` \| null | `build`: `{sanitizers[], binary_sha256, build_id}`, plus `fidelity` when the harness compiled only after bhf supplied inputs the build context lacked; `command` is relative to `results/`: it runs the finding's `replay.py`, or is `bhf replay findings/<id>` for a `binary rehost` finding; for a `kernel import` finding it compiles and runs `repro.c`, else runs `repro.syz` under `syz-execprog`, in the test VM; for a `kernel fuzz` finding it is `bhf kernel replay findings/<id>`, which boots the guest the finding records and runs its program |
 | `reproduce.build.fidelity` | `{level, context, fabricated[]}` (optional) | `level` is `reduced`; `context` is where the build context came from (`none`, `exact_tu_compile_database`, ...); each `fabricated` entry is `{kind, name, value}` with `kind` `macro`, `header`, `type`, or `include_dir` (a dir of real headers found by file name outside the scanned tree, which may be another project's). Such a finding's `confidence.level` is `low` and `fidelity.caveats` names what was fabricated: code compiled against a placeholder macro value or header can take paths the real build never does, so the finding may be false or not reproduce against the real build |
 | `evidence` | `{dir, files[]}` \| null | each file: `{role, path, sha256, size}` — roles: `finding`, `testcase`, `testcase_minimized`, `sanitizer_log`, `decoded`, `replay_script`, `repro_ada`, `byte_control`, `runtrace` (the runtrace events of the replay that recorded the comparison evidence); for a `kernel import` finding also `console_log` (syzkaller's `log0`), `repro_syz` and `repro_c` (its reproducers), with the kernel report as `sanitizer_log`; a `kernel fuzz` finding has its program as `testcase` (`testcase.bin`, the executor's format), decoded as `decoded` (`decoded.json`), as C as `repro_c`, the guest's console from the program's start as `console_log` and the report as `sanitizer_log` |
@@ -153,9 +157,8 @@ gating, SARIF `level`, CSV and `INDEX.md` ordering all read this resolved
 
 ### Confirmation levels
 
-`confirmation.level` is a normalized evidence strength; bhf owns these
-semantics so importers don't have to re-derive them from raw fields. The
-first row that matches wins:
+`confirmation.level` is a normalized evidence strength, so importers do not
+have to derive it from raw fields. The first row that matches wins:
 
 | Level | Rule |
 |---|---|
@@ -174,7 +177,7 @@ first row that matches wins:
 
 Every per-finding evidence record (`results/findings/<ID>/finding.json`)
 carries the envelope below, in addition to its producer-specific fields
-(documented inline above per block — `fuzz`, `static`, `sca`, `binary`):
+(the `fuzz`, `static`, `sca` and `binary` blocks above):
 
 | Field | Meaning |
 |---|---|
@@ -200,9 +203,9 @@ those.
 
 Children spawned by multicore fuzz workers and the continuous daemon's job
 workers run with the hidden env var `BHF_RESULTS_DEFER=1`, which skips their
-own per-job rebuild and producer record entirely — the parent process (the
-multicore coordinator, or the daemon's results-refresh thread) merges their
-findings and owns the single record for the batch.
+own per-job rebuild and producer record. The parent process (the multicore
+coordinator, or the daemon's results-refresh thread) merges their findings
+and writes the one record for the batch.
 
 ## `findings.csv`
 
@@ -255,7 +258,8 @@ reading the old layout directly:
 - `findings.csv` has the single column set above. The per-harness stub
   accounting (`stub_total`, `stub_blind`, `stub_declared`, `linked_real`) moved
   to `auto/run.json` `targets[]`; `--static-dynamic` is a no-op.
-- `runtime_mode` is not written anywhere in the new contract.
+- `runtime_mode` stays in each finding's `finding.json` (see above);
+  `findings.json` does not carry it.
 - An old-layout work dir (`<work>/findings/` at the top) is migrated
   automatically the first time any command opens it, including commands that
   only read (`explain`, `capsule`): `findings/` is renamed to
@@ -365,9 +369,10 @@ dir. Read each finding's `sanitizer.log` where it has one, otherwise run its
   call its body makes, or `volatile_pointer`), `findings.json` carries it as
   `reachability.reachability_basis`, and `bhf explain` says what each verdict
   rests on. A finding whose input is empty or all zero bytes, or whose method
-  ran on an object bhf's harness constructed, carries a caveat that real
-  callers may never produce that state (`fidelity.caveats`, the INDEX.md
-  `Caveat:` line, and beside the verdict in `bhf explain`). A heap overflow of a buffer the generated harness sized
-  for a pointer parameter it passes without a length is `lab_only`
-  (precondition-dependent); one passed with its length, such as the buffer of a
-  `(buf, len)` pair, keeps the entry's verdict.
+  ran on an object bhf's harness constructed, carries a note that real
+  callers may never produce that state, in `fidelity.caveats`, on the
+  INDEX.md `Caveat:` line, and beside the verdict in `bhf explain`. A heap
+  overflow of a buffer the generated harness sized for a pointer parameter it
+  passes without a length is `lab_only` (it depends on a precondition); one
+  passed with its length, such as the buffer of a `(buf, len)` pair, keeps
+  the entry's verdict.

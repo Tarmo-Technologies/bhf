@@ -1,73 +1,80 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Builtin harness protocol resolution
 
-Finding recorded before implementation, 2026-09-24. Scope: the builtin fuzz
-runner's protocol choice in `crates/cli/src/fuzz.rs`; the generated harness and
-build layouts remain unchanged.
+The builtin fuzz engine has to know how a harness binary takes its input
+before it can fuzz it. `crates/cli/src/protocol_detect.rs` makes that choice
+once, and `bhf fuzz`, `bhf replay`, `bhf minimize` and `bhf report --backfill`
+all use it. The generated harness and build layouts are the same for every
+protocol.
 
-Resumed checkpoint, 2026-09-24: the real public generate → build → fuzz
-regression now passes with framed execution, nonzero edge feedback and a
-reproduced ASan finding. The integration also covers no-fork execution. It
-exposed a second defect: fresh-process isolation of a framed driver must pass
-the input filename as argv[1], since raw stdin does not call the target in
-that mode. The runner now does so for native framed binaries. The rebuilt
-release binary also passed a BHF-only benchmark smoke using the documented
-split generated/build layout. See the root development plan for hashes and
-remaining qualification gates.
-The broader C++ amalgamation test then caught a related guard error: its
-fresh-process recheck still required the external libFuzzer classification,
-which framed drivers no longer have. The recheck now runs for framed-driver
-coverage candidates. The five-test amalgamation target passed, including a
-state-masked ASan crash reproduced from its saved testcase.
+## Protocols
 
-## Reproduced failure
+| Protocol | `harness_protocol` value | How the harness runs |
+|---|---|---|
+| bhf framed | `bhf_framed` | bhf's C/C++ (or Go, Rust, launcher) driver: a framed fork-server loop, plus one input by file name (`argv[1]`) outside the loop. |
+| libFuzzer single input | `libfuzzer_single_input` | A libFuzzer-style binary run on one input file per process. |
+| stdin event log | `stdin_event_log` | The Ada runtime: input on stdin, results in an event log. |
+
+The run summary `<work-dir>/fuzz_runs/<harness-id>-latest.json` records the
+chosen protocol as `execution.harness_protocol`, and whether the fork server
+started as `execution.forkserver`.
+
+## Resolution order
+
+The first rule that matches decides:
+
+1. An `input_mode` declared in a `harness-protocol.json` sidecar next to the
+   binary (`bhf project run` writes it from a `bhf.project.v1` target), unless
+   the binary is a libFuzzer binary without bhf's driver (rule 3).
+2. The `BHF_FRAMED` marker in a launcher script that is the harness itself.
+3. The libFuzzer runtime's messages in a binary without bhf's `BHF_FRAMED`
+   driver: a libFuzzer target, whatever source sits beside it.
+4. A bhf `main.c` or `main.cpp` with `BHF_FRAMED` beside the binary, or in a
+   harness directory of the work dir: `generated_harnesses/<id>/`,
+   `harnesses/<id>/`, `auto/<id>/` or `build/<id>/`.
+5. Strings compiled into the binary. bhf's C/C++ driver and the Ada runtime
+   both read `BHF_FRAMED`; a GNAT-bound main also embeds `GNAT Version: `. The
+   whole file is scanned, so a binary copied alone into `build/<id>/main` is
+   still recognised.
+6. A C/C++ source without the marker: a plain libFuzzer target.
+7. Otherwise, the Ada stdin/event-log protocol.
+
+bhf's generated C source defines both `LLVMFuzzerTestOneInput` and its own
+`BHF_FRAMED` `main`, so the presence of C source never overrides the marker.
+Source and launcher reads are bounded, and an executable whose first 4 KiB
+looks binary is not decoded as text.
+
+For a `-fsanitize=fuzzer` binary without bhf's driver, `bhf fuzz` runs one
+input file per process, without coverage guidance, and prints how to wrap the
+fuzz target with `bhf generate-harness <fuzz_target.cc> --target
+LLVMFuzzerTestOneInput` for coverage-guided fuzzing.
+
+## Background: the split-layout defect (2026-09-24)
 
 The engine-parity `magic_byte` manual C workflow generated
-`<work>/generated_harnesses/H-C0017/main.c` with a `BHF_FRAMED` persistent-loop
-marker, then built `<work>/build/H-C0017/main`. The existing driver check only
-read a `main.c` beside the **built binary**, and attempted to decode the binary
-itself as UTF-8. It missed the generated source. The separate libFuzzer check
-saw `main.c` in `generated_harnesses` and selected single-input argv mode.
+`<work>/generated_harnesses/H-C0017/main.c`, with the `BHF_FRAMED` marker, and
+built `<work>/build/H-C0017/main`. The driver check of that time read only a
+`main.c` beside the built binary, so it missed the generated source; the
+separate libFuzzer check found `main.c` under `generated_harnesses/` and chose
+single-input mode. The run recorded `harness_protocol: libfuzzer_single_input`,
+`forkserver: false`, no coverage edges and no finding.
 
-Evidence in `benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/`
-`magic_byte/trial-1/builtin/work/fuzz_runs/H-C0017-latest.json`: 125
-executions in three seconds, `harness_protocol: libfuzzer_single_input`,
-`forkserver: false`, no coverage edges, and no finding. The generated C source
-contains `BHF_FRAMED`; the 1.57 MiB built ELF resides under `build/`, while the
-24 KiB source resides under `generated_harnesses/`. This is a protocol mismatch,
-not a performance comparison. A later unmodified benchmark repetition by the
-feature agent reported the same protocol/coverage mismatch; execution count
-varied with runner staging and must not be treated as a throughput baseline.
+The fix resolves the protocol in one place, from the work-dir layouts above,
+and gives an explicit `BHF_FRAMED` marker priority over plain C/C++ source.
+Fresh-process runs of a framed driver pass the input file name as `argv[1]`,
+because raw stdin does not call the target in that mode.
 
-## Narrow resolution design
+Regression coverage:
 
-Resolve one harness-protocol classification from the runner path and work dir:
-first look for an explicit `BHF_FRAMED` marker in bounded text reads of source
-beside the binary, then in the matching `generated_harnesses`, `harnesses`, and
-legacy `auto` source layouts, plus a textual launcher. Explicit framed evidence
-wins over the presence of C/C++ source. Only source layouts without that marker
-retain the existing libFuzzer single-input fallback; no C source remains the
-stdin/event-log fallback. This retains real external libFuzzer support and
-interpreted/script launchers while fixing the split generated/build layout.
-
-Use the same classification for forkserver eligibility, coverage feedback,
-single-input argv dispatch, crash replay/filtering, and the run summary. Resolve
-once for the hot fuzz loop; replay-only helpers use the same resolver. Bound text
-reads to a small fixed maximum and reject binary-looking executable prefixes
-before reading the rest, so protocol detection never loads a whole ELF as a
-UTF-8 string. A missing/oversized marker source falls back conservatively; the
-forkserver handshake remains the runtime backstop.
-
-## Regression acceptance
-
-- Unit layouts: manual `build/<id>/main` plus
-  `generated_harnesses/<id>/main.c` with `BHF_FRAMED`; sibling auto source;
-  textual launcher; external libFuzzer C source without `BHF_FRAMED`; source
-  absent; and a large binary that is not scanned as text.
-- A bounded integration must invoke real generate-harness, build, then fuzz on
-  a planted C crash fixture. Assert the built path differs from generated
-  source, protocol is not `libfuzzer_single_input`, forkserver is active when
-  requested, coverage edges are nonzero, and the expected sanitizer finding is
-  emitted. Record execution count only as a diagnostic, never as a parity or
-  throughput claim. Keep fixture local and deterministic; no benchmark trial
-  is required for this regression.
+- Unit tests cover the manual `build/<id>/main` plus
+  `generated_harnesses/<id>/main.c` layout, sibling auto source, a textual
+  launcher, an external libFuzzer C source without `BHF_FRAMED`, no source,
+  and a large binary.
+- An integration test runs `generate-harness`, `build` and `fuzz` on a planted
+  C crash fixture. It checks that the built path differs from the generated
+  source, the protocol is not `libfuzzer_single_input`, the fork server runs
+  when requested, coverage edges are nonzero, and the sanitizer finding is
+  reported. Its execution count is diagnostic only.
+- The C++ amalgamation tests cover a fresh-process recheck of framed-driver
+  coverage candidates, including a state-masked ASan crash reproduced from
+  its saved testcase.

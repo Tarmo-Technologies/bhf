@@ -1,94 +1,138 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
-# Enterprise daemon reliability: bounded work and owned processes
+# Daemon Reliability: Bounded Work and Owned Processes
 
-Review baseline: current shared production-readiness worktree, 2026-09-24.
-Scope: the stdio daemon, continuous scheduler, and GNAT Studio daemon client.
+This page describes how three long-running components bound their memory and
+their child processes:
 
-## Confirmed gaps and implemented controls
+- the stdio daemon `bhf-daemon` (see [Daemon](site/daemon.md) for its
+  protocol);
+- the continuous scheduler (`continuous_daemon` crate), which runs queued fuzz
+  jobs;
+- the GNAT Studio client in `editors/gnatstudio/`, which talks to the daemon.
 
-1. `run_json_rpc_with_security` serialized complete responses into an unbounded
-   `Vec`. Responses and both error fallbacks now serialize directly into a
-   bounded buffer using `BHF_DAEMON_MAX_MESSAGE_BYTES`; an oversized result
-   yields a small JSON-RPC error frame without desynchronizing the next request.
-   If a request ID itself prevents the detailed error from fitting, the compact
-   error uses a null ID.
-2. The daemon formerly called the CLI-oriented report loader, which read every
-   finding and potentially read large `testcase.bin` bodies to generate
-   reproducers. A metadata preflight was rejected after review because files can
-   grow between stat and read. The daemon now calls a report-library read-only
-   loader that caps bytes on opened finding descriptors with `Read::take`, caps
-   count and normalized serialized bytes before retaining each record, and
-   rejects symlink/nonregular finding records. It never reads auxiliary testcase
-   or reproducer bodies or writes reproducers. The CLI report API is unchanged.
-3. GNAT Studio's blocking frame read could freeze refresh indefinitely if its
-   child stopped writing. Requests now have a finite configurable deadline;
-   timeout terminates the owned process tree and makes bounded attempts to reap
-   the child and join the reader worker.
-4. The scheduler's blocking `Command::status` let a child ignoring `--time`
-   block `Drop` forever. It now polls owned fuzz children and shutdown, kills
-   their process group on shutdown, bounds reaping, and persists interrupted
-   jobs as Queued for restart. The configurable shutdown wait was added without
-   changing existing `DaemonConfig` literals.
+## Message size
 
-## Intended defaults and limits
+`bhf-daemon` reads requests and writes responses under one limit,
+`BHF_DAEMON_MAX_MESSAGE_BYTES`:
 
-- Daemon input and output use the same memory-aware
-  `BHF_DAEMON_MAX_MESSAGE_BYTES` value (1–64 MiB by default, depending on
-  available memory; a positive environment value overrides it).
-- The bounded report reader allows at most `clamp(limit / 16 KiB, 1, 4096)`
-  records, `limit / 2` aggregate raw JSON bytes, `limit` normalized JSON
-  bytes, and `8 × max_records + 1024` directory entries. It reads each opened
-  finding file through a byte-limited stream. The serialized response cap
-  remains authoritative for the complete JSON-RPC envelope.
-- GNAT Studio defaults to a 30-second request deadline, configurable through
-  `BHF/daemon-timeout-seconds`. The client keeps one reader worker per in-flight
-  request and tears it down when the owned daemon exits or times out.
-- Scheduler shutdown interrupts owned fuzz jobs. A stopped running job is
-  persisted as Queued, so a later scheduler start can retry it. Queued jobs
-  retain their previous durable state. `Scheduler::start` uses a two-second
-  child-reap bound; `start_with_shutdown_timeout` lets an operator configure it.
-  Positive job budgets are rounded up to whole seconds and have a scheduler
-  wall deadline of the requested budget plus a default 30-second build/setup
-  grace, followed by the child-reap bound. `start_with_limits` can configure
-  that grace. Deadline expiry persists Failed; shutdown still persists Queued.
+| Setting | Value |
+|---|---|
+| Default on Linux | 1/512 of available memory, clamped to 1–64 MiB |
+| Default elsewhere | 8 MiB |
+| Override | A positive integer in `BHF_DAEMON_MAX_MESSAGE_BYTES` |
 
-## Platform and trust limits
+Responses and both error fallbacks serialize directly into a buffer of that
+size. A result too large for it becomes a small JSON-RPC error frame, and the
+next request is read normally. When the request ID itself is too large for the
+detailed error to fit, the compact error carries a null ID.
 
-- The bounded report reader rejects symlinked finding directories and files.
-  On Unix, no-follow directory/file opens keep the file descriptor anchored
-  while reading. A concurrent replacement of an ancestor of the findings root
-  still needs a dirfd-based workspace traversal to eliminate fully; do not
-  expose the stdio daemon to untrusted writers of the workspace root.
-- Parsing and normalizing a single capped finding can temporarily hold copies
-  of its JSON and derived fields before the normalized-byte charge. The budget
-  bounds file input and retained results, not a strict instantaneous heap peak.
-- On Unix, the scheduler and GNAT Studio client signal a new process group.
-  A descendant that deliberately creates a new session can escape that group.
-  On Windows, `taskkill /T /F` is used with a finite fallback to direct-child
-  termination. If a descendant escapes and keeps stdout open, GNAT Studio's
-  daemon reader is left as a daemon thread rather than blocking the UI on join.
-  Native Windows process-tree validation remains required.
-- Scheduler webhooks use separate socket-operation timeouts and synchronous
-  DNS resolution. A webhook already in progress may delay `Drop` beyond the
-  configured fuzz-child reap bound; the bound applies to owned fuzz children.
-- The jobs snapshot is atomically replaced and its parent directory synced on
-  Unix; malformed, truncated, duplicate-ID, and unrepresentable-budget logs
-  fail startup without modification. A directory-sync failure after replacement
-  reports uncertain durability and blocks new submissions until restart. Queue
-  size and snapshot loading remain unbounded; see `enterprise-service-soak-plan.md`.
-- A kernel task stuck in uninterruptible I/O may resist termination. After the
-  configured reap wait, the scheduler logs this and returns from its worker;
-  userspace cannot guarantee reaping that task within a finite deadline.
+## Loading findings
 
-## Validation
+The daemon loads findings through a read-only loader in the report library,
+separate from the CLI's report loader. The loader:
 
-- `cargo test -p bhf-daemon -p report -p continuous_daemon --lib --offline`:
-  daemon 24/24, report 71/71, scheduler 17/17 passed. Coverage includes
-  bounded output and oversized-ID fallback followed by a valid frame, large
-  and growing finding inputs, normalized expansion, tenant symlink rejection,
-  and retained queued state after bounded child/grandchild shutdown.
-- `python3 -m unittest discover -s editors/gnatstudio/tests -v`: 18/18 passed,
-  including normal reply, silence, partial frame, early death, and owned
-  grandchild cleanup.
-- `cargo test -p continuous_daemon --lib --offline`: 22/22 passed after the
-  restart-validation and scheduler wall-deadline slice.
+- reads only `finding.json` records, never `testcase.bin` or reproducer
+  bodies, and writes no reproducers;
+- caps the bytes read from each opened file with `Read::take`, so a file that
+  grows between `stat` and `read` stays bounded;
+- caps the record count and the normalized serialized bytes before it keeps
+  each record;
+- rejects symlinked and non-regular finding directories and files.
+
+With `limit` the message size above, its budget is:
+
+| Budget | Value |
+|---|---|
+| Records | `clamp(limit / 16 KiB, 1, 4096)` |
+| Raw JSON bytes, all records | `limit / 2` |
+| Normalized JSON bytes, all records | `limit` |
+| Directory entries scanned | `8 × records + 1024` |
+
+The response limit still applies to the complete JSON-RPC envelope. The
+budget bounds file input and retained results. While one capped finding is
+parsed, the heap briefly holds extra copies of its JSON and derived fields
+before the normalized-byte charge, so momentary heap use can exceed the
+budget.
+
+## Deadlines and child processes
+
+**GNAT Studio client.** Each request has a deadline, 30 seconds by default,
+set with the `BHF/daemon-timeout-seconds` preference. On a timeout the client
+terminates the daemon's process tree and makes bounded attempts to reap the
+child and join its reader worker. The client keeps one reader worker per
+in-flight request and stops it when the daemon exits or times out.
+
+**Scheduler.** The scheduler polls its fuzz children and its shutdown flag; a
+child that ignores `--time` cannot block shutdown.
+
+| Setting | Default | Set with |
+|---|---|---|
+| Wait to reap a child after its process tree is killed | 2 s | `Scheduler::start_with_shutdown_timeout` |
+| Build and setup grace added to a job's wall deadline | 30 s | `Scheduler::start_with_limits` |
+
+A job with a positive budget has its budget rounded up to whole seconds. Its
+wall deadline is that budget plus the grace, followed by the reap wait. A job
+with a zero budget runs until shutdown.
+
+| Event | Stored job state |
+|---|---|
+| Wall deadline expires | `Failed` |
+| Scheduler shuts down while the job runs | `Queued`, so a later start retries it |
+| Scheduler shuts down while the job waits | Unchanged |
+
+On Unix, the scheduler and the GNAT Studio client start each child in a new
+process group and signal that group. On Windows they run `taskkill /T /F`,
+with a bounded fallback to terminating the direct child.
+
+## Job storage
+
+The scheduler persists jobs to `<data_dir>/jobs.jsonl`. Each update atomically
+replaces the file, and on Unix the parent directory is synced. A
+directory-sync failure after the replacement reports uncertain durability and
+blocks new submissions until the scheduler restarts. A malformed or truncated
+log, a duplicate job ID, or a budget that cannot be represented fails startup
+and leaves the file unchanged.
+
+Default scheduler limits (`SchedulerLimits`):
+
+| Limit | Default |
+|---|---|
+| Jobs kept in memory | 10,000 |
+| Queued jobs | 1,024 |
+| Snapshot size, at load and on write | 64 MiB |
+| One job's serialized record | 64 KiB |
+| Jobs per list page | 1,000 |
+
+Soak testing of these limits is planned in
+[Service soak plan](enterprise-service-soak-plan.md).
+
+## Trust and platform boundaries
+
+- Run the stdio daemon only on a workspace that untrusted users cannot write
+  to. On Unix the loader opens finding directories and files without
+  following links, which keeps each descriptor anchored while it reads. A
+  concurrent replacement of an ancestor of the findings root is outside that
+  check.
+- On Unix, a descendant that creates its own session leaves the process group
+  and is not signalled. If such a descendant keeps stdout open, the GNAT Studio
+  client leaves its reader as a daemon thread and the UI does not wait on it.
+  Process-tree termination on native Windows has not yet been validated.
+- Scheduler webhooks use their own socket timeouts and synchronous DNS
+  resolution. A webhook in progress can delay shutdown past the reap wait,
+  which applies to fuzz children.
+- A process stuck in uninterruptible kernel I/O can resist termination. After
+  the reap wait, the scheduler logs it and returns from the worker.
+
+## Tests
+
+```sh
+cargo test -p bhf-daemon -p report -p continuous_daemon --lib --offline
+python3 -m unittest discover -s editors/gnatstudio/tests -v
+```
+
+The Rust tests cover bounded output, the oversized-ID fallback followed by a
+valid frame, large and growing finding files, normalized expansion, symlink
+rejection, scheduler wall deadlines, restart validation, and queued state kept
+after a bounded shutdown of a child and grandchild. The GNAT Studio tests
+cover a normal reply, a silent daemon, a partial frame, early daemon exit and
+cleanup of an owned grandchild.

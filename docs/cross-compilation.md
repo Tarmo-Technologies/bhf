@@ -1,16 +1,19 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# Cross-Compilation
+# Ada Cross-Compilation and Probe Backends
 
-> **Scope.** This guide covers **Ada** cross-compilation with GNAT/GPRbuild and the
-> embedded probe backends. **C and C++** also cross-compile and emulate — qemu-user
-> for foreign-architecture ELF Linux and wine for Windows-native targets — and
-> support RTOS platform-stub packs (VxWorks/INTEGRITY/QNX). **Rust** cross-compilation
-> is partial; **Java** does not cross-compile. The LD_PRELOAD runtrace shim
-> (behavioral and taint oracles) and the AFL++ secondary engine are **native-only**:
-> neither is active under cross-compiled or emulated (qemu/wine) runs.
+This page covers building an Ada harness for another target with
+GNAT/GPRbuild, the embedded probe backends, and qemu-user replay of an Ada
+harness. C and C++ cross builds, wine for Windows targets, RTOS platform-stub
+packs (VxWorks, INTEGRITY, QNX) and whole-sweep cross targets in `bhf auto` are
+in [Cross-Compilation](site/cross-compilation.md). That page also lists what
+runs under emulation: Rust cross builds share the qemu-user path, Java runs on
+the host JVM only, and the LD_PRELOAD runtrace shim (behavioral and taint
+oracles) and the AFL++ engine run on native targets only.
 
-`bhf build` accepts cross-toolchain flags:
+## Build Flags
+
+`bhf build` takes the target, the Ada runtime and the tool prefix:
 
 ```sh
 bhf build bhf_work \
@@ -20,44 +23,60 @@ bhf build bhf_work \
   --toolchain aarch64-linux-gnu
 ```
 
-The generated `bhf_build.gpr` includes:
+The generated `bhf_build.gpr` then contains:
 
 ```gpr
 for Target use "aarch64-linux-gnu";
 for Runtime ("Ada") use "ravenscar-full";
 ```
 
-`--toolchain` is the executable prefix used on `PATH`, never a
-`Toolchain_Name` (that attribute takes a gprconfig compiler name such as
-`GNAT`, which `--toolchain GNAT` writes). With the example above, bhf runs
-`aarch64-linux-gnu-gprbuild` for project builds, or the multi-target `gprbuild`
-when there is no prefixed one, and `aarch64-linux-gnu-gnatmake` (else
-`aarch64-linux-gnu-gnat`) for the capability canary. If `--toolchain` is omitted
-but `--target` is present, the target triple is used as the prefix; if
-`--target` is omitted, the prefix is the target.
+`--toolchain` is the prefix of the executables on `PATH`. With the example
+above, bhf runs:
 
-Before building, the capability probe compiles a tiny canary with:
+- `aarch64-linux-gnu-gprbuild` for the project build, or the multi-target
+  `gprbuild` when there is no prefixed one;
+- `aarch64-linux-gnu-gnatmake`, else `aarch64-linux-gnu-gnat`, for the
+  capability canary.
+
+Without `--toolchain`, the `--target` triple is the prefix. Without
+`--target`, the prefix is the target.
+
+A `--toolchain` value that is a plain identifier, such as `GNAT` or
+`GNAT_LLVM`, is a gprconfig compiler name. bhf writes it as
+`for Toolchain_Name ("Ada") use "GNAT";` and does not use it as a prefix. A
+value with a `-` in it is always a prefix.
+
+`--ada-gprbuild` and `--ada-gnat` name the programs explicitly, and
+`--ada-switch` appends a compiler switch to bhf's own. The same settings can
+come from the `[toolchain.ada]` table of a `--config` file; see
+[Cross-Compilation](site/cross-compilation.md#build-flags).
+
+Before building, the capability probe compiles a small canary unit:
 
 ```sh
 <prefix>-gnatmake -c -gnatc <dialect> canary.adb
 ```
 
-(`<prefix>-gnat` with the same switches when no prefixed gnatmake is
-installed.)
+When there is no prefixed `gnatmake`, it runs `<prefix>-gnat` with the same
+switches.
 
-If a required prefixed tool is missing, the command exits with code `2` and a
-message of the form:
+When a required prefixed tool is missing, `bhf build` exits with code `2` and
+prints:
 
 ```text
 host toolchain <prefix> for target <target> not found: missing <tool> on PATH
 ```
 
-`bhf stub` accepts the same flags so diagnostic-driven stub generation can
-use the same generated project attributes and compiler adapter selection.
+`bhf stub` takes the same `--target`, `--runtime`, `--toolchain` and
+`--probe-backend` flags, so stub generation from build diagnostics uses the
+same project attributes and compiler.
 
-## Probe Backend
+## Probe Backends
 
-`bhf build` and `bhf stub` also accept `--probe-backend`:
+The probe backend is the body of the `AdaFuzz.Probe` runtime package: it
+decides where the harness writes its coverage and testcase events. Select it
+with `--probe-backend` on `bhf build` or `bhf stub` (config key
+`toolchain.ada.probe-backend`):
 
 ```sh
 bhf build bhf_work \
@@ -68,47 +87,60 @@ bhf build bhf_work \
   --probe-backend memory_buffer
 ```
 
-The default backend is `host_file`, which preserves the existing
-`AdaFuzz.Probe` behavior of writing events through host file I/O. The
-`memory_buffer` backend compiles the same probe API against a fixed-size in-RAM
-ring buffer and avoids `Ada.Streams.Stream_IO` and environment-variable access.
+| Backend | Where the events go | Needs |
+|---|---|---|
+| `host_file` (default) | A file on the host, through host file I/O (`BHF_EVENTS_PATH`) | `Ada.Streams.Stream_IO` and environment access |
+| `memory_buffer` | A 64 KiB ring buffer in target RAM | Nothing beyond the runtime |
+| `semihosting` | Host file descriptor `2`, through a semihosting call | An `adafuzz_semihosting_write` symbol from the runtime, BSP or link inputs |
+| `stub` | No event stream; the result class becomes the process exit status | `Ada.Command_Line` |
 
-The memory-buffer backend exports these C symbols for a runner, emulator, JTAG,
-or serial drain to inspect:
+bhf copies the selected body into the build's runtime source directory as
+`adafuzz-probe.adb`, so each build compiles exactly one probe body.
 
-- `adafuzz_probe_memory_buffer`
+A backend other than `host_file` keeps the events on the target. For an Ada
+harness built for this host, `bhf build` refuses it with exit code `2`.
+
+### memory_buffer
+
+The `memory_buffer` body compiles the same probe API against the in-RAM ring.
+It uses neither `Ada.Streams.Stream_IO` nor environment variables. It exports
+these C symbols for a runner, emulator, JTAG probe or serial drain to read:
+
+- `adafuzz_probe_memory_buffer` (the ring)
 - `adafuzz_probe_memory_buffer_capacity`
-- `adafuzz_probe_memory_buffer_write`
-- `adafuzz_probe_memory_buffer_wrapped`
+- `adafuzz_probe_memory_buffer_write` (the write cursor)
+- `adafuzz_probe_memory_buffer_wrapped` (set once the ring wraps)
 
-The selected backend is materialized into the build-local runtime source
-directory as `adafuzz-probe.adb`, so generated GPR projects compile exactly one
-probe body per build.
+`bhf fuzz --target-transport` with `--transport-coverage-map` reads this ring
+over a gdb stub, qemu-system or Renode. See
+[Hardware-in-the-Loop Bring-Up](hil-bringup.md) and
+[On-Target Fuzzing](site/on-target-fuzzing.md).
 
-`--probe-backend semihosting` selects a target runtime body for ARM/RISC-V
-semihosting-style runs. It writes the same binary event stream to host file
-descriptor `2` by calling an imported runtime support hook:
+### semihosting
+
+The `semihosting` body is for ARM and RISC-V semihosting runs. It writes the
+same binary event stream to host file descriptor `2` through an imported hook:
 
 ```c
 void adafuzz_semihosting_write(uint32_t fd, const void *buf, uint32_t len);
 ```
 
-That symbol must be provided by the selected target runtime, BSP, or user linker
-inputs. If it is absent, the target link should fail rather than silently
-falling back to host file I/O.
+The target runtime, the BSP or your own link inputs must define this symbol.
+When nothing defines it, the target link fails.
 
-`--probe-backend stub` selects a no-output runtime body for ROM-only smoke
-runs. It preserves the `AdaFuzz.Probe` API and breadcrumb/current-testcase state
-for instrumented code, but it does not write an event stream, expose a drain
-buffer, or import semihosting support. A top-level harness catch records failure
-status, and explicit nonzero `End_Testcase` result classes are reflected through
-`Ada.Command_Line.Set_Exit_Status`, so runners that only observe the target
-process return code still get a coarse signature class.
+### stub
 
-## qemu-user Runner
+The `stub` body is for ROM-only smoke runs. It keeps the `AdaFuzz.Probe` API
+and the breadcrumb and current-testcase state for instrumented code, and
+writes no event stream. A top-level harness handler records a failure status,
+and a nonzero `End_Testcase` result class is passed to
+`Ada.Command_Line.Set_Exit_Status`. A runner that sees only the process
+return code still gets a coarse signature class.
 
-`bhf replay` and `bhf minimize` can wrap harness execution with a
-user-installed qemu-user binary for ELF-Linux cross targets:
+## qemu-user Replay
+
+`bhf replay` and `bhf minimize` run an ELF-Linux cross-built harness under a
+qemu-user emulator:
 
 ```sh
 bhf replay --finding F-0001 \
@@ -118,39 +150,43 @@ bhf replay --finding F-0001 \
   --qemu-arg=/usr/aarch64-linux-gnu
 ```
 
-The runner invokes:
+The command line is:
 
 ```text
 <qemu-user> <qemu-args...> <harness>
 ```
 
-BHF still pipes testcase bytes to the harness stdin and sets
-`BHF_EVENTS_PATH` for the selected `host_file`-compatible event stream. The
-qemu executable is not bundled or auto-detected in this phase; pass the
-appropriate `qemu-*-static` or `qemu-*` command and any sysroot/library path
-arguments required by the target environment.
+bhf pipes the testcase bytes to the harness's stdin and sets
+`BHF_EVENTS_PATH`, so use the `host_file` probe backend for this path.
+
+Without `--qemu-user`, bhf uses the runner that `bhf build --runner` recorded
+beside the harness (`build/<id>/obj/bhf_runner.json` for an Ada harness). A
+harness built for another architecture with neither is refused. bhf does not
+ship qemu: install `qemu-<arch>` or `qemu-<arch>-static` yourself and pass any
+sysroot or library-path arguments the target needs.
 
 ## aarch64 Acceptance Fixture
 
-`examples/swallowed_constraint_error/` is the M17 acceptance fixture for
+`examples/swallowed_constraint_error/` is the acceptance fixture for
 ELF-Linux cross replay. Its generated direct harness reaches a swallowed
-`Constraint_Error` in `Pkg.Parse`. The acceptance test builds and runs that
-harness on the host, then builds it again for `aarch64-linux-gnu` and checks
-that qemu-user replay matches the host finding.
+`Constraint_Error` in `Pkg.Parse`. The test builds and runs the harness on the
+host, builds it again for `aarch64-linux-gnu`, replays the host finding under
+qemu-user and checks that the cross run produces the same finding.
 
-Run the focused acceptance test with:
+Run the test from a bhf source checkout:
 
 ```sh
 cargo test -p bhf --test m17_aarch64_cross_fixture swallowed_constraint_error_ -- --nocapture
 ```
 
-The full aarch64 path runs only when these user-installed tools are available:
+The aarch64 case runs only when these tools are installed, and is skipped
+otherwise:
 
-- `gprbuild`, or `aarch64-linux-gnu-gprbuild`
-- `aarch64-linux-gnu-gnat` (Ubuntu's `gnat-13-aarch64-linux-gnu`)
+- the multi-target `gprbuild`
+- `aarch64-linux-gnu-gnat` (Ubuntu package `gnat-13-aarch64-linux-gnu`)
 - `qemu-aarch64` or `qemu-aarch64-static`
 
-Set `BHF_AARCH64_QEMU_USER` to override qemu discovery. Set
-`BHF_AARCH64_SYSROOT` when qemu-user needs an explicit target sysroot; the
-test passes it as `-L <sysroot>`. If the override is absent and
-`/usr/aarch64-linux-gnu` exists, the test uses that path as the qemu sysroot.
+| Variable | Effect |
+|---|---|
+| `BHF_AARCH64_QEMU_USER` | qemu-user program to use in place of the one found on `PATH` |
+| `BHF_AARCH64_SYSROOT` | Sysroot passed to qemu-user as `-L <sysroot>`; defaults to `/usr/aarch64-linux-gnu` when that directory exists |

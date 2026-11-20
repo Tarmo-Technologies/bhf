@@ -2,29 +2,24 @@
 
 # Symbolic Seed Generation
 
-BHF keeps symbolic-execution-assisted seed generation in the research-lab
-boundary. The strict-permissive core does not embed solver libraries, compiler
-front ends, or proprietary Ada analysis tools.
+`bhf fuzz --symbolic-seed-source <file.adb>` mines seeds from the guards of an
+Ada source file and adds them to the builtin engine's seed list. The flag can
+be repeated. The mined seeds go through the normal corpus and finding flow.
 
-The current prototype is intentionally small:
+How the seeds are built (`fuzz_engine_builtin::generate_symbolic_seeds`):
 
-- `fuzz_engine_builtin::generate_symbolic_seeds` lexes Ada source with the
-  existing permissive parser stack;
-- string literals found in `if`, `elsif`, `case`, or `when` guard regions become
-  seed bytes;
-- duplicate seed bytes are removed deterministically;
-- `bhf fuzz --symbolic-seed-source <file.adb>` appends those generated seeds
-  to the normal built-in engine seed list, so useful seeds enter the existing
-  corpus and finding flow.
+- the Ada source is lexed with bhf's existing parser stack;
+- each non-empty string literal inside an `if`, `elsif`, `case` or `when`
+  guard becomes a seed;
+- duplicate seeds are removed in a deterministic order.
 
-Candidate future integrations remain optional and out-of-process:
+The strict-permissive core embeds no solver library, compiler front end or
+proprietary Ada analysis tool. Integrations that would go further run out of
+process, outside the core:
 
-| Candidate | Boundary | Risk |
+| Candidate | Boundary | Prerequisite or constraint |
 | --- | --- | --- |
-| SMT solver fed by generated harness constraints | research-lab subprocess | Requires an Ada-to-constraints frontend before it is useful. |
-| Compiler IR path from a user LLVM/Ada toolchain | optional adapter | No production-stable Ada/LLVM path is assumed today. |
-| Libadalang-based path condition mining | research-lab only | Licensing and distribution boundary keeps it out of core. |
-| GNATfuzz or vendor tools | forbidden for product core | Competes with BHF goals and is not redistributable as a core dependency. |
-
-This gives validation runs a concrete way to test guarded paths without changing
-the product dependency policy.
+| SMT solver fed by generated harness constraints | separate subprocess | Needs an Ada-to-constraints front end |
+| Compiler IR from a user-supplied LLVM/Ada toolchain | optional adapter | Needs a production-ready Ada/LLVM path |
+| Libadalang-based path-condition mining | outside the core | Its license and distribution terms keep it out of the core |
+| GNATfuzz or vendor tools | excluded from the core | Not redistributable as a core dependency |

@@ -1,45 +1,56 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
-# Verified distribution handoff
+# Verified Distribution Handoff
 
-## Purpose and trust boundary
+`scripts/verify-offline-dist.py` verifies the detached Ed25519 signature of a
+bhf offline distribution archive and can write a separate copy of the
+**exact bytes it verified**. It is a standalone Python script, not a `bhf`
+subcommand. It does not extract the archive, run anything from it, or use the
+network.
 
-`scripts/verify-offline-dist.py` verifies the existing BHF detached distribution
-signature and can publish an independent copy of the **exact bytes verified**.
-It is a standalone utility, not a new `bhf` subcommand. Neither mode extracts the
-archive, executes its contents, or accesses the network.
+The release workflow runs it for the Linux installation smoke test (see
+[Release controls](enterprise-release-controls.md)). It is not packed inside
+the distribution archive: obtain it separately, through the same trusted
+channel as the publisher's public key.
 
-Obtain this verifier and the publisher's public key through a trusted channel
-independent of the unverified distribution. A public key inside the archive is
-not a trust anchor. The script, Python interpreter, OpenSSL executable and
-configuration, ancestor directories, and output directory must be trusted. This
-is not a sandbox against malicious processes running as the same account.
+## Trust boundary
 
-The signature format is unchanged: a raw 64-byte Ed25519 signature over
-`BHF.DIST.TARBALL.ED25519.V1`, a NUL byte, and the raw 32-byte SHA-256 archive
-digest. The external public-key file must contain exactly 64 lowercase hex
-characters, optionally followed by one LF or CRLF. No embedded newlines, extra
-whitespace, or arbitrary key-file size is accepted by the Python verifier.
+- Get this verifier and the publisher's public key through a trusted channel
+  independent of the archive you are checking. A public key inside the archive
+  is not a trust anchor.
+- The script, the Python interpreter, the OpenSSL executable and its
+  configuration, the ancestor directories and the output directory must all be
+  trusted. A malicious process running as the same account can interfere
+  with the check.
 
-## Requirements and local crypto check
+## Signature format
 
-The implementation uses Python's standard library and targets Python 3.8 or
-later. OpenSSL must support Ed25519 verification with `pkeyutl -rawin`; the
-self-test checks the actual installed implementation and configured policy.
-Use an absolute `--openssl` path when PATH is not under operator control.
+- The signature is a raw 64-byte Ed25519 signature over
+  `BHF.DIST.TARBALL.ED25519.V1`, a NUL byte, and the raw 32-byte SHA-256 digest
+  of the archive.
+- The public-key file holds exactly 64 lowercase hex characters, optionally
+  followed by one LF or CRLF. The Python verifier rejects embedded newlines,
+  extra whitespace and any other size.
+
+## Requirements and the crypto self-test
+
+The script uses only Python's standard library and runs on Python 3.8 or
+later. OpenSSL must support Ed25519 verification with `pkeyutl -rawin`. Pass
+an absolute `--openssl` path when you do not control `PATH`.
 
 ```sh
 python3 scripts/verify-offline-dist.py --self-test --json
 ```
 
-This checks both a valid and a tampered public RFC 8032 test vector. Its result
-explicitly says `archive_verified: false`. It is a compatibility check, not a
-cryptographic module validation or publisher-authentication check. A failing
-local crypto policy is not disabled, bypassed, or changed by the utility.
+The self-test checks a valid and a tampered public RFC 8032 test vector
+against the installed OpenSSL and its configured policy. It reports
+`archive_verified: false`, because it checks crypto compatibility only, not an
+archive or a publisher. A local crypto policy that fails the self-test stays
+as it is; the script does not change or bypass it.
 
-## Verify and publish a separate copy
+## Verify and write a separate copy
 
-Create or select a trusted destination directory first. The destination file
-must not already exist, including as a dangling symlink.
+Pick a trusted destination directory first. The destination file must not
+exist yet, not even as a dangling symlink.
 
 ```sh
 python3 scripts/verify-offline-dist.py \
@@ -52,134 +63,124 @@ python3 scripts/verify-offline-dist.py \
   --json
 ```
 
-Only proceed when the exit code is zero and the JSON `status` is `verified`.
-Consume **`accepted/bhf-release.tar.gz`**, not the original `incoming` path.
-The result includes the archive byte count and SHA-256, fingerprints of the
-supplied public key and signature, and the published-copy path.
+Continue only when the exit code is `0` and the JSON `status` is `verified`.
+Then use **`accepted/bhf-release.tar.gz`**, not the original `incoming` path.
+The result gives the archive's byte count and SHA-256, fingerprints of the
+public key and the signature, and the path of the copy.
 
-Copy mode hashes the bytes while writing a private staging file on the output
-filesystem. It verifies the digest, synchronizes the staged file, and then
-publishes it using atomic hard-link creation without replacing an existing
-name. Concurrent publishers cannot overwrite the winner. A filesystem without
-hard-link support fails explicitly; there is no ordinary-rename fallback.
-This technique requires available disk space for another archive copy.
+How the copy is written:
 
-On POSIX, the copy has owner read/write permissions only (0600, subject to the
-operator's umask); executable bits and source permissions are not inherited.
-The containing directory is synchronized after publication. On non-POSIX hosts,
-`publication_directory_sync` reports `not_supported` rather than claiming the
-same durability. Windows filesystem and ACL behavior has not been validated by
-this change set.
+1. The bytes are hashed while they are written to a private staging file on
+   the output filesystem.
+2. The digest is verified and the staged file is synced.
+3. The copy is published with an atomic hard link, which never replaces an
+   existing name, so of two concurrent publishers only the first succeeds. A
+   filesystem without hard links fails with an error; there is no
+   rename fallback.
 
-A directory-sync or cleanup failure after publication returns a nonzero result
-and reports `published_copy`. The verified bytes may therefore exist even when
-the overall operation reports an operational error. Do not assume every error
-means nothing was created, or delete that path without inspecting the reported
-condition. This is especially important for retry logic.
+The copy needs disk space for a second archive. On POSIX it has owner
+read/write permission only (`0600`, subject to your umask), with no execute
+bits and no permissions copied from the source, and the containing directory
+is synced after publication. On other hosts, `publication_directory_sync`
+reports `not_supported`. Windows filesystem and ACL behavior has not been
+validated.
 
-The independent copy is **not immutable**: its owner or an administrator can
-change it after publication. Protect the destination directory and consume the
-copy within the same controlled handoff. Sudden termination may leave a private
-staging directory; no automatic wildcard cleanup of other runs is performed.
+A directory-sync or cleanup failure after publication returns a nonzero exit
+and still reports `published_copy`: the verified copy can exist even when the
+command reports an error. Inspect the reported condition before deleting that
+path or retrying.
 
-## Verification without copying
+The owner of the copy or an administrator can still change it after
+publication. Protect the destination directory and use the copy within the
+same controlled handoff. If the process is killed, a private staging
+directory can remain; the script does not clean up other runs' directories.
 
-Omit `--verified-copy` to authenticate only the bytes read from the source.
-This mode needs no second archive copy, but it cannot guarantee that the source
-path will still contain those bytes when another process later opens it. The
-human-readable output warns about this distinction.
+## Verify without a copy
 
-## Limits, errors, and machine-readable results
+Without `--verified-copy`, the script authenticates the bytes it reads from
+the source. This mode needs no second copy, but another process that opens
+the source path later may see different bytes. The human-readable output says
+so.
 
-The default archive limit is 4 GiB, configurable with `--max-archive-bytes`.
-Hashing is streamed in 1 MiB chunks and enforces the bound even if the source
-size grows after its metadata is inspected. Public keys are bounded at 66
-bytes, and signatures must be exactly 64 bytes. Leaf symlinks and nonregular
-input files are rejected; POSIX no-follow/nonblocking flags protect the open
-against leaf symlink/FIFO substitution. Parent directories remain trusted.
+## Limits
 
-Each OpenSSL subprocess has its own timeout (default 15 seconds; permitted
-range 1–120 seconds). This is **not a deadline for the entire operation**:
-filesystem reads, writes, and synchronization can block on the underlying
-filesystem. OpenSSL stdout and stderr are discarded, and no shell is used to
-construct the crypto command.
+| Limit | Value |
+|---|---|
+| Archive size | 4 GiB by default; set with `--max-archive-bytes`. Hashing streams in 1 MiB chunks and enforces the limit even if the file grows after its size was checked |
+| Public-key file | At most 66 bytes |
+| Signature | Exactly 64 bytes |
+| Input files | Leaf symlinks and non-regular files are rejected; on POSIX the open uses no-follow and non-blocking flags against a symlink or FIFO swapped in at the leaf. Parent directories are trusted |
+| OpenSSL timeout | Per OpenSSL subprocess: 15 s by default, 1–120 s allowed (`--openssl-timeout`) |
+
+The OpenSSL timeout applies to each subprocess, not to the whole run:
+filesystem reads, writes and syncs can still block. OpenSSL's stdout and
+stderr are discarded, and the command is run without a shell.
+
+## Exit codes and JSON output
 
 | Exit | Meaning |
 | --- | --- |
-| 0 | `verified`, or `self_test_passed` when explicitly running a self-test. |
-| 1 | Distribution signature rejected after the crypto self-test succeeded. |
-| 2 | Invalid inputs, missing tools, resource limits, timeout, filesystem error, or failed crypto self-test. |
+| 0 | `verified`, or `self_test_passed` for `--self-test` |
+| 1 | The signature was rejected after the crypto self-test succeeded |
+| 2 | Invalid input, missing tool, resource limit, timeout, filesystem error, or failed crypto self-test |
 
-With `--json`, runtime and semantic validation outcomes are written as one JSON
-object. Syntactically invalid command-line options follow normal argparse
-behavior: usage text on stderr and exit 2. A result JSON document is an
-observation, not a signed attestation; its contents alone do not authenticate a
-separate copy of the archive.
+With `--json`, every runtime and validation outcome is one JSON object.
+Malformed command-line options follow normal argparse behavior: usage text on
+stderr and exit `2`. The JSON is an unsigned record of what the script
+observed; it does not authenticate a separate copy of the archive.
 
-## Existing shell-verifier compatibility
+## The Bash verifier
 
-The existing Bash verifier is unchanged by this patch. The inspected branch emits
-the fixed Ed25519 SubjectPublicKeyInfo prefix and validated key bytes using
-Bash's builtin `printf` instead of requiring `xxd`, and bounds its key-file read.
-It remains verification-only; it does not inherit the Python verifier's copy,
-descriptor, timeout, or publication guarantees. It also retains its previous
-CR/LF-stripping behavior for accepted key files, subject to the new size bound.
+`scripts/verify-offline-dist.sh` checks the same signature. It builds the fixed
+Ed25519 SubjectPublicKeyInfo prefix and the key bytes with Bash's builtin
+`printf`, so it needs no `xxd`, and it bounds its key-file read. It verifies
+only: it has none of the Python verifier's copy, descriptor, timeout or
+publication handling. It strips a trailing CR/LF from the key file, within
+the size bound. The change that removed its `xxd` dependency,
+`eb7a787f9114e47d2bdee69de071b2b3d6cb0fc0`, also added EL7 test
+prerequisites; full EL7 acceptance is a separate gate.
 
-The missing-`xxd` dependency was removed by the separate branch commit
-`eb7a787f9114e47d2bdee69de071b2b3d6cb0fc0`, which also added EL7 test prerequisites.
-This additive patch does not replace those changes or establish full EL7 acceptance.
+## What a successful check means
 
-## Scope of the guarantee
+A successful check authenticates the bytes under the **trusted key you
+supplied**. Key revocation and expiry, rollback and version policy, release
+approval, vulnerability status, license compliance, extraction safety,
+operational fitness and deployment authorization are separate decisions. A
+signed empty file also authenticates and is still not an installable bhf
+release. Keep the installer's safe extraction, the authenticated content-pack
+checks, the release acceptance and the operator's approval in place.
 
-A successful signature check authenticates the bytes under the **supplied
-trusted key**. It does not decide key revocation, expiry, rollback/version
-policy, release approval, vulnerability status, license compliance, archive
-extraction safety, operational suitability, or deployment authorization. Even a
-signed empty file can authenticate; that does not make it an installable BHF
-release. Keep the installer's safe extraction and authenticated content-pack
-checks, as well as release acceptance and operator approval.
+## Tests
 
-This utility is not automatically added to release bundles or release assets by
-this patch. Distribute it separately through the trusted verifier channel until
-the publishing workflow explicitly integrates and validates it.
-
-## Regression validation
-
-The new test file is under the existing CI discovery path, so the current
-`python3 -m unittest discover -s scripts/ci/tests -v` step will discover it after
-application. That job will now also require an OpenSSL executable with Ed25519
-signing and verification support; absence is an error, not a silent skip.
-The focused command is:
+`scripts/ci/tests/test_distribution_verifier.py` runs in CI's
+`python3 -m unittest discover -s scripts/ci/tests -v` step, which needs an
+OpenSSL with Ed25519 signing and verification; a missing OpenSSL is an error.
+To run only these tests:
 
 ```sh
 python3 -m unittest discover -s scripts/ci/tests \
   -p test_distribution_verifier.py -v
 ```
 
-Fifty focused tests passed locally on Linux with Python 3.13.5 and OpenSSL 3.5.5,
-with zero failures and zero skips. Tests generate temporary Ed25519 keys and
-real signatures, check interoperability with the Bash verifier without `xxd`,
-and cover tampering, exact resource limits, input replacement, concurrent
-publication, filesystem failures, cleanup outcomes, and an actual stalled crypto
-process that is killed and reaped. Some filesystem failures are injected;
-concurrent publication and signature operations use the real filesystem and
-OpenSSL. Temporary test private keys are neither shipped nor retained.
+The tests generate temporary Ed25519 keys and real signatures, and check:
+interoperability with the Bash verifier without `xxd`, tampering, exact
+resource limits, input replacement, concurrent publication, filesystem
+failures, cleanup outcomes, and a stalled crypto process that is killed and
+reaped. Some filesystem failures are injected; concurrent publication and
+signing use the real filesystem and OpenSSL. The stalled-process fixture runs
+Python with `-S`, so site-customization hooks cannot delay its startup. The
+temporary private keys are neither shipped nor kept.
 
-A publication-time rerun on 2026-09-25 initially found the stalled-process
-fixture timing out before its Python startup marker. The fixture now uses
-Python's `-S` flag to avoid unrelated site/customization startup hooks; its
-one-second timeout and the production timeout behavior are unchanged. All 50
-focused tests and the 8 unchanged Bash-verifier tests passed after that repair.
+The tests passed on Linux with Python 3.13.5 and OpenSSL 3.5.5. Python 3.8
+syntax is checked separately. Running the suite on Python 3.8, Windows and
+old-glibc systems is still needed before those platforms are claimed.
 
-Python 3.8 syntax is checked separately; executing the test suite on Python 3.8,
-Windows, old-glibc systems, and the complete BHF repository remains necessary
-before extending those platform claims. No full workspace build or hosted CI
-success is established by these focused local tests.
+## References
 
-## Primary references
-
-- BHF's existing signature contract: `scripts/verify-offline-dist.sh` at
+- bhf's signature contract: `scripts/verify-offline-dist.sh` at
   `eb7a787f9114e47d2bdee69de071b2b3d6cb0fc0`.
-- RFC 8032, section 7.1 TEST 2: https://www.rfc-editor.org/rfc/rfc8032.html#section-7.1
-- RFC 8410, Ed25519 SubjectPublicKeyInfo: https://www.rfc-editor.org/rfc/rfc8410.html
-- OpenSSL pkeyutl: https://docs.openssl.org/3.0/man1/openssl-pkeyutl/
+- RFC 8032, section 7.1, TEST 2:
+  <https://www.rfc-editor.org/rfc/rfc8032.html#section-7.1>
+- RFC 8410, Ed25519 SubjectPublicKeyInfo:
+  <https://www.rfc-editor.org/rfc/rfc8410.html>
+- OpenSSL `pkeyutl`: <https://docs.openssl.org/3.0/man1/openssl-pkeyutl/>

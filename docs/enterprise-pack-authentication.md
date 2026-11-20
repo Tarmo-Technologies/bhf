@@ -1,16 +1,29 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# Authenticated offline update packs (E1 design and handoff)
+# Authenticated offline update packs
 
-Status: governance and CLI implementation complete; distribution packaging integration remains a separate gate. This contract was recorded before code changes.
+An update pack is a manifest plus payload files (rules, seed corpora and other content) that you carry to an offline host and install with `bhf pack install`. This page describes how packs and the offline distribution archive are signed and verified. [Release packaging](release-packaging.md) and [INSTALL.md](../INSTALL.md) show where these steps fit in a release and an install.
 
-## Threat model and format
+## Pack signature format
 
-`sha256-items-v1` remains a legacy, unkeyed transport-integrity digest. Its caller-supplied `key_id` is only a label. It must never satisfy an authentication policy. A new `ed25519-json-v1` signature authenticates the entire manifest (schema, pack ID, version, root, ordered item array, every item metadata field, signature algorithm, and key ID) except the signature **bytes** field. The signature object has exactly `algorithm`, `key_id`, and `signature` (lowercase 128-character hex). The signed bytes are ASCII `BHF.UPDATE_PACK.ED25519.V1\0` followed by compact UTF-8 JSON of the manifest with only `signature.signature` removed; object keys are lexicographically sorted recursively and array order is preserved. JSON strings use `serde_json` escaping. Binding `key_id` prevents relabeling a revoked ID to a still-trusted alias, even if both IDs map to the same public key. Unknown fields, duplicate fields, invalid types, and malformed signatures in this version must be rejected, not silently omitted from signed bytes.
+A pack manifest carries one of two integrity schemes:
 
-The private key is a local Ed25519 PKCS#8 v2 DER file, created with exclusive, owner-only permissions. `bhf pack create --signing-key FILE --key-id ID` signs with it; the old `--sign-key ID` remains a deprecated digest-label option and conflicts with `--signing-key`. Neither private key material nor signatures are printed in diagnostics. The trusted public key is the raw 32-byte Ed25519 public key encoded as lowercase 64-character hex, configured **only** in an installer-controlled policy as `update_packs.trusted_public_keys: {"ID": "HEX"}`. `update_packs.revoked_keys` optionally lists IDs. A manifest-declared key ID is only a lookup hint, never evidence of trust.
+| Scheme | What it proves |
+|---|---|
+| `ed25519-json-v1` | The manifest was signed by the holder of an Ed25519 private key. |
+| `sha256-items-v1` (legacy) | The payload files match the digests in the manifest. Its `key_id` is a label only, and it never satisfies an authentication policy. |
 
-Example (the policy is installed independently on the receiving host; never put the private key in the pack):
+An `ed25519-json-v1` signature covers the whole manifest (schema, pack ID, version, root, the ordered item array, every item metadata field, the signature algorithm, and the key ID) except the signature bytes. The signature object has exactly `algorithm`, `key_id`, and `signature` (lowercase 128-character hex). The signed bytes are ASCII `BHF.UPDATE_PACK.ED25519.V1\0` followed by compact UTF-8 JSON of the manifest with only `signature.signature` removed. Object keys are sorted recursively, array order is preserved, and strings use `serde_json` escaping. Because `key_id` is signed, a pack cannot be relabeled from a revoked key ID to a trusted alias, even when both IDs map to the same public key. Unknown fields, duplicate fields, invalid types, and malformed signatures are rejected.
+
+## Keys and trust policy
+
+- The private key is a local Ed25519 PKCS#8 v2 DER file, created with exclusive, owner-only permissions by `bhf pack keygen`.
+- `bhf pack create --signing-key FILE --key-id ID` signs with it. The older `--sign-key ID` is a deprecated digest label for `sha256-items-v1`; it does not sign, and it conflicts with `--signing-key`.
+- bhf never prints private key material or signatures in diagnostics.
+- The trusted public key is the raw 32-byte Ed25519 key as lowercase 64-character hex. It is configured only in a policy file on the receiving host, as `update_packs.trusted_public_keys: {"ID": "HEX"}`. `update_packs.revoked_keys` optionally lists revoked IDs.
+- The key ID in a manifest is a lookup hint. Trust comes only from the policy.
+
+Example. Install the policy on the receiving host through a separate channel, and keep the private key out of the pack:
 
 ```sh
 bhf pack keygen --private-key keys/publisher.der --public-key keys/publisher.pub
@@ -34,30 +47,62 @@ bhf pack install packs/current/pack.json --root packs/current --policy policy.js
 }
 ```
 
-Verification of `ed25519-json-v1` requires an explicit matching trusted public key, valid signature, intact payload hashes, and a non-revoked ID, even without `require_signature`. An unknown key, malformed policy/key, revoked key, malformed signed manifest, payload or metadata tamper, or unsupported algorithm is invalid. `require_signature: true` or any authentication-specific trust/revocation setting rejects unsigned and legacy digest packs (downgrade prevention). Without that policy, legacy digest packs retain their existing integrity-only behavior. Installation verifies before writes; `install.json` must record authenticated status, algorithm, key ID, and trusted public-key fingerprint for audit. This does not make an untrusted pack executable-safe; publication, distribution, and key custody remain operational responsibilities.
+`bhf pack verify` and `bhf pack install` also take `--require-authenticated`, which rejects any pack without a verified signature from a trusted key.
 
-Key rotation: add the new ID/public key alongside the old one, issue new packs, then list the old ID in `revoked_keys` (or remove it). Revocation takes precedence over trust. Policy files must be distributed and protected independently of the pack. Private keys must not be committed or included in release artifacts.
+## Verification rules
 
-Acceptance: independent Ed25519 known-vector or OpenSSL interoperability check; CLI create/verify/install success; metadata and payload tampering fail; forged key ID, unknown key, malformed key, revocation, rotation, and unsigned/legacy downgrade fail under auth policy; legacy integrity-only packs remain installable without auth policy. Signed install identity appears in receipt. No release signing or production credential use in tests.
+- An `ed25519-json-v1` pack verifies only with a matching trusted public key, a valid signature, intact payload hashes, and a key ID that is not revoked, whether or not the policy sets `require_signature`.
+- An unknown key, a malformed policy or key, a revoked key, a malformed signed manifest, a changed payload or metadata field, or an unsupported algorithm makes the pack invalid.
+- `require_signature: true`, or any trust or revocation setting, rejects unsigned and legacy digest packs, so a signed pack cannot be downgraded to an unsigned one.
+- With no authentication policy, legacy digest packs keep their integrity-only behavior.
+- Item paths that resolve outside the pack root are rejected.
+- Installation verifies before it writes. `install.json` records the authenticated status, algorithm, key ID, and trusted public-key fingerprint.
 
-Implementation evidence: Ring 0.17.14 provides the Ed25519 primitive (`Apache-2.0 AND ISC` in its local package metadata). The RFC 8032 section 7.1 test vector verifies independently; governance tests cover metadata/payload tampering, duplicate and unknown fields, malformed policy, forged trusted key, rotation, revocation and downgrade. `crates/cli/tests/pack_auth_cli.rs` exercises key generation, signing, verification, install receipt, tamper and revocation with temporary keys. The verifier rejects item paths resolving outside the pack root and checks policy before installation writes.
+A valid signature shows which trusted key signed the pack. Whether the content is safe to use, and how the publisher keeps the key, are operational decisions.
 
-Remaining security gates: the installer now copies into an owned stage and re-verifies the staged bytes before publishing. Linux uses no-clobber `renameat2` for the final directory; a pre-existing destination is rejected. The initial and staged pack identity, signature, and item verification results must agree. This closes the ordinary mutable-payload verify/copy race, with deterministic mutation and concurrent-installer tests. A writable ancestor can still be substituted between path checks and filesystem operations, and non-Linux rename behavior needs native qualification. A controlled, non-world-writable install parent remains part of the deployment threat model. This work does not sign an official release or establish BHF publisher key custody/recovery procedures.
+**Key rotation:** add the new ID and public key beside the old one, issue new packs, then list the old ID in `revoked_keys` or remove it. Revocation takes precedence over trust. Distribute and protect the policy file separately from the pack. Never commit a private key or put one in a release artifact.
 
-## E1 distribution integration handoff (recorded before script edits)
+## Installer behavior and limits
 
-The offline packager will accept explicit private signing-key and key-ID inputs, sign the content pack with `bhf pack create --signing-key/--key-id`, and bundle **only** the manifest, payloads, and public/nonsecret metadata. It must never copy the private key into the distribution. Checksum-only package generation remains an explicitly selected legacy mode, clearly labeled unauthenticated. The installer will accept an **external** trust policy path supplied by the receiving operator; it must not infer trust from any pack-contained key or policy. Auth-required install must verify in the owned staging prefix before activation and leave the prior prefix and symlinks unchanged on bad signature, tampered payload or metadata, unknown/revoked key, or policy downgrade. Tests will use only temporary keys and fake bundle fixtures and exercise both success and rejection. The scripts' existing staged rollback rules still apply.
+- The installer copies the pack into a stage it owns and verifies the staged bytes again before publishing them. The pack identity, signature and item results from both checks must agree, so a payload changed during the copy is rejected.
+- On Linux the final directory is published with a no-clobber `renameat2`; an existing destination is rejected.
+- Install into a parent directory that other users cannot write. A writable ancestor directory can be swapped between the path checks and the filesystem operations.
+- Pack creation and verification hash payloads in fixed-size buffers. On Unix, files are opened with `O_NOFOLLOW | O_NONBLOCK`, and a signing key or pack input that is not a regular file (a FIFO, for example) is rejected without blocking.
+- Limits: a manifest is at most 64 MiB, a pack has at most 10,000 items, each payload is at most 2 GiB, and all payloads together at most 20 GiB. Snapshot copying enforces the same byte limits.
+- bhf does not hold the source path's ancestor directories open, so a concurrent replacement of an ancestor can redirect a read. Archive signing and hashing read release inputs as they are, so keep them unchanged while you sign.
 
-Bootstrap limitation: running an unverified `install.sh` or `bhf` binary from an untrusted artifact is not made safe by a public key supplied in the same artifact—the code doing verification could itself be hostile. Receiving operators must authenticate the complete distribution and its verifier out of band, using the detached whole-tarball signature and independently pinned public key **before** executing bundle code. The content-pack signature protects pack data only after that trusted bootstrap. The local signing and verification flow is tested; the protected release workflow and public-key distribution channel remain unexercised operational gates.
+### Seed archives
 
-Verifier hardening completed: content-pack creation and verification stream SHA-256 in fixed-size buffers. On Unix, regular-file open uses `O_NOFOLLOW | O_NONBLOCK`, and nonregular/FIFO signing-key and pack input files are rejected without blocking. Pack manifests are capped at 64 MiB, item count at 10,000, each payload at 2 GiB, and aggregate payload at 20 GiB; snapshot copying enforces the same payload byte caps. Staged install re-verification ensures published payloads match the signed manifest even if the source changes while copying. The original source path and its ancestors are not held by directory descriptors, so hostile concurrent ancestor replacement can still redirect a read; archive signing/hashing also does not freeze a concurrently mutable release input. These limits are not solved by Ed25519 authentication alone.
+`install.sh --install-seeds` extracts the bundled seed corpus into `<prefix>/corpora/seeds` and needs Python 3. When content installation is on, it reads the archive from the verified, installed pack copy, copies at most 2 GiB into an owned snapshot, and validates and extracts that snapshot. Validation allows only regular files and directories, and rejects absolute, traversing or control-character names, more than 100,000 members, any file over 2 GiB, and a declared uncompressed total over 20 GiB. Extraction runs in a staged directory before activation; existing seed content moves to `corpora/seeds.previous.<timestamp>`. With `--no-content`, the installer skips content-pack verification and installation. Recovery from an interrupted seed extraction has not been qualified.
 
-Seed archive audit: GNU tar on this host rejected a symlink-following `pivot/marker` member with `Cannot open: Not a directory`, so that attempted outside write was **not** reproduced. It did accept and create a FIFO member (`seed.pipe`) under the extraction directory, which can hang consumers and is unsuitable pack content. The installer now requires Python 3 for `--install-seeds`, reads the archive from the verified installed pack copy when content installation is enabled, copies at most 2 GiB into an owned exclusive archive snapshot, then validates and extracts that same snapshot. A deterministic fixture changes the incoming bundle archive after pack installation and confirms extraction still uses the installed copy. Explicit `--no-content` keeps the unauthenticated bundle source behavior. Validation permits regular files/directories only and rejects absolute/traversing/control-character names, more than 100,000 members, individual files over 2 GiB, and total declared uncompressed size over 20 GiB. Extraction happens in an owned staged directory before activation; existing seed content is retained under `corpora/seeds.previous.<timestamp>`. Uncompressed extraction disk use and interruption/recovery need further qualification.
+## Distribution packaging
 
-## E1 whole-distribution bootstrap signature (contract before implementation)
+`scripts/package-offline-dist.sh` takes a private signing key and key ID, signs the content pack with `bhf pack create --signing-key/--key-id`, and bundles only the manifest, the payloads, and public, nonsecret metadata. The private key never goes into the distribution. `--legacy-integrity-only` builds an unauthenticated checksum-only pack and must be chosen explicitly.
 
-The pack signature alone cannot authenticate the binary that verifies it. A detached archive signature therefore covers the exact compressed `bhf-dist-*.tar.gz` bytes. Format: a raw 64-byte Ed25519 signature in `ARCHIVE.tar.gz.sig`, over `ASCII("BHF.DIST.TARBALL.ED25519.V1\0") || SHA256(archive bytes)` where `SHA256` is exactly 32 binary bytes. The package script signs with the same PKCS#8 v2 private key specified for the content pack and emits `.tar.gz.sha256` and `.tar.gz.sig.sha256` provenance sidecars. No private material or public-key trust policy goes in the archive. The sidecars remain useful for accidental corruption but are not authentication factors. The signature is detached so it cannot refer to itself; no JSON/key-ID metadata is needed for verification. The operator pins the public key independently.
+The installer (`install.sh`) takes the receiving operator's own trust policy with `--trust-policy FILE`, or `--allow-legacy-integrity-only` for a checksum-only pack; it never takes trust from a key or policy inside the pack. An authenticated install verifies in the owned staging prefix before activation. On a bad signature, a changed payload or metadata field, an unknown or revoked key, or a policy downgrade, it leaves the previous prefix and its symlinks unchanged.
 
-Verification uses a separately obtained, trusted `scripts/verify-offline-dist.sh` wrapper around system OpenSSL `pkeyutl` and `dgst` (no BHF executable or custom cryptography), with the operator's externally provisioned raw public-key hex. The wrapper checks input types and exact signature length, converts the raw public key to RFC 8410 SubjectPublicKeyInfo, computes the archive SHA-256, and verifies the detached Ed25519 signature before tar extraction or installer execution. It must not be sourced from the unverified tarball; fetching the wrapper and public key from the same untrusted release location leaves bootstrap untrusted. A signed key-rotation/rollback policy and trusted verifier distribution channel remain release-operations gates.
+## Whole-distribution signature
 
-Release workflow integration: a separate tag-only `sign-linux-bundle` job requires the protected `production-release` environment's `BHF_RELEASE_SIGNING_KEY_PKCS8_B64` secret and `BHF_RELEASE_KEY_ID` / `BHF_RELEASE_PUBLIC_KEY_HEX` variables. It fails closed if any is absent or malformed, decodes the private key only into an owner-only temporary directory outside upload paths, verifies `.tar.gz.sig` with OpenSSL before extraction, installs with an external trust policy, and uploads archive, signature, and both hash sidecars. The existing PR matrix still builds unsigned platform binaries without access to the signing environment. Global checksums and publication depend on signed-job success. Repository administrators must configure protected tag rules, constrain the environment to reviewed release refs/approvers, and provision the key before tags can publish: a workflow checked out from an attacker-controlled tag could otherwise read the signing secret. Never substitute a generated CI key for production signing and never silently select `--legacy-integrity-only` in a release. No production secret is being created or used in this worktree.
+The pack signature cannot vouch for the `bhf` binary or `install.sh` that checks it, because a hostile bundle could ship a hostile verifier. Authenticate the whole distribution before you run any code from it.
+
+The detached signature covers the exact compressed `bhf-dist-*.tar.gz` bytes:
+
+- `ARCHIVE.tar.gz.sig` holds a raw 64-byte Ed25519 signature over `ASCII("BHF.DIST.TARBALL.ED25519.V1\0") || SHA256(archive bytes)`, where `SHA256` is the 32 binary bytes.
+- `bhf pack sign-archive --archive ARCHIVE --signing-key FILE --out SIG` creates it, with the same PKCS#8 v2 key as the content pack. The package script runs it and also writes `.tar.gz.sha256` and `.tar.gz.sig.sha256` sidecars.
+- The sidecars detect accidental corruption; they do not authenticate anything.
+- The archive holds no private key and no trust policy. You pin the public key yourself.
+
+Verify with `scripts/verify-offline-dist.sh`, obtained through a channel you trust and not from the tarball being checked. It wraps system OpenSSL `pkeyutl` and `dgst` (no BHF executable, no custom cryptography) and takes your raw public-key hex. It checks input types and the exact signature length, converts the public key to an RFC 8410 SubjectPublicKeyInfo, hashes the archive, and verifies the signature before anything is extracted or run. Fetching the wrapper and the public key from the same place as the archive gives no assurance. bhf does not define a signed rotation or rollback policy for the release key.
+
+## Release workflow
+
+The tag-only `sign-linux-bundle` job in `.github/workflows/release.yml` runs in the protected `production-release` environment and needs the secret `BHF_RELEASE_SIGNING_KEY_PKCS8_B64` and the variables `BHF_RELEASE_KEY_ID` and `BHF_RELEASE_PUBLIC_KEY_HEX`. It fails if any is missing or malformed. It decodes the private key only into an owner-only temporary directory outside the upload paths, verifies `.tar.gz.sig` with OpenSSL before extraction, installs with an external trust policy, and uploads the archive, the signature, and both hash sidecars. The PR matrix builds unsigned platform binaries without access to the signing environment. Global checksums and publication run only after the signing job succeeds.
+
+Repository administrators must set protected tag rules, limit the environment to reviewed release refs and approvers, and provision the key before a tag can publish; a workflow run from an attacker-controlled tag could otherwise read the signing secret. Never use a generated CI key for production signing, and never select `--legacy-integrity-only` in a release.
+
+## Tests
+
+- Ring 0.17.14 provides the Ed25519 primitive (`Apache-2.0 AND ISC` in its package metadata). The RFC 8032 section 7.1 test vector verifies against it.
+- The governance tests cover metadata and payload tampering, duplicate and unknown fields, malformed policy, a forged trusted key, rotation, revocation, and downgrade.
+- `crates/cli/tests/pack_auth_cli.rs` runs key generation, signing, verification, install receipts, tampering, and revocation with temporary keys.
+- `crates/cli/tests/offline_dist_scripts.rs` runs the packaging and install scripts with temporary keys and fake bundle fixtures, for both success and rejection. One fixture changes the incoming seed archive after pack installation and checks that extraction uses the installed copy.
