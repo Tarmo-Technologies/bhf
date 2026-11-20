@@ -212,3 +212,141 @@ fn a_fresh_syz_manager_workdir_imports() {
         );
     }
 }
+
+fn stderr_of(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// A kernel crash ran in a kernel, which no harness replays: `bhf replay`
+/// and `bhf minimize` say what reproduces it instead of looking for a
+/// harness, and `bhf explain` shows its program and that command.
+#[test]
+fn the_triage_commands_point_a_kernel_crash_at_what_reproduces_it() {
+    use results::import_syzkaller as kernel;
+    // A crash `bhf kernel fuzz` found in its guest, written as it writes one.
+    let work = TestDir::new("kernel-guest-triage");
+    let console =
+        fs::read_to_string(fixture().join("../kernel_guest/console/kasan-slab-out-of-bounds.log"))
+            .unwrap();
+    let report = kernel::console_report(&console).unwrap();
+    let program_text =
+        "r0 = openat(0xffffffffffffff9c, &(0x20000000)=\"/dev/widget\\x00\", 0x2, 0x0)\n\
+                        r1 = ioctl(r0, 0xc0285703, &(0x20000010)=x\"0400\")\n";
+    let found = kernel::record_guest_crash(
+        &work,
+        &kernel::GuestCrash {
+            report: &report,
+            console: &console,
+            program: b"\x00\x04program",
+            program_text,
+            decoded: &serde_json::json!({"calls": []}),
+            c_repro: "int main(void) { return 0; }\n",
+            guest: &serde_json::json!({"kernel": "/k/bzImage"}),
+            reproduced: false,
+            unconfirmed: Some("its confirming run could not be made: the guest did not start"),
+            release: Some("6.12.118"),
+        },
+    )
+    .unwrap();
+    let dir = work.join("results/findings").join(&found.id);
+    let replay_hint = format!("`bhf kernel replay {}`", dir.display());
+    for command in ["replay", "minimize"] {
+        let output = bhf().arg(command).arg(&dir).output().unwrap();
+        let stderr = stderr_of(&output);
+        assert_eq!(output.status.code(), Some(1), "{command}: {stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "{} is a kernel crash bhf kernel fuzz found in a qemu-system guest",
+                found.id
+            )) && stderr.contains(&replay_hint),
+            "{command}: {stderr}"
+        );
+        assert!(!stderr.contains("harness binary"), "{command}: {stderr}");
+    }
+    let output = bhf()
+        .args(["explain", "--work-dir"])
+        .arg(&work)
+        .args(["--finding-id", &found.id])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}\n{}", stderr_of(&output));
+    assert!(
+        stdout.contains(&format!(
+            "━━━ {} — KASAN: slab-out-of-bounds Write in widget_ioctl (CWE-122, BHF-201) ━━━",
+            found.id
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("the guest kernel's KASAN report"),
+        "{stdout}"
+    );
+    let program = stdout
+        .split("THE PROGRAM  (program.txt: the calls testcase.bin makes, in order)")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no program in {stdout}"));
+    assert!(program.contains("  r1 = ioctl(r0, 0xc0285703"), "{stdout}");
+    let reproduce = stdout.split("REPRODUCE OFFLINE").nth(1).unwrap();
+    assert!(
+        reproduce.contains(&format!("bhf kernel replay {}", dir.display())),
+        "{reproduce}"
+    );
+    assert!(
+        reproduce.contains(&format!("{}", dir.join("repro.c").display())),
+        "{reproduce}"
+    );
+    assert!(
+        reproduce
+            .contains("(not confirmed when it was found: its confirming run could not be made"),
+        "{reproduce}"
+    );
+    for harness_only in [
+        "bhf replay --show-args",
+        "No offline reproducer is available",
+        "bhf capsule",
+        "HARNESS ARGUMENTS",
+        "FAKED ENVIRONMENT",
+        "No comparison evidence",
+    ] {
+        assert!(!stdout.contains(harness_only), "{harness_only}: {stdout}");
+    }
+
+    // A crash syzkaller found: its reproducer runs in the kernel's test VM.
+    let imported = TestDir::new("kernel-import-triage");
+    let output = import(&fixture().join("crashes"), &imported, None);
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let id = findings(&imported)[0]["id"].as_str().unwrap().to_owned();
+    let dir = imported.join("results/findings").join(&id);
+    let output = bhf().arg("replay").arg(&dir).output().unwrap();
+    let stderr = stderr_of(&output);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "{id} is a kernel crash syzkaller found (bhf kernel import)"
+        )) && stderr.contains(&format!(
+            "run `gcc -pthread -o repro findings/{id}/repro.c && ./repro` from the results \
+             directory in the kernel's test VM"
+        )),
+        "{stderr}"
+    );
+    let output = bhf()
+        .args(["explain", "--work-dir"])
+        .arg(&imported)
+        .args(["--finding-id", &id])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}\n{}", stderr_of(&output));
+    let reproduce = stdout.split("REPRODUCE OFFLINE").nth(1).unwrap();
+    assert!(
+        reproduce.contains(&format!(
+            "  gcc -pthread -o repro findings/{id}/repro.c && ./repro"
+        )),
+        "{reproduce}"
+    );
+    assert!(
+        !stdout.contains("No offline reproducer is available"),
+        "{stdout}"
+    );
+}

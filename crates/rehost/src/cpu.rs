@@ -9,13 +9,15 @@
 //! floating-point instructions), the banked stack pointers, the IT state,
 //! `SVC` exception entry and return, the System Control Block registers a
 //! start-up file writes (`VTOR`, `CCR`, `CPACR`, `AIRCR`), semihosting
-//! output and exit, and peripheral reads through the MMIO models
-//! (`mmio.rs`). Interrupts, the MPU and privilege checks are not.
+//! output and exit, peripheral reads through the MMIO models (`mmio.rs`),
+//! and, when the machine has an interrupt schedule, the NVIC and the
+//! interrupts it raises (`nvic.rs`). The MPU and privilege checks are not.
 
 use crate::coverage::EdgeMap;
 use crate::fault::{Fault, FaultKind};
 use crate::memory::{Memory, Miss};
 use crate::mmio::Mmio;
+use crate::nvic::{Nvic, AIRCR, ICSR};
 use crate::IdleReason;
 use std::collections::HashMap;
 
@@ -25,11 +27,8 @@ pub(crate) const PPB_BASE: u32 = 0xe000_0000;
 pub(crate) const PPB_END: u32 = 0xe010_0000;
 
 const CPUID: u32 = 0xe000_ed00;
-const ICSR: u32 = 0xe000_ed04;
 const VTOR: u32 = 0xe000_ed08;
-const AIRCR: u32 = 0xe000_ed0c;
 const CCR: u32 = 0xe000_ed14;
-const SHPR2: u32 = 0xe000_ed1c;
 const CPACR: u32 = 0xe000_ed88;
 const DWT_CYCCNT: u32 = 0xe000_1004;
 /// Cortex-M4 r0p1.
@@ -38,7 +37,7 @@ const CCR_RESET: u32 = 1 << 9;
 const CCR_UNALIGN_TRP: u32 = 1 << 3;
 const CCR_DIV_0_TRP: u32 = 1 << 4;
 const CCR_STKALIGN: u32 = 1 << 9;
-const SVCALL: u32 = 11;
+pub(crate) const SVCALL: u32 = 11;
 const SEMIHOSTING_BKPT: u32 = 0xab;
 /// Most semihosting output kept from one run.
 const MAX_OUTPUT: usize = 64 * 1024;
@@ -92,6 +91,7 @@ pub(crate) struct Saved {
     vtor: u32,
     ccr: u32,
     cpacr: u32,
+    irq: Option<Box<Nvic>>,
     block_end: bool,
     direct_branch: bool,
     pending_exception: Option<u32>,
@@ -135,7 +135,7 @@ pub(crate) struct Core {
     /// The stack pointer not in use.
     other_sp: u32,
     /// Exceptions being handled, outermost first.
-    active: Vec<u32>,
+    pub(crate) active: Vec<u32>,
     event: bool,
     monitor: bool,
     pub(crate) mem: Memory,
@@ -147,6 +147,8 @@ pub(crate) struct Core {
     pub(crate) vtor: u32,
     pub(crate) ccr: u32,
     pub(crate) cpacr: u32,
+    /// The interrupt controller and schedule, when the machine has one.
+    pub(crate) irq: Option<Box<Nvic>>,
     pub(crate) edges: EdgeMap,
     pub(crate) block_end: bool,
     /// The instruction was a direct branch, so a branch to itself is a loop
@@ -161,7 +163,7 @@ pub(crate) struct Core {
 }
 
 impl Core {
-    pub(crate) fn new(mem: Memory, mmio: Mmio, vtor: u32) -> Self {
+    pub(crate) fn new(mem: Memory, mmio: Mmio, vtor: u32, irq: Option<Nvic>) -> Self {
         Self {
             r: [0; 16],
             pc: 0,
@@ -189,6 +191,7 @@ impl Core {
             vtor,
             ccr: CCR_RESET,
             cpacr: 0,
+            irq: irq.map(Box::new),
             edges: EdgeMap::new(),
             block_end: false,
             direct_branch: false,
@@ -226,6 +229,9 @@ impl Core {
         self.vtor = self.vtor_reset;
         self.ccr = CCR_RESET;
         self.cpacr = 0;
+        if let Some(nvic) = self.irq.as_mut() {
+            nvic.reset();
+        }
         self.edges.clear();
         self.edges.enter(self.pc);
         self.block_end = false;
@@ -272,6 +278,7 @@ impl Core {
             vtor,
             ccr,
             cpacr,
+            irq,
             edges: _,
             block_end,
             direct_branch,
@@ -301,6 +308,7 @@ impl Core {
             vtor: *vtor,
             ccr: *ccr,
             cpacr: *cpacr,
+            irq: irq.clone(),
             block_end: *block_end,
             direct_branch: *direct_branch,
             pending_exception: *pending_exception,
@@ -332,6 +340,7 @@ impl Core {
         self.vtor = saved.vtor;
         self.ccr = saved.ccr;
         self.cpacr = saved.cpacr;
+        self.irq.clone_from(&saved.irq);
         self.block_end = saved.block_end;
         self.direct_branch = saved.direct_branch;
         self.pending_exception = saved.pending_exception;
@@ -600,7 +609,7 @@ impl Core {
         if (PPB_BASE..PPB_END).contains(&address) {
             return Ok(self.ppb_read(address, size));
         }
-        if (PERIPHERAL_BASE..PERIPHERAL_END).contains(&address) {
+        if self.mmio.windows.serves(address, size) {
             return self
                 .mmio
                 .read(address, self.pc, size, self.instructions)
@@ -647,7 +656,7 @@ impl Core {
         if (PPB_BASE..PPB_END).contains(&address) {
             return self.ppb_write(address, size, value);
         }
-        if (PERIPHERAL_BASE..PERIPHERAL_END).contains(&address) {
+        if self.mmio.windows.serves(address, size) {
             // Peripheral writes go nowhere.
             return Ok(());
         }
@@ -671,7 +680,15 @@ impl Core {
         Err(self.fault(FaultKind::WriteUnmapped, Some(address)))
     }
 
-    fn ppb_word(&self, word: u32) -> u32 {
+    pub(crate) fn ppb_word(&self, word: u32) -> u32 {
+        if let Some(nvic) = self.irq.as_ref() {
+            if word == ICSR {
+                return self.icsr();
+            }
+            if let Some(value) = nvic.read(word, &self.active) {
+                return value;
+            }
+        }
         match word {
             CPUID => CPUID_VALUE,
             ICSR => self.ipsr & 0x1ff,
@@ -702,6 +719,15 @@ impl Core {
             2 => 0xffff,
             _ => 0xffff_ffff,
         } << shift;
+        if let Some(nvic) = self.irq.as_mut() {
+            if nvic.write(word, (value << shift) & mask, mask) {
+                return Ok(());
+            }
+            if word == ICSR {
+                self.write_icsr((value << shift) & mask);
+                return Ok(());
+            }
+        }
         let merged = (self.ppb_word(word) & !mask) | ((value << shift) & mask);
         match word {
             CPUID | ICSR => {}
@@ -710,8 +736,11 @@ impl Core {
             CCR => self.ccr = merged | CCR_STKALIGN,
             CPACR => self.cpacr = merged,
             AIRCR => {
-                if merged >> 16 == 0x05fa && merged & 4 != 0 {
-                    return Err(Trap::SystemReset { pc: self.pc });
+                if merged >> 16 == 0x05fa {
+                    if merged & 4 != 0 {
+                        return Err(Trap::SystemReset { pc: self.pc });
+                    }
+                    self.write_prigroup(merged);
                 }
             }
             _ => {
@@ -724,14 +753,10 @@ impl Core {
     // ---- exceptions -------------------------------------------------------
 
     /// `SVC`: taken when the instruction completes, unless the core is at a
-    /// priority SVCall cannot preempt, which escalates to HardFault.
+    /// priority SVCall cannot preempt (`nvic.rs`), which escalates to
+    /// HardFault.
     pub(crate) fn supervisor_call(&mut self) -> Step {
-        let svc_priority = self.ppb_word(SHPR2) >> 24;
-        let masked = self.primask
-            || self.faultmask
-            || self.ipsr != 0
-            || (self.basepri != 0 && svc_priority >= self.basepri);
-        if masked {
+        if self.supervisor_call_masked() {
             return Err(self.fault(FaultKind::Escalation, None));
         }
         self.pending_exception = Some(SVCALL);
@@ -740,7 +765,7 @@ impl Core {
 
     /// Exception entry: stack the frame, switch to Handler mode on the main
     /// stack, and branch to the vector.
-    fn take_exception(&mut self, number: u32, return_address: u32) -> Step {
+    pub(crate) fn take_exception(&mut self, number: u32, return_address: u32) -> Step {
         let sp = self.r[13];
         let realign = self.ccr & CCR_STKALIGN != 0 && sp & 4 != 0;
         let frame = sp.wrapping_sub(0x20) & !(u32::from(realign) << 2);
@@ -800,6 +825,7 @@ impl Core {
         if to_thread != (self.active.len() == 1) {
             return Err(self.fault(FaultKind::InvalidExceptionReturn, Some(exc_return)));
         }
+        let returning = self.active.last().copied();
         // In Handler mode r13 is the main stack; other_sp the process stack.
         let frame = if to_psp { self.other_sp } else { self.r[13] };
         let mut words = [0u32; 8];
@@ -811,6 +837,9 @@ impl Core {
             .wrapping_add(0x20)
             .wrapping_add(((xpsr >> 9) & 1) << 2);
         self.active.pop();
+        // Every exception modelled is one other than NMI, whose return
+        // clears FAULTMASK.
+        self.faultmask = false;
         if to_psp {
             self.other_sp = after;
         } else {
@@ -838,12 +867,20 @@ impl Core {
         self.monitor = false;
         self.next_pc = words[6] & !1;
         self.block_end = true;
+        if let Some(number) = returning {
+            self.returned_from(number);
+        }
         Ok(())
     }
 
     // ---- miscellaneous instructions ----------------------------------------
 
-    pub(crate) fn wait_for_interrupt(&self) -> Step {
+    /// `WFI`: a no-op when an interrupt wakes the core (`nvic.rs`), else
+    /// the core sleeps for good and the run ends.
+    pub(crate) fn wait_for_interrupt(&mut self) -> Step {
+        if self.wakes(true) {
+            return Ok(());
+        }
         Err(Trap::Idle {
             pc: self.pc,
             reason: IdleReason::WaitForInterrupt,
@@ -851,7 +888,7 @@ impl Core {
     }
 
     pub(crate) fn wait_for_event(&mut self) -> Step {
-        if std::mem::take(&mut self.event) {
+        if std::mem::take(&mut self.event) || self.wakes(false) {
             return Ok(());
         }
         Err(Trap::Idle {
@@ -969,6 +1006,10 @@ impl Core {
 
     /// Execute one instruction.
     pub(crate) fn step(&mut self) -> Step {
+        if self.irq.is_some() && self.service_interrupts()? {
+            // The core is at the handler's first instruction.
+            return Ok(());
+        }
         let pc = self.pc;
         if !self.thumb {
             return Err(self.fetch_fault(FaultKind::InvalidState, pc));
@@ -1003,7 +1044,8 @@ impl Core {
         if let Some(number) = self.pending_exception.take() {
             self.take_exception(number, self.next_pc)?;
         }
-        if self.direct_branch && self.next_pc == pc {
+        // A loop nothing can leave but an interrupt.
+        if self.direct_branch && self.next_pc == pc && !self.wakes(false) {
             return Err(Trap::Idle {
                 pc,
                 reason: IdleReason::BranchToSelf,

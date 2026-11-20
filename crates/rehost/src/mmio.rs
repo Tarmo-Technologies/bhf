@@ -14,6 +14,11 @@
 //! needs more bytes than are left ends the run, since the firmware asked for
 //! more input than the testcase holds. Writes to peripheral registers are
 //! dropped.
+//!
+//! Which addresses are peripheral registers at all is the machine's
+//! windows: the whole Cortex-M peripheral region by default, or the address
+//! blocks a device description gives ([`PeripheralWindow`], `svd.rs`), in
+//! which case an access between them is no register's and faults.
 
 use std::collections::HashMap;
 
@@ -75,6 +80,103 @@ impl MmioDefault {
             Self::Zero => "zero",
             Self::Passthrough => "passthrough",
         }
+    }
+}
+
+/// A peripheral's address range: where its registers are, as a device
+/// description (an SVD file's address block) gives it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PeripheralWindow {
+    pub name: String,
+    pub base: u32,
+    /// Bytes from `base`; at least one.
+    pub size: u32,
+}
+
+/// Where the peripheral registers are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Windows {
+    /// Merged `[start, end)` ranges, lowest first.
+    ranges: Vec<(u64, u64)>,
+    /// Each window, lowest first, for naming an address.
+    named: Vec<PeripheralWindow>,
+    /// Whether these are the whole region, as when no device description
+    /// gives them.
+    guessed: bool,
+}
+
+/// The Cortex-M peripheral region and its bit-band alias.
+const REGION: (u32, u32) = (0x4000_0000, 0x6000_0000);
+const ALIAS: (u32, u32) = (0x4200_0000, 0x4400_0000);
+
+impl Windows {
+    /// The whole peripheral region, `0x40000000`-`0x5fffffff`.
+    pub(crate) fn region() -> Self {
+        Self {
+            ranges: vec![(u64::from(REGION.0), u64::from(REGION.1))],
+            named: Vec::new(),
+            guessed: true,
+        }
+    }
+
+    /// The windows a device description gives, which the machine has
+    /// checked are not empty and end within the address space.
+    pub(crate) fn described(windows: &[PeripheralWindow]) -> Self {
+        let mut named = windows.to_vec();
+        named.sort_by_key(|window| (window.base, window.size));
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        for window in &named {
+            let (start, end) = (
+                u64::from(window.base),
+                u64::from(window.base) + u64::from(window.size),
+            );
+            match ranges.last_mut() {
+                Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                _ => ranges.push((start, end)),
+            }
+        }
+        Self {
+            ranges,
+            named,
+            guessed: false,
+        }
+    }
+
+    fn holds(&self, address: u32, size: u32) -> bool {
+        let start = u64::from(address);
+        let end = start + u64::from(size);
+        let at = self.ranges.partition_point(|range| range.1 <= start);
+        self.ranges
+            .get(at)
+            .is_some_and(|range| range.0 <= start && end <= range.1)
+    }
+
+    /// Whether a `size`-byte access at `address` is a peripheral register's:
+    /// in a window, or in the peripheral bit-band alias of a byte that is.
+    #[inline]
+    pub(crate) fn serves(&self, address: u32, size: u32) -> bool {
+        if self.holds(address, size) {
+            return true;
+        }
+        (ALIAS.0..ALIAS.1).contains(&address)
+            && self.holds(REGION.0 + ((address - ALIAS.0) >> 5), 1)
+    }
+
+    /// The peripheral whose window holds `address`, when a device
+    /// description names it.
+    pub(crate) fn name_of(&self, address: u32) -> Option<&str> {
+        self.named
+            .iter()
+            .filter(|window| {
+                window.base <= address
+                    && u64::from(address) < u64::from(window.base) + u64::from(window.size)
+            })
+            .map(|window| window.name.as_str())
+            .next()
+    }
+
+    pub(crate) fn guessed(&self) -> bool {
+        self.guessed
     }
 }
 
@@ -141,6 +243,8 @@ const FNV_PRIME: u64 = 0x0100_0000_01b3;
 
 /// The models in force and the state of a run's peripheral reads.
 pub(crate) struct Mmio {
+    /// Where the registers are.
+    pub(crate) windows: Windows,
     by_site: HashMap<(u32, u32), MmioModelKind>,
     by_address: HashMap<u32, MmioModelKind>,
     default: MmioDefault,
@@ -179,8 +283,8 @@ fn deposit(mut bits: u32, mut mask: u32) -> u32 {
 
 impl Mmio {
     /// The models of `config`, which the machine has checked hold at most
-    /// one model per site.
-    pub(crate) fn new(config: &MmioConfig) -> Self {
+    /// one model per site, for the registers in `windows`.
+    pub(crate) fn new(config: &MmioConfig, windows: Windows) -> Self {
         let mut by_site = HashMap::new();
         let mut by_address = HashMap::new();
         for model in &config.models {
@@ -190,6 +294,7 @@ impl Mmio {
             };
         }
         Self {
+            windows,
             by_site,
             by_address,
             default: config.default,
@@ -275,6 +380,11 @@ impl Mmio {
         Ok(value)
     }
 
+    /// The next byte of the stream, for the interrupt schedule.
+    pub(crate) fn take_byte(&mut self) -> Option<u8> {
+        self.take(1).ok().map(|value| value as u8)
+    }
+
     /// A read of `size` (1, 2 or 4) bytes at `address` by the instruction at
     /// `pc`, after `instructions` instructions.
     pub(crate) fn read(
@@ -331,10 +441,53 @@ mod tests {
     use std::collections::HashSet;
 
     fn mmio(models: &[MmioModel], default: MmioDefault) -> Mmio {
-        Mmio::new(&MmioConfig {
-            models: models.to_vec(),
-            default,
-        })
+        Mmio::new(
+            &MmioConfig {
+                models: models.to_vec(),
+                default,
+            },
+            Windows::region(),
+        )
+    }
+
+    fn window(name: &str, base: u32, size: u32) -> PeripheralWindow {
+        PeripheralWindow {
+            name: name.to_owned(),
+            base,
+            size,
+        }
+    }
+
+    #[test]
+    fn described_windows_serve_their_bytes_and_alias_bits_only() {
+        let windows = Windows::described(&[
+            window("B", 0x4000_0600, 0x400),
+            window("A", 0x4000_0000, 0x400),
+            window("A2", 0x4000_0200, 0x400),
+            window("C", 0x5000_0000, 4),
+        ]);
+        // Overlapping windows merge; adjacent ones do too.
+        assert!(windows.serves(0x4000_0000, 4));
+        assert!(windows.serves(0x4000_03fe, 4), "across A and A2");
+        assert!(windows.serves(0x4000_05fe, 4), "across A2 and B");
+        assert!(windows.serves(0x4000_09fc, 4));
+        assert!(!windows.serves(0x4000_09fe, 4), "past B's end");
+        assert!(!windows.serves(0x4000_0a00, 1));
+        assert!(windows.serves(0x5000_0003, 1));
+        assert!(!windows.serves(0x5000_0004, 1));
+        assert!(!windows.serves(0x3fff_fffc, 4));
+        // The bit-band alias of a window's byte, and of no window's.
+        assert!(windows.serves(0x4200_0000 + 0x604 * 32, 4));
+        assert!(!windows.serves(0x4200_0000 + 0x2000 * 32, 4));
+        assert_eq!(windows.name_of(0x4000_0300), Some("A"));
+        assert_eq!(windows.name_of(0x4000_0604), Some("B"));
+        assert_eq!(windows.name_of(0x4000_3000), None);
+        assert!(!windows.guessed());
+        let region = Windows::region();
+        assert!(region.guessed());
+        assert!(region.serves(0x4002_0000, 4) && region.serves(0x5fff_fffc, 4));
+        assert!(!region.serves(0x6000_0000, 1));
+        assert_eq!(region.name_of(0x4000_0000), None);
     }
 
     #[test]

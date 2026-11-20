@@ -761,6 +761,11 @@ pub fn run(args: MinimizeArgs) -> i32 {
     if crate::session_fuzz::is_session_finding(&finding_dir) {
         return crate::session_fuzz::minimize_session_finding(&finding_dir);
     }
+    // A kernel crash ran in a kernel, not a harness: say what replays it.
+    if let Some(refusal) = crate::kernel::harness_command_refusal("minimize", &finding_dir) {
+        bhfeprintln!("error: {refusal}");
+        return 1;
+    }
     match run_inner(args) {
         Ok(summary) => {
             if let Some(fields) = &summary.unverified {

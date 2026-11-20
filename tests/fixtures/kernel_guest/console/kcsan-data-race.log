@@ -1,0 +1,60 @@
+[   21.829569] test_basic-torture: Creating access_thread task
+[   21.832962] test_basic-torture: Creating access_thread task
+[   21.969686] ==================================================================
+[   21.970445] BUG: KCSAN: data-race in test_kernel_read / test_kernel_write
+[   21.970950] 
+[   21.971288] write to 0xffffffff83d2f860 of 8 bytes by task 61 on cpu 1:
+[   21.971872]  test_kernel_write+0x1d/0x40
+[   21.972297]  access_thread+0x70/0xe0
+[   21.972715]  kthread+0x175/0x1c0
+[   21.973093]  ret_from_fork+0x48/0x60
+[   21.973505]  ret_from_fork_asm+0x1a/0x30
+[   21.973902] 
+[   21.974178] read to 0xffffffff83d2f860 of 8 bytes by task 62 on cpu 0:
+[   21.974645]  test_kernel_read+0x14/0x30
+[   21.975046]  access_thread+0x70/0xe0
+[   21.975396]  kthread+0x175/0x1c0
+[   21.975760]  ret_from_fork+0x48/0x60
+[   21.976135]  ret_from_fork_asm+0x1a/0x30
+[   21.976639] 
+[   21.976859] value changed: 0x000000000001349a -> 0x00000000000134b6
+[   21.977228] 
+[   21.977433] Reported by Kernel Concurrency Sanitizer on:
+[   21.978925] CPU: 0 UID: 0 PID: 62 Comm: access_thread Tainted: G                 N 6.12.118 #1
+[   21.979769] Tainted: [N]=TEST
+[   21.980069] Hardware name: QEMU Ubuntu 24.04 PC v2 (i440FX + PIIX, arch_caps fix, 1996), BIOS 1.16.3-debian-1.16.3-2 04/01/2014
+[   21.980662] ==================================================================
+[   21.981355] Kernel panic - not syncing: KCSAN: panic_on_warn set ...
+[   21.982112] CPU: 0 UID: 0 PID: 62 Comm: access_thread Tainted: G                 N 6.12.118 #1
+[   21.982626] Tainted: [N]=TEST
+[   21.982886] Hardware name: QEMU Ubuntu 24.04 PC v2 (i440FX + PIIX, arch_caps fix, 1996), BIOS 1.16.3-debian-1.16.3-2 04/01/2014
+[   21.983487] Call Trace:
+[   21.984155]  <TASK>
+[   21.984951]  dump_stack_lvl+0x30/0xa0
+[   21.986010]  dump_stack+0x15/0x20
+[   21.986839]  vpanic+0x4ce/0x590
+[   21.987692]  ? test_kernel_write+0x1d/0x40
+[   21.988427]  panic+0x6b/0x70
+[   21.989116]  check_panic_on_warn+0xa4/0xb0
+[   21.989921]  print_report+0x43d/0x620
+[   21.990758]  ? kcsan_report_known_origin+0x1bb/0x1e0
+[   21.991625]  ? kcsan_setup_watchpoint+0x325/0x430
+[   21.992359]  ? test_kernel_read+0x14/0x30
+[   21.993019]  ? access_thread+0x70/0xe0
+[   21.993696]  ? kthread+0x175/0x1c0
+[   21.994292]  ? ret_from_fork+0x48/0x60
+[   21.994908]  ? ret_from_fork_asm+0x1a/0x30
+[   21.995738]  kcsan_report_known_origin+0x1bb/0x1e0
+[   21.996504]  kcsan_setup_watchpoint+0x325/0x430
+[   21.997221]  ? test_kernel_read+0x14/0x30
+[   21.997944]  ? __pfx_access_thread+0x10/0x10
+[   21.998671]  test_kernel_read+0x14/0x30
+[   21.999324]  access_thread+0x70/0xe0
+[   21.999926]  ? __pfx_access_thread_timer+0x10/0x10
+[   22.000733]  kthread+0x175/0x1c0
+[   22.001345]  ? __pfx_kthread+0x10/0x10
+[   22.001970]  ret_from_fork+0x48/0x60
+[   22.002680]  ? __pfx_kthread+0x10/0x10
+[   22.003323]  ret_from_fork_asm+0x1a/0x30
+[   22.004055]  </TASK>
+[   22.006052] Kernel Offset: disabled

@@ -116,6 +116,22 @@ class SchemaFilesTest(unittest.TestCase):
         bad["findings"][0]["evidence"]["files"][-1]["role"] = "repro_cobol"
         self.assertNotEqual(_errors(findings, bad), [])
 
+    def test_a_kernel_crash_bhf_found_in_its_guest_validates(self):
+        """`bhf kernel fuzz`: producer `kernel fuzz`, with the program as the
+        testcase, decoded, and its C reproducer."""
+        findings = _validator("bhf.findings.v1.schema.json")
+        doc = json.loads((EXAMPLES / "findings.v1.example.json").read_text())
+        finding = doc["findings"][0]
+        finding["producer"] = "kernel fuzz"
+        evidence_dir = finding["evidence"]["dir"]
+        for role, name in (("console_log", "console.log"), ("repro_c", "repro.c"), ("decoded", "decoded.json")):
+            finding["evidence"]["files"].append(
+                {"role": role, "path": f"{evidence_dir}/{name}", "sha256": None, "size": 12})
+        self.assertEqual(_errors(findings, doc), [])
+        bad = json.loads(json.dumps(doc))
+        bad["findings"][0]["producer"] = "kernel guess"
+        self.assertNotEqual(_errors(findings, bad), [])
+
     def test_allocated_by_harness_is_an_optional_flag(self):
         findings = _validator("bhf.findings.v1.schema.json")
         doc = json.loads((EXAMPLES / "findings.v1.example.json").read_text())

@@ -519,6 +519,102 @@ class RenodeLaneTests(unittest.TestCase):
 
 
 
+class KernelGuestLaneTests(unittest.TestCase):
+    """The kernel guest tests skip in the hash shards, which build no guest
+    kernel, and run in hil-emu against the one the recipe builds (#350)."""
+
+    def test_the_hash_shards_may_skip_only_the_kernel_guest_tests(self) -> None:
+        allowed = (ROOT / "scripts/ci/allowed-skips.txt").read_text()
+        self.assertIn(
+            "bhf::kernel_guest_cli::*  skip kernel_guest_cli: set BHF_KERNEL_GUEST=1*", allowed
+        )
+        tests = (ROOT / "crates/cli/tests/kernel_guest_cli.rs").read_text()
+        self.assertIn('"skip kernel_guest_cli: set BHF_KERNEL_GUEST=1 and BHF_KERNEL_IMAGE', tests)
+
+    def test_the_kernel_is_a_pinned_release_fetched_by_digest(self) -> None:
+        script = (ROOT / "scripts/ci/build-kcov-guest-kernel.sh").read_text()
+        self.assertIn("version=6.12.118\n", script)
+        self.assertIn(
+            "sha256=08308460320e852ac0745b2be3c7ae1cd81bdad713506ed7d817ba1ec9e1a5a5\n", script
+        )
+        self.assertEqual(script.count('"$here/fetch.sh" \\\n'), 1, script)
+        self.assertNotIn("curl", script)
+        for option in ["CONFIG_KCOV=y", "CONFIG_KCOV_ENABLE_COMPARISONS=y", "CONFIG_KASAN=y"]:
+            self.assertIn(option, script)
+        self.assertIn("make \"${make_args[@]}\" kvm_guest.config", script)
+
+    def test_an_output_the_recipe_built_is_used_as_it_is(self) -> None:
+        script = ROOT / "scripts/ci/build-kcov-guest-kernel.sh"
+        fixture = ROOT / "tests/fixtures/kernel_widget/linux"
+        recipe = __import__("hashlib").sha256(
+            script.read_bytes()
+            + (fixture / "drivers/misc/widget.c").read_bytes()
+            + (fixture / "include/uapi/linux/widget.h").read_bytes()
+        ).hexdigest()
+        with tempfile.TemporaryDirectory() as out, tempfile.TemporaryDirectory() as bin_dir:
+            # Only what the script runs before its tool check: a rebuild
+            # finds no compiler and stops.
+            for tool in ["cat", "sha256sum", "cut", "dirname", "mkdir", "rm", "getconf"]:
+                found = subprocess.run(["which", tool], capture_output=True, text=True)
+                os.symlink(found.stdout.strip(), Path(bin_dir) / tool)
+            env = {"PATH": bin_dir, "HOME": out}
+            (Path(out) / "bzImage").write_bytes(b"kernel")
+            (Path(out) / "widget.ko").write_bytes(b"module")
+            (Path(out) / "recipe.sha256").write_text(recipe + "\n")
+            done = subprocess.run(
+                ["/bin/bash", str(script), out], env=env, capture_output=True, text=True
+            )
+            self.assertEqual(done.returncode, 0, done)
+            self.assertEqual(
+                done.stdout.splitlines(),
+                [f"BHF_KERNEL_IMAGE={out}/bzImage", f"BHF_KERNEL_MODULE={out}/widget.ko"],
+            )
+            # Another recipe's output is rebuilt, not used.
+            (Path(out) / "recipe.sha256").write_text("0" * 64 + "\n")
+            stale = subprocess.run(
+                ["/bin/bash", str(script), out], env=env, capture_output=True, text=True
+            )
+            self.assertEqual(stale.returncode, 1, stale)
+            self.assertIn("gcc is not installed", stale.stderr)
+            self.assertEqual(stale.stdout, "")
+            self.assertFalse((Path(out) / "recipe.sha256").exists())
+
+    def test_hil_emu_builds_the_kernel_and_requires_the_guest_tests(self) -> None:
+        workflow = (ROOT / ".github/workflows/hil-emu.yml").read_text()
+        build = workflow.index(
+            'bash scripts/ci/build-kcov-guest-kernel.sh "$HOME/.local/opt/kcov-guest" >> "$GITHUB_ENV"'
+        )
+        run = workflow.index("run: scripts/hil-emu.sh")
+        self.assertLess(build, run)
+        for package in ["qemu-system-x86", "flex", "bison", "libelf-dev"]:
+            self.assertIn(f"            {package}", workflow)
+        lane = (ROOT / "scripts/hil-emu.sh").read_text()
+        self.assertIn("BHF_REQUIRE_TOOLS=1 BHF_KERNEL_GUEST=1 cargo test --locked \\\n", lane)
+        self.assertIn("-p bhf --test kernel_guest_cli", lane)
+
+    def test_the_lane_fails_without_the_guest_kernel(self) -> None:
+        lane = (ROOT / "scripts/hil-emu.sh").read_text()
+        start = lane.index('[ -f "${BHF_KERNEL_IMAGE:-}" ]')
+        guard = lane[start : lane.index("\n}\n", start) + 3]
+        with tempfile.TemporaryDirectory() as empty:
+            env = {"PATH": empty, "BHF_KERNEL_IMAGE": "", "BHF_KERNEL_MODULE": ""}
+            missing = subprocess.run(
+                ["/bin/bash", "-c", guard + "echo ran"], env=env, capture_output=True, text=True
+            )
+            self.assertEqual(missing.returncode, 1, missing)
+            self.assertIn("RV-8 needs qemu-system-x86_64", missing.stderr)
+            for name in ["bzImage", "widget.ko", "qemu-system-x86_64"]:
+                (Path(empty) / name).write_text("#!/bin/sh\n")
+            qemu = Path(empty) / "qemu-system-x86_64"
+            qemu.chmod(qemu.stat().st_mode | stat.S_IXUSR)
+            env["BHF_KERNEL_IMAGE"] = str(Path(empty) / "bzImage")
+            env["BHF_KERNEL_MODULE"] = str(Path(empty) / "widget.ko")
+            found = subprocess.run(
+                ["/bin/bash", "-c", guard + "echo ran"], env=env, capture_output=True, text=True
+            )
+            self.assertEqual(found.stdout.strip(), "ran", found)
+
+
 class PersistentLoopBenchmarkTests(unittest.TestCase):
     """The reset=persistent and reset=fast benchmarks run in hil-emu on the
     nightly schedule and by hand, not on a pull request or a push (#346,

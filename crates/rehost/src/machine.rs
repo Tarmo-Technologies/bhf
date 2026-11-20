@@ -8,7 +8,8 @@ use crate::cpu::{executable_region, Core, Saved, Trap, PERIPHERAL_BASE, PERIPHER
 use crate::fault::Fault;
 use crate::image::Image;
 use crate::memory::{Checkpoint, Memory};
-use crate::mmio::{Mmio, MmioAccess, MmioConfig, MmioMark, MmioModelKind, Probe};
+use crate::mmio::{Mmio, MmioAccess, MmioConfig, MmioMark, MmioModelKind, Probe, Windows};
+use crate::nvic::{InterruptConfig, InterruptEvent, Nvic};
 use std::collections::HashSet;
 use thiserror::Error;
 
@@ -38,7 +39,8 @@ impl MemoryRange {
 
 /// How a run's input reaches the firmware: written into a fixed buffer, as
 /// a receive routine would leave it. Peripheral reads that take input (see
-/// [`MmioConfig`]) take the bytes after the buffer's `capacity`.
+/// [`MmioConfig`]) and the interrupt schedule ([`InterruptConfig`]) take the
+/// bytes after the buffer's `capacity`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InputBuffer {
     /// Where the input is written.
@@ -67,6 +69,12 @@ pub struct MachineConfig {
     pub max_instructions: u64,
     /// What peripheral registers read as.
     pub mmio: MmioConfig,
+    /// Where the peripheral registers are; `None` is the Cortex-M peripheral
+    /// region, `0x40000000`-`0x5fffffff`, all of it.
+    pub peripheral_windows: Option<Vec<crate::PeripheralWindow>>,
+    /// The interrupt schedule; `None` models no interrupts: the NVIC's
+    /// registers hold what is written to them, and nothing is ever taken.
+    pub interrupts: Option<InterruptConfig>,
 }
 
 impl Default for MachineConfig {
@@ -78,6 +86,8 @@ impl Default for MachineConfig {
             exit_at: Vec::new(),
             max_instructions: DEFAULT_MAX_INSTRUCTIONS,
             mmio: MmioConfig::default(),
+            peripheral_windows: None,
+            interrupts: None,
         }
     }
 }
@@ -120,6 +130,16 @@ pub enum SetupError {
     )]
     MmioOutsidePeripherals { address: u32 },
     #[error(
+        "the MMIO model for {address:#010x} is in none of the peripheral windows the device \
+         description gives"
+    )]
+    MmioOutsideWindows { address: u32 },
+    #[error(
+        "the peripheral window {name} at {base:#010x} of {size:#x} bytes is empty or runs past \
+         the end of the address space"
+    )]
+    BadPeripheralWindow { name: String, base: u32, size: u32 },
+    #[error(
         "the MMIO model for {address:#010x} would never be used: RAM or an image segment holds that \
          address, and memory answers its reads"
     )]
@@ -128,6 +148,8 @@ pub enum SetupError {
     DuplicateMmioModel { address: u32, pc: Option<u32> },
     #[error("the bit-extract model for {address:#010x} has no bits in its mask")]
     EmptyBitMask { address: u32 },
+    #[error("the interrupt schedule's interval is zero")]
+    NoInterruptInterval,
 }
 
 fn read_by(pc: Option<u32>) -> String {
@@ -140,7 +162,7 @@ fn read_by(pc: Option<u32>) -> String {
 /// Why the core went idle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdleReason {
-    /// `WFI`, with no interrupt modelled to wake it.
+    /// `WFI`, with no interrupt to wake it.
     WaitForInterrupt,
     /// `WFE` with no event pending.
     WaitForEvent,
@@ -216,6 +238,10 @@ pub struct Execution {
     pub mmio_reads: u64,
     /// Bytes of the input its peripheral reads took.
     pub mmio_input: usize,
+    /// Interrupts the run took.
+    pub interrupts: u64,
+    /// Bytes of the input the interrupt schedule took.
+    pub interrupt_input: usize,
     /// What the firmware wrote through semihosting.
     pub output: Vec<u8>,
 }
@@ -257,6 +283,12 @@ impl Machine {
     pub fn new(image: &Image, config: MachineConfig) -> Result<Self, SetupError> {
         if config.max_instructions == 0 {
             return Err(SetupError::NoBudget);
+        }
+        if config
+            .interrupts
+            .is_some_and(|interrupts| interrupts.interval == 0)
+        {
+            return Err(SetupError::NoInterruptInterval);
         }
         let mut memory = Memory::new(image, &config.ram)?;
         let vector_table = config.vector_table.unwrap_or(image.vector_table());
@@ -301,10 +333,31 @@ impl Machine {
         for &address in &config.exit_at {
             check_code(&memory, "the exit address", address)?;
         }
+        let windows = match &config.peripheral_windows {
+            None => Windows::region(),
+            Some(windows) => {
+                for window in windows {
+                    if window.size == 0 || u64::from(window.base) + u64::from(window.size) > 1 << 32
+                    {
+                        return Err(SetupError::BadPeripheralWindow {
+                            name: window.name.clone(),
+                            base: window.base,
+                            size: window.size,
+                        });
+                    }
+                }
+                Windows::described(windows)
+            }
+        };
         let mut sites = HashSet::new();
         for model in &config.mmio.models {
-            if !(PERIPHERAL_BASE..PERIPHERAL_END).contains(&model.address) {
+            if !(PERIPHERAL_BASE..PERIPHERAL_END).contains(&model.address) && windows.guessed() {
                 return Err(SetupError::MmioOutsidePeripherals {
+                    address: model.address,
+                });
+            }
+            if !windows.serves(model.address, 1) {
+                return Err(SetupError::MmioOutsideWindows {
                     address: model.address,
                 });
             }
@@ -329,7 +382,12 @@ impl Machine {
             }
         }
         Ok(Self {
-            core: Core::new(memory, Mmio::new(&config.mmio), vector_table),
+            core: Core::new(
+                memory,
+                Mmio::new(&config.mmio, windows),
+                vector_table,
+                config.interrupts.map(Nvic::new),
+            ),
             initial_sp,
             reset_vector,
             input: config.input,
@@ -359,6 +417,18 @@ impl Machine {
     /// zero stops recording.
     pub fn trace_mmio(&mut self, limit: usize) {
         self.core.mmio.set_trace_limit(limit);
+    }
+
+    /// The first interrupts the last run took, up to
+    /// [`crate::INTERRUPT_LOG_LIMIT`] of them.
+    pub fn interrupt_log(&self) -> &[InterruptEvent] {
+        self.core.irq.as_ref().map_or(&[], |nvic| &nvic.log)
+    }
+
+    /// The peripheral whose window holds `address`, when the machine's
+    /// windows come from a device description that names it.
+    pub fn peripheral_at(&self, address: u32) -> Option<&str> {
+        self.core.mmio.windows.name_of(address)
     }
 
     /// The peripheral reads of the last run, as far as its trace holds them.
@@ -450,19 +520,26 @@ impl Machine {
                 break stop;
             }
         };
+        let (interrupts, interrupt_input) = self
+            .core
+            .irq
+            .as_ref()
+            .map_or((0, 0), |nvic| (nvic.taken, nvic.schedule_bytes));
         Execution {
             stop,
             instructions: self.core.instructions,
             blocks: self.core.blocks,
             input_delivered: self.delivered,
             mmio_reads: self.core.mmio.reads,
-            mmio_input: self.core.mmio.consumed(),
+            mmio_input: self.core.mmio.consumed() - interrupt_input,
+            interrupts,
+            interrupt_input,
             output: std::mem::take(&mut self.core.output),
         }
     }
 
-    /// The bytes of `input` peripheral reads take: the buffer takes the
-    /// first `capacity`, and they take the rest.
+    /// The bytes of `input` peripheral reads and the interrupt schedule
+    /// take: the buffer takes the first `capacity`, and they take the rest.
     fn peripheral_input<'a>(&self, input: &'a [u8]) -> &'a [u8] {
         let buffered = self
             .input
@@ -983,6 +1060,51 @@ mod tests {
         machine.trace_mmio(64);
         machine.run(&input);
         assert_eq!(machine.mmio_trace(), &recorded[..]);
+    }
+
+    #[test]
+    fn a_probe_from_a_paused_run_takes_the_interrupts_the_run_took() {
+        // The interrupt-driven fixture (`tests/fixtures/irq.c`): every
+        // peripheral read is in its receive interrupt's handler.
+        let image = Image::elf(include_bytes!("../tests/fixtures/irq.elf")).unwrap();
+        let config = MachineConfig {
+            max_instructions: 100_000,
+            mmio: MmioConfig {
+                models: Vec::new(),
+                default: crate::MmioDefault::Passthrough,
+            },
+            interrupts: Some(crate::InterruptConfig::default()),
+            ..MachineConfig::default()
+        };
+        let mut machine = Machine::new(&image, config).unwrap();
+        let input: Vec<u8> = b"FUZZQ\n"
+            .iter()
+            .flat_map(|&byte| [0x00, 0x20, 0, 0, 0, byte, 0, 0, 0])
+            .collect();
+        machine.trace_mmio(64);
+        let run = machine.run(&input);
+        assert_eq!(run.interrupts, 6);
+        let recorded = machine.mmio_trace().to_vec();
+        assert_eq!(recorded.len(), 12);
+        // Paused before the third interrupt's status read, a probe runs on
+        // into its data read as the run did: the pending interrupts, the
+        // schedule and the handler's stack come back with the pause.
+        let at = 4;
+        let point = machine
+            .pause_before(&input, &recorded[at], 100_000)
+            .unwrap();
+        for _ in 0..3 {
+            let probed = machine.probe_from(&point, &input, 0, 100_000).to_vec();
+            assert_eq!(probed, recorded[at..at + 2]);
+        }
+        // With RXNE flipped off the handler returns, and the next read is
+        // the next interrupt's status read.
+        let probed = reads(machine.probe_from(&point, &input, 0x20, 100_000));
+        assert_eq!(probed[0].2, 0);
+        assert_eq!(
+            probed[1].1, recorded[at].address,
+            "the status register again"
+        );
     }
 
     #[test]

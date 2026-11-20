@@ -61,7 +61,8 @@ binary release.
 | An on-device agent (TCP/serial) | **On-target agent** | Real device; coverage over the agent protocol | ⛔ unproven: the host side ships; no target-side agent does yet ([#289](https://github.com/Tarmo-Technologies/bhf/issues/289)), so you write one to the frame format in §3c |
 | A physical board | **HIL** (hardware-in-the-loop) | Silicon | ⛔ unproven (`BHF_HIL_GDB`) |
 | A Linux driver's source, and syzkaller | **syzkaller descriptions and crash import** (`bhf kernel syzlang`, `bhf kernel import`, §10) | syzkaller runs the kernel and its KCOV coverage; bhf describes the driver's ioctls and triages the crashes | ✅ snapshot of the widget fixture's description, and the import of a crash directory in syz-manager's layout; ⛔ syz-sysgen acceptance and a fresh syz-manager workdir gated (need syzkaller) |
-| Only a firmware image (ELF or flash dump), no source | **Rehosting** (`bhf binary rehost`, §9) | bhf's own Cortex-M interpreter: the real instructions; peripheral reads from per-register models (input-fed, constant, or bit-extract inferred from polling loops), no interrupts | ✅ fixture images in `crates/rehost/tests/fixtures/`: edge coverage that grows with the input, invalid-access, bad-PC and HardFault findings, a parser fed through a peripheral data register, a polled UART's parser bug reached through inferred models, `bhf replay` MATCH |
+| A Linux kernel built with KCOV (and KASAN), and qemu-system | **Kernel guest** (`bhf kernel run`, `bhf kernel fuzz`, `bhf kernel replay`, §10) | The real kernel in a qemu-system guest; bhf's executor runs system-call programs and returns each call's KCOV PCs or comparisons, which the campaign maps into its coverage map; the guest's kernel reports become findings with their programs | ✅ the executor's decoder and protocol, on the host, the edge mapping on recorded replies, and the report classification on recorded console logs; ⛔ the guest itself gated (`BHF_KERNEL_GUEST=1`, a kernel from `scripts/ci/build-kcov-guest-kernel.sh`) |
+| Only a firmware image (ELF or flash dump), no source | **Rehosting** (`bhf binary rehost`, §9) | `rehosted, peripheral-modelled`: bhf's own Cortex-M interpreter runs the real instructions; peripheral reads come from per-register models (input-fed, constant, or bit-extract inferred from polling loops) in the windows the part's SVD file gives (or the whole peripheral region); interrupts the firmware enables are raised on a schedule the input chooses | ✅ fixture images in `crates/rehost/tests/fixtures/`: edge coverage that grows with the input, invalid-access, bad-PC and HardFault findings, a parser fed through a peripheral data register, a polled UART's parser bug reached through inferred models, an RX-interrupt handler's bug reached through the interrupt schedule, a read between an SVD's peripherals found as an invalid access (Arm's CMSIS example SVD parsed), `bhf replay` MATCH |
 
 ---
 
@@ -936,7 +937,8 @@ stack pointer and the reset vector come from the vector table. The input
 reaches the firmware in a fixed buffer in its memory (the receive buffer its
 parser reads, with an optional length word), through its peripheral reads
 (MMIO models, below), or both. Execution runs until the core goes idle
-(`WFI`, `WFE`, a branch to itself), reaches an `--exit-at` address, exits
+(`WFI`, `WFE`, a branch to itself) with no interrupt to wake it, reaches an
+`--exit-at` address, exits
 through semihosting, requests a system reset, runs out of input at a
 peripheral read, faults, or uses `--max-instructions`. Every basic block the core enters is counted in a
 64 KiB edge map that steers the builtin engine's mutator and power schedule.
@@ -956,6 +958,15 @@ bhf binary rehost firmware.bin --base 0x08000000 --work-dir bhf_work \
 # register, after checking an ID register that must read a fixed value:
 bhf binary rehost firmware.elf --work-dir bhf_work \
   --mmio 0x40013000=constant:0x4c31a5c3 --seed-file seed.bin
+
+# The part's SVD file: only its peripherals' address blocks are registers.
+bhf binary rehost firmware.elf --work-dir bhf_work \
+  --svd STM32F407.svd --seed-file seed.bin
+
+# Firmware that sleeps until its UART interrupts it: interrupts are raised
+# on the input's schedule by default, here a tick every 500 instructions:
+bhf binary rehost firmware.elf --work-dir bhf_work \
+  --interrupt-interval 500 --seed-file seed.bin
 ```
 
 - Addresses are hex, `0x` optional, so a value copied from `nm` or `objdump`
@@ -1001,6 +1012,34 @@ bhf binary rehost firmware.elf --work-dir bhf_work \
   the default to the rule above. The run JSON's `mmio_reads` counts the peripheral
   reads of the campaign, and a finding's `input` block says how many bytes
   its peripheral reads took (`mmio_bytes`).
+- **Peripheral windows (`--svd FILE`).** Without a device description
+  every address in the peripheral region (`0x40000000`-`0x5fffffff`) is
+  taken for a register, so a wild pointer into it reads as the default
+  model and the bug goes unseen. `--svd` reads the part's CMSIS-SVD file
+  (the vendor's `.svd`, as debuggers and header generators use) and takes
+  only its peripherals' address blocks for registers: each `addressBlock`
+  at `baseAddress` plus its `offset`, `size` bytes long, other than
+  `reserved` ones. A peripheral `derivedFrom` another with no blocks of its
+  own takes that one's, and a peripheral array (`dim`, `dimIncrement`,
+  `dimIndex`, `%s` in its name) is each of its elements. A load or store
+  anywhere else, between peripherals or in a reserved block, is an invalid
+  access (`read_unmapped` or `write_unmapped`), as on the part's bus; the
+  peripheral bit-band alias follows the windows, and a window may lie
+  outside the region (an nRF part's `FICR` at `0x10000000`, say) when
+  memory does not hold it. Blocks in the system space are the core's own
+  (the System Control Block, the NVIC) and give no window; a peripheral with
+  no block gets a warning on stderr, and a file that gives no window is
+  refused. An `--mmio` model for an address no window holds is refused
+  before anything runs. The setup records the windows and the file they
+  came from (`rehost.setup.peripheral_windows`: `source`, the SVD's `path`,
+  `sha256`, `device` and its interrupt names, and each window's `name`,
+  `base`, `size`), so `bhf replay` needs no copy of the file; a setup
+  recorded before windows existed takes the whole region. With an SVD the
+  run JSON's `mmio_inference` names each loop's `peripheral`, and a
+  finding's `rehost.interrupts` names each interrupt (`USART1`). Only the
+  blocks, the interrupts and the device's name are read; registers, fields
+  and the rest of the file are skipped, so a vendor file of a few megabytes
+  reads in a fraction of a second.
 - **Polling loops (inferred bit-extract models).** Firmware that waits for a
   status bit (`while (!(USART->SR & RXNE)) {}`) stalls on a zero read and,
   fed whole from the input, eats several input bytes a poll on a bit the
@@ -1044,6 +1083,49 @@ bhf binary rehost firmware.elf --work-dir bhf_work \
   inferred. `--no-mmio-inference` turns it off. Loops that alternate
   between two registers, or whose exit depends on more than the bits of
   one read, are not inferred; name those with `--mmio`.
+- **Interrupts (an input-chosen schedule).** Firmware that sleeps until its
+  peripherals interrupt it (a UART's receive interrupt, a timer tick) never
+  progresses when nothing raises one. bhf models the NVIC (its enable,
+  pending, active and priority registers, `AIRCR.PRIGROUP`, and `ICSR`'s
+  PendSV and SysTick bits) and raises interrupts on a schedule that is part
+  of the testcase, as Fuzzware's fuzzer-chosen interrupt triggers do. Every
+  tick, `--interrupt-interval` instructions apart (default 1000), takes one
+  byte of the input, from the same stream the peripheral reads take, in
+  order with them, and pends one of the interrupts the firmware has enabled:
+  its NVIC IRQs, and SysTick when its counter and its interrupt are on. The
+  byte modulo how many are enabled picks which, lowest exception number
+  first, and its top three bits pick the wait until the next tick: the
+  interval, a half, a quarter, one instruction, 4, 8 or 16 times it, or
+  twice it (`000` to `111`). A tick with nothing enabled takes no byte, and a
+  tick the input has no byte left for raises nothing. A core that sleeps
+  (`WFI`, `WFE`, a branch to itself) runs on to the next tick at once, and
+  ends the run idle only when nothing enabled could wake it or the input is
+  used up. A pending interrupt is taken between two instructions when its
+  group priority preempts the core's execution priority (the active
+  exceptions, `BASEPRI`, `PRIMASK`, `FAULTMASK`); the frame is stacked and
+  the handler entered as the hardware does, and the pending bits the
+  firmware sets itself (`NVIC_ISPR`, `PENDSVSET`, `PENDSTSET`) are taken the
+  same way. An `SVC` in a handler is taken when SVCall's priority preempts
+  the handler's, and escalates otherwise; an exception return clears
+  `FAULTMASK`. A handler counts its own edges: the edge into it is from the
+  interrupt, not from where it landed, and its return counts none, so an
+  interrupt's timing alone makes no new coverage. An input buffer setup
+  gets room for the schedule too: the buffer then takes at most the input's
+  first 4096 bytes, as with peripheral input. With an input fed through
+  peripheral reads, a status register that every interrupt's handler reads
+  once is a loop to inference like a status poll, and gets a bit-extract
+  model for the bit the handler tests. A finding records the interrupts its
+  run took (`rehost.interrupts`: how many, the schedule's input bytes, and
+  the first 64 with the instruction count, exception and IRQ number and the
+  instruction each interrupted), the exception whose handler faulted
+  (`rehost.fault.exception`, 16 + n for IRQ n), and the schedule in its
+  setup (`rehost.setup.interrupts`), which `bhf replay` runs; a finding
+  recorded before the schedule existed replays without one.
+  `--no-interrupts` raises none: the NVIC's registers then hold what is
+  written to them and a core that sleeps ends the run. No peripheral raises
+  an interrupt of its own accord; NMI and the fault exceptions are never
+  raised (a fault ends the run), and tail-chaining runs as a return and a
+  fresh entry.
 - `--ram BASE:SIZE` (repeatable) maps RAM; the default is
   `0x20000000:0x100000`, and an ELF's `.data` and `.bss` RAM is mapped as
   well. An initial stack pointer outside RAM is refused before anything
@@ -1074,16 +1156,26 @@ bhf binary rehost firmware.elf --work-dir bhf_work \
   `results/INDEX.md` and `findings.json` give for these findings (producer
   `binary rehost`); they get no `replay.py`, which runs a host harness.
 
-**Fidelity.** The run JSON and every finding carry a `fidelity` block. The
+**Fidelity.** The run JSON and every finding carry a `fidelity` block whose
+`label` is `rehosted, peripheral-modelled`: the firmware ran in bhf's
+emulator, its peripherals' reads served by models, not on the device. Every
+finding also carries it as its `fidelity_caveat`, with where its peripheral
+windows came from (`peripheral windows from the SVD STM32F407`, or
+`peripheral windows guessed, no SVD`), so `results/findings.json` lists it
+in the finding's `fidelity.caveats` and a report never reads a rehosted
+fault as one seen on hardware. The block's `peripheral_windows` says where
+the windows came from. The
 CPU runs the real instructions: the Cortex-M3/M4 integer set with the M4's
-halfword multiplies and saturation, the banked stack pointers, `SVC`
-exception entry and return, and the System Control Block registers start-up
-code writes. Peripherals are modelled only as far as their reads go: each
-read returns what its model says (the input's bytes or a constant), writes
-are dropped, and nothing a peripheral does on its own (a FIFO filling, a
-timer counting) happens. With no models and the `zero` default the block
-says peripherals are not modelled. Interrupts, the FPU, the M4's SIMD
-instructions, the MPU and privilege are not modelled. An instruction outside the model
+halfword multiplies and saturation, the banked stack pointers, `SVC` and
+interrupt exception entry and return, the NVIC, and the System Control
+Block registers start-up code writes. Peripherals are modelled only as far
+as their reads go: each read returns what its model says (the input's bytes
+or a constant), writes are dropped, and nothing a peripheral does on its
+own (a FIFO filling, a timer counting) happens; its interrupts come from
+the schedule (`interrupts` says so, or `not modelled` under
+`--no-interrupts`). With no models and the `zero` default the block says
+peripherals are not modelled. The FPU, the M4's SIMD instructions, the MPU
+and privilege are not modelled. An instruction outside the model
 ends the run as `unsupported` in the run JSON's `stops` and `unsupported`
 fields, never as a finding. An UNPREDICTABLE encoding (one that sets a bit
 the architecture says should be clear, say) runs as the instruction it
@@ -1095,10 +1187,13 @@ them.
 ## 10. Linux kernel drivers: syzkaller descriptions
 
 A Linux driver's bugs are in the kernel, which a user-space harness never
-runs. bhf does not fuzz the kernel itself; it gives syzkaller what it needs
-to: `bhf kernel syzlang` reads the driver's C source and writes the syzkaller
-description (syzlang) of its ioctl interface, and `bhf kernel import` brings
-the crashes syzkaller finds back into `results/` (below).
+runs. bhf gives syzkaller what it needs to fuzz one: `bhf kernel syzlang`
+reads the driver's C source and writes the syzkaller description (syzlang) of
+its ioctl interface, and `bhf kernel import` brings the crashes syzkaller
+finds back into `results/` (below). `bhf kernel run` boots the kernel itself
+in a qemu-system guest and runs system-call programs in it with KCOV
+coverage, and `bhf kernel fuzz` fuzzes it with them
+([below](#kernel-guest)).
 
 ```sh
 # The driver's directory and the uapi header that defines its commands:
@@ -1217,6 +1312,169 @@ syz-repro found since is added). A crash of syzkaller's own test machine
 (`lost connection to test machine`, `SYZFAIL`) is skipped and listed. Exit
 status: 0 when at least one crash was imported, 1 otherwise.
 
+<a id="kernel-guest"></a>
+### A kernel in a qemu-system guest: `bhf kernel run`
+
+```sh
+# A kernel built with KCOV, debugfs and KASAN, and the driver as a module:
+bhf kernel run --kernel bzImage --module widget.ko program.bin
+```
+
+bhf boots `--kernel` under qemu-system with an initramfs it builds: its
+executor (`c_runtime/kernel_executor.c`, compiled with `--cc`, default `cc`,
+and linked statically; `--executor` takes a prebuilt one) as `/init`, and
+each `--module`, which the executor loads at boot in the order given. The
+executor mounts `/dev`, `/proc`, `/sys` and debugfs, opens
+`/sys/kernel/debug/kcov`, and serves bhf over a virtio-serial port
+(`org.bhf.executor`) that QEMU connects to a Unix socket. Each program runs in
+a forked child with KCOV on; the reply carries each call's result and errno
+and the kernel PCs KCOV recorded while it ran, at most 256 Ki per call and
+512 Ki per program. `--json` prints one object per program, with the KCOV
+edges it took (distinct pairs of consecutive PCs).
+
+- **The kernel.** `CONFIG_KCOV` and `CONFIG_DEBUG_FS` for coverage
+  (without them the programs run, and the HELLO's notes say why there is no
+  coverage), `CONFIG_DEVTMPFS` and `CONFIG_VIRTIO_CONSOLE` for the executor,
+  and `CONFIG_KASAN` for memory-safety reports.
+  `scripts/ci/build-kcov-guest-kernel.sh OUT` builds one: a pinned
+  kernel.org release (6.12), x86_64 defconfig and `kvm_guest.config` with
+  those options and DWARF debug info, and the widget driver fixture as
+  `widget.ko`.
+- **The command line.** `console=ttyS0 nokaslr panic_on_warn=1 oops=panic
+  panic=-1 rcupdate.rcu_cpu_stall_timeout=100`, then `--append`: the PCs do
+  not move between boots, and the first kernel report panics the guest,
+  which QEMU (`-no-reboot`) then leaves.
+- **The guest.** `--qemu` (default `qemu-system-x86_64`), `--accel` (kvm
+  when `/dev/kvm` can be opened, else tcg), `--memory` (MiB, default 1024),
+  `--smp` (default 1), and `--qemu-arg` for anything else (another
+  architecture's machine, with its `--append console=` and an `--executor`
+  built for it). `--boot-timeout` (default 300 s) bounds the boot,
+  `--timeout` (default 10 s) each program (each at most 86400 s): the
+  executor kills a program that outlasts it, and bhf waits twice as long,
+  and 10 s more, for the reply.
+- **Programs.** A program is a list of calls, each a selector byte, an
+  argument count and the arguments: a constant, bytes copied into the data
+  area (1 MiB at `0x20000000`; the argument is their address), zeroed bytes
+  there for the kernel to fill, or the result of an earlier call (a file
+  descriptor). The selector names openat, close, read, write, ioctl, mmap,
+  munmap, pread64, pwrite64, lseek, fcntl or dup, or a raw call by number.
+  Every byte string decodes to a program, so a mutated one is one too. A
+  raw call that would reboot the guest, load or unload modules, change
+  mounts, silence the console, signal or trace other processes, or reach I/O
+  ports is not made and fails with EPERM. The format is described in full
+  atop `c_runtime/kernel_executor.c`.
+
+Exit status: 0 when every program ran, 1 when the guest stopped or did not
+answer (the console's last lines are printed), or could not boot.
+
+<a id="kernel-guest-fuzz"></a>
+#### Fuzzing it: `bhf kernel fuzz`
+
+```sh
+bhf kernel fuzz --kernel bzImage --module widget.ko \
+  --source drivers/misc/widget include/uapi/linux/widget.h \
+  --work-dir bhf_work --time 1h
+```
+
+The guest boots as for `bhf kernel run` (the same options), and the
+campaign runs in it:
+
+- **Seeds.** With `--source` (the driver's sources and headers, read as
+  `bhf kernel syzlang` reads them), each ioctl command its handlers
+  dispatch on becomes a program that opens its device node (`O_RDWR`) and
+  calls it with a zeroed argument of its size (an out buffer for `_IOR`, a
+  constant 0 for `_IO`), and one more program calls them all. The numbers
+  are computed for the guest's architecture (its `uname -m`), and they and
+  the node's path are mutation tokens. `--device` names the node when the
+  source does not; without `--source`, a program that opens `--device` and
+  reads, writes and calls ioctl on it is the seed. `--seeds DIR` adds the
+  programs in DIR, and a corpus an earlier run left in
+  `<work-dir>/kernel/corpus/` runs again first.
+- **The modules.** bhf prints the executor's setup notes (each module
+  loaded, or why not, and KCOV) and `fuzz.json` keeps them (`notes`). A
+  `--module` the guest did not load (built for another kernel, a vermagic
+  mismatch, a file that is no module) leaves nothing of the driver to
+  reach: the campaign stops before it runs a program, and exits 1.
+- **Coverage.** Each call's KCOV PCs, in order, are the coverage map's
+  breadcrumbs, as a harness's are: a PC is an id (its two 32-bit halves
+  XORed: the kernel's and its modules' upper halves are the same, so ids
+  stay distinct), each id's hits are counted in buckets, and each pair of
+  consecutive ids is an edge. A program that adds to the map joins the
+  corpus (`<work-dir>/kernel/corpus/`).
+- **Comparisons.** When the kernel has `CONFIG_KCOV_ENABLE_COMPARISONS`,
+  each corpus program runs once more with KCOV recording the comparisons
+  its calls made. Wherever a call's argument (a constant's low bytes, or an
+  aligned word of a buffer) holds one operand of a comparison made while
+  that call ran, the program with the other operand there runs next (as
+  syzkaller's hints do; at most 128 per program, the calls taking turns),
+  and the operands are the CmpLog its mutations splice from (at most 4096
+  hints wait, and the CmpLogs of the 256 corpus programs used last are
+  kept, so memory stays bounded as the corpus grows). A driver's
+  bound check (`if (xfer->slot > WIDGET_SLOTS)`) gives the boundary value
+  this way.
+- **Mutation.** bhf's builtin mutator, on the program's bytes, with each
+  constant, result index and out-buffer length as an integer, each buffer as
+  bytes and its first 64 bytes as 4-byte words, and the calls as an
+  operation sequence (swapped, or their selector changed). Every mutated
+  program decodes. `--max-len` (default 4096) caps a program; `--rng-seed`
+  makes the mutations repeat.
+- **Kernel reports become findings.** After every run bhf reads the
+  guest's console from the program's start with the parser `bhf kernel
+  import` uses (`results::import_syzkaller`): a KASAN, KCSAN, KMSAN, KFENCE
+  or UBSAN report, a general protection fault or NULL dereference (with
+  KASAN's `null-ptr-deref in range`, classed as a NULL dereference), a page
+  fault, `kernel BUG`, a `WARNING`, a soft lockup, a hung task, an RCU stall
+  or a panic gets the title syzkaller would give it (`KASAN:
+  slab-out-of-bounds Write in widget_ioctl`, `WARNING in bugs_ioctl`), its
+  class, rule and CWE, the stack from the blamed function down (an oops'
+  `RIP` first), the access and the object. It becomes a finding under
+  `<work-dir>/results/findings/F-KERNEL-NNNN-<hash>/`, producer `kernel
+  fuzz`: `finding.json`, the report as `sanitizer.log`, the console as
+  `console.log`, and the program as `testcase.bin`, `decoded.json`,
+  `program.txt` and `repro.c` (the same calls through `syscall(2)` on the
+  same data area; build it statically for the guest). A title found the
+  first time runs its program again alone in a freshly booted guest:
+  `kernel.reproduced` (and confidence `high`) when it made the same report.
+  The finding is written before that run; when the fresh guest does not
+  boot, it stays unconfirmed, `kernel.unconfirmed` saying why, and the
+  campaign goes on (it stops when the guest does not boot again).
+  A title found again is counted on its finding (`kernel.occurrences`).
+  Then the guest boots again, as after every report (with `--append
+  panic_on_warn=0` a guest that went on is reset too). `results/` is
+  rebuilt after the campaign, as after any producer. A panic of the
+  executor itself (`Attempted to kill init`) is no finding.
+- **A run the guest does not survive** without a kernel report (it hung,
+  or stopped): the program, its decoded text, the console and the reason go
+  to `<work-dir>/kernel/crashes/NNNN/`, and the next run boots the guest
+  again.
+- **The budget.** `--iterations` (default 1000; with `--time` alone, none)
+  counts every run, the comparison, hint and confirming runs included;
+  `--time` bounds the wall clock, and `--stop-after-findings N` stops once
+  N findings were written or counted again.
+
+`<work-dir>/kernel/fuzz.json` (`bhf.kernel-fuzz.v1`) records the guest
+(release, machine, accel, KCOV and comparisons), the seeds and where they
+came from, the executions, comparison runs and hint runs, the coverage once
+the seeds had run and at the end (edges, and PCs with their hit buckets),
+the corpus, the kernel reports, the findings and the confirming runs, the
+crashes and the boots. Exit status: 0 when the campaign ran its budget, 1
+when the guest could not boot again or no seed left it running.
+
+```sh
+bhf kernel replay bhf_work/results/findings/F-KERNEL-0000-0e49f8eb
+```
+
+`bhf kernel replay FINDING` boots the guest the finding records (in
+`kernel.guest`: the kernel, modules, qemu, accel, memory, CPUs, command line
+and timeout; `--kernel`, `--module`, `--qemu`, `--accel`, `--cc`,
+`--executor` and `--timeout` replace them), runs its `testcase.bin` and
+prints `MATCH: <title>` when the kernel makes the same report (exit 0),
+`MISMATCH` and the other title, or `NOT REPRODUCED` (exit 1); exit 2 when
+the finding cannot be read or the guest cannot boot. It is the finding's
+reproduce command (`bhf kernel replay findings/<id>`, from `results/`):
+`bhf replay` and `bhf minimize`, which run a harness, name it instead, and
+`bhf explain` shows the program's calls and it.
+
 ---
 
 ## What is and isn't proven
@@ -1269,12 +1527,26 @@ status: 0 when at least one crash was imported, 1 otherwise.
   numbers the kernel defines (`FS_IOC_GETFLAGS`, `KVM_CREATE_VM`). That syz-sysgen
   accepts it is checked by `kernel_syzlang_cli`'s gated test, which needs a
   syzkaller checkout (`BHF_SYZKALLER_CLI=1`, `BHF_SYZKALLER=<checkout>`); no
-  CI job installs syzkaller. bhf runs no kernel and collects no KCOV
-  coverage: syzkaller does both. `bhf kernel import` is tested on a crash
+  CI job installs syzkaller. `bhf kernel import` is tested on a crash
   directory written in syz-manager's layout for the fixture's planted bug
   (`tests/fixtures/kernel_widget/crashes/`); `kernel_import_cli`'s gated
   test imports a real syz-manager workdir (`BHF_SYZKALLER_CLI=1`,
   `BHF_SYZKALLER_WORKDIR=<workdir>`).
+- **The kernel guest (§10):** the executor's program decoder is checked
+  against bhf's own on programs and noise, and its protocol against a mock
+  executor and against the executor itself over pipes on the host, in every
+  run, and so are the mapping of KCOV PCs into the coverage map, on replies
+  recorded from the guest, and the classification of KASAN (out-of-bounds,
+  use-after-free, double free, NULL dereference), KCSAN, oops and WARNING
+  reports, on console logs recorded from guests
+  (`tests/fixtures/kernel_guest/`). Booting a guest
+  needs a KCOV kernel: `kernel_guest_cli` (which also checks that a
+  campaign's coverage grows past its seeds', and that the widget driver's
+  planted slab-out-of-bounds write is found as a finding that replays) runs
+  with
+  `BHF_KERNEL_GUEST=1` and `BHF_KERNEL_IMAGE` (and `BHF_KERNEL_MODULE` for
+  the widget driver), which `scripts/ci/build-kcov-guest-kernel.sh` builds;
+  it was run on that kernel under QEMU 8.2.2 with tcg.
 - **Not available yet:** typed mutation of a raw struct image in a big-endian
   target's byte order (decoded arguments are typed, little-endian as the
   decoder reads them; §5).

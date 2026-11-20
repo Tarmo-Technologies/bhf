@@ -59,7 +59,8 @@ before them still validate; bhf always writes them. A validator holding the
 older schema rejects them. The `binary rehost` value of `producer` came
 later too, and an older schema rejects it, as it rejects the `kernel import`
 producer and the `console_log`, `repro_syz` and `repro_c` evidence roles of
-an imported syzkaller crash. `reproduce.build.fidelity` is optional the same
+an imported syzkaller crash, and the `kernel fuzz` producer of a crash bhf
+found in a kernel guest. `reproduce.build.fidelity` is optional the same
 way, but written only for a finding whose harness build used fabricated
 inputs (below).
 
@@ -90,7 +91,7 @@ lines). INDEX.md says "Reached through N call stacks".
 |---|---|---|
 | `id` | string | unique within `results/` |
 | `kind` | enum | `fuzz`, `runtime`, `static`, `binary`, `differential`, `sca` |
-| `producer` | string | command that wrote it, inferred from the ID family; `binary rehost` for a `rehost_fault` record, `kernel import` for a `kernel_crash` record (a syzkaller crash `bhf kernel import` brought in, `F-KERNEL-*`) |
+| `producer` | string | command that wrote it, inferred from the ID family; `binary rehost` for a `rehost_fault` record, `kernel import` for a `kernel_crash` record (a syzkaller crash `bhf kernel import` brought in, `F-KERNEL-*`), `kernel fuzz` for one `bhf kernel fuzz` found in its guest (its `kernel.tool` is `bhf`) |
 | `rule` | `{id, slug, name}`, each nullable | `id` is `BHF-NNNN`, the static rule id, or `null` when no catalog rule matches |
 | `title` | string | one line, for lists |
 | `message` | string | tool message (addresses stripped) |
@@ -110,13 +111,13 @@ lines). INDEX.md says "Reached through N call stacks".
 | `group` | string \| null | root-cause group key |
 | `occurrences` | int | members in the group this finding represents |
 | `first_seen`, `last_seen` | RFC 3339 \| null | `last_seen` updates when a later run reproduces the same `fingerprint.primary` |
-| `reachability` | object \| null | entry path for fuzz (`{kind, source, target}`: `harness`, its `testcase.bin`, the fuzzed function; for a `kernel import` finding `syscall`, the program syzkaller reached it with, `repro.syz`, else `repro.c`, else `console.log`, and the crashing function); fuzz reachability for SCA. Its `attacker_reachable` is the entry's signature verdict, so it can be `true` while the finding's `verdict` is `lab_only` for the reason in `verdict_reason` (such as `harness_sized_buffer`) |
+| `reachability` | object \| null | entry path for fuzz (`{kind, source, target}`: `harness`, its `testcase.bin`, the fuzzed function; for a `kernel import` finding `syscall`, the program syzkaller reached it with, `repro.syz`, else `repro.c`, else `console.log`, and the crashing function; for a `kernel fuzz` finding `syscall`, `repro.c`); fuzz reachability for SCA. Its `attacker_reachable` is the entry's signature verdict, so it can be `true` while the finding's `verdict` is `lab_only` for the reason in `verdict_reason` (such as `harness_sized_buffer`) |
 | `fidelity` | `{stubs_used, forced, caveats[]}` | `forced` when the target ran forced-and-stub-heavy under `--force` |
 | `remediation` | string \| null | |
 | `patch_hints` | `[{title, guidance}]` | advisory, not a literal diff |
-| `reproduce` | `{harness_id, command, build}` \| null | `build`: `{sanitizers[], binary_sha256, build_id}`, plus `fidelity` when the harness compiled only after bhf supplied inputs the build context lacked; `command` is relative to `results/`: it runs the finding's `replay.py`, or is `bhf replay findings/<id>` for a `binary rehost` finding; for a `kernel import` finding it compiles and runs `repro.c`, else runs `repro.syz` under `syz-execprog`, in the test VM |
+| `reproduce` | `{harness_id, command, build}` \| null | `build`: `{sanitizers[], binary_sha256, build_id}`, plus `fidelity` when the harness compiled only after bhf supplied inputs the build context lacked; `command` is relative to `results/`: it runs the finding's `replay.py`, or is `bhf replay findings/<id>` for a `binary rehost` finding; for a `kernel import` finding it compiles and runs `repro.c`, else runs `repro.syz` under `syz-execprog`, in the test VM; for a `kernel fuzz` finding it is `bhf kernel replay findings/<id>`, which boots the guest the finding records and runs its program |
 | `reproduce.build.fidelity` | `{level, context, fabricated[]}` (optional) | `level` is `reduced`; `context` is where the build context came from (`none`, `exact_tu_compile_database`, ...); each `fabricated` entry is `{kind, name, value}` with `kind` `macro`, `header`, `type`, or `include_dir` (a dir of real headers found by file name outside the scanned tree, which may be another project's). Such a finding's `confidence.level` is `low` and `fidelity.caveats` names what was fabricated: code compiled against a placeholder macro value or header can take paths the real build never does, so the finding may be false or not reproduce against the real build |
-| `evidence` | `{dir, files[]}` \| null | each file: `{role, path, sha256, size}` — roles: `finding`, `testcase`, `testcase_minimized`, `sanitizer_log`, `decoded`, `replay_script`, `repro_ada`, `byte_control`, `runtrace` (the runtrace events of the replay that recorded the comparison evidence); for a `kernel import` finding also `console_log` (syzkaller's `log0`), `repro_syz` and `repro_c` (its reproducers), with the kernel report as `sanitizer_log` |
+| `evidence` | `{dir, files[]}` \| null | each file: `{role, path, sha256, size}` — roles: `finding`, `testcase`, `testcase_minimized`, `sanitizer_log`, `decoded`, `replay_script`, `repro_ada`, `byte_control`, `runtrace` (the runtrace events of the replay that recorded the comparison evidence); for a `kernel import` finding also `console_log` (syzkaller's `log0`), `repro_syz` and `repro_c` (its reproducers), with the kernel report as `sanitizer_log`; a `kernel fuzz` finding has its program as `testcase` (`testcase.bin`, the executor's format), decoded as `decoded` (`decoded.json`), as C as `repro_c`, the guest's console from the program's start as `console_log` and the report as `sanitizer_log` |
 | `fuzz` | `{exception, classification, harness_id, dialect, oracle, access, input_to_state, input_to_state_input, input_to_state_status, input_to_state_reason, input_to_state_search, arguments, sanitizer_second_opinion, lineage}` \| null | `exception`: `{name, message, sanitizer}`; see [Fuzz block](#fuzz-block) |
 | `static` | `{engine, precision, snippet, baseline_status, triage_state}` \| null | |
 | `sca` | object \| null | `{vuln_id, aliases[], component, fixed_versions[], cvss, kev, references[], match_confidence, matching_method, vex}` |

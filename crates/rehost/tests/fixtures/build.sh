@@ -12,3 +12,6 @@ for image in magic faults mmio uart dispatch; do
     arm-none-eabi-gcc $CFLAGS $LDFLAGS -o "$image.elf" startup.c "$image.c" -lgcc
     arm-none-eabi-objcopy -O binary "$image.elf" "$image.bin"
 done
+# irq.c carries its own start-up code: its vector table reaches IRQ 37.
+arm-none-eabi-gcc $CFLAGS $LDFLAGS -o irq.elf irq.c -lgcc
+arm-none-eabi-objcopy -O binary irq.elf irq.bin

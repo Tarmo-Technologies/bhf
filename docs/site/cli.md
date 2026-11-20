@@ -14,7 +14,7 @@ checks.
 | Build and instrumentation support | `stub`, `instrument`, `fake-corba` |
 | Corpus and crash triage | `corpus`, `minimize`, `replay`, `capsule`, `verify-poc`, `env-capsule`, `differential`, `relational`, `cmplog`, `explain`, `cartography`, `decode-args` |
 | Source-unavailable binaries | `binary` (`scan`, `adapter`, `fuzz`, `rehost`) |
-| Linux kernel drivers (syzkaller) | `kernel` (`syzlang`, `import`); see [On-Target & Embedded §10](../on-target-fuzzing/#10-linux-kernel-drivers-syzkaller-descriptions) |
+| Linux kernel drivers (syzkaller, a qemu-system guest) | `kernel` (`syzlang`, `import`, `run`, `fuzz`, `replay`); see [On-Target & Embedded §10](../on-target-fuzzing/#10-linux-kernel-drivers-syzkaller-descriptions) |
 | External project profiles | `project` (`validate`, `list`, `run`) |
 | Out-of-process extensions | `extension` (`validate`, `evaluate`), and `fuzz --extension` |
 | Static and supply chain | `static-scan`, `sloc`, `sbom`, `license-audit`, `extract-state-machines` |
@@ -528,13 +528,20 @@ firmware's peripheral reads through MMIO models (`--mmio ADDR[@PC]=MODEL`,
 `passthrough` from the input, `constant:VALUE` or `bitextract:MASK`;
 `--mmio-models FILE`; `--mmio-default zero|passthrough`), or both. Polling
 loops on a status register get bit-extract models inferred before the
-campaign (`--no-mmio-inference` turns that off). The core starts from the
+campaign (`--no-mmio-inference` turns that off). `--svd FILE` takes the
+peripheral windows from the part's CMSIS-SVD file, so an access between its
+peripherals is an invalid access rather than a modelled read. The core starts from the
 reset vector, and basic-block edge coverage steers the mutation. Addresses are
 hex, `0x` optional, as `nm` prints them. An invalid memory access, a bad PC
 or a HardFault is a `kind: rehost_fault` finding, which `bhf replay`
-reproduces through the recorded machine setup and MMIO models. Interrupts
-are not modelled; see [On-target fuzzing §9](on-target-fuzzing.md) for the
-flags and the fidelity.
+reproduces through the recorded machine setup and MMIO models; each carries
+the fidelity label `rehosted, peripheral-modelled` (its `fidelity_caveat`
+in `results/`). Interrupts
+the firmware enables are raised on a schedule the input chooses: each tick
+(`--interrupt-interval`, default 1000 instructions) takes one input byte
+that picks the interrupt and the wait to the next tick, and a sleeping core
+runs on to the next tick (`--no-interrupts` raises none); see
+[On-target fuzzing §9](on-target-fuzzing.md) for the flags and the fidelity.
 
 `--runtime-oracles auto|on|off` (on `bhf fuzz` and `bhf binary fuzz`) loads the
 runtrace sink oracles via the `LD_PRELOAD` shim so a **clean-exit** semantic
@@ -844,6 +851,12 @@ MATCH
   `collector` or `transport`) and `details`; `harness` is present only for a
   binary finding. `--show-output` prints a binary target's stderr; the other
   lanes run no local harness.
+- **Kernel crashes.** A `F-KERNEL-*` finding ran in a kernel, not a harness:
+  `bhf replay` and `bhf minimize` exit `1` and name what reproduces it,
+  `bhf kernel replay <finding>` for one `bhf kernel fuzz` found in its guest
+  (its program is `testcase.bin`, and as C `repro.c`), or the syzkaller
+  reproducer to run in the kernel's test VM for an imported one. `bhf
+  explain` shows the kernel report, the program's calls and those commands.
 - **Ada (event-log) findings.** The verdict compares event-log signatures;
   the summary says what both runs raised. `crash` is the replayed exception
   the verdict rests on (the rule and classification, then `NAME: message`),

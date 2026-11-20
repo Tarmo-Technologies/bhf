@@ -26,6 +26,11 @@
 #         profile's serial lane
 #   RV-7  the Renode transport (#340): live_renode and the shipped CLI against
 #         the pinned Renode BHF_RENODE names (scripts/ci/install-renode.sh)
+#   RV-8  the kernel guest lane (#350, #378, #379): bhf kernel run, fuzz
+#         (coverage, and the planted KASAN bug as a finding) and replay
+#         against the KCOV/KASAN guest kernel and widget module
+#         BHF_KERNEL_IMAGE and BHF_KERNEL_MODULE name
+#         (scripts/ci/build-kcov-guest-kernel.sh)
 #
 # Unlike the default `cargo test` (which self-skips when the emulator/cross
 # toolchains are absent), this lane first HARD-FAILS if any required tool is
@@ -172,4 +177,13 @@ BHF_REQUIRE_TOOLS=1 BHF_RENODE_CLI=1 cargo test --locked \
   -p bhf --test transport_fuzz_renode_cli -- --nocapture
 echo
 
-echo "== hil-emu: RV-1 through RV-7 executed the REAL live paths and passed =="
+echo "== RV-8: a Linux kernel in a qemu-system guest, with KCOV coverage =="
+[ -f "${BHF_KERNEL_IMAGE:-}" ] && [ -f "${BHF_KERNEL_MODULE:-}" ] && command -v qemu-system-x86_64 >/dev/null || {
+  echo "ERROR: RV-8 needs qemu-system-x86_64 and BHF_KERNEL_IMAGE and BHF_KERNEL_MODULE (scripts/ci/build-kcov-guest-kernel.sh)" >&2
+  exit 1
+}
+BHF_REQUIRE_TOOLS=1 BHF_KERNEL_GUEST=1 cargo test --locked \
+  -p bhf --test kernel_guest_cli -- --nocapture
+echo
+
+echo "== hil-emu: RV-1 through RV-8 executed the REAL live paths and passed =="

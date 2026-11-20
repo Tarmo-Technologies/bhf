@@ -323,14 +323,26 @@ const MAX_LISTED_MEMBERS: usize = 10;
 /// they are not explained separately.
 fn explain_one(work_dir: &Path, f: &Finding, others: &[String], collapsed: bool) -> String {
     let mut s = String::new();
+    // A kernel crash's input is a program a kernel ran: no harness records
+    // comparisons, arguments or a faked environment for it, and its title
+    // and CWE are its own.
+    let kernel_crash = results::import_syzkaller::is_kernel_crash(&f.raw);
     let rule = str_at(&f.raw, "/rule_id").unwrap_or("");
     let cwe = f
         .raw
         .pointer("/actionability/cwe/0")
+        .or_else(|| kernel_crash.then(|| f.raw.pointer("/cwe/0")).flatten())
         .and_then(Value::as_str)
         .unwrap_or("");
-    let cwe_name = str_at(&f.raw, "/actionability/cwe_name").unwrap_or("crash");
-    let _ = writeln!(s, "━━━ {} — {cwe_name} ({cwe}, {rule}) ━━━", f.id);
+    let cwe_name = str_at(&f.raw, "/actionability/cwe_name")
+        .or_else(|| kernel_crash.then(|| str_at(&f.raw, "/message")).flatten())
+        .unwrap_or("crash");
+    let _ = writeln!(
+        s,
+        "━━━ {} — {} ({cwe}, {rule}) ━━━",
+        f.id,
+        terminal_safe(cwe_name)
+    );
     let harness_id = str_at(&f.raw, "/harness_id").unwrap_or("").to_owned();
     if !harness_id.is_empty() {
         let _ = writeln!(
@@ -393,6 +405,8 @@ fn explain_one(work_dir: &Path, f: &Finding, others: &[String], collapsed: bool)
             &f.raw,
             input.as_ref().map(|(name, _)| *name),
         ))
+    } else if kernel_crash {
+        results::import_syzkaller::explanation(&f.raw)
     } else {
         str_at(&f.raw, "/actionability/explanation").map(|expl| match &input {
             Some((name, _)) => retarget_trigger(expl, name),
@@ -515,8 +529,17 @@ fn explain_one(work_dir: &Path, f: &Finding, others: &[String], collapsed: bool)
     }
 
     // Comparison evidence: operands recorded while this input ran.
-    let evidence = comparison_evidence(work_dir, f, input.as_ref());
-    if let Some((name, bytes)) = &input {
+    let evidence = if kernel_crash {
+        Evidence {
+            capture: None,
+            recorded_now: false,
+            missing: None,
+            own_events: None,
+        }
+    } else {
+        comparison_evidence(work_dir, f, input.as_ref())
+    };
+    if let Some((name, bytes)) = input.as_ref().filter(|_| !kernel_crash) {
         for line in evidence_lines(&evidence, name) {
             let _ = writeln!(s, "{line}");
         }
@@ -539,24 +562,32 @@ fn explain_one(work_dir: &Path, f: &Finding, others: &[String], collapsed: bool)
         }
     }
 
-    // HARNESS ARGUMENTS: what each parameter was decoded to
-    for line in argument_lines(work_dir, f, &evidence, input.as_ref()) {
+    // HARNESS ARGUMENTS: what each parameter was decoded to; a kernel
+    // crash's program, call by call.
+    let arguments = if kernel_crash {
+        crate::kernel::program_lines(&f.dir)
+    } else {
+        argument_lines(work_dir, f, &evidence, input.as_ref())
+    };
+    for line in arguments {
         let _ = writeln!(s, "{line}");
     }
 
     // FAKED ENVIRONMENT + byte-origin taint: this input's own replay when it
     // was recorded, else the harness's last fuzz pass, else not observed.
-    let (env_source, env) = environment(work_dir, f, &harness_id, &evidence);
-    match env_source {
-        Some(source) => {
-            let _ = writeln!(s, "\nFAKED ENVIRONMENT  ({source})");
+    if !kernel_crash {
+        let (env_source, env) = environment(work_dir, f, &harness_id, &evidence);
+        match env_source {
+            Some(source) => {
+                let _ = writeln!(s, "\nFAKED ENVIRONMENT  ({source})");
+            }
+            None => {
+                let _ = writeln!(s, "\nFAKED ENVIRONMENT");
+            }
         }
-        None => {
-            let _ = writeln!(s, "\nFAKED ENVIRONMENT");
+        for line in env {
+            let _ = writeln!(s, "  {line}");
         }
-    }
-    for line in env {
-        let _ = writeln!(s, "  {line}");
     }
 
     // REACHABILITY & PROVENANCE
@@ -612,9 +643,11 @@ fn explain_one(work_dir: &Path, f: &Finding, others: &[String], collapsed: bool)
         }
     }
 
-    // REPRODUCE
+    // REPRODUCE: a kernel crash in the kernel it was found in.
     let _ = writeln!(s, "\nREPRODUCE OFFLINE");
-    for line in reproduce_lines(work_dir, f, &evidence) {
+    let reproduce = crate::kernel::reproduce_lines(&f.dir)
+        .unwrap_or_else(|| reproduce_lines(work_dir, f, &evidence));
+    for line in reproduce {
         let _ = writeln!(s, "  {line}");
     }
     s

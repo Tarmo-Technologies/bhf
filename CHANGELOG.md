@@ -5,6 +5,68 @@
 ## Unreleased
 
 ### Added
+- `bhf binary rehost --svd FILE` takes the peripheral windows from the
+  part's CMSIS-SVD file (#354): only its peripherals' address blocks
+  (inherited through `derivedFrom`, arrays expanded, reserved blocks and the
+  system space left out) are registers the MMIO models serve, so a load or
+  store between them is an invalid-access finding, and an `--mmio` model
+  outside them is refused. The rehost crate gains `Svd` (its own XML
+  reader, no new dependency) and `MachineConfig::peripheral_windows`. The
+  setup records the windows and the SVD's path, digest, device and interrupt
+  names (`rehost.setup.peripheral_windows`; older findings replay with the
+  whole region). Every rehosted run and finding carries the fidelity label
+  `rehosted, peripheral-modelled` (`fidelity.label`, and a finding's
+  `fidelity_caveat`, which `results/findings.json` lists in
+  `fidelity.caveats`), and with an SVD inferred loops and interrupts are
+  named by peripheral.
+- `bhf binary rehost` raises the interrupts the firmware enables on a
+  schedule stored in the testcase (#353): every tick
+  (`--interrupt-interval`, default 1000 instructions) takes one input byte
+  that pends one of the enabled NVIC IRQs or SysTick and sets the wait to
+  the next tick, a sleeping core runs on to the next tick, and the rehost
+  crate models the NVIC's enable, pending, active and priority registers,
+  priority grouping and preemption, and PendSV and SysTick pending bits. A
+  finding records the interrupts taken and the faulting handler's exception
+  (`rehost.interrupts`, `rehost.fault.exception`), the setup records the
+  schedule (`rehost.setup.interrupts`; older findings replay without one),
+  and the run JSON gains `interrupts_taken`. `--no-interrupts` keeps the
+  old behaviour. With interrupts on, an input buffer takes at most the
+  input's first 4096 bytes, as with peripheral input.
+- `bhf kernel fuzz` turns the kernel reports on its guest's console (KASAN,
+  KCSAN, KMSAN, KFENCE, UBSAN, oops, WARNING, hangs, panics) into findings
+  (#379), with syzkaller's title and the class, rule, CWE and stack the
+  syzkaller import parser gives them, the program as `testcase.bin`,
+  `decoded.json`, `program.txt` and `repro.c`, and `kernel.reproduced` when
+  the program alone made the report again in a fresh guest (the finding is
+  written first: when that guest does not boot, `kernel.unconfirmed` says
+  why); the guest boots again after each report. `bhf replay` and `bhf
+  minimize` name `bhf kernel replay` (or an imported crash's syzkaller
+  reproducer) for a kernel crash finding, and `bhf explain` shows its
+  program and those commands. `bhf kernel replay FINDING` boots the recorded
+  guest, runs the program and prints MATCH, MISMATCH or NOT REPRODUCED.
+  `bhf.findings.v1` gains the `kernel fuzz` producer (additive; an older copy
+  of the schema rejects it). `bhf kernel run` prints a report's title.
+- `bhf kernel fuzz --kernel IMAGE [--module M.ko]... --work-dir DIR` fuzzes
+  a Linux kernel in the qemu-system guest `bhf kernel run` boots (#378):
+  seeds from a driver's ioctl commands (`--source`, numbers for the guest's
+  architecture), `--seeds` or `--device`; each call's KCOV PCs mapped into
+  the builtin engine's coverage map as edges and hit buckets; KCOV
+  comparisons turned into hint programs and a CmpLog; typed and per-call
+  mutations; a run the guest does not survive saved under
+  `kernel/crashes/` and the guest booted again; `kernel/fuzz.json`
+  (`bhf.kernel-fuzz.v1`, with the executor's setup notes, which bhf also
+  prints). A `--module` the guest did not load stops the campaign before
+  it runs a program (exit 1). The executor's protocol gains comparison
+  collection (EXEC flag 2, REPLY flag 4, HELLO flag 4).
+- `bhf kernel run --kernel IMAGE [--module M.ko]... PROGRAM...` boots a
+  Linux kernel in a qemu-system guest whose `/init` is bhf's executor
+  (`c_runtime/kernel_executor.c`, built statically by bhf) and runs
+  system-call programs in it (#350): the executor loads the modules, opens
+  KCOV, runs each program in a child and returns each call's result and the
+  kernel PCs it took over a virtio-serial port; `--json` prints the calls and
+  the KCOV edges; `--boot-timeout` and `--timeout` take 1 to 86400 seconds.
+  `scripts/ci/build-kcov-guest-kernel.sh` builds a KCOV and
+  KASAN guest kernel and the widget driver fixture's module.
 - `bhf kernel import CRASHES... --work-dir DIR [--source-root DIR]` turns
   syzkaller crash directories (or a syz-manager workdir) into findings
   under `results/findings/F-KERNEL-*` (#349): the crash class, rule and CWE

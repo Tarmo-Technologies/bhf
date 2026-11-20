@@ -459,6 +459,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "c_runtime/kernel_executor.c",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "c_runtime/zephyr/bhf_agent_zephyr.c",
       "license": "Apache-2.0"
     },
@@ -1935,6 +1939,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/kernel_guest.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/launch_spec.rs",
       "license": "Apache-2.0"
     },
@@ -3244,6 +3252,10 @@
     },
     {
       "path": "crates/cli/tests/java_driver_noise.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/kernel_guest_cli.rs",
       "license": "Apache-2.0"
     },
     {
@@ -4615,6 +4627,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/rehost/src/irq_tests.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/rehost/src/lib.rs",
       "license": "Apache-2.0"
     },
@@ -4628,6 +4644,14 @@
     },
     {
       "path": "crates/rehost/src/mmio.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/rehost/src/nvic.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/rehost/src/svd.rs",
       "license": "Apache-2.0"
     },
     {
@@ -4651,7 +4675,15 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/rehost/tests/fixture_irq.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/rehost/tests/fixture_mmio.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/rehost/tests/fixture_svd.rs",
       "license": "Apache-2.0"
     },
     {
@@ -4664,6 +4696,10 @@
     },
     {
       "path": "crates/rehost/tests/fixtures/faults.c",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/rehost/tests/fixtures/irq.c",
       "license": "Apache-2.0"
     },
     {
@@ -6392,6 +6428,10 @@
     },
     {
       "path": "tests/fixtures/government_legacy_patterns/gpr/scenario_app.gpr",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/kernel_guest/console/bugs.c",
       "license": "Apache-2.0"
     },
     {

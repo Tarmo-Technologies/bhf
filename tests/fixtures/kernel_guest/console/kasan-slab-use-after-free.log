@@ -1,0 +1,104 @@
+[   28.002799] bhf-executor: ready (kcov on, comparisons on)
+[   28.030214] ==================================================================
+[   28.030940] BUG: KASAN: slab-use-after-free in bugs_ioctl+0x1b6/0x1e0 [bugs]
+[   28.032421] Read of size 8 at addr ffff88800892b288 by task bhf-program/51
+[   28.032894] 
+[   28.033903] CPU: 0 UID: 0 PID: 51 Comm: bhf-program Tainted: P           O       6.12.118 #1
+[   28.034607] Tainted: [P]=PROPRIETARY_MODULE, [O]=OOT_MODULE
+[   28.034696] Hardware name: QEMU Ubuntu 24.04 PC v2 (i440FX + PIIX, arch_caps fix, 1996), BIOS 1.16.3-debian-1.16.3-2 04/01/2014
+[   28.034989] Call Trace:
+[   28.035094]  <TASK>
+[   28.035219]  dump_stack_lvl+0xab/0xe0
+[   28.035537]  print_report+0xd0/0x660
+[   28.035705]  ? __pfx__raw_spin_lock_irqsave+0x10/0x10
+[   28.035866]  ? entry_SYSCALL_64_after_hwframe+0x77/0x7f
+[   28.036061]  ? bugs_ioctl+0x1b6/0x1e0 [bugs]
+[   28.036208]  kasan_report+0xce/0x100
+[   28.036381]  ? bugs_ioctl+0x1b6/0x1e0 [bugs]
+[   28.036533]  bugs_ioctl+0x1b6/0x1e0 [bugs]
+[   28.036664]  ? __pfx_bugs_ioctl+0x10/0x10 [bugs]
+[   28.036792]  __x64_sys_ioctl+0x193/0x200
+[   28.036993]  do_syscall_64+0x9e/0x1c0
+[   28.037147]  entry_SYSCALL_64_after_hwframe+0x77/0x7f
+[   28.037400] RIP: 0033:0x42283d
+[   28.037725] Code: ff c3 66 2e 0f 1f 84 00 00 00 00 00 90 f3 0f 1e fa 48 89 f8 48 89 f7 48 89 d6 48 89 ca 4d 89 c2 4d 89 c8 4c 8b 4c 24 08 0f 05 <48> 3d 01 f0 ff ff 73 01 c3 48 c7 c1 c0 ff ff ff f7 d8 64 89 01 48
+[   28.037958] RSP: 002b:00007ffd7da64fb8 EFLAGS: 00000246 ORIG_RAX: 0000000000000010
+[   28.038164] RAX: ffffffffffffffda RBX: 00007f5404aea000 RCX: 000000000042283d
+[   28.038273] RDX: 0000000000000000 RSI: 0000000000004203 RDI: 0000000000000005
+[   28.038384] RBP: 0000000000000001 R08: 0000000000000000 R09: 0000000000000000
+[   28.038495] R10: 0000000000000000 R11: 0000000000000246 R12: 0000000000000010
+[   28.038600] R13: 0000000000000000 R14: 00000000004b8bb8 R15: 00007f5404cea000
+[   28.038743]  </TASK>
+[   28.038868] 
+[   28.042860] Allocated by task 51:
+[   28.043341]  kasan_save_stack+0x33/0x60
+[   28.043999]  kasan_save_track+0x14/0x30
+[   28.044383]  __kasan_kmalloc+0x8f/0xa0
+[   28.044726]  bugs_ioctl+0x124/0x1e0 [bugs]
+[   28.045079]  __x64_sys_ioctl+0x193/0x200
+[   28.045448]  do_syscall_64+0x9e/0x1c0
+[   28.045772]  entry_SYSCALL_64_after_hwframe+0x77/0x7f
+[   28.046238] 
+[   28.046497] Freed by task 51:
+[   28.046745]  kasan_save_stack+0x33/0x60
+[   28.047099]  kasan_save_track+0x14/0x30
+[   28.047456]  kasan_save_free_info+0x3b/0x60
+[   28.047761]  __kasan_slab_free+0x37/0x50
+[   28.048082]  kfree+0x121/0x360
+[   28.048373]  bugs_ioctl+0x139/0x1e0 [bugs]
+[   28.048706]  __x64_sys_ioctl+0x193/0x200
+[   28.049071]  do_syscall_64+0x9e/0x1c0
+[   28.049394]  entry_SYSCALL_64_after_hwframe+0x77/0x7f
+[   28.049792] 
+[   28.050035] The buggy address belongs to the object at ffff88800892b280
+[   28.050035]  which belongs to the cache kmalloc-16 of size 16
+[   28.050575] The buggy address is located 8 bytes inside of
+[   28.050575]  freed 16-byte region [ffff88800892b280, ffff88800892b290)
+[   28.051092] 
+[   28.051366] The buggy address belongs to the physical page:
+[   28.051837] page: refcount:1 mapcount:0 mapping:0000000000000000 index:0x0 pfn:0x892b
+[   28.052484] flags: 0x100000000000000(node=0|zone=1)
+[   28.053267] page_type: f5(slab)
+[   28.054098] raw: 0100000000000000 ffff888005c41640 dead000000000122 0000000000000000
+[   28.054503] raw: 0000000000000000 0000000080800080 00000001f5000000 0000000000000000
+[   28.054903] page dumped because: kasan: bad access detected
+[   28.055182] 
+[   28.055377] Memory state around the buggy address:
+[   28.055933]  ffff88800892b180: 00 04 fc fc 00 04 fc fc 00 03 fc fc 00 03 fc fc
+[   28.056275]  ffff88800892b200: 00 04 fc fc 00 04 fc fc fa fb fc fc fa fb fc fc
+[   28.056608] >ffff88800892b280: fa fb fc fc fc fc fc fc fc fc fc fc fc fc fc fc
+[   28.056918]                       ^
+[   28.057246]  ffff88800892b300: fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc
+[   28.057563]  ffff88800892b380: fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc
+[   28.057867] ==================================================================
+[   28.059147] Kernel panic - not syncing: KASAN: panic_on_warn set ...
+[   28.059884] CPU: 0 UID: 0 PID: 51 Comm: bhf-program Tainted: P           O       6.12.118 #1
+[   28.060357] Tainted: [P]=PROPRIETARY_MODULE, [O]=OOT_MODULE
+[   28.060621] Hardware name: QEMU Ubuntu 24.04 PC v2 (i440FX + PIIX, arch_caps fix, 1996), BIOS 1.16.3-debian-1.16.3-2 04/01/2014
+[   28.060979] Call Trace:
+[   28.061185]  <TASK>
+[   28.061399]  dump_stack_lvl+0x3d/0xe0
+[   28.061763]  vpanic+0x622/0x6e0
+[   28.062104]  ? __pfx_vpanic+0x10/0x10
+[   28.062446]  ? bugs_ioctl+0x1b6/0x1e0 [bugs]
+[   28.062794]  panic+0xcb/0xd0
+[   28.063130]  ? __pfx_panic+0x10/0x10
+[   28.063476]  check_panic_on_warn+0xab/0xb0
+[   28.063813]  end_report+0xcb/0xe0
+[   28.064144]  kasan_report+0xdc/0x100
+[   28.064499]  ? bugs_ioctl+0x1b6/0x1e0 [bugs]
+[   28.064826]  bugs_ioctl+0x1b6/0x1e0 [bugs]
+[   28.065164]  ? __pfx_bugs_ioctl+0x10/0x10 [bugs]
+[   28.065536]  __x64_sys_ioctl+0x193/0x200
+[   28.065910]  do_syscall_64+0x9e/0x1c0
+[   28.066238]  entry_SYSCALL_64_after_hwframe+0x77/0x7f
+[   28.066616] RIP: 0033:0x42283d
+[   28.066910] Code: ff c3 66 2e 0f 1f 84 00 00 00 00 00 90 f3 0f 1e fa 48 89 f8 48 89 f7 48 89 d6 48 89 ca 4d 89 c2 4d 89 c8 4c 8b 4c 24 08 0f 05 <48> 3d 01 f0 ff ff 73 01 c3 48 c7 c1 c0 ff ff ff f7 d8 64 89 01 48
+[   28.067408] RSP: 002b:00007ffd7da64fb8 EFLAGS: 00000246 ORIG_RAX: 0000000000000010
+[   28.067802] RAX: ffffffffffffffda RBX: 00007f5404aea000 RCX: 000000000042283d
+[   28.068092] RDX: 0000000000000000 RSI: 0000000000004203 RDI: 0000000000000005
+[   28.068382] RBP: 0000000000000001 R08: 0000000000000000 R09: 0000000000000000
+[   28.068665] R10: 0000000000000000 R11: 0000000000000246 R12: 0000000000000010
+[   28.068946] R13: 0000000000000000 R14: 00000000004b8bb8 R15: 00007f5404cea000
+[   28.069241]  </TASK>
+[   28.070248] Kernel Offset: disabled

@@ -17,6 +17,17 @@
 //! that records the machine setup, its MMIO models included; `bhf replay`
 //! runs its testcase through the same machine again and matches the fault
 //! signature.
+//!
+//! With the part's SVD file (`--svd`), only its peripherals' address blocks
+//! are registers, and an access between them is a finding. Every finding
+//! carries the fidelity label [`FIDELITY_LABEL`]: it was found rehosted,
+//! with modelled peripherals, not on the device.
+//!
+//! Interrupts come from a schedule in the input: every tick takes one input
+//! byte and pends one of the interrupts the firmware has enabled (the byte
+//! picks which, and how long until the next tick), so firmware that sleeps
+//! until its UART or timer interrupts it progresses, and the schedule that
+//! reached a fault is in its testcase.
 
 use anyhow::{anyhow, Context};
 use fuzz_engine_builtin::{
@@ -24,8 +35,9 @@ use fuzz_engine_builtin::{
     ScheduleFeedback,
 };
 use rehost::{
-    CoverageMap, Execution, Fault, Image, InputBuffer, Machine, MachineConfig, MemoryRange,
-    MmioConfig, MmioDefault, MmioModel, MmioModelKind, NotAPoll, Stop, DEFAULT_MAX_INSTRUCTIONS,
+    CoverageMap, Execution, Fault, Image, InputBuffer, InterruptConfig, InterruptEvent, Machine,
+    MachineConfig, MemoryRange, MmioConfig, MmioDefault, MmioModel, MmioModelKind, NotAPoll,
+    PeripheralWindow, Stop, Svd, DEFAULT_INTERRUPT_INTERVAL, DEFAULT_MAX_INSTRUCTIONS,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -42,6 +54,11 @@ const RUN_SCHEMA: &str = "bhf.binary_rehost.run.v1";
 const RULE_ID: &str = "BHF-501";
 /// The longest input the mutator makes when the buffer is larger.
 const MAX_INPUT_LEN: u32 = 4096;
+/// The fidelity label every rehosted finding and run carries: the firmware
+/// ran in bhf's emulator, with its peripherals' reads served by models.
+pub(crate) const FIDELITY_LABEL: &str = "rehosted, peripheral-modelled";
+/// The longest SVD file read.
+const MAX_SVD_BYTES: u64 = 256 << 20;
 
 #[derive(Debug, clap::Args)]
 pub struct BinaryRehostArgs {
@@ -81,10 +98,13 @@ pub struct BinaryRehostArgs {
     #[arg(long = "input-buffer", value_name = "ADDR|SYMBOL")]
     pub input_buffer: Option<String>,
 
-    /// Bytes the input buffer holds; a longer input is cut to this, and
-    /// peripheral reads that take input take the bytes after it (the buffer
-    /// then takes at most the input's first 4096 bytes). Default: the
-    /// symbol's size.
+    /// Bytes the input buffer holds: it takes up to this many of an input's
+    /// first bytes. The bytes after them go to peripheral reads that take
+    /// input and to the interrupt schedule (on unless `--no-interrupts`);
+    /// while either is on, the buffer takes at most the first 4096 bytes, so
+    /// an input the mutator makes reaches them. With `--no-interrupts` and
+    /// no peripheral read taking input, it takes up to its whole capacity.
+    /// Default: the symbol's size.
     #[arg(long = "input-size", value_name = "BYTES", requires = "input_buffer")]
     pub input_size: Option<u32>,
 
@@ -145,6 +165,16 @@ pub struct BinaryRehostArgs {
     #[arg(long = "mmio-default", value_enum, value_name = "MODEL")]
     pub mmio_default: Option<MmioDefaultArg>,
 
+    /// A CMSIS-SVD device description of the part (the vendor's `.svd`
+    /// file): only the address blocks its peripherals give are peripheral
+    /// registers, served through the MMIO models, and a load or store
+    /// anywhere else in the peripheral region is an invalid access, as on
+    /// the part's bus. Without it the whole region 0x40000000-0x5fffffff is
+    /// taken for registers. The windows are recorded in the setup, so
+    /// `bhf replay` needs no copy of the file.
+    #[arg(long = "svd", value_name = "FILE")]
+    pub svd: Option<PathBuf>,
+
     /// Do not infer models for polling loops. By default, before the
     /// campaign, the seeds (and an input of zeros) run with each peripheral
     /// read recorded; a register one instruction reads over and over, that
@@ -158,6 +188,29 @@ pub struct BinaryRehostArgs {
     /// lists the loops.
     #[arg(long = "no-mmio-inference")]
     pub no_mmio_inference: bool,
+
+    /// Instructions between two ticks of the interrupt schedule. Each tick
+    /// takes one byte of the input (after the bytes `--input-buffer` holds,
+    /// in order with the peripheral reads) and pends one of the interrupts
+    /// the firmware has enabled in the NVIC, or SysTick: the byte modulo how
+    /// many are enabled picks which, and its top three bits the wait until
+    /// the next tick (this interval, a half, a quarter, one instruction, or
+    /// 2, 4, 8 or 16 times it). A tick with nothing enabled takes no byte; a
+    /// core that sleeps (WFI, WFE, a branch to itself) runs on to the next
+    /// tick, or ends the run when nothing enabled could wake it or the
+    /// input has no byte left.
+    #[arg(
+        long = "interrupt-interval",
+        value_name = "INSTRUCTIONS",
+        default_value_t = DEFAULT_INTERRUPT_INTERVAL,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub interrupt_interval: u64,
+
+    /// Raise no interrupts: the NVIC's registers hold what is written to
+    /// them, nothing is ever taken, and a core that sleeps ends the run.
+    #[arg(long = "no-interrupts")]
+    pub no_interrupts: bool,
 
     /// Runs in the campaign: the seeds, then mutations of the inputs that
     /// reached new edges.
@@ -498,6 +551,145 @@ struct Setup {
     mmio: MmioConfig,
     /// The sites of the models inference added.
     inferred: BTreeSet<Site>,
+    /// The interrupt schedule; `None` raises no interrupts, as a setup
+    /// recorded before there was one does.
+    interrupts: Option<InterruptConfig>,
+    /// The peripheral windows; `None` takes the whole peripheral region for
+    /// registers, as a setup recorded before there were windows does.
+    windows: Option<Vec<PeripheralWindow>>,
+    /// The SVD file the windows come from.
+    svd: Option<SvdSource>,
+}
+
+/// Where a setup's peripheral windows came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SvdSource {
+    path: PathBuf,
+    sha256: String,
+    device: Option<String>,
+    /// The name of each IRQ the SVD gives one.
+    interrupts: BTreeMap<u32, String>,
+}
+
+/// Read the SVD at `path`: its windows and where they came from.
+fn load_svd(path: &Path) -> anyhow::Result<(Vec<PeripheralWindow>, SvdSource)> {
+    let size = fs::metadata(path)
+        .with_context(|| format!("read {}", path.display()))?
+        .len();
+    if size > MAX_SVD_BYTES {
+        return Err(anyhow!(
+            "{} is {size} bytes, more than the {MAX_SVD_BYTES} an SVD file may be",
+            path.display()
+        ));
+    }
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let svd = Svd::parse(&String::from_utf8_lossy(&bytes))
+        .map_err(|error| anyhow!("{}: {error}", path.display()))?;
+    let windows = svd.windows();
+    if windows.is_empty() {
+        return Err(anyhow!(
+            "{} gives no peripheral windows: no peripheral has an address block outside the \
+             system space",
+            path.display()
+        ));
+    }
+    let unplaced = svd.unplaced();
+    if !unplaced.is_empty() {
+        bhfeprintln!(
+            "bhf binary rehost: warning: {} gives no address block for {}; an access to their \
+             registers is an invalid access",
+            path.display(),
+            unplaced.join(", ")
+        );
+    }
+    let mut interrupts = BTreeMap::new();
+    for interrupt in svd.peripherals.iter().flat_map(|p| &p.interrupts) {
+        interrupts
+            .entry(interrupt.value)
+            .or_insert_with(|| interrupt.name.clone());
+    }
+    let source = SvdSource {
+        path: fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+        sha256: sha256_hex(&bytes),
+        device: svd.device.clone(),
+        interrupts,
+    };
+    Ok((windows, source))
+}
+
+/// The `peripheral_windows` a setup records: `null` for the whole region.
+fn windows_to_json(windows: Option<&[PeripheralWindow]>, svd: Option<&SvdSource>) -> Value {
+    let Some(windows) = windows else {
+        return Value::Null;
+    };
+    json!({
+        "source": if svd.is_some() { "svd" } else { "given" },
+        "svd": svd.map(|svd| json!({
+            "path": svd.path,
+            "sha256": svd.sha256,
+            "device": svd.device,
+            "interrupts": svd.interrupts.iter().map(|(irq, name)| json!({
+                "irq": irq,
+                "name": name,
+            })).collect::<Vec<_>>(),
+        })),
+        "windows": windows.iter().map(|window| json!({
+            "name": window.name,
+            "base": hex(window.base),
+            "size": hex(window.size),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+type Windows = (Option<Vec<PeripheralWindow>>, Option<SvdSource>);
+
+/// The windows a setup records; one recorded before there were windows (no
+/// `peripheral_windows`) takes the whole region, as its campaign did.
+fn windows_from_json(value: &Value) -> Result<Windows, String> {
+    const FIELD: &str = "rehost.setup.peripheral_windows";
+    if value.is_null() {
+        return Ok((None, None));
+    }
+    let hex_at = |entry: &Value, name: &str| -> Result<u32, String> {
+        entry[name]
+            .as_str()
+            .and_then(hex_number)
+            .ok_or_else(|| format!("{FIELD}.windows[].{name} {} is not hex", entry[name]))
+    };
+    let windows = value["windows"]
+        .as_array()
+        .ok_or_else(|| format!("{FIELD}.windows is missing"))?
+        .iter()
+        .map(|entry| {
+            Ok(PeripheralWindow {
+                name: entry["name"]
+                    .as_str()
+                    .ok_or_else(|| format!("{FIELD}.windows[].name is missing"))?
+                    .to_owned(),
+                base: hex_at(entry, "base")?,
+                size: hex_at(entry, "size")?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let svd = match &value["svd"] {
+        Value::Null => None,
+        svd => Some(SvdSource {
+            path: PathBuf::from(svd["path"].as_str().unwrap_or_default()),
+            sha256: svd["sha256"].as_str().unwrap_or_default().to_owned(),
+            device: svd["device"].as_str().map(str::to_owned),
+            interrupts: svd["interrupts"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|entry| {
+                    let irq = u32::try_from(entry["irq"].as_u64()?).ok()?;
+                    Some((irq, entry["name"].as_str()?.to_owned()))
+                })
+                .collect(),
+        }),
+    };
+    Ok((Some(windows), svd))
 }
 
 impl Setup {
@@ -542,6 +734,10 @@ impl Setup {
             ));
         }
         let image_path = fs::canonicalize(&args.image).unwrap_or_else(|_| args.image.clone());
+        let (windows, svd) = match args.svd.as_deref().map(load_svd).transpose()? {
+            Some((windows, svd)) => (Some(windows), Some(svd)),
+            None => (None, None),
+        };
         Ok(Self {
             image: image_path,
             base: args.base,
@@ -556,6 +752,11 @@ impl Setup {
             max_instructions: args.max_instructions,
             mmio,
             inferred,
+            interrupts: (!args.no_interrupts).then_some(InterruptConfig {
+                interval: args.interrupt_interval,
+            }),
+            windows,
+            svd,
         })
     }
 
@@ -570,6 +771,8 @@ impl Setup {
             exit_at: self.exit_at.clone(),
             max_instructions: self.max_instructions,
             mmio: self.mmio.clone(),
+            peripheral_windows: self.windows.clone(),
+            interrupts: self.interrupts,
         }
     }
 
@@ -578,13 +781,19 @@ impl Setup {
             .map_err(|error| anyhow!("{}: {error}", self.image.display()))
     }
 
+    /// Whether anything takes the bytes of an input after the buffer's:
+    /// peripheral reads that take input, or the interrupt schedule.
+    fn stream_takes_input(&self) -> bool {
+        self.mmio.takes_input() || self.interrupts.is_some()
+    }
+
     /// The bytes of each input the buffer takes: its capacity, or, when
-    /// peripheral reads take input as well, at most [`MAX_INPUT_LEN`], so
-    /// that the bytes after it reach the peripheral reads in an input the
-    /// mutator can make.
+    /// peripheral reads or the interrupt schedule take input as well, at
+    /// most [`MAX_INPUT_LEN`], so that the bytes after it reach them in an
+    /// input the mutator can make.
     fn buffer_share(&self) -> u32 {
         self.input.map_or(0, |input| {
-            if self.mmio.takes_input() {
+            if self.stream_takes_input() {
                 input.capacity.min(MAX_INPUT_LEN)
             } else {
                 input.capacity
@@ -593,15 +802,15 @@ impl Setup {
     }
 
     /// The longest input a run can use: the buffer's bytes, then what the
-    /// peripheral reads take.
+    /// peripheral reads and the interrupt schedule take.
     fn max_input_len(&self) -> usize {
         let buffer = self.buffer_share().min(MAX_INPUT_LEN);
-        let peripherals = if self.mmio.takes_input() {
+        let stream = if self.stream_takes_input() {
             MAX_INPUT_LEN
         } else {
             0
         };
-        (buffer + peripherals).max(1) as usize
+        (buffer + stream).max(1) as usize
     }
 
     /// How the input reaches the firmware, as a finding's `input.mode`.
@@ -631,7 +840,29 @@ impl Setup {
             "exit_at": self.exit_at.iter().copied().map(hex).collect::<Vec<_>>(),
             "max_instructions": self.max_instructions,
             "mmio": mmio_to_json(&self.mmio, &self.inferred),
+            "interrupts": self.interrupts.map(|interrupts| json!({
+                "interval": interrupts.interval,
+            })),
+            "peripheral_windows": windows_to_json(self.windows.as_deref(), self.svd.as_ref()),
         })
+    }
+
+    /// The peripheral whose window holds `address`, when the windows have
+    /// names.
+    fn peripheral_at(&self, address: u32) -> Option<&str> {
+        self.windows
+            .as_deref()?
+            .iter()
+            .find(|window| {
+                window.base <= address
+                    && u64::from(address) < u64::from(window.base) + u64::from(window.size)
+            })
+            .map(|window| window.name.as_str())
+    }
+
+    /// The name the SVD gives IRQ `irq`.
+    fn interrupt_name(&self, irq: u32) -> Option<&str> {
+        self.svd.as_ref()?.interrupts.get(&irq).map(String::as_str)
     }
 
     fn from_json(value: &Value) -> Result<Self, String> {
@@ -675,6 +906,7 @@ impl Setup {
                 inject_at: address(&input["inject_at"], "input.inject_at")?,
             }),
         };
+        let (windows, svd) = windows_from_json(&value["peripheral_windows"])?;
         let exit_at = value
             .get("exit_at")
             .and_then(Value::as_array)
@@ -698,7 +930,26 @@ impl Setup {
                 .ok_or("rehost.setup.max_instructions is missing")?,
             mmio: mmio_from_json(&value["mmio"], "rehost.setup.mmio")?,
             inferred: inferred_from_json(&value["mmio"]),
+            interrupts: interrupts_from_json(&value["interrupts"])?,
+            windows,
+            svd,
         })
+    }
+}
+
+/// The interrupt schedule a setup records; a setup recorded before there was
+/// one (no `interrupts` field) raises none, as its campaign did.
+fn interrupts_from_json(value: &Value) -> Result<Option<InterruptConfig>, String> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Object(_) => match value["interval"].as_u64() {
+            Some(interval) if interval > 0 => Ok(Some(InterruptConfig { interval })),
+            _ => Err(format!(
+                "rehost.setup.interrupts.interval {} is not a number of instructions above zero",
+                value["interval"]
+            )),
+        },
+        other => Err(format!("rehost.setup.interrupts is {other}, not an object")),
     }
 }
 
@@ -761,7 +1012,7 @@ fn infer_mmio_models(setup: &mut Setup, image: &Image, seeds: &[Vec<u8>]) -> any
             setup.inferred.insert((model.address, model.pc));
             setup.mmio.models.push(model);
         }
-        loops.push(json!({
+        let mut entry = json!({
             "pc": hex(found.polling.pc),
             "address": hex(found.polling.address),
             "size": found.polling.size,
@@ -775,7 +1026,11 @@ fn infer_mmio_models(setup: &mut Setup, image: &Image, seeds: &[Vec<u8>]) -> any
                 _ => json!({"reason": reason.as_str()}),
             }),
             "model": model.map(|model| model.kind.as_str()),
-        }));
+        });
+        if let Some(peripheral) = setup.peripheral_at(found.polling.address) {
+            entry["peripheral"] = json!(peripheral);
+        }
+        loops.push(entry);
     }
     Ok(json!({
         "rounds": inference.rounds,
@@ -789,11 +1044,91 @@ fn infer_mmio_models(setup: &mut Setup, image: &Image, seeds: &[Vec<u8>]) -> any
 /// finding so a result is never read as more than it is.
 fn fidelity(setup: &Setup) -> Value {
     json!({
+        "label": FIDELITY_LABEL,
         "execution": "rehosted",
         "cpu": "ARMv7-M Thumb-2 integer core (Cortex-M3/M4), interpreted",
         "peripherals": describe_peripherals(&setup.mmio, setup.inferred.len()),
-        "interrupts": "not modelled",
+        "peripheral_windows": describe_windows(setup),
+        "interrupts": describe_interrupts(setup.interrupts),
         "floating_point": "not modelled",
+    })
+}
+
+/// Where the peripheral registers are taken to be.
+fn describe_windows(setup: &Setup) -> String {
+    match (&setup.windows, &setup.svd) {
+        (None, _) => "guessed: with no SVD, every address in the peripheral region \
+                      0x40000000-0x5fffffff is taken for a register"
+            .to_owned(),
+        (Some(windows), svd) => {
+            let from = match svd {
+                Some(svd) => format!(
+                    "the SVD {} ({})",
+                    svd.device.as_deref().unwrap_or("of an unnamed device"),
+                    svd.path.file_name().map_or_else(
+                        || svd.path.display().to_string(),
+                        |name| { name.to_string_lossy().into_owned() }
+                    )
+                ),
+                None => "the recorded setup".to_owned(),
+            };
+            format!(
+                "from {from}: {} windows; an access elsewhere in the peripheral region is an \
+                 invalid access",
+                windows.len()
+            )
+        }
+    }
+}
+
+/// The fidelity caveat a finding carries for `results/`: the label, and
+/// what it means for this run.
+fn fidelity_caveat(setup: &Setup) -> String {
+    let windows = match (&setup.windows, &setup.svd) {
+        (None, _) => "peripheral windows guessed, no SVD".to_owned(),
+        (Some(_), Some(svd)) => format!(
+            "peripheral windows from the SVD {}",
+            svd.device.as_deref().unwrap_or("of an unnamed device")
+        ),
+        (Some(_), None) => "peripheral windows from the recorded setup".to_owned(),
+    };
+    format!(
+        "{FIDELITY_LABEL}: found in bhf's Cortex-M emulator with peripheral reads served by models, \
+         not on the device ({windows})"
+    )
+}
+
+fn describe_interrupts(interrupts: Option<InterruptConfig>) -> String {
+    match interrupts {
+        None => "not modelled: nothing raises an interrupt, and a core that sleeps ends the run"
+            .to_owned(),
+        Some(InterruptConfig { interval }) => format!(
+            "injected on a schedule the input chooses: each tick (every {interval} instructions, \
+             stretched or shortened by its byte, and whenever the core sleeps) takes one input \
+             byte and pends one of the interrupts the firmware has enabled (NVIC IRQs, SysTick); \
+             taken by priority as the NVIC does, as are the firmware's own pending bits; no \
+             peripheral raises one of its own accord"
+        ),
+    }
+}
+
+/// The interrupts a run took, as far as its log holds them, named as the
+/// SVD names them.
+fn interrupts_json(setup: &Setup, run: &Execution, log: &[InterruptEvent]) -> Value {
+    json!({
+        "taken": run.interrupts,
+        "schedule_bytes": run.interrupt_input,
+        "first": log.iter().map(|event| json!({
+            "at": event.instructions,
+            "exception": event.exception,
+            "irq": event.irq(),
+            "name": match event.exception {
+                14 => Some("PendSV"),
+                15 => Some("SysTick"),
+                _ => event.irq().and_then(|irq| setup.interrupt_name(irq)),
+            },
+            "pc": hex(event.pc),
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -846,6 +1181,8 @@ fn fault_json(fault: &Fault) -> Value {
         "site": hex(fault.site()),
         "registers": registers,
         "xpsr": hex(fault.xpsr),
+        // The exception whose handler faulted (16 + n for IRQ n), from IPSR.
+        "exception": Some(fault.xpsr & 0x1ff).filter(|&number| number != 0),
     })
 }
 
@@ -882,7 +1219,7 @@ fn render_finding(
     dir: &Path,
     target: &Target<'_>,
     input: &[u8],
-    run: &Execution,
+    (run, interrupts): (&Execution, &[InterruptEvent]),
     fault: &Fault,
 ) -> Value {
     json!({
@@ -893,6 +1230,7 @@ fn render_finding(
         "severity": "high",
         "confidence": "high",
         "message": format!("Rehosted firmware fault: {}", fault.message()),
+        "fidelity_caveat": fidelity_caveat(target.setup),
         "binary": {
             "path": target.setup.image,
             "sha256": target.sha256,
@@ -904,6 +1242,7 @@ fn render_finding(
             "delivered": run.input_delivered,
             "mmio_reads": run.mmio_reads,
             "mmio_bytes": run.mmio_input,
+            "schedule_bytes": run.interrupt_input,
             "testcase": "testcase.bin",
         },
         "crash": {
@@ -917,6 +1256,7 @@ fn render_finding(
             "fault": fault_json(fault),
             "instructions": run.instructions,
             "blocks": run.blocks,
+            "interrupts": interrupts_json(target.setup, run, interrupts),
             "fidelity": fidelity(target.setup),
         },
         "paths": {
@@ -962,6 +1302,8 @@ struct Campaign<'a> {
     input_not_delivered: usize,
     /// Peripheral registers the runs read.
     mmio_reads: u64,
+    /// Interrupts the runs took.
+    interrupts_taken: u64,
     /// How the first of them ended.
     first_undelivered: Option<String>,
 }
@@ -973,6 +1315,7 @@ impl Campaign<'_> {
         let run = self.machine.run(input);
         self.executions += 1;
         self.mmio_reads += run.mmio_reads;
+        self.interrupts_taken += run.interrupts;
         *self.stops.entry(run.stop.as_str()).or_default() += 1;
         if self.target.setup.input.is_some() && run.input_delivered.is_none() {
             self.input_not_delivered += 1;
@@ -1027,7 +1370,14 @@ impl Campaign<'_> {
             .context("create a finding directory")?;
         fs::write(dir.join("testcase.bin"), input)
             .with_context(|| format!("write {}", dir.join("testcase.bin").display()))?;
-        let mut finding = render_finding(&id, &dir, &self.target, input, run, fault);
+        let mut finding = render_finding(
+            &id,
+            &dir,
+            &self.target,
+            input,
+            (run, self.machine.interrupt_log()),
+            fault,
+        );
         corpus::finding::stamp_v1(&mut finding, corpus::finding::finding_kind::BINARY);
         fs::write(
             dir.join("finding.json"),
@@ -1106,6 +1456,7 @@ fn run_inner(args: &BinaryRehostArgs) -> anyhow::Result<Value> {
         repeated_faults: 0,
         input_not_delivered: 0,
         mmio_reads: 0,
+        interrupts_taken: 0,
         first_undelivered: None,
     };
     let started = Instant::now();
@@ -1174,6 +1525,7 @@ fn run_inner(args: &BinaryRehostArgs) -> anyhow::Result<Value> {
         "repeated_faults": campaign.repeated_faults,
         "input_not_delivered": campaign.input_not_delivered,
         "mmio_reads": campaign.mmio_reads,
+        "interrupts_taken": campaign.interrupts_taken,
         "elapsed_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
     }))
 }
@@ -1259,6 +1611,33 @@ pub(crate) fn replay_rehost_outcome(
             ),
         ));
     }
+    if let Some(windows) = &setup.windows {
+        details.push(crate::replay::Detail::new(
+            "peripheral windows",
+            format!(
+                "{} from {}",
+                windows.len(),
+                setup
+                    .svd
+                    .as_ref()
+                    .map_or("the recorded setup".to_owned(), |svd| {
+                        format!(
+                            "the SVD {}",
+                            svd.device.as_deref().unwrap_or("of an unnamed device")
+                        )
+                    })
+            ),
+        ));
+    }
+    if run.interrupts > 0 {
+        details.push(crate::replay::Detail::new(
+            "interrupts",
+            format!(
+                "{} taken on the testcase's schedule ({} input bytes)",
+                run.interrupts, run.interrupt_input
+            ),
+        ));
+    }
     Ok(crate::replay::LaneReplay {
         lane: "rehost",
         matched,
@@ -1311,7 +1690,10 @@ mod tests {
             mmio: Vec::new(),
             mmio_models: None,
             mmio_default: None,
+            svd: None,
             no_mmio_inference: false,
+            interrupt_interval: DEFAULT_INTERRUPT_INTERVAL,
+            no_interrupts: false,
             iterations: 1,
             time: None,
             seed_inputs: Vec::new(),
@@ -1553,6 +1935,40 @@ mod tests {
     }
 
     #[test]
+    fn the_interrupt_schedule_is_recorded_and_a_setup_without_one_raises_none() {
+        let work = TestDir::new("rehost-setup-interrupts");
+        let (image, _) = load_image(&fixture("irq.elf"), None).unwrap();
+        let mut args = irq_args(&work);
+        args.interrupt_interval = 250;
+        let setup = Setup::from_args(&args, &image).unwrap();
+        assert_eq!(setup.interrupts, Some(InterruptConfig { interval: 250 }));
+        assert_eq!(setup.to_json()["interrupts"], json!({"interval": 250}));
+        assert_eq!(Setup::from_json(&setup.to_json()), Ok(setup.clone()));
+        // A setup recorded before the schedule existed replays without one.
+        let mut old = setup.to_json();
+        old.as_object_mut().unwrap().remove("interrupts");
+        assert_eq!(Setup::from_json(&old).unwrap().interrupts, None);
+        args.no_interrupts = true;
+        let off = Setup::from_args(&args, &image).unwrap();
+        assert_eq!(off.interrupts, None);
+        assert_eq!(off.to_json()["interrupts"], Value::Null);
+        let fidelity = fidelity(&off);
+        assert!(
+            fidelity["interrupts"]
+                .as_str()
+                .unwrap()
+                .starts_with("not modelled"),
+            "{fidelity:#}"
+        );
+        for bad in [json!({"interval": 0}), json!({}), json!(1000)] {
+            let mut broken = setup.to_json();
+            broken["interrupts"] = bad;
+            let error = Setup::from_json(&broken).unwrap_err();
+            assert!(error.contains("rehost.setup.interrupts"), "{error}");
+        }
+    }
+
+    #[test]
     fn mmio_models_parse_from_their_flags_and_bad_ones_are_named() {
         let (image, _) = load_image(&fixture("mmio.elf"), None).unwrap();
         let main = image.symbol("main").unwrap().address;
@@ -1738,8 +2154,14 @@ mod tests {
         let dir = corpus::layout::findings_dir(&work).join(&id);
         let replay = replay_rehost_outcome(&dir, None).unwrap();
         assert!(replay.matched, "{:?}", replay.differences);
-        // With no peripheral input the buffer keeps its whole capacity.
+        // With no peripheral input the interrupt schedule still takes the
+        // bytes after the buffer's share.
         args.mmio_default = Some(MmioDefaultArg::Zero);
+        let setup = Setup::from_args(&args, &image).unwrap();
+        assert_eq!(setup.config().input.unwrap().capacity, 4096);
+        assert_eq!(setup.max_input_len(), 8192);
+        // With neither, the buffer keeps its whole capacity.
+        args.no_interrupts = true;
         let setup = Setup::from_args(&args, &image).unwrap();
         assert_eq!(setup.config().input.unwrap().capacity, 8192);
         assert_eq!(setup.max_input_len(), 4096);
@@ -1961,6 +2383,279 @@ mod tests {
             Setup::from_json(&summary["setup"]).unwrap().inferred,
             BTreeSet::from([(USART_SR, Some(TXE_POLL)), (USART_SR, Some(RXNE_POLL))])
         );
+    }
+
+    /// The interrupt-driven UART fixture (`irq.c`): only its receive
+    /// interrupt's handler reads the UART and calls the frame parser.
+    fn irq_args(work: &Path) -> BinaryRehostArgs {
+        let mut args = args(fixture("irq.elf"), work);
+        args.input_buffer = None;
+        args.input_length = None;
+        args.inject_at = None;
+        args.max_instructions = 200_000;
+        args
+    }
+
+    /// The handler's status read (`ldr r2, [r3, #0]`), which inference
+    /// gives a bit-extract model for RXNE: each tick's interrupt reads it
+    /// once, so over the ticks it is a loop like a status poll's.
+    const IRQ_STATUS_READ: u32 = 0x0800_011a;
+
+    /// `bytes` as the interrupt-driven fixture receives them under the
+    /// model inference gives its status read: the tick's byte (the receive
+    /// interrupt, the plain wait), a byte for RXNE, and the data register.
+    fn received(bytes: &[u8]) -> Vec<u8> {
+        bytes
+            .iter()
+            .flat_map(|&byte| [0x00, 0x01, byte, 0, 0, 0])
+            .collect()
+    }
+
+    /// A received "FUZZW" frame that stores at `offset` in the table: clean
+    /// for an offset inside it.
+    fn received_store(dir: &Path, offset: u32) -> PathBuf {
+        let mut frame = b"FUZZW".to_vec();
+        frame.extend_from_slice(&offset.to_le_bytes());
+        frame.extend_from_slice(b"Z\n");
+        let path = dir.join(format!("seed-irq-{offset:08x}"));
+        fs::write(&path, received(&frame)).unwrap();
+        path
+    }
+
+    #[test]
+    fn an_interrupt_driven_uart_bug_is_found_by_mutation_and_replays_with_its_schedule() {
+        let work = TestDir::new("rehost-irq");
+        let mut args = irq_args(&work);
+        args.seed_files = vec![received_store(&work, 1)];
+        args.iterations = 3000;
+        let summary = run_inner(&args).unwrap();
+        assert_eq!(summary["setup"]["interrupts"], json!({"interval": 1000}));
+        assert_eq!(
+            summary["setup"]["mmio"]["models"],
+            json!([{"address": "0x40011000", "pc": hex(IRQ_STATUS_READ), "model": "bitextract",
+                    "mask": "0x00000020", "inferred": true}]),
+            "{summary:#}"
+        );
+        assert!(
+            summary["interrupts_taken"].as_u64().unwrap() >= 11,
+            "{summary:#}"
+        );
+        let findings = summary["findings"].as_array().unwrap();
+        assert!(!findings.is_empty(), "{summary:#}");
+        let dir = corpus::layout::findings_dir(&work).join(findings[0].as_str().unwrap());
+        let finding: Value =
+            serde_json::from_slice(&fs::read(dir.join("finding.json")).unwrap()).unwrap();
+        let fault = &finding["rehost"]["fault"];
+        assert_eq!(fault["kind"], "write_unmapped", "{finding:#}");
+        assert_eq!(fault["pc"], "0x08000110", "the parser's table store");
+        assert_eq!(fault["exception"], 53, "in USART1's handler (IRQ 37)");
+        let interrupts = &finding["rehost"]["interrupts"];
+        assert!(
+            interrupts["taken"].as_u64().unwrap() >= 11,
+            "{interrupts:#}"
+        );
+        assert_eq!(interrupts["first"][0]["irq"], 37);
+        assert_eq!(interrupts["first"][0]["exception"], 53);
+        assert!(finding["input"]["schedule_bytes"].as_u64().unwrap() >= 11);
+        let described = finding["rehost"]["fidelity"]["interrupts"]
+            .as_str()
+            .unwrap();
+        assert!(described.starts_with("injected"), "{described}");
+        let replay = replay_rehost_outcome(&dir, None).unwrap();
+        assert!(replay.matched, "{:?}", replay.differences);
+        assert!(
+            replay
+                .details
+                .iter()
+                .any(|detail| detail.label == "interrupts"),
+            "{:?}",
+            replay.details
+        );
+        // The recorded schedule is what the replay runs: without it the
+        // firmware sleeps before the handler reads a byte.
+        let mut stripped = finding.clone();
+        stripped["rehost"]["setup"]["interrupts"] = Value::Null;
+        fs::write(dir.join("finding.json"), stripped.to_string()).unwrap();
+        let replay = replay_rehost_outcome(&dir, None).unwrap();
+        assert!(!replay.matched);
+        assert!(
+            replay.differences[0].contains("went idle (wfi)"),
+            "{:?}",
+            replay.differences
+        );
+    }
+
+    #[test]
+    fn with_no_interrupts_the_interrupt_driven_uart_never_reads_its_input() {
+        let work = TestDir::new("rehost-irq-off");
+        let mut args = irq_args(&work);
+        args.seed_files = vec![received_store(&work, 0x0100_0001)];
+        args.iterations = 200;
+        args.no_interrupts = true;
+        let summary = run_inner(&args).unwrap();
+        assert_eq!(summary["findings"], json!([]), "{summary:#}");
+        assert_eq!(summary["setup"]["interrupts"], Value::Null);
+        assert_eq!(summary["interrupts_taken"], 0);
+        assert_eq!(summary["mmio_reads"], 0, "{summary:#}");
+        assert_eq!(summary["stops"]["idle"], summary["executions"]);
+        // The same seed with the schedule faults at once.
+        args.no_interrupts = false;
+        args.iterations = 1;
+        let summary = run_inner(&args).unwrap();
+        assert_eq!(summary["stops"]["fault"], 1, "{summary:#}");
+    }
+
+    /// Every rehosted finding's fidelity label.
+    const LABEL: &str = "rehosted, peripheral-modelled";
+
+    fn finding_of(work: &Path, summary: &Value) -> (PathBuf, Value) {
+        let id = summary["findings"][0]
+            .as_str()
+            .unwrap_or_else(|| panic!("no finding: {summary:#}"));
+        let dir = corpus::layout::findings_dir(work).join(id);
+        let finding = serde_json::from_slice(&fs::read(dir.join("finding.json")).unwrap()).unwrap();
+        (dir, finding)
+    }
+
+    #[test]
+    fn an_svd_restricts_the_peripheral_windows_and_a_read_between_them_is_a_finding() {
+        let work = TestDir::new("rehost-svd");
+        let mut args = args(fixture("faults.elf"), &work);
+        // A read between two of the part's peripherals.
+        args.seed_files = vec![write_record(&work, b'R', 0x4002_0000)];
+        // Guessed, the whole region is registers: the read is zero.
+        let guessed = run_inner(&args).unwrap();
+        assert_eq!(guessed["findings"], json!([]), "{guessed:#}");
+        assert_eq!(guessed["setup"]["peripheral_windows"], Value::Null);
+        assert!(
+            guessed["fidelity"]["peripheral_windows"]
+                .as_str()
+                .unwrap()
+                .starts_with("guessed"),
+            "{guessed:#}"
+        );
+        args.svd = Some(fixture("irq.svd"));
+        let summary = run_inner(&args).unwrap();
+        let (dir, finding) = finding_of(&work, &summary);
+        assert_eq!(finding["rehost"]["fault"]["kind"], "read_unmapped");
+        assert_eq!(finding["rehost"]["fault"]["address"], "0x40020000");
+        let windows = &finding["rehost"]["setup"]["peripheral_windows"];
+        assert_eq!(windows["source"], "svd");
+        assert_eq!(windows["svd"]["device"], "WIDGET_M4");
+        assert_eq!(
+            windows["svd"]["sha256"],
+            sha256_hex(&fs::read(fixture("irq.svd")).unwrap())
+        );
+        assert_eq!(
+            windows["windows"][3],
+            json!({"name": "USART1", "base": "0x40011000", "size": "0x00000400"})
+        );
+        assert_eq!(windows["windows"].as_array().unwrap().len(), 5);
+        let fidelity = &finding["rehost"]["fidelity"];
+        assert_eq!(fidelity["label"], LABEL);
+        let described = fidelity["peripheral_windows"].as_str().unwrap();
+        assert!(
+            described.contains("WIDGET_M4") && described.contains("5 windows"),
+            "{described}"
+        );
+        let caveat = finding["fidelity_caveat"].as_str().unwrap();
+        assert!(
+            caveat.starts_with(LABEL) && caveat.contains("WIDGET_M4"),
+            "{caveat}"
+        );
+        // The replay runs the recorded windows, with no copy of the SVD.
+        let replay = replay_rehost_outcome(&dir, None).unwrap();
+        assert!(replay.matched, "{:?}", replay.differences);
+        let mut stripped = finding.clone();
+        stripped["rehost"]["setup"]["peripheral_windows"] = Value::Null;
+        fs::write(dir.join("finding.json"), stripped.to_string()).unwrap();
+        let replay = replay_rehost_outcome(&dir, None).unwrap();
+        assert!(!replay.matched);
+        assert!(
+            replay.differences[0].contains("went idle"),
+            "{:?}",
+            replay.differences
+        );
+    }
+
+    #[test]
+    fn every_rehosted_finding_carries_the_fidelity_label() {
+        let work = TestDir::new("rehost-label");
+        let mut args = args(fixture("faults.elf"), &work);
+        args.seed_files = vec![write_record(&work, b'W', 0x6000_0000)];
+        let summary = run_inner(&args).unwrap();
+        assert_eq!(summary["fidelity"]["label"], LABEL);
+        let (_, finding) = finding_of(&work, &summary);
+        assert_eq!(finding["rehost"]["fidelity"]["label"], LABEL);
+        let caveat = finding["fidelity_caveat"].as_str().unwrap();
+        assert!(caveat.starts_with(&format!("{LABEL}:")), "{caveat}");
+        assert!(caveat.contains("guessed"), "{caveat}");
+    }
+
+    #[test]
+    fn a_model_outside_the_svd_windows_and_a_bad_svd_are_refused() {
+        let work = TestDir::new("rehost-svd-refused");
+        let mut args = args(fixture("faults.elf"), &work);
+        args.svd = Some(fixture("irq.svd"));
+        args.mmio = vec!["0x40020000=passthrough".to_owned()];
+        let error = run_inner(&args).unwrap_err().to_string();
+        assert!(error.contains("peripheral windows"), "{error}");
+        args.mmio = vec!["0x40011004=passthrough".to_owned()];
+        assert!(run_inner(&args).is_ok());
+        let broken = work.join("broken.svd");
+        fs::write(&broken, "<device><peripherals><peripheral>").unwrap();
+        args.svd = Some(broken);
+        let error = format!("{:#}", run_inner(&args).unwrap_err());
+        assert!(
+            error.contains("broken.svd") && error.contains("not closed"),
+            "{error}"
+        );
+        let empty = work.join("empty.svd");
+        fs::write(&empty, "<device><name>NONE</name><peripherals/></device>").unwrap();
+        args.svd = Some(empty);
+        let error = format!("{:#}", run_inner(&args).unwrap_err());
+        assert!(error.contains("no peripheral windows"), "{error}");
+    }
+
+    #[test]
+    fn the_peripheral_windows_round_trip_and_a_setup_without_them_guesses() {
+        let work = TestDir::new("rehost-svd-setup");
+        let (image, _) = load_image(&fixture("faults.elf"), None).unwrap();
+        let mut args = args(fixture("faults.elf"), &work);
+        args.svd = Some(fixture("ARM_Example.svd"));
+        let setup = Setup::from_args(&args, &image).unwrap();
+        let windows = setup.windows.clone().unwrap();
+        assert_eq!(windows.len(), 3);
+        assert_eq!(Setup::from_json(&setup.to_json()), Ok(setup.clone()));
+        let mut old = setup.to_json();
+        old.as_object_mut().unwrap().remove("peripheral_windows");
+        let read = Setup::from_json(&old).unwrap();
+        assert_eq!((read.windows, read.svd), (None, None));
+        let mut broken = setup.to_json();
+        broken["peripheral_windows"]["windows"][0]["size"] = json!("lots");
+        let error = Setup::from_json(&broken).unwrap_err();
+        assert!(error.contains("rehost.setup.peripheral_windows"), "{error}");
+    }
+
+    #[test]
+    fn with_its_svd_the_interrupt_driven_fixture_names_its_interrupt_and_peripheral() {
+        let work = TestDir::new("rehost-irq-svd");
+        let mut args = irq_args(&work);
+        args.svd = Some(fixture("irq.svd"));
+        args.seed_files = vec![received_store(&work, 0x0100_0001)];
+        let summary = run_inner(&args).unwrap();
+        assert_eq!(
+            summary["mmio_inference"]["polling_loops"][0]["peripheral"], "USART1",
+            "{summary:#}"
+        );
+        let (dir, finding) = finding_of(&work, &summary);
+        let first = &finding["rehost"]["interrupts"]["first"][0];
+        assert_eq!(
+            (&first["irq"], &first["name"]),
+            (&json!(37), &json!("USART1"))
+        );
+        let replay = replay_rehost_outcome(&dir, None).unwrap();
+        assert!(replay.matched, "{:?}", replay.differences);
     }
 
     #[test]

@@ -10,6 +10,10 @@
 //! and CWE from the title, the stack and the memory access from the report,
 //! and the reproducers as evidence. Re-importing a crash updates its finding
 //! in place.
+//!
+//! The same parser reads the kernel reports `bhf kernel fuzz` finds on its
+//! guest's console ([`console_report`]): [`record_guest_crash`] writes each
+//! as an `F-KERNEL-*` finding with the program that made it.
 
 use crate::model::Severity;
 use crate::ResultsError;
@@ -24,6 +28,10 @@ use std::path::{Path, PathBuf};
 pub const KERNEL_CRASH_KIND: &str = "kernel_crash";
 /// The producer findings.json names for one.
 pub const PRODUCER: &str = "kernel import";
+/// The producer of a crash `bhf kernel fuzz` found in its guest.
+pub const GUEST_PRODUCER: &str = "kernel fuzz";
+/// `kernel.tool` of such a crash.
+pub const GUEST_TOOL: &str = "bhf";
 /// Finding id family.
 pub const ID_PREFIX: &str = "F-KERNEL-";
 /// The schema of a finding's `kernel` block.
@@ -44,10 +52,28 @@ pub const REPORT_FILE: &str = "sanitizer.log";
 pub const CONSOLE_FILE: &str = "console.log";
 pub const SYZ_REPRO_FILE: &str = "repro.syz";
 pub const C_REPRO_FILE: &str = "repro.c";
+/// A guest crash's program, as the executor runs it, decoded, and as text.
+pub const TESTCASE_FILE: &str = "testcase.bin";
+pub const DECODED_FILE: &str = "decoded.json";
+pub const PROGRAM_FILE: &str = "program.txt";
 
 /// Whether a `finding.json` is an imported kernel crash.
 pub fn is_kernel_crash(raw: &Value) -> bool {
     raw.get("kind").and_then(Value::as_str) == Some(KERNEL_CRASH_KIND)
+}
+
+/// Whether a kernel crash's `finding.json` is one bhf's guest lane found.
+pub fn is_guest_crash(raw: &Value) -> bool {
+    is_kernel_crash(raw) && raw.pointer("/kernel/tool").and_then(Value::as_str) == Some(GUEST_TOOL)
+}
+
+/// The producer of a kernel crash's `finding.json`.
+pub fn producer(raw: &Value) -> &'static str {
+    if is_guest_crash(raw) {
+        GUEST_PRODUCER
+    } else {
+        PRODUCER
+    }
 }
 
 /// The command that reproduces an imported crash, relative to `results/`:
@@ -55,6 +81,10 @@ pub fn is_kernel_crash(raw: &Value) -> bool {
 /// syz-execprog with the options syz-repro recorded. Both run in the test VM
 /// that runs the kernel. `None` when syzkaller found no reproducer.
 pub fn reproduce_command(id: &str, raw: &Value, has_c: bool, has_syz: bool) -> Option<String> {
+    // The guest bhf found it in boots again and runs its program.
+    if is_guest_crash(raw) {
+        return Some(format!("bhf kernel replay findings/{id}"));
+    }
     if has_c {
         return Some(format!(
             "gcc -pthread -o repro findings/{id}/{C_REPRO_FILE} && ./repro"
@@ -106,9 +136,15 @@ pub fn explanation(raw: &Value) -> Option<String> {
     let kernel = raw.get("kernel")?;
     let class = kernel.get("class").and_then(Value::as_str)?;
     let detector = kernel.get("detector").and_then(Value::as_str);
+    let guest = is_guest_crash(raw);
+    let whose = if guest {
+        "the guest kernel's"
+    } else {
+        "syzkaller's"
+    };
     let mut text = match detector {
-        Some(detector) => format!("syzkaller's {detector} report: {}", class.replace('-', " ")),
-        None => format!("syzkaller's kernel report: {}", class.replace('-', " ")),
+        Some(detector) => format!("{whose} {detector} report: {}", class.replace('-', " ")),
+        None => format!("{whose} kernel report: {}", class.replace('-', " ")),
     };
     if let Some(access) = raw.pointer("/exception/access") {
         if let Some(direction) = access.get("direction").and_then(Value::as_str) {
@@ -153,7 +189,11 @@ pub fn explanation(raw: &Value) -> Option<String> {
             text.push_str(&format!(" ({at})"));
         }
     }
-    text.push_str(", reached from a system call syzkaller made. ");
+    text.push_str(if guest {
+        ", reached from a system call of the program bhf kernel fuzz ran in its guest. "
+    } else {
+        ", reached from a system call syzkaller made. "
+    });
     text.push_str(match family(class) {
         Family::Memory => {
             "A kernel memory-safety bug that user space can reach can crash the machine, \
@@ -185,6 +225,27 @@ pub fn explanation(raw: &Value) -> Option<String> {
         }
     });
     let reproducer = kernel.get("reproducer").filter(|r| r.is_object());
+    if guest {
+        let repeated = kernel.get("reproduced").and_then(Value::as_bool) == Some(true);
+        let unconfirmed = kernel.get("unconfirmed").and_then(Value::as_str);
+        let how = match unconfirmed {
+            _ if repeated => {
+                ", as bhf did once, in a freshly booted guest, when it found the crash".to_owned()
+            }
+            Some(why) => format!(
+                " (bhf could not run it alone in a freshly booted guest when it found the \
+                 crash: {why})"
+            ),
+            None => " (it did not crash a freshly booted guest again when bhf found it: the \
+                     crash may depend on what ran before it)"
+                .to_owned(),
+        };
+        text.push_str(&format!(
+            " The program is attached ({TESTCASE_FILE}, and as C in {C_REPRO_FILE}); `bhf kernel \
+             replay` boots the same guest and runs it{how}."
+        ));
+        return Some(text);
+    }
     match reproducer {
         Some(reproducer) => {
             let files: Vec<&str> = ["c", "syz"]
@@ -1104,6 +1165,290 @@ fn region(lines: &[&str]) -> Option<Region> {
     })
 }
 
+// ── Console reports ──────────────────────────────────────────────────────
+
+/// A kernel report found in a console log: the title syzkaller would give
+/// it, its class, its text and what it says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsoleReport {
+    pub title: String,
+    pub class: CrashClass,
+    /// The report's lines, from its first to its last, console timestamps
+    /// left as they were.
+    pub report: String,
+    pub parsed: ParsedReport,
+}
+
+/// Most lines of one console report.
+const MAX_REPORT_LINES: usize = 1000;
+
+/// A panic of the guest's own `/init` (bhf's executor), not of the kernel.
+const NOT_KERNEL_PANICS: &[&str] = &["Attempted to kill init", "No working init found"];
+
+/// Whether a console line (its timestamp removed) starts a kernel report.
+fn starts_report(text: &str) -> bool {
+    const STARTS: &[&str] = &[
+        "BUG: ",
+        "watchdog: BUG: ",
+        "UBSAN: ",
+        "WARNING: ",
+        "general protection fault",
+        "Oops: general protection fault",
+        "Oops: divide error",
+        "divide error: ",
+        "kernel BUG at ",
+        "INFO: task ",
+        "INFO: rcu_",
+        "rcu: INFO: rcu_",
+        "unregister_netdevice: waiting for",
+        "Kernel panic - not syncing:",
+    ];
+    starts_with_any(text, STARTS)
+        && !(text.starts_with("INFO: task ") && !text.contains(" blocked for more than "))
+        && !((text.starts_with("INFO: rcu_") || text.starts_with("rcu: INFO: rcu_"))
+            && !text.contains("detected stall"))
+}
+
+/// The function a symbol names: `widget_ioctl+0x46c/0x4a0` is
+/// `widget_ioctl`, `f.constprop.0` is `f`.
+fn symbol_function(symbol: &str) -> Option<String> {
+    let name = symbol.split('+').next()?.split('.').next()?;
+    (!name.is_empty()
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && !name.as_bytes()[0].is_ascii_digit())
+    .then(|| name.to_owned())
+}
+
+/// The function the report's kernel-mode `RIP:` (x86) or `pc :` (arm64)
+/// line names.
+fn faulting_function(lines: &[&str]) -> Option<String> {
+    lines.iter().find_map(|line| {
+        let text = line.trim();
+        let symbol = text
+            .strip_prefix("RIP: 0010:")
+            .or_else(|| text.strip_prefix("pc : "))?;
+        let symbol = symbol.split_whitespace().next()?;
+        symbol.contains("+0x").then(|| symbol_function(symbol))?
+    })
+}
+
+/// The title syzkaller gives the report whose lines are `lines` (its
+/// header first), with `first` the first frame of its stack; `None` for a
+/// panic of the guest's `/init`.
+fn console_title(lines: &[&str], first: Option<&str>) -> Option<String> {
+    let header = lines[0].trim();
+    let header = header.strip_prefix("watchdog: ").unwrap_or(header);
+    let header = header.strip_prefix("Oops: ").unwrap_or(header);
+    let rip = faulting_function(lines);
+    let blamed = rip.as_deref().or(first);
+    let in_blamed = |head: &str| match blamed {
+        Some(function) => format!("{head} in {function}"),
+        None => head.to_owned(),
+    };
+    for detector in ["KASAN", "KFENCE", "KMSAN", "KCSAN"] {
+        let Some(body) = header.strip_prefix(&format!("BUG: {detector}: ")) else {
+            continue;
+        };
+        let (class, location) = body.split_once(" in ").unwrap_or((body, ""));
+        let location = location
+            .split(" / ")
+            .filter_map(|side| side.split_whitespace().next())
+            .filter_map(symbol_function)
+            .collect::<Vec<_>>()
+            .join(" / ");
+        let access = (detector == "KASAN")
+            .then(|| {
+                lines.iter().find_map(|line| {
+                    let text = line.trim();
+                    if text.starts_with("Read of size ") {
+                        Some("Read")
+                    } else if text.starts_with("Write of size ") {
+                        Some("Write")
+                    } else {
+                        None
+                    }
+                })
+            })
+            .flatten();
+        let head = match access {
+            Some(access) => format!("{detector}: {} {access}", class.trim()),
+            None => format!("{detector}: {}", class.trim()),
+        };
+        return Some(if location.is_empty() {
+            head
+        } else {
+            format!("{head} in {location}")
+        });
+    }
+    if let Some(body) = header.strip_prefix("UBSAN: ") {
+        let check = body.split(" in ").next().unwrap_or(body).trim();
+        return Some(match first {
+            Some(function) => format!("UBSAN: {check} in {function}"),
+            None => header.to_owned(),
+        });
+    }
+    if let Some(message) = header.strip_prefix("Kernel panic - not syncing: ") {
+        if NOT_KERNEL_PANICS
+            .iter()
+            .any(|prefix| message.starts_with(prefix))
+        {
+            return None;
+        }
+        return Some(format!("kernel panic: {}", message.trim()));
+    }
+    if let Some(rest) = header.strip_prefix("WARNING: CPU: ") {
+        // `WARNING: CPU: 0 PID: 51 at FILE:LINE FUNC+0x19b/0x1e0 [module]`.
+        let function = rest
+            .split_once(" at ")
+            .and_then(|(_, at)| at.split_whitespace().nth(1))
+            .and_then(symbol_function);
+        return Some(match function.as_deref().or(blamed) {
+            Some(function) => format!("WARNING in {function}"),
+            None => "WARNING".to_owned(),
+        });
+    }
+    if header.starts_with("WARNING: possible circular locking dependency")
+        || header.starts_with("WARNING: possible recursive locking")
+    {
+        return Some(in_blamed("possible deadlock"));
+    }
+    if let Some(rest) = header.strip_prefix("WARNING: ") {
+        let what = rest
+            .trim_end_matches('!')
+            .trim_end_matches(" detected")
+            .trim();
+        return Some(in_blamed(&format!("WARNING: {what}")));
+    }
+    if header.starts_with("INFO: task ") {
+        return Some(in_blamed("INFO: task hung"));
+    }
+    if header.contains("detected stall") {
+        return Some(in_blamed("INFO: rcu detected stall"));
+    }
+    if header.starts_with("general protection fault") {
+        return Some(in_blamed("general protection fault"));
+    }
+    if header.starts_with("divide error") {
+        return Some(in_blamed("divide error"));
+    }
+    if header.starts_with("kernel BUG at ") {
+        return Some(in_blamed("kernel BUG"));
+    }
+    if header.starts_with("unregister_netdevice: ") {
+        return Some(header.to_owned());
+    }
+    // `BUG: kernel NULL pointer dereference, address: 0000000000000008`,
+    // `BUG: soft lockup - CPU#0 stuck for 22s! [...]`, `BUG: sleeping
+    // function called from invalid context at FILE:LINE`: what it is, in
+    // the blamed function.
+    let what = header
+        .split([',', '!'])
+        .next()
+        .unwrap_or(header)
+        .split(" - ")
+        .next()
+        .unwrap_or(header);
+    let what = what.split(" at ").next().unwrap_or(what);
+    let what = match what.split_once(": ") {
+        Some(("BUG", rest)) => match rest.split_once(": ") {
+            // `BUG: scheduling while atomic: comm/1/0x2`
+            Some((kind, _)) => format!("BUG: {kind}"),
+            None => format!("BUG: {rest}"),
+        },
+        _ => what.to_owned(),
+    };
+    let what = what
+        .strip_suffix(" for address")
+        .map(str::to_owned)
+        .unwrap_or(what);
+    Some(in_blamed(what.trim()))
+}
+
+/// The first kernel report in `console` (a guest's serial console, or a
+/// part of it), as syzkaller's report parser reads one: its title, class,
+/// text and stack. `None` when it holds none, or only a panic of the
+/// guest's own `/init`.
+pub fn console_report(console: &str) -> Option<ConsoleReport> {
+    let raw: Vec<&str> = console
+        .lines()
+        .map(|line| line.trim_end_matches('\r'))
+        .collect();
+    let lines: Vec<&str> = raw.iter().map(|line| strip_console_prefix(line)).collect();
+    let start = lines
+        .iter()
+        .position(|line| starts_report(line.trim_start()))?;
+    let panic = lines[start].trim_start().starts_with("Kernel panic");
+    // A sanitizer frames its report with `====` lines; an oops or a warning
+    // ends with its trace, or at the panic it causes.
+    let framed = start > 0 && lines[start - 1].trim().starts_with("====");
+    let mut end = (start + MAX_REPORT_LINES).min(lines.len());
+    for (at, line) in lines.iter().enumerate().take(end).skip(start + 1) {
+        let text = line.trim();
+        if framed && text.starts_with("====") || text.starts_with("---[ end trace") {
+            end = at + 1;
+            break;
+        }
+        if (!panic && text.starts_with("Kernel panic - not syncing"))
+            || text.starts_with("Kernel Offset:")
+            || text.starts_with("Rebooting in")
+        {
+            end = at;
+            break;
+        }
+    }
+    let body = &lines[start..end];
+    let text = body.join("\n");
+    let mut parsed = parse_report(&text);
+    let title = console_title(
+        body,
+        parsed.stack.first().map(|frame| frame.function.as_str()),
+    )?;
+    let mut class = classify(&title)?;
+    // With KASAN a NULL dereference faults on its shadow address: the
+    // report says which it was.
+    if class.class == "general-protection-fault" && text.contains("KASAN: null-ptr-deref in range")
+    {
+        let function = class.function.clone();
+        class = classify("BUG: kernel NULL pointer dereference")?;
+        class.function = function;
+    }
+    // The blamed function is the stack's first frame: an oops' RIP, which
+    // its call trace leaves out, else the frames above the one the title
+    // names are the detector's own.
+    match class.function.as_deref() {
+        Some(function) if class.detector.is_none() => {
+            if parsed.stack.first().map(|frame| frame.function.as_str()) != Some(function) {
+                parsed.stack.insert(
+                    0,
+                    KernelFrame {
+                        function: function.to_owned(),
+                        file: None,
+                        line: None,
+                        inline: false,
+                    },
+                );
+                parsed.stack.truncate(MAX_FRAMES);
+            }
+        }
+        Some(function) => {
+            if let Some(at) = parsed
+                .stack
+                .iter()
+                .position(|frame| frame.function == function)
+            {
+                parsed.stack.drain(..at);
+            }
+        }
+        None => {}
+    }
+    Some(ConsoleReport {
+        title,
+        class,
+        report: raw[start..end].join("\n") + "\n",
+        parsed,
+    })
+}
+
 // ── Crash directories ────────────────────────────────────────────────────
 
 /// One syzkaller crash directory, read.
@@ -1320,23 +1665,22 @@ fn sha256_hex(text: &str) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// The `finding.json` of `crash` under `id`, before the v1 envelope.
-pub fn finding_record(id: &str, crash: &KernelCrash) -> Value {
-    let class = &crash.class;
+/// What a kernel crash's `finding.json` says about the crash itself: its
+/// identity, class, rule and CWE, exception, access, location.
+fn crash_fields(id: &str, title: &str, class: &CrashClass, parsed: &ParsedReport) -> Value {
     let sanitizer = class.detector.map(str::to_ascii_lowercase);
-    let access = crash
-        .parsed
+    let access = parsed
         .access
         .map(|(direction, size)| (direction, Some(size)))
         .or_else(|| class.access.map(|direction| (direction, None)));
     let mut exception = json!({
         "name": class.exception,
-        "message": crash.title,
+        "message": title,
         "sanitizer": sanitizer,
-        "stack": crash.parsed.stack.iter().map(frame_json).collect::<Vec<_>>(),
+        "stack": parsed.stack.iter().map(frame_json).collect::<Vec<_>>(),
     });
     if let Some((direction, size)) = access {
-        let region = crash.parsed.region.as_ref().map(|region| {
+        let region = parsed.region.as_ref().map(|region| {
             let offset = match region.relation {
                 "after" => region
                     .size
@@ -1357,63 +1701,28 @@ pub fn finding_record(id: &str, crash: &KernelCrash) -> Value {
             "direction": direction,
             "size": size,
             "region": region,
-            "alloc_stack": crash.parsed.alloc_stack.iter().map(frame_json).collect::<Vec<_>>(),
-            "free_stack": crash.parsed.free_stack.iter().map(frame_json).collect::<Vec<_>>(),
+            "alloc_stack": parsed.alloc_stack.iter().map(frame_json).collect::<Vec<_>>(),
+            "free_stack": parsed.free_stack.iter().map(frame_json).collect::<Vec<_>>(),
         });
     }
-    let reproducer = (crash.syz_repro.is_some() || crash.c_repro.is_some()).then(|| {
-        json!({
-            "syz": crash.syz_repro.as_ref().map(|_| SYZ_REPRO_FILE),
-            "c": crash.c_repro.as_ref().map(|_| C_REPRO_FILE),
-            "options": crash.repro_options,
-        })
-    });
-    let key = sha256_hex(&format!("syzkaller:{}", crash.title));
+    let key = sha256_hex(&format!("syzkaller:{title}"));
     let mut record = json!({
         "id": id,
         "kind": KERNEL_CRASH_KIND,
         "classification": "unhandled",
-        "message": crash.title,
+        "message": title,
         "signature": &key[..16],
         "cluster_key": &key[..16],
         "cluster_key_full": key,
-        "cluster_normalized_frames": crash
-            .parsed
+        "cluster_normalized_frames": parsed
             .stack
             .iter()
             .take(3)
             .map(|frame| frame.function.clone())
             .collect::<Vec<_>>(),
         "cluster_fallback": false,
-        "confidence": if reproducer.is_some() { "high" } else { "medium" },
         "cwe": class.cwe.iter().map(|cwe| format!("CWE-{cwe}")).collect::<Vec<_>>(),
         "exception": exception,
-        "fidelity_caveat": "imported from syzkaller: the kernel ran in syzkaller's test VM, \
-                            and bhf did not run or reproduce the crash",
-        "kernel": {
-            "schema": KERNEL_BLOCK_SCHEMA,
-            "tool": "syzkaller",
-            "title": crash.title,
-            "class": class.class,
-            "detector": class.detector,
-            "access": class.access,
-            "function": class.function,
-            "crash_dir": crash
-                .dir
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned()),
-            "occurrences": crash.occurrences,
-            "report": crash.report.as_ref().map(|(name, _)| name.clone()),
-            "kernel_tag": crash.kernel_tag,
-            "reproducer": reproducer,
-        },
-        "paths": {
-            "sanitizer_log": crash.report.as_ref().map(|_| REPORT_FILE),
-            "console_log": crash.console.as_ref().map(|_| CONSOLE_FILE),
-            "repro_syz": crash.syz_repro.as_ref().map(|_| SYZ_REPRO_FILE),
-            "repro_c": crash.c_repro.as_ref().map(|_| C_REPRO_FILE),
-            "finding": "finding.json",
-        },
     });
     if let Some(rule) = class.rule {
         record["rule_id"] = json!(rule);
@@ -1421,7 +1730,7 @@ pub fn finding_record(id: &str, crash: &KernelCrash) -> Value {
     if let Some(severity) = class.severity {
         record["severity"] = json!(severity.as_str());
     }
-    if let Some(top) = crash.parsed.stack.first() {
+    if let Some(top) = parsed.stack.first() {
         if let Some(file) = &top.file {
             record["target"] = json!({
                 "subprogram": top.function,
@@ -1431,6 +1740,236 @@ pub fn finding_record(id: &str, crash: &KernelCrash) -> Value {
         }
     }
     record
+}
+
+/// The `finding.json` of `crash` under `id`, before the v1 envelope.
+pub fn finding_record(id: &str, crash: &KernelCrash) -> Value {
+    let class = &crash.class;
+    let reproducer = (crash.syz_repro.is_some() || crash.c_repro.is_some()).then(|| {
+        json!({
+            "syz": crash.syz_repro.as_ref().map(|_| SYZ_REPRO_FILE),
+            "c": crash.c_repro.as_ref().map(|_| C_REPRO_FILE),
+            "options": crash.repro_options,
+        })
+    });
+    let mut record = crash_fields(id, &crash.title, class, &crash.parsed);
+    record["confidence"] = json!(if reproducer.is_some() {
+        "high"
+    } else {
+        "medium"
+    });
+    record["fidelity_caveat"] = json!(
+        "imported from syzkaller: the kernel ran in syzkaller's test VM, \
+         and bhf did not run or reproduce the crash"
+    );
+    record["kernel"] = json!({
+        "schema": KERNEL_BLOCK_SCHEMA,
+        "tool": "syzkaller",
+        "title": crash.title,
+        "class": class.class,
+        "detector": class.detector,
+        "access": class.access,
+        "function": class.function,
+        "crash_dir": crash
+            .dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned()),
+        "occurrences": crash.occurrences,
+        "report": crash.report.as_ref().map(|(name, _)| name.clone()),
+        "kernel_tag": crash.kernel_tag,
+        "reproducer": reproducer,
+    });
+    record["paths"] = json!({
+        "sanitizer_log": crash.report.as_ref().map(|_| REPORT_FILE),
+        "console_log": crash.console.as_ref().map(|_| CONSOLE_FILE),
+        "repro_syz": crash.syz_repro.as_ref().map(|_| SYZ_REPRO_FILE),
+        "repro_c": crash.c_repro.as_ref().map(|_| C_REPRO_FILE),
+        "finding": "finding.json",
+    });
+    record
+}
+
+// ── Guest crashes ────────────────────────────────────────────────────────
+
+/// A kernel crash `bhf kernel fuzz` found in its guest.
+#[derive(Debug, Clone, Copy)]
+pub struct GuestCrash<'a> {
+    pub report: &'a ConsoleReport,
+    /// The console from the program's start.
+    pub console: &'a str,
+    /// The program, as the executor runs it.
+    pub program: &'a [u8],
+    /// It, decoded: one call per line, and as JSON.
+    pub program_text: &'a str,
+    pub decoded: &'a Value,
+    /// A C program making the same calls.
+    pub c_repro: &'a str,
+    /// How the guest was booted, which `bhf kernel replay` boots again.
+    pub guest: &'a Value,
+    /// The program crashed a freshly booted guest again, with the same title.
+    pub reproduced: bool,
+    /// Why it is not known whether it did: the confirming run has not run
+    /// yet ([`CONFIRMING`]), or could not be made.
+    pub unconfirmed: Option<&'a str>,
+    /// The guest's `uname -r`.
+    pub release: Option<&'a str>,
+}
+
+/// A guest crash's `kernel.unconfirmed` until its confirming run is made:
+/// what stays when bhf stops during it.
+pub const CONFIRMING: &str =
+    "the confirming run of its program alone in a freshly booted guest did not finish";
+
+/// The `finding.json` of `crash` under `id`, before the v1 envelope.
+pub fn guest_finding_record(id: &str, crash: &GuestCrash<'_>) -> Value {
+    let report = crash.report;
+    let class = &report.class;
+    let mut record = crash_fields(id, &report.title, class, &report.parsed);
+    record["confidence"] = json!(if crash.reproduced { "high" } else { "medium" });
+    record["fidelity_caveat"] = json!(
+        "found by bhf kernel fuzz in a qemu-system guest, where other programs ran before \
+         it in the same boot"
+    );
+    record["kernel"] = json!({
+        "schema": KERNEL_BLOCK_SCHEMA,
+        "tool": GUEST_TOOL,
+        "title": report.title,
+        "class": class.class,
+        "detector": class.detector,
+        "access": class.access,
+        "function": class.function,
+        "occurrences": 1,
+        "report": "console",
+        "release": crash.release,
+        "reproduced": crash.reproduced,
+        "unconfirmed": crash.unconfirmed,
+        "guest": crash.guest,
+        "reproducer": {
+            "program": TESTCASE_FILE,
+            "c": C_REPRO_FILE,
+        },
+    });
+    if crash.unconfirmed.is_none() {
+        if let Some(kernel) = record["kernel"].as_object_mut() {
+            kernel.remove("unconfirmed");
+        }
+    }
+    record["paths"] = json!({
+        "testcase": TESTCASE_FILE,
+        "decoded": DECODED_FILE,
+        "program": PROGRAM_FILE,
+        "sanitizer_log": REPORT_FILE,
+        "console_log": CONSOLE_FILE,
+        "repro_syz": null,
+        "repro_c": C_REPRO_FILE,
+        "finding": "finding.json",
+    });
+    record
+}
+
+/// Record the confirming run of the guest crash `id` under `<work_dir>`:
+/// whether its program alone made the report again in a freshly booted
+/// guest (`kernel.reproduced`, and confidence `high` when it did), or why
+/// that run could not be made (`kernel.unconfirmed`).
+pub fn confirm_guest_crash(
+    work_dir: &Path,
+    id: &str,
+    reproduced: bool,
+    unconfirmed: Option<&str>,
+) -> Result<(), ResultsError> {
+    let path = corpus::layout::findings_dir(work_dir)
+        .join(id)
+        .join("finding.json");
+    let mut record = read_capped(&path, MAX_FILE_BYTES)
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .filter(is_guest_crash)
+        .ok_or_else(|| ResultsError::Io {
+            path: path.clone(),
+            source: std::io::Error::other("no finding.json of a guest crash"),
+        })?;
+    record["confidence"] = json!(if reproduced { "high" } else { "medium" });
+    let kernel = record["kernel"]
+        .as_object_mut()
+        .expect("a guest crash has a kernel block");
+    kernel.insert("reproduced".to_owned(), json!(reproduced));
+    match unconfirmed {
+        Some(why) => kernel.insert("unconfirmed".to_owned(), json!(why)),
+        None => kernel.remove("unconfirmed"),
+    };
+    let bytes = serde_json::to_vec_pretty(&record).map_err(|source| ResultsError::Json {
+        path: path.clone(),
+        source,
+    })?;
+    crate::rebuild::write_atomic(&path, &bytes)
+}
+
+/// Write `crash` as a finding under `<work_dir>/results/findings/`, or,
+/// when the guest lane found its title before, count it on that finding,
+/// whose program and evidence stay.
+pub fn record_guest_crash(
+    work_dir: &Path,
+    crash: &GuestCrash<'_>,
+) -> Result<Imported, ResultsError> {
+    let findings_dir = corpus::layout::findings_dir(work_dir);
+    fs::create_dir_all(&findings_dir).map_err(crate::io_err(&findings_dir))?;
+    let title = &crash.report.title;
+    let finding_json = |id: &str| findings_dir.join(id).join("finding.json");
+    let write_json = |path: &Path, record: &Value| -> Result<(), ResultsError> {
+        let bytes = serde_json::to_vec_pretty(record).map_err(|source| ResultsError::Json {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        crate::rebuild::write_atomic(path, &bytes)
+    };
+    if let Some((id, _)) = earlier_kernel_findings(&findings_dir, true).remove(title) {
+        let path = finding_json(&id);
+        let mut record = read_capped(&path, MAX_FILE_BYTES)
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .ok_or_else(|| ResultsError::Io {
+                path: path.clone(),
+                source: std::io::Error::other("unreadable finding.json"),
+            })?;
+        let occurrences = record
+            .pointer("/kernel/occurrences")
+            .and_then(Value::as_u64)
+            .unwrap_or(1);
+        record["kernel"]["occurrences"] = json!(occurrences + 1);
+        record["last_seen"] = json!(corpus::finding::now_rfc3339());
+        write_json(&path, &record)?;
+        return Ok(Imported {
+            id,
+            title: title.clone(),
+            class: crash.report.class.class.clone(),
+            reproducer: Some(TESTCASE_FILE),
+            updated: true,
+        });
+    }
+    let mut allocator = corpus::layout::FamilyAllocator::new(&findings_dir, ID_PREFIX)
+        .map_err(crate::io_err(&findings_dir))?;
+    let (id, dir) = allocator
+        .create_with_suffix(&sha256_hex(title)[..8])
+        .map_err(crate::io_err(&findings_dir))?;
+    let mut record = guest_finding_record(&id, crash);
+    corpus::finding::stamp_v1(&mut record, corpus::finding::finding_kind::FUZZ);
+    crate::rebuild::write_atomic(&dir.join(TESTCASE_FILE), crash.program)?;
+    write_evidence(&dir, REPORT_FILE, Some(&crash.report.report))?;
+    write_evidence(&dir, CONSOLE_FILE, Some(crash.console))?;
+    write_evidence(&dir, PROGRAM_FILE, Some(crash.program_text))?;
+    write_evidence(&dir, C_REPRO_FILE, Some(crash.c_repro))?;
+    let decoded =
+        serde_json::to_string_pretty(crash.decoded).map_err(|source| ResultsError::Json {
+            path: dir.join(DECODED_FILE),
+            source,
+        })?;
+    write_evidence(&dir, DECODED_FILE, Some(&decoded))?;
+    write_json(&dir.join("finding.json"), &record)?;
+    Ok(Imported {
+        id,
+        title: title.clone(),
+        class: crash.report.class.class.clone(),
+        reproducer: Some(TESTCASE_FILE),
+        updated: false,
+    })
 }
 
 // ── Import ───────────────────────────────────────────────────────────────
@@ -1456,6 +1995,15 @@ pub struct ImportSummary {
 
 /// The kernel crashes earlier imports wrote: title -> (id, `created_at`).
 fn earlier_imports(findings_dir: &Path) -> HashMap<String, (String, Option<Value>)> {
+    earlier_kernel_findings(findings_dir, false)
+}
+
+/// The kernel crashes of `findings_dir`, the guest lane's or syzkaller's
+/// imports: title -> (id, `created_at`).
+fn earlier_kernel_findings(
+    findings_dir: &Path,
+    guest: bool,
+) -> HashMap<String, (String, Option<Value>)> {
     let mut found = HashMap::new();
     let Ok(entries) = fs::read_dir(findings_dir) else {
         return found;
@@ -1467,7 +2015,7 @@ fn earlier_imports(findings_dir: &Path) -> HashMap<String, (String, Option<Value
         }
         let Some(raw) = read_capped(&entry.path().join("finding.json"), MAX_FILE_BYTES)
             .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-            .filter(is_kernel_crash)
+            .filter(|raw| is_kernel_crash(raw) && is_guest_crash(raw) == guest)
         else {
             continue;
         };
@@ -1572,6 +2120,408 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join(
             "../../tests/fixtures/kernel_widget/crashes/330f1cd22e8dec39433794b0af2230020ad97506",
         )
+    }
+
+    /// A console log recorded from a guest, `tests/fixtures/kernel_guest/console/`.
+    fn recorded_console(name: &str) -> String {
+        fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/kernel_guest/console")
+                .join(name),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn recorded_console_logs_parse_into_classified_reports() {
+        struct Expected {
+            log: &'static str,
+            title: &'static str,
+            class: &'static str,
+            exception: &'static str,
+            detector: Option<&'static str>,
+            rule: Option<&'static str>,
+            cwe: &'static [u32],
+            access: Option<(&'static str, u64)>,
+            top: &'static str,
+            last_line: &'static str,
+        }
+        let cases = [
+            Expected {
+                log: "kasan-slab-out-of-bounds.log",
+                title: "KASAN: slab-out-of-bounds Write in widget_ioctl",
+                class: "slab-out-of-bounds",
+                exception: "SLAB_OUT_OF_BOUNDS",
+                detector: Some("KASAN"),
+                rule: Some("BHF-201"),
+                cwe: &[122, 787],
+                access: Some(("write", 16)),
+                top: "widget_ioctl",
+                last_line: "====",
+            },
+            Expected {
+                log: "kasan-slab-use-after-free.log",
+                title: "KASAN: slab-use-after-free Read in bugs_ioctl",
+                class: "slab-use-after-free",
+                exception: "SLAB_USE_AFTER_FREE",
+                detector: Some("KASAN"),
+                rule: Some("BHF-202"),
+                cwe: &[416],
+                access: Some(("read", 8)),
+                top: "bugs_ioctl",
+                last_line: "====",
+            },
+            Expected {
+                log: "kasan-double-free.log",
+                title: "KASAN: double-free in bugs_ioctl",
+                class: "double-free",
+                exception: "DOUBLE_FREE",
+                detector: Some("KASAN"),
+                rule: Some("BHF-204"),
+                cwe: &[415],
+                access: None,
+                top: "bugs_ioctl",
+                last_line: "====",
+            },
+            Expected {
+                log: "kasan-null-ptr-deref.log",
+                title: "general protection fault in bugs_ioctl",
+                class: "null-ptr-deref",
+                exception: "NULL_PTR_DEREF",
+                detector: None,
+                rule: Some("BHF-206"),
+                cwe: &[476],
+                access: None,
+                top: "bugs_ioctl",
+                last_line: "---[ end trace",
+            },
+            Expected {
+                log: "null-ptr-deref.log",
+                title: "BUG: kernel NULL pointer dereference in bugs_ioctl",
+                class: "null-ptr-deref",
+                exception: "NULL_PTR_DEREF",
+                detector: None,
+                rule: Some("BHF-206"),
+                cwe: &[476],
+                access: None,
+                top: "bugs_ioctl",
+                last_line: "---[ end trace",
+            },
+            Expected {
+                log: "warning.log",
+                title: "WARNING in bugs_ioctl",
+                class: "warning",
+                exception: "WARNING",
+                detector: None,
+                rule: None,
+                cwe: &[617],
+                access: None,
+                top: "bugs_ioctl",
+                last_line: "</TASK>",
+            },
+            Expected {
+                log: "kcsan-data-race.log",
+                title: "KCSAN: data-race in test_kernel_read / test_kernel_write",
+                class: "data-race",
+                exception: "DATA_RACE",
+                detector: Some("KCSAN"),
+                rule: Some("BHF-556"),
+                cwe: &[362],
+                access: None,
+                top: "test_kernel_write",
+                last_line: "====",
+            },
+        ];
+        for case in cases {
+            let console = recorded_console(case.log);
+            let report = console_report(&console).unwrap_or_else(|| panic!("{}", case.log));
+            assert_eq!(report.title, case.title, "{}", case.log);
+            assert_eq!(report.class.class, case.class, "{}", case.log);
+            assert_eq!(report.class.exception, case.exception, "{}", case.log);
+            assert_eq!(report.class.detector, case.detector, "{}", case.log);
+            assert_eq!(report.class.rule, case.rule, "{}", case.log);
+            assert_eq!(report.class.cwe, case.cwe, "{}", case.log);
+            assert_eq!(report.parsed.access, case.access, "{}", case.log);
+            assert_eq!(report.parsed.stack[0].function, case.top, "{}", case.log);
+            // The report is its own lines: from its header to its end, not
+            // the boot before it or the panic after it.
+            let first = report.report.lines().next().unwrap();
+            assert!(
+                starts_report(strip_console_prefix(first)),
+                "{}: {first}",
+                case.log
+            );
+            let last = strip_console_prefix(report.report.lines().last().unwrap()).trim();
+            assert!(last.starts_with(case.last_line), "{}: {last}", case.log);
+            assert!(
+                !report.report.contains("bhf-executor: ready"),
+                "{}",
+                case.log
+            );
+            assert!(!report.report.contains("Kernel panic"), "{}", case.log);
+        }
+        // KASAN's report names the object and both its stacks.
+        let oob = console_report(&recorded_console("kasan-slab-out-of-bounds.log")).unwrap();
+        let region = oob.parsed.region.unwrap();
+        assert_eq!(
+            (region.kind, region.size, region.relation),
+            ("heap", Some(104), "after")
+        );
+        assert_eq!(oob.parsed.alloc_stack[0].function, "widget_open");
+        let uaf = console_report(&recorded_console("kasan-slab-use-after-free.log")).unwrap();
+        assert_eq!(uaf.parsed.free_stack[0].function, "bugs_ioctl");
+    }
+
+    #[test]
+    fn a_console_log_titles_its_report_as_syzkaller_does() {
+        // syzkaller's own console log of a crash, symbolized: the title is
+        // the one syz-manager wrote.
+        let log = fs::read_to_string(fixture_dir().join("log0")).unwrap();
+        let description = fs::read_to_string(fixture_dir().join("description")).unwrap();
+        let report = console_report(&log).unwrap();
+        assert_eq!(report.title, description.trim());
+        assert_eq!(report.parsed.stack[0].function, "widget_copy_at");
+        assert_eq!(report.parsed.stack[0].line, Some(46));
+
+        let title = |text: &str| console_report(text).map(|report| report.title);
+        assert_eq!(title("[    1.0] booting\n[    2.0] all quiet\n"), None);
+        // The guest's /init dying is not a kernel bug.
+        assert_eq!(
+            title(
+                "[ 9.1] Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000009\n"
+            ),
+            None
+        );
+        assert_eq!(
+            title("Kernel panic - not syncing: Out of memory and no killable processes...\n"),
+            Some("kernel panic: Out of memory and no killable processes...".to_owned())
+        );
+        assert_eq!(
+            title(
+                "watchdog: BUG: soft lockup - CPU#0 stuck for 22s! [bhf-program:51]\n\
+                 RIP: 0010:widget_spin+0x10/0x20 [widget]\n"
+            ),
+            Some("BUG: soft lockup in widget_spin".to_owned())
+        );
+        assert_eq!(
+            title(
+                "BUG: sleeping function called from invalid context at mm/slab.h:12\n\
+                 Call Trace:\n widget_lock+0x1/0x2 [widget]\n"
+            ),
+            Some("BUG: sleeping function called from invalid context in widget_lock".to_owned())
+        );
+        assert_eq!(
+            title(
+                "UBSAN: shift-out-of-bounds in drivers/misc/widget.c:70:12\n\
+                 Call Trace:\n dump_stack_lvl+0x1/0x2\n widget_shift+0x1/0x2 [widget]\n"
+            ),
+            Some("UBSAN: shift-out-of-bounds in widget_shift".to_owned())
+        );
+        assert_eq!(
+            title("INFO: task bhf-program:51 blocked for more than 143 seconds.\nCall Trace:\n widget_wait+0x1/0x2\n"),
+            Some("INFO: task hung in widget_wait".to_owned())
+        );
+        assert_eq!(title("INFO: task bhf-program:51 is waiting\n"), None);
+        assert_eq!(
+            title("WARNING: possible circular locking dependency detected\nCall Trace:\n widget_lock+0x1/0x2\n"),
+            Some("possible deadlock in widget_lock".to_owned())
+        );
+        assert_eq!(
+            title("Oops: divide error: 0000 [#1] PREEMPT SMP\nRIP: 0010:widget_div+0x1/0x2 [widget]\n"),
+            Some("divide error in widget_div".to_owned())
+        );
+        let class = console_report(
+            "kernel BUG at drivers/misc/widget.c:9!\nRIP: 0010:widget_check+0x1/0x2\n",
+        )
+        .unwrap();
+        assert_eq!(class.title, "kernel BUG in widget_check");
+        assert_eq!(class.class.class, "kernel-bug");
+    }
+
+    #[test]
+    fn a_guest_crash_becomes_a_finding_with_its_program() {
+        let work = tempfile::tempdir().unwrap();
+        let console = recorded_console("kasan-slab-out-of-bounds.log");
+        let report = console_report(&console).unwrap();
+        let guest = json!({"kernel": "/k/bzImage", "modules": ["/k/widget.ko"]});
+        let decoded = json!({"calls": [{"call": "openat"}, {"call": "ioctl"}]});
+        let crash = GuestCrash {
+            report: &report,
+            console: &console,
+            program: b"\x00\x04program",
+            program_text: "r0 = openat(...)\nr1 = ioctl(r0, 0xc0285703, ...)\n",
+            decoded: &decoded,
+            c_repro: "int main(void) { return 0; }\n",
+            guest: &guest,
+            reproduced: true,
+            unconfirmed: None,
+            release: Some("6.12.118"),
+        };
+        let first = record_guest_crash(work.path(), &crash).unwrap();
+        assert!(first.id.starts_with("F-KERNEL-0000-"), "{first:?}");
+        assert!(!first.updated);
+        assert_eq!(first.class, "slab-out-of-bounds");
+        assert_eq!(first.reproducer, Some(TESTCASE_FILE));
+        let dir = corpus::layout::findings_dir(work.path()).join(&first.id);
+        let raw: Value =
+            serde_json::from_slice(&fs::read(dir.join("finding.json")).unwrap()).unwrap();
+        assert!(is_kernel_crash(&raw));
+        assert_eq!(producer(&raw), GUEST_PRODUCER);
+        assert_eq!(
+            raw["message"],
+            "KASAN: slab-out-of-bounds Write in widget_ioctl"
+        );
+        assert_eq!(raw["rule_id"], "BHF-201");
+        assert_eq!(raw["exception"]["access"]["direction"], "write");
+        assert_eq!(raw["exception"]["stack"][0]["function"], "widget_ioctl");
+        assert_eq!(raw["confidence"], "high");
+        assert_eq!(raw["kernel"]["tool"], GUEST_TOOL);
+        assert_eq!(raw["kernel"]["reproduced"], true);
+        assert_eq!(raw["kernel"]["occurrences"], 1);
+        assert_eq!(raw["kernel"]["release"], "6.12.118");
+        assert_eq!(raw["kernel"]["guest"], guest);
+        assert_eq!(raw["kernel"]["reproducer"]["program"], TESTCASE_FILE);
+        assert_eq!(raw["kernel"]["reproducer"]["c"], C_REPRO_FILE);
+        assert_eq!(raw["paths"]["repro_c"], C_REPRO_FILE);
+        assert!(raw["paths"]["repro_syz"].is_null());
+        assert_eq!(
+            fs::read(dir.join(TESTCASE_FILE)).unwrap(),
+            b"\x00\x04program"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join(REPORT_FILE)).unwrap(),
+            report.report
+        );
+        assert_eq!(fs::read_to_string(dir.join(CONSOLE_FILE)).unwrap(), console);
+        assert!(fs::read_to_string(dir.join(PROGRAM_FILE))
+            .unwrap()
+            .contains("ioctl"));
+        assert!(dir.join(DECODED_FILE).is_file() && dir.join(C_REPRO_FILE).is_file());
+        assert_eq!(
+            reproduce_command(&first.id, &raw, true, false),
+            Some(format!("bhf kernel replay findings/{}", first.id))
+        );
+        let text = explanation(&raw).unwrap();
+        assert!(text.contains("the guest kernel's KASAN report"), "{text}");
+        assert!(text.contains("bhf kernel replay"), "{text}");
+        assert!(!text.contains("syzkaller"), "{text}");
+
+        // Found again: the same finding, counted, its first program kept.
+        let again = GuestCrash {
+            program: b"another program",
+            reproduced: false,
+            ..crash
+        };
+        let second = record_guest_crash(work.path(), &again).unwrap();
+        assert_eq!(second.id, first.id);
+        assert!(second.updated);
+        let raw: Value =
+            serde_json::from_slice(&fs::read(dir.join("finding.json")).unwrap()).unwrap();
+        assert_eq!(raw["kernel"]["occurrences"], 2);
+        assert_eq!(raw["kernel"]["reproduced"], true);
+        assert_eq!(
+            fs::read(dir.join(TESTCASE_FILE)).unwrap(),
+            b"\x00\x04program"
+        );
+        assert!(raw["created_at"].as_str().is_some());
+
+        // A syzkaller import of the same title is a finding of its own.
+        let imported = import(work.path(), &[fixture_dir()]).unwrap();
+        assert_ne!(imported.imported[0].id, first.id);
+        let raw: Value = serde_json::from_slice(
+            &fs::read(
+                corpus::layout::findings_dir(work.path())
+                    .join(&imported.imported[0].id)
+                    .join("finding.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(producer(&raw), PRODUCER);
+
+        // A crash the program did not repeat in a fresh guest is less sure.
+        let other = console_report(&recorded_console("warning.log")).unwrap();
+        let unconfirmed = GuestCrash {
+            report: &other,
+            reproduced: false,
+            ..crash
+        };
+        let found = record_guest_crash(work.path(), &unconfirmed).unwrap();
+        let raw: Value = serde_json::from_slice(
+            &fs::read(
+                corpus::layout::findings_dir(work.path())
+                    .join(&found.id)
+                    .join("finding.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(raw["confidence"], "medium");
+        assert_eq!(raw["kernel"]["reproduced"], false);
+    }
+
+    /// A guest crash is written before its program runs alone in a fresh
+    /// guest, as not yet confirmed; the confirming run's outcome then
+    /// updates it, and a run that could not be made says why.
+    #[test]
+    fn a_guest_crash_is_written_before_it_is_confirmed_and_updated_after() {
+        let work = tempfile::tempdir().unwrap();
+        let console = recorded_console("kasan-slab-out-of-bounds.log");
+        let report = console_report(&console).unwrap();
+        let null = Value::Null;
+        let crash = GuestCrash {
+            report: &report,
+            console: &console,
+            program: b"program",
+            program_text: "r0 = openat(...)\n",
+            decoded: &null,
+            c_repro: "int main(void) { return 0; }\n",
+            guest: &null,
+            reproduced: false,
+            unconfirmed: Some(CONFIRMING),
+            release: None,
+        };
+        let found = record_guest_crash(work.path(), &crash).unwrap();
+        let path = corpus::layout::findings_dir(work.path())
+            .join(&found.id)
+            .join("finding.json");
+        let read = || -> Value { serde_json::from_slice(&fs::read(&path).unwrap()).unwrap() };
+        let raw = read();
+        assert_eq!(raw["kernel"]["reproduced"], false);
+        assert_eq!(raw["kernel"]["unconfirmed"], CONFIRMING);
+        assert_eq!(raw["confidence"], "medium");
+
+        let why = "its confirming run could not be made: the guest did not start: qemu \
+                   exited (exit status: 1) before it connected";
+        confirm_guest_crash(work.path(), &found.id, false, Some(why)).unwrap();
+        let raw = read();
+        assert_eq!(raw["kernel"]["reproduced"], false);
+        assert_eq!(raw["kernel"]["unconfirmed"], why);
+        assert_eq!(raw["confidence"], "medium");
+        let text = explanation(&raw).unwrap();
+        assert!(text.contains("could not run it alone"), "{text}");
+        assert!(text.contains("qemu exited (exit status: 1)"), "{text}");
+
+        confirm_guest_crash(work.path(), &found.id, true, None).unwrap();
+        let raw = read();
+        assert_eq!(raw["kernel"]["reproduced"], true);
+        assert!(raw["kernel"].get("unconfirmed").is_none(), "{raw:#}");
+        assert_eq!(raw["confidence"], "high");
+        assert!(explanation(&raw)
+            .unwrap()
+            .contains("as bhf did once, in a freshly booted guest"));
+        // The rest of the finding is as it was written.
+        assert_eq!(
+            raw["message"],
+            "KASAN: slab-out-of-bounds Write in widget_ioctl"
+        );
+        assert_eq!(
+            fs::read(path.parent().unwrap().join(TESTCASE_FILE)).unwrap(),
+            b"program"
+        );
+
+        let error = confirm_guest_crash(work.path(), "F-KERNEL-9999-00000000", true, None);
+        assert!(error.is_err());
     }
 
     fn frame(function: &str, file: &str, line: u64, inline: bool) -> KernelFrame {
@@ -2053,6 +3003,82 @@ mod tests {
     }
 
     #[test]
+    fn a_guest_crash_in_results_is_the_kernel_fuzz_producers_with_its_replay() {
+        let work = tempfile::tempdir().unwrap();
+        let console = recorded_console("kasan-slab-use-after-free.log");
+        let report = console_report(&console).unwrap();
+        let null = Value::Null;
+        let crash = GuestCrash {
+            report: &report,
+            console: &console,
+            program: b"program",
+            program_text: "r0 = openat(...)\n",
+            decoded: &null,
+            c_repro: "int main(void) { return 0; }\n",
+            guest: &null,
+            reproduced: true,
+            unconfirmed: None,
+            release: None,
+        };
+        let found = record_guest_crash(work.path(), &crash).unwrap();
+        let options = crate::RebuildOptions {
+            now: Some("2026-11-19T00:00:00Z".to_owned()),
+            ..crate::RebuildOptions::default()
+        };
+        crate::ProducerRun::begin(work.path(), GUEST_PRODUCER, vec!["bhf".to_owned()])
+            .complete_with(0, crate::model::ProducerStatus::Complete, &options)
+            .unwrap();
+        let doc: Value =
+            serde_json::from_slice(&fs::read(work.path().join("results/findings.json")).unwrap())
+                .unwrap();
+        let finding = &doc["findings"][0];
+        assert_eq!(finding["id"], found.id.as_str());
+        assert_eq!(finding["producer"], GUEST_PRODUCER);
+        assert_eq!(
+            finding["title"],
+            "KASAN: slab-use-after-free Read in bugs_ioctl"
+        );
+        assert_eq!(finding["rule"]["id"], "BHF-202");
+        assert_eq!(finding["cwe"], json!([416]));
+        assert_eq!(
+            finding["reproduce"]["command"],
+            format!("bhf kernel replay findings/{}", found.id)
+        );
+        let roles: Vec<&str> = finding["evidence"]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["role"].as_str().unwrap())
+            .collect();
+        for role in [
+            "testcase",
+            "sanitizer_log",
+            "console_log",
+            "repro_c",
+            "decoded",
+        ] {
+            assert!(roles.contains(&role), "{role}: {roles:?}");
+        }
+        assert!(!roles.contains(&"replay_script"), "{roles:?}");
+        assert_eq!(finding["reachability"]["kind"], "syscall");
+        assert_eq!(finding["reachability"]["target"], "bugs_ioctl");
+        let explanation = finding["explanation"].as_str().unwrap();
+        assert!(explanation.contains("bhf kernel replay"), "{explanation}");
+        let index = fs::read_to_string(work.path().join("results/INDEX.md")).unwrap();
+        assert!(
+            index.contains("slab-use-after-free Read in bugs\\_ioctl"),
+            "{index}"
+        );
+        assert!(
+            index.contains(&format!(
+                "Reproduce: `bhf kernel replay findings/{}`",
+                found.id
+            )),
+            "{index}"
+        );
+    }
+
+    #[test]
     fn the_results_index_shows_the_crash_its_class_and_reproducer() {
         let work = tempfile::tempdir().unwrap();
         let source_root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2345,7 +3371,13 @@ mod tests {
             serde_json::from_str(include_str!("../../../schemas/bhf.findings.v1.schema.json"))
                 .unwrap();
         let text = schema.to_string();
-        for value in [PRODUCER, "console_log", "repro_syz", "repro_c"] {
+        for value in [
+            PRODUCER,
+            GUEST_PRODUCER,
+            "console_log",
+            "repro_syz",
+            "repro_c",
+        ] {
             assert!(text.contains(&format!("\"{value}\"")), "{value}");
         }
     }

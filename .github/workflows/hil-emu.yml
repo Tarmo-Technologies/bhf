@@ -6,7 +6,8 @@
 # RV-2 (live gdb-remote), RV-3 (live full-system snapshot on emulated Cortex-M),
 # RV-4 (pinned FreeRTOS task/queue, CLI finding and replay), RV-5 (the
 # reference agent's Zephyr sample, CLI finding and replay), RV-7 (the Renode
-# transport against a pinned Renode, library and CLI) —
+# transport against a pinned Renode, library and CLI), RV-8 (a Linux kernel in
+# a qemu-system guest with bhf's executor, on a KCOV/KASAN kernel built here) —
 # via scripts/hil-emu.sh. The script hard-fails if the qemu / cross toolchains are
 # missing and runs the gated tests with BHF_HIL_REQUIRE=1, so the emulator
 # validations CANNOT silently skip in CI. The physical-board lane
@@ -33,6 +34,11 @@ on:
       - "scripts/ci/install-zephyr.sh"
       - "crates/cli/tests/transport_fuzz_renode_cli.rs"
       - "scripts/ci/install-renode.sh"
+      - "c_runtime/kernel_executor.c"
+      - "crates/cli/src/kernel*.rs"
+      - "crates/cli/tests/kernel_guest_cli.rs"
+      - "scripts/ci/build-kcov-guest-kernel.sh"
+      - "tests/fixtures/kernel_widget/**"
       - "scripts/ci/fetch.sh"
       - "scripts/hil-emu.sh"
       - ".github/workflows/hil-emu.yml"
@@ -52,7 +58,7 @@ jobs:
   hil-emu:
     name: Live-QEMU transport validation (RV-1/RV-2/RV-3/RV-4)
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -76,7 +82,13 @@ jobs:
             clang \
             device-tree-compiler \
             gperf \
-            git
+            git \
+            qemu-system-x86 \
+            flex \
+            bison \
+            bc \
+            libelf-dev \
+            libssl-dev
           # Sanity: the exact binaries scripts/hil-emu.sh requires.
           for tool in qemu-arm qemu-ppc64 qemu-system-arm qemu-img \
                       arm-none-eabi-gcc arm-linux-gnueabihf-gcc powerpc64-linux-gnu-gcc nm cc git \
@@ -109,6 +121,24 @@ jobs:
       # portable Renode; the script puts BHF_RENODE in the environment.
       - name: Install Renode
         run: bash scripts/ci/install-renode.sh "$HOME/.local/opt/renode-ci" >> "$GITHUB_ENV"
+
+      # RV-8 boots a KCOV/KASAN guest kernel, built once per recipe.
+      - name: Cache the KCOV guest kernel
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/opt/kcov-guest
+          key: kcov-guest-${{ runner.os }}-${{ hashFiles('scripts/ci/build-kcov-guest-kernel.sh', 'tests/fixtures/kernel_widget/linux/**') }}
+
+      - name: Build the KCOV guest kernel
+        run: |
+          bash scripts/ci/build-kcov-guest-kernel.sh "$HOME/.local/opt/kcov-guest" >> "$GITHUB_ENV"
+          # The guest boots under kvm where the runner offers it.
+          if [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+              | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+          fi
 
       - name: Run the emulator-in-the-loop validations
         run: scripts/hil-emu.sh
