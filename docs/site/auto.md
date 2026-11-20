@@ -93,6 +93,26 @@ when every input bhf tries on it before fuzzing stops at the same undefined
 global, such as `FileReader` or a name only the host defines; [Browser
 globals](javascript.md#browser-globals) lists the inputs it tries.
 
+**Go panics from `Must` functions.** A generated Go harness reports a
+recovered panic as a finding, with two exceptions, where the panic counts as a
+rejected input instead:
+
+- The fuzz target is a `Must` function (`MustParseHash`, or a method such as
+  `MustAdd`), and a `Must` function raised the panic, directly or through
+  `log.Panicf`. A `Must` function panics on input it rejects; that is its
+  documented contract.
+- `template.Must` (`html/template` or `text/template`) raised the panic, under
+  any target. It panics on a template error, and the templates it checks are
+  part of the program (gin's `LoadHTMLGlob` loads them through it).
+
+A runtime fault in a `Must` function's own body (an index, slice, nil or
+divide error) is still a finding, and so is a panic raised in code the `Must`
+function calls. A target that is not a `Must` function but passes its input
+to one, in a call such as `regexp.MustCompile(filter)`, breaks that function's
+contract: its panic is a finding, with the actionability verdict `lab_only`
+(`must_panic`). A project's own fuzz test reports every panic, as `go test`
+does.
+
 **Interpreter crashes.** When an interpreter (Python, Perl, Ruby, Lua, PHP or
 Node) dies by SIGSEGV without an error message of its own, bhf reports
 BHF-210 with CWE-674 (uncontrolled recursion) rather than an invalid memory

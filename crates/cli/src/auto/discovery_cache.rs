@@ -37,7 +37,8 @@ const CACHE_VERSION: u32 = 3;
 /// and input reachability read parameter types through the file's typedefs.
 /// v4: pointer typedefs to bytes (`LPCBYTE`, `typedef const octet_t *rbuf_t`)
 /// are byte buffers, and each C/C++ candidate records its reachability basis.
-pub(crate) const DISCOVERY_SEMANTIC_VERSION: u32 = 4;
+/// v5: a Go `MustX` beside its `X` in the same file ranks below `X`.
+pub(crate) const DISCOVERY_SEMANTIC_VERSION: u32 = 5;
 
 /// Filename written under the work dir.
 pub const CACHE_FILENAME: &str = "discovery-cache.json";

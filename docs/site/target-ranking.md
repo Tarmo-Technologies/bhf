@@ -281,7 +281,11 @@ Byte/string/reader channel `+30`; parser name `+25`; arity 1–3 `+10`; free
 function `+8`; receiver `−10`; getter/writer `−20`; registry/callback/opaque
 surface `−25`; and no byte channel `−25`. A zero-argument terminal method with a
 same-receiver public byte feeder receives `+105`, allowing the lifecycle pair to
-surface. Unexported functions are gated out.
+surface. A `MustX` function beside its `X` in the same file (`MustParseHash`
+and `ParseHash`) loses at least `30`, and always ranks below `X`: by contract
+it panics on whatever `X` rejects, so fuzzing `X` reaches the same code. A
+`Must` function with no such counterpart keeps its score. Unexported functions
+are gated out.
 
 Implementation: `crates/target_rank/src/go_rank.rs`.
 

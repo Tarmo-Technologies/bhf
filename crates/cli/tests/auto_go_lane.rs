@@ -350,6 +350,126 @@ fn a_dependency_init_panic_is_a_not_entered_target_naming_the_package() {
     assert_eq!(out.status.code(), Some(1), "{log}");
 }
 
+/// A `Must` function panics on input it rejects by contract (#399). The lane
+/// ranks `MustParseHash` below `ParseHash`, fuzzes `ParseHash`, and reports
+/// neither `MustParseHash`'s documented panic nor `template.Must`'s. A fault in
+/// a `Must` function's own body, `MustParseTag`'s slice past the end of a
+/// short tag, is still a finding. So is the panic of `regexp.MustCompile`
+/// under `MatchFilter`, which is no `Must` function and passes its input on:
+/// that breaks MustCompile's contract, and is marked lab-only as a
+/// `must_panic`.
+#[test]
+fn a_must_functions_documented_panic_is_not_a_finding_but_its_own_fault_is() {
+    if !have_go() {
+        eprintln!("skipping: no go toolchain on PATH (GNAT-less rule)");
+        return;
+    }
+    let src_guard = TestDir::new("golane_must");
+    let src = src_guard.join("src");
+    copy_dir(&fixture_named("go_must"), &src).expect("copy go fixture module");
+    let work_guard = TestDir::new("golane_must_w");
+    let work = work_guard.join("work");
+    let out = Command::new(bhf_bin())
+        .args([
+            "auto",
+            "--per-target-time",
+            "6",
+            "--single-pass",
+            "--jobs",
+            "1",
+            "--work-dir",
+            work.to_str().unwrap(),
+            src.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run bhf auto");
+    let log = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let run: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(work.join("auto/run.json")).unwrap_or_else(|e| panic!("{e}\n{log}")),
+    )
+    .expect("parse run.json");
+    let target = |name: &str| {
+        run["targets"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|target| target["name"] == name)
+            .unwrap_or_else(|| panic!("{name} was not attempted: {run:#}\n{log}"))
+            .clone()
+    };
+    let parse = target("ParseHash");
+    let must = target("MustParseHash");
+    let tag = target("MustParseTag");
+    let page = target("RenderPage");
+    let filter = target("MatchFilter");
+    assert_eq!(
+        parse["outcome"]["outcome"], "built_and_fuzzed",
+        "{parse:#}\n{log}"
+    );
+    assert!(
+        must["score"].as_i64() < parse["score"].as_i64(),
+        "MustParseHash must rank below ParseHash: {must:#}\n{parse:#}"
+    );
+
+    let doc = results_doc(&work);
+    let findings: Vec<&serde_json::Value> =
+        doc["findings"].as_array().into_iter().flatten().collect();
+    let of = |target: &serde_json::Value| -> Vec<String> {
+        findings
+            .iter()
+            .filter(|finding| finding["fuzz"]["harness_id"] == target["harness_id"])
+            .map(|finding| finding.to_string())
+            .collect()
+    };
+    for (name, target) in [
+        ("ParseHash", &parse),
+        ("MustParseHash", &must),
+        ("RenderPage", &page),
+    ] {
+        assert_eq!(
+            of(target),
+            Vec::<String>::new(),
+            "{name}: a Must function's documented panic is not a finding\n{log}"
+        );
+    }
+    let tag_findings = of(&tag);
+    assert!(
+        tag_findings
+            .iter()
+            .any(|finding| finding.contains("slice bounds out of range")),
+        "the fault in MustParseTag's own body must be a finding: {doc:#}\n{log}"
+    );
+    // A fault is not the function's contract, so it is not demoted as one.
+    for finding in findings
+        .iter()
+        .filter(|finding| finding["fuzz"]["harness_id"] == tag["harness_id"])
+    {
+        assert_ne!(finding["verdict_reason"], "must_panic", "{finding:#}");
+    }
+    let filter_findings: Vec<&&serde_json::Value> = findings
+        .iter()
+        .filter(|finding| finding["fuzz"]["harness_id"] == filter["harness_id"])
+        .collect();
+    assert!(
+        !filter_findings.is_empty()
+            && filter_findings
+                .iter()
+                .all(|finding| finding["verdict_reason"] == "must_panic"),
+        "MatchFilter's input reaching regexp.MustCompile must be a must_panic finding: \
+         {filter:#}\n{doc:#}\n{log}"
+    );
+    assert!(
+        !tag_findings
+            .iter()
+            .any(|finding| finding.contains("want a #tag")),
+        "MustParseTag's documented panic is not a finding: {tag_findings:#?}"
+    );
+}
+
 fn fixture_named(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures")

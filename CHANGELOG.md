@@ -1921,6 +1921,17 @@
   is additive. Such targets are not listed in `bug-report.md`. A run whose
   only targets are not entered this way exits 1 (none built and ran), where
   the finding it used to write made it exit 0.
+- A Go `Must` function's documented panic is no longer a finding (#399).
+  When the fuzz target is a `Must` function (`MustParseHash`), a generated Go
+  harness treats a panic that a `Must` function raises, also through
+  `log.Panicf`, as a rejected input. It does the same for `template.Must`'s
+  panic under any target. A target that is not a `Must` function and passes
+  its input to one (`regexp.MustCompile(filter)`) still reports the panic,
+  as `lab_only` (`must_panic`). A runtime fault in a `Must` function's own
+  body is still a finding, and its verdict is no longer lowered to
+  `lab_only` as a `must_panic`. Ranking puts `MustX` below `X` when both are
+  in the same file; the Go score breakdown gains `must_wrapper`, and a
+  discovery cache from an earlier build is not reused.
 - A SEGV on a fixed address is taken for a missing device register only when
   the target reads that address as a register: a volatile access that is no
   poison or sentinel value (#437). A fault on a plain pointer constant, such

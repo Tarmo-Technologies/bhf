@@ -1914,7 +1914,9 @@ fn is_harness_cleanup_artifact(raw: &Value) -> bool {
 /// Conservative: fires only for a recovered Go panic whose PANICKING frame (the
 /// top non-runtime frame, i.e. the function that called `panic`) is itself the
 /// `Must*` function. A genuine runtime panic (nil deref / index OOB) raised
-/// deeper inside the callee surfaces a non-`Must*` top frame and is left alone.
+/// deeper inside the callee surfaces a non-`Must*` top frame and is left alone,
+/// and so is one in the `Must*` function's own body (#399): Go's runtime
+/// faults read `runtime error: …`, and only an explicit `panic` is the contract.
 fn is_go_must_panic(raw: &Value) -> bool {
     let name = string_at(raw, &["exception", "name"]).unwrap_or_default();
     let message = string_at(raw, &["exception", "message"]).unwrap_or_default();
@@ -1922,6 +1924,13 @@ fn is_go_must_panic(raw: &Value) -> bool {
         || name.eq_ignore_ascii_case("go-panic")
         || message.starts_with("Go panic");
     if !is_go_panic {
+        return false;
+    }
+    let raised = message
+        .strip_prefix("Go panic:")
+        .unwrap_or(&message)
+        .trim_start();
+    if raised.starts_with("runtime error:") {
         return false;
     }
     let Some(frames) = raw.pointer("/exception/stack").and_then(Value::as_array) else {

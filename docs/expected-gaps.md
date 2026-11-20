@@ -277,6 +277,22 @@ failure there is reported as `built_not_entered` (`target_environment`),
 naming the package and the panic, with no finding (#398). The Go release the
 project supports is the fix.
 
+### Go-6. A `Must` function's documented panic — 9 findings — **[FIXED]**
+
+terraform's `MustParseHash`, `MustParseVersion` and `MustParseProviderPart`,
+etcd's `MustUnmarshalMessage`, headscale's `MustParseNodeID`, multica's
+`MustParseUUID`, and gin's `LoadHTMLGlob` through `template.Must`. Each of
+these panics on input it rejects, by contract; the caller promises valid
+input, usually a constant. This is the Go analogue of Rust-3. In the
+[2026-11-16 re-sweep](validation/2026-11-16-go-resweep.md) all 9 were
+reported as findings. When the fuzz target is a `Must` function, the
+generated harness now treats a panic that a `Must` function raises as a
+rejected input, and it does the same for `template.Must`'s panic under any
+target. The ranking puts `MustX` below its `X` (#399). A runtime fault in a
+`Must` function's own body is still a finding. So is the panic of a target
+that is not a `Must` function and passes its input to one
+(`regexp.MustCompile(filter)`), marked `lab_only` (`must_panic`).
+
 ---
 
 ## Rust

@@ -47,13 +47,28 @@ pub struct GoScoreBreakdown {
     /// same receiver. An expert drives the feeder from fuzz bytes and then calls
     /// the terminal; scoring the terminal in isolation otherwise hides it.
     pub stateful_byte_feeder: i32,
+    /// Penalty for a `MustX` wrapper whose `X` is beside it (#399). `MustX`
+    /// panics on any input `X` rejects, by contract, so fuzzing `X` reaches
+    /// the same code without that panic; the wrapper ranks below it.
+    pub must_wrapper: i32,
     pub total: i32,
 }
 
+/// How far at least a `MustX` wrapper ranks below its own score when its `X`
+/// is beside it; it always ends below `X`.
+const MUST_WRAPPER_PENALTY: i32 = 30;
+
+/// Whether a Go function name follows the `MustX` convention: `Must` and then
+/// nothing or an upper-case letter (`MustParse`, `Must`; not `Mustang`).
+pub fn is_must_function_name(name: &str) -> bool {
+    name.strip_prefix("Must")
+        .is_some_and(|rest| rest.chars().next().is_none_or(|c| c.is_ascii_uppercase()))
+}
+
 pub fn rank_go_targets(functions: &[GoFunc]) -> Vec<GoTarget> {
-    let mut targets: Vec<GoTarget> = functions
+    let exported: Vec<&GoFunc> = functions.iter().filter(|f| f.is_exported).collect();
+    let mut targets: Vec<GoTarget> = exported
         .iter()
-        .filter(|f| f.is_exported)
         .map(|f| {
             let stateful = find_stateful_byte_feeder(f, functions).is_some();
             let (breakdown, reach) = score(f, stateful);
@@ -67,6 +82,7 @@ pub fn rank_go_targets(functions: &[GoFunc]) -> Vec<GoTarget> {
             }
         })
         .collect();
+    rank_must_wrappers_below_their_counterparts(&exported, &mut targets);
     targets.sort_by(|a, b| {
         b.score
             .cmp(&a.score)
@@ -74,6 +90,35 @@ pub fn rank_go_targets(functions: &[GoFunc]) -> Vec<GoTarget> {
             .then_with(|| a.line.cmp(&b.line))
     });
     targets
+}
+
+/// #399: a `MustX` that sits beside its non-panicking `X` (the same file, a
+/// free function beside a free function, a method beside a method of the
+/// same receiver) ranks below `X`, by at least [`MUST_WRAPPER_PENALTY`].
+/// `exported[i]` is the function `targets[i]` was scored from.
+fn rank_must_wrappers_below_their_counterparts(exported: &[&GoFunc], targets: &mut [GoTarget]) {
+    let scores: Vec<i32> = targets.iter().map(|target| target.score).collect();
+    for (i, must) in exported.iter().enumerate() {
+        let Some(plain) = must
+            .name
+            .strip_prefix("Must")
+            .filter(|_| is_must_function_name(&must.name))
+        else {
+            continue;
+        };
+        let Some(j) = exported.iter().position(|f| {
+            f.name == plain
+                && f.is_method == must.is_method
+                && receiver_base(f) == receiver_base(must)
+        }) else {
+            continue;
+        };
+        let penalty = -MUST_WRAPPER_PENALTY.max(scores[i] - scores[j] + 1);
+        let target = &mut targets[i];
+        target.breakdown.must_wrapper = penalty;
+        target.breakdown.total += penalty;
+        target.score = target.breakdown.total;
+    }
 }
 
 fn is_byte_channel(ty: &str) -> bool {
@@ -279,6 +324,48 @@ mod tests {
                 .parser_name,
             0
         );
+    }
+
+    /// #399: `MustParseHash` panics on whatever `ParseHash` rejects, by
+    /// contract, so it ranks below `ParseHash`; the name alone ties them.
+    #[test]
+    fn a_must_wrapper_ranks_below_its_counterpart() {
+        let t = rank(
+            "package p\n\
+             func MustParseHash(s string) Hash { return Hash{} }\n\
+             func ParseHash(s string) (Hash, error) { return Hash{}, nil }\n\
+             func RenderPage(s string) {}\n",
+        );
+        let names: Vec<&str> = t.iter().map(|x| x.name.as_str()).collect();
+        let at = |name: &str| names.iter().position(|n| *n == name).unwrap();
+        assert!(at("ParseHash") < at("MustParseHash"), "{names:?}");
+        let must = &t[at("MustParseHash")];
+        let plain = &t[at("ParseHash")];
+        assert!(must.score <= plain.score - MUST_WRAPPER_PENALTY, "{t:#?}");
+        assert_eq!(must.breakdown.must_wrapper, must.score - plain.score);
+        assert_eq!(plain.breakdown.must_wrapper, 0);
+        assert_eq!(must.score, must.breakdown.total);
+    }
+
+    /// A `Must` function with no counterpart beside it, a wrapper whose
+    /// counterpart is a method of another receiver, and a name that only
+    /// starts with `Must` keep their scores.
+    #[test]
+    fn a_must_function_without_a_counterpart_keeps_its_score() {
+        let t = rank(
+            "package p\n\
+             func MustParseUUID(s string) UUID { return UUID{} }\n\
+             func (d *Decoder) ParseTag(s string) error { return nil }\n\
+             func MustParseTag(s string) Tag { return Tag{} }\n\
+             func Mustache(s string) string { return s }\n",
+        );
+        for target in &t {
+            assert_eq!(target.breakdown.must_wrapper, 0, "{target:#?}");
+        }
+        assert!(is_must_function_name("Must"));
+        assert!(is_must_function_name("MustCompile"));
+        assert!(!is_must_function_name("Mustache"));
+        assert!(!is_must_function_name("mustParse"));
     }
 
     #[test]
