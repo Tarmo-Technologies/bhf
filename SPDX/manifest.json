@@ -5423,6 +5423,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "docs/README.md",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "docs/ci-acceptance.md",
       "license": "Apache-2.0"
     },
@@ -5460,6 +5464,10 @@
     },
     {
       "path": "docs/designs/2026-10-16-ada-static-rules.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/designs/README.md",
       "license": "Apache-2.0"
     },
     {
@@ -5916,6 +5924,10 @@
     },
     {
       "path": "docs/validation/2026-11-19-fullsystem-persistent-loop.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/validation/README.md",
       "license": "Apache-2.0"
     },
     {

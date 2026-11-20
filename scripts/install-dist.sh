@@ -33,7 +33,8 @@ usage() {
   cat <<'EOF'
 Usage: install.sh [options]
 
-Install or update a binary-only BHF distribution.
+Install or update a binary-only BHF distribution. The binaries, the harness
+runtimes and the documentation (README.md, RUN-BHF.md, docs/) go to --prefix.
 
 On a TTY the interactive installer shows a whiptail (or dialog) boxed "popup"
 checklist — Up/Down move, Space toggles, Enter accepts, Esc/Cancel aborts. If
@@ -411,9 +412,9 @@ fallback_checklist() {
   (IFS=,; printf '%s' "${picked[*]}")
 }
 
-# Boxed "popup" checklist via whiptail (or dialog) — the classic Linux-installer
-# GUI feel, and far more robust across terminals (SSH, tmux, serial/disconnected
-# consoles) than the hand-rolled escape-sequence checklist below. Same interface
+# Boxed "popup" checklist via whiptail (or dialog), which works in more
+# terminals (SSH, tmux, serial or disconnected consoles) than the hand-rolled
+# escape-sequence checklist below. Same interface
 # as ask_checklist: prints the selected tags as a comma list on stdout. Returns
 # 130 if the user cancels, or 2 (no output) when neither tool is installed so the
 # caller can fall back.
@@ -979,6 +980,19 @@ done
 run_with_optional_prefix "$SUDO_INSTALL_WORD" mkdir -p "$(dirname "$NEW_PREFIX")"
 run_with_optional_prefix "$SUDO_INSTALL_WORD" mkdir "$NEW_PREFIX"
 run_with_optional_prefix "$SUDO_INSTALL_WORD" cp -a "$TOOL_DIR/." "$NEW_PREFIX/"
+# The documentation beside the bundle's README.md, laid out as in the bundle
+# so its relative links resolve in the prefix too: the top-level guides and
+# notices, VERSION, docs/, examples/, schemas/, the benchmark write-ups under
+# benchmarks/, and the READMEs the guides link under docker/, evidence/,
+# crates/ and SPDX/. The bundle's docs/ merges with the tool's docs/; the tool
+# already carries c_runtime/.
+for doc in "$BUNDLE_ROOT"/*.md "$BUNDLE_ROOT/LICENSE" "$BUNDLE_ROOT/NOTICE" \
+  "$BUNDLE_ROOT/VERSION" "$BUNDLE_ROOT/docs" "$BUNDLE_ROOT/examples" \
+  "$BUNDLE_ROOT/schemas" "$BUNDLE_ROOT/benchmarks" "$BUNDLE_ROOT/docker" \
+  "$BUNDLE_ROOT/evidence" "$BUNDLE_ROOT/crates" "$BUNDLE_ROOT/SPDX"; do
+  [[ -e "$doc" && ! -L "$doc" ]] || continue
+  run_with_optional_prefix "$SUDO_INSTALL_WORD" cp -a "$doc" "$NEW_PREFIX/"
+done
 
 if [[ -d "$PREFIX/packs" ]]; then
   run_with_optional_prefix "$SUDO_INSTALL_WORD" rm -rf "$NEW_PREFIX/packs"

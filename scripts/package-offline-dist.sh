@@ -27,14 +27,15 @@ usage() {
   cat <<'EOF'
 Usage: scripts/package-offline-dist.sh [options]
 
-Build a binary-only BHF distribution tarball. The tarball includes
-release binaries, harness runtime support files, an authenticated content pack
-(or explicitly requested unauthenticated legacy pack),
-install.sh, bhf-bug-report, INSTALL.md, LICENSE, README.md,
-RELEASE_NOTES.md, README-DIST.md, RUN-BHF.md, RECOMMENDED-SWEEP.md,
-AUTO-OFFLINE-RUNBOOK.md, and a tiny pre-activation smoke
-fixture.
-It does not include BHF source.
+Build a binary-only BHF distribution tarball. The tarball includes the
+release binaries, the harness runtime files, a signed content pack (or, when
+asked for, an unsigned checksum-only legacy pack), install.sh,
+bhf-bug-report, a small C fixture for the installer's smoke test, and the
+documentation: INSTALL.md, LICENSE, NOTICE, README.md, RELEASE_NOTES.md,
+README-DIST.md, RUN-BHF.md, RECOMMENDED-SWEEP.md, AUTO-OFFLINE-RUNBOOK.md,
+and docs/, examples/ and schemas/ laid out as in the repository (see
+scripts/stage-dist-docs.sh).
+It does not include BHF source code.
 
 Options:
   --out DIR               Output directory for staged dist, tar.gz, .sig, and hashes (default: dist)
@@ -415,6 +416,10 @@ run cp "$REPO_ROOT/README.md" "$STAGE_ROOT/README.md"
 run cp "$REPO_ROOT/RELEASE_NOTES.md" "$STAGE_ROOT/RELEASE_NOTES.md"
 run cp "$REPO_ROOT/docs/site/offline-auto-runbook.md" "$STAGE_ROOT/AUTO-OFFLINE-RUNBOOK.md"
 run cp "$REPO_ROOT/docs/recommended-sweep.md" "$STAGE_ROOT/RECOMMENDED-SWEEP.md"
+# The user documentation, beside README.md as in the repository, so the
+# relative links in README.md and docs/ resolve in the extracted bundle.
+# install.sh copies the same files into the install prefix.
+run bash "$SCRIPT_DIR/stage-dist-docs.sh" "$REPO_ROOT" "$STAGE_ROOT"
 run mkdir -p "$TOOL_DIR/docs"
 run cp "$REPO_ROOT/docs/site/offline-auto-runbook.md" "$TOOL_DIR/docs/AUTO-OFFLINE-RUNBOOK.md"
 run cp "$REPO_ROOT/docs/recommended-sweep.md" "$TOOL_DIR/docs/RECOMMENDED-SWEEP.md"
@@ -444,17 +449,32 @@ commit=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || printf unknown)
 EOF
 
   cat >"$STAGE_ROOT/README-DIST.md" <<'EOF'
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # BHF Distribution
 
-This is the all-in-one Linux package. It contains the BHF CLI and daemon,
-both Linux preload shims, harness runtime support files, a tiny pre-activation
-smoke fixture, a privacy-scrubbing bug-report collector, and a content
-pack (authenticated unless the producer explicitly selected legacy mode).
-`INSTALL.md`, `LICENSE`, `README.md`, and `RELEASE_NOTES.md` are included
-at the archive root as the standard installation, licensing, usage, and release
-documentation, alongside `RUN-BHF.md` (running it after install),
-`RECOMMENDED-SWEEP.md` (the one command to start with and how to size every
-flag), and `AUTO-OFFLINE-RUNBOOK.md` (broken or incomplete Ada/C/C++ drops).
+This is the all-in-one Linux package for x86_64. It contains the BHF CLI and
+daemon, both Linux preload shims, the harness runtime files, the
+`bhf-bug-report` support-report collector, a signed content pack (or, when
+its producer asked for one, an unsigned checksum-only legacy pack), a small
+C fixture for the installer's smoke test, and the documentation.
+
+| File | Contents |
+|---|---|
+| `README.md` | What bhf does, a first run, and how to read the results |
+| `INSTALL.md` | Verifying and installing this package, and the component archives |
+| `RUN-BHF.md` | Running bhf after installing it |
+| `docs/site/index.md` | Every user guide, by task |
+| `docs/README.md` | Reference pages, design notes and dated validation records |
+| `RECOMMENDED-SWEEP.md`, `AUTO-OFFLINE-RUNBOOK.md` | Copies of `docs/recommended-sweep.md` and `docs/site/offline-auto-runbook.md` |
+| `RELEASE_NOTES.md`, `CHANGELOG.md` | The current release, and every change release by release |
+| `LICENSE`, `NOTICE`, `THIRD_PARTY.md` | License and third-party notices |
+| `benchmarks/` | The benchmark write-ups and their results |
+| `examples/`, `schemas/` | Example projects, and the JSON schemas of bhf's output files |
+
+`install.sh` copies the documentation into the install prefix too:
+`/opt/bhf/README.md`, `/opt/bhf/RUN-BHF.md` and `/opt/bhf/docs/` with the
+default prefix.
 
 Install or update:
 
@@ -462,23 +482,21 @@ Install or update:
 ./install.sh --trust-policy /path/from/trusted-channel/policy.json
 ```
 
-Authenticate the **whole distribution archive and installer/verifier** through
-an independent trusted channel before running bundle code. The public key or
-policy shipped in the same unverified archive would not establish trust.
-For explicitly produced legacy checksum-only packs, use
-`--allow-legacy-integrity-only` instead of `--trust-policy`; this does not
-authenticate the publisher.
+Before you run any code from this package, verify the **whole distribution
+archive** with a verifier and publisher public key obtained through a
+separate trusted channel (`INSTALL.md` shows how). A key or policy shipped in
+the archive itself cannot vouch for the archive. A legacy checksum-only pack
+installs only with `--allow-legacy-integrity-only` in place of
+`--trust-policy`; that format carries no publisher signature.
 
-Re-running `install.sh` from a newer package **updates** an existing install in
-place — you do not uninstall first. It stages and validates the new files,
-then moves the old prefix to a backup and the stage into place. It **replaces**
-the binaries + runtime trees, **preserves** your `<prefix>/packs/` and
-`<prefix>/corpora/`, and **backs
-up** the previous install to `<prefix>.backup.<timestamp>` (roll back with `mv`).
-Your run outputs under any `--work-dir` live outside the prefix and are never
-touched.
+Running `install.sh` from a newer package **updates** an existing install in
+place; you do not uninstall first. It stages and checks the new files, then
+moves the old prefix to `<prefix>.backup.<timestamp>` and the new one into
+place. It **replaces** the binaries, runtimes and documentation, **keeps**
+`<prefix>/packs/` and `<prefix>/corpora/`, and leaves work directories
+alone. To roll back, move the backup into place with `mv`.
 
-The installer can also be run non-interactively:
+The installer can also run non-interactively:
 
 ```sh
 ./install.sh --non-interactive [options]
@@ -492,6 +510,7 @@ Installer options:
 --non-interactive       Do not prompt; use selected or default profiles
 --languages LIST        Comma list: c,cpp,rust,java,python,perl,go,ada,cobol,
                         fortran,csharp,javascript,typescript,ruby,lua,php,all
+                        (default: all sixteen languages)
 --targets LIST          Comma list: native,windows,aarch64,all,none
 --fuzzers LIST          Comma list: builtin,afl,all,none
 --extras LIST           Comma list: build-recovery,sandbox,archives,all,none
@@ -501,14 +520,15 @@ Installer options:
 --no-system-packages    Skip system package installation
 --no-apt                Compatibility alias for --no-system-packages
 --no-rustup             Skip rustup installation and nightly toolchain setup
---trust-policy FILE     Externally provisioned publisher public-key policy
---allow-legacy-integrity-only  Permit checksum-only, unauthenticated content
---no-content            Skip content pack verify/install
+--trust-policy FILE     Operator-supplied external policy with trusted public keys;
+                        required for authenticated content installation
+--allow-legacy-integrity-only  Explicitly allow unauthenticated checksum-only packs
+--no-content            Skip content pack verify/install entirely
 --no-symlink            Do not create bhf symlinks in --bin-dir
 --no-smoke              Skip the pre-activation bhf auto smoke test
 --smoke-work-dir DIR    Work directory for the pre-activation smoke test
 --dry-run               Print commands without executing them
--h, --help              Show installer help
+-h, --help              Show this help
 ```
 
 Multiple-selection example:
@@ -533,55 +553,56 @@ Full install example:
   --install-seeds
 ```
 
-`--languages all` means all sixteen supported languages and is the default.
-Use `--languages c,cpp` (or another explicit subset) to reduce installed tooling.
+`--languages all`, the default, selects all sixteen supported languages.
+Name a subset, such as `--languages c,cpp`, to install fewer toolchains.
 Language selections must be nonempty; `none` and mixing `all` with named languages are rejected.
-The C# lane
-requires a separately staged .NET 8 SDK and `SharpFuzz.CommandLine`; TypeScript
-requires `esbuild` on `PATH` or already installed in the target project.
+The C# lane needs a separately staged .NET 8 SDK and `SharpFuzz.CommandLine`;
+TypeScript needs `esbuild` on `PATH` or in the target project.
 
 The installer detects Debian/Ubuntu (`apt-get`) and RHEL-family
-(`dnf`/`yum`) hosts automatically. On RHEL, packages absent from the enabled
-repositories are reported per lane while available core dependencies continue
-to install. Use `--package-manager` to override detection.
+(`dnf`/`yum`) hosts. On RHEL, a package missing from the enabled
+repositories is reported for its lane and the other dependencies still
+install. `--package-manager` overrides the detection.
 
-The bundled content pack lives under `content/packs/current` and is verified
-against the external trust policy before any package-manager or prefix change.
+The content pack is in `content/packs/current`. The installer verifies it
+against the trust policy before it installs any system package or changes
+the prefix.
 
-This `install.sh` bundle is the simplest complete Linux install. The release
-also publishes separate `.tar.xz` component archives for operators who prefer
-to manually co-locate only selected files. See `INSTALL.md` for that alternative.
+The release also publishes separate `.tar.xz` component archives, for
+operators who prefer to manually co-locate only selected files. `INSTALL.md`
+describes that layout.
 
-If BHF itself errors on your source tree (an internal panic, or a harness its
-own codegen left broken), it records a boiled-down bug report at
-`<work-dir>/auto/bug-report.md` (+ `.json`) instead of only crashing, and keeps
-sweeping past the bad file. Run with `--debug` to capture a backtrace per panic:
+When bhf itself fails on your source tree (an internal panic, or a harness
+its own code generation left broken), it records the problem in
+`<work-dir>/auto/bug-report.md` and `.json` and carries on with the next
+file. Add `--debug` to record a backtrace for each panic:
 
 ```sh
 bhf auto --debug <source-tree> --work-dir bhf_work
 ```
 
-Send `bug-report.md` (or one entry from it) to the maintainer — it carries the
-bhf version/commit, the file/target, and the backtrace needed to fix it.
+Send `bug-report.md`, or one entry from it, to the maintainer; it has the
+bhf version and commit, the file and target, and the backtrace.
 
-For build/harness failures on a running or completed campaign, create a compact
-support report instead of collecting ad hoc commands by hand:
+For build and harness failures in a running or finished campaign, collect a
+compact support report:
 
 ```sh
 bhf-bug-report /path/to/bhf_work
 ```
 
-The collector reads structured result checkpoints, so it works before the sweep
-finishes. It includes outcome/error counts, representative diagnostic shapes,
-repair-ledger health, artifact presence, and local toolchain versions. It never
-includes source or generated harness text, and replaces paths, file names,
-targets, variables, types, Ada units, symbols, and macros before writing the
-size-capped `bhf-support-report.txt`.
+The collector reads the per-target result checkpoints, so it works before
+the sweep finishes. It reports outcome and error counts, representative
+diagnostic shapes, repair-ledger health, which artifacts exist, and the
+local toolchain versions. It leaves out source and generated harness text,
+and replaces paths, file names, targets, variables, types, Ada units,
+symbols and macros before it writes the size-capped
+`bhf-support-report.txt`.
 
-For running BHF after installation, see `RUN-BHF.md`. For the strongest
-offline Ada/C/C++ recovery commands, including known-build, unknown-build, and
-forced fallback variants, see `AUTO-OFFLINE-RUNBOOK.md`. The installer also
-places that runbook at `<prefix>/docs/AUTO-OFFLINE-RUNBOOK.md`.
+To run BHF after installing it, see `RUN-BHF.md`. For broken or incomplete
+Ada, C and C++ source drops (known build, unknown build, and the forced
+fallback), see `AUTO-OFFLINE-RUNBOOK.md`; the installer also places it at
+`<prefix>/docs/AUTO-OFFLINE-RUNBOOK.md`.
 EOF
 
   cat >"$STAGE_ROOT/RUN-BHF.md" <<'EOF'
@@ -589,27 +610,31 @@ EOF
 
 # Running BHF
 
-This guide is for operators using this binary-only BHF distribution after
-`install.sh` has installed it.
+This guide covers running bhf from this binary distribution after
+`install.sh` has installed it. The full documentation is in `docs/`: start
+at `docs/site/index.md`.
 
 ## Installed Layout
 
-The default install prefix is `/opt/bhf`. Unless you passed different
-installer options, the installer copies the CLI, daemon, runtrace shim, and
-harness runtime files there, then creates `bhf` and `bhf-daemon`
-symlinks in `/usr/local/bin`.
+The default install prefix is `/opt/bhf`. Unless you passed other installer
+options, the installer copies the CLI, the daemon, both shims, the harness
+runtime files and the documentation there, and links `bhf`, `bhf-daemon` and
+`bhf-bug-report` into `/usr/local/bin`.
 
-Useful locations:
-
-- `/opt/bhf/bhf` - CLI binary
-- `/opt/bhf/bhf-daemon` - JSON-RPC/read-only-MCP daemon for IDE and agent integrations
-- `/opt/bhf/libbhf_runtrace.so` - LD_PRELOAD runtime shim
-- `/opt/bhf/libbhf_cc_intercept.so` - compiler-interception shim for complex C/C++ build recovery
-- `/opt/bhf/bhf-bug-report` - compact privacy-scrubbed support-report collector
-- `/opt/bhf/packs/` - installed offline content packs
-- `/opt/bhf/corpora/seeds/` - bundled seeds when installed with
+- `/opt/bhf/bhf`: the CLI
+- `/opt/bhf/bhf-daemon`: the JSON-RPC and read-only MCP daemon for IDE and
+  agent integrations
+- `/opt/bhf/libbhf_runtrace.so`: the `LD_PRELOAD` runtime shim
+- `/opt/bhf/libbhf_cc_intercept.so`: the compiler-interception shim for C/C++
+  build recovery
+- `/opt/bhf/bhf-bug-report`: the scrubbed support-report collector
+- `/opt/bhf/packs/`: installed content packs
+- `/opt/bhf/corpora/seeds/`: the bundled seeds, when installed with
   `--install-seeds`
-- `VERSION` - package name, version, target triple, build time, and commit
+- `/opt/bhf/README.md`, `/opt/bhf/RUN-BHF.md`, `/opt/bhf/docs/`: the
+  documentation; `/opt/bhf/docs/site/index.md` lists every guide
+- `/opt/bhf/VERSION`: the package name, version, target triple, build time
+  and commit
 
 Run this first:
 
@@ -617,29 +642,37 @@ Run this first:
 bhf --help
 ```
 
-If you installed without symlinks, call `/opt/bhf/bhf` directly or add
-`/opt/bhf` to `PATH`.
+If you installed without symlinks, run `/opt/bhf/bhf` or add `/opt/bhf` to
+`PATH`.
 
 ## Smoke Test
 
-The installer runs the bundled C smoke fixture by default. To rerun it from the
-extracted distribution directory:
+The installer fuzzes the bundled C fixture before it activates the install.
+To run it again from the extracted distribution directory:
 
 ```sh
 # --per-target-time is in seconds; 5 means 5 seconds per discovered target.
 bhf auto smoke/c --work-dir /tmp/bhf-smoke --per-target-time 5 --verbose
 ```
 
-The smoke run proves discovery, harness generation, build, fuzz execution, and
-report rendering for the C lane. It requires `clang` and `make`.
+The smoke run checks that the C lane can discover a target, generate and
+build its harness, fuzz it and write the report. It needs `clang` and
+`make`.
 
 ## Run an Automatic Sweep
 
 For most source drops, use `bhf auto`. It discovers targets, ranks them,
-generates harnesses, repairs build gaps where possible, fuzzes, and writes
-reports. This is the recommended command — `RECOMMENDED-SWEEP.md` in this
-distribution explains how to size every flag, and `bhf auto --help` prints
-the same command at the end:
+generates harnesses, repairs build gaps where it can, fuzzes, and writes
+reports. Start with one target to check the toolchain:
+
+```sh
+bhf auto /path/to/source-tree --work-dir /path/to/bhf_work \
+  --jobs 1 --max-targets 1 --per-target-time 10
+```
+
+Keep the work directory outside the source tree. This is the recommended
+sweep; `RECOMMENDED-SWEEP.md` in this distribution explains how to size each
+flag, and `bhf auto --help` prints the same command at the end:
 
 ```sh
 bhf auto /path/to/source-tree \
@@ -656,12 +689,11 @@ bhf auto /path/to/source-tree \
   --debug
 ```
 
-`--unsafe-search-and-run-build-commands` EXECUTES the scanned tree's own build
-to recover its real compile flags. Use it only on sources you trust; without it
-BHF still recovers what it can from `compile_commands.json` and its probes.
+`--unsafe-search-and-run-build-commands` RUNS the scanned tree's own build to
+recover its real compile flags. Use it only on sources you trust. Without it,
+bhf recovers what it can from `compile_commands.json` and its own probes.
 
-For a smaller first look, drop `--sbom` and use `--per-target-time 5
---max-targets 10`:
+A shorter run of the whole tree:
 
 ```sh
 # --per-target-time is in seconds; 30 means 30 seconds per discovered target.
@@ -671,122 +703,131 @@ bhf auto /path/to/source-tree \
   --verbose
 ```
 
-`auto` recognizes all sixteen source lanes: Ada, C, C++, Rust, Java, Python,
-Perl, Go, COBOL, Fortran, C#, JavaScript, TypeScript, Ruby, Lua, and PHP.
+`auto` covers all sixteen source languages: Ada, C, C++, Rust, Java, Python,
+Perl, Go, COBOL, Fortran, C#, JavaScript, TypeScript, Ruby, Lua and PHP.
 
-Useful options:
+Common options:
 
-- `--languages c,cpp,ada,csharp,javascript` limits the sweep to selected lanes;
-  omit it to use every lane found in the tree.
-- `--max-targets 25` runs only the highest ranked targets.
-- `--campaign-time 3600` caps the whole run at 3600 seconds, which is one hour.
-  This is the whole-campaign maximum time; use it when you want the sweep to
-  stop starting new targets after a fixed wall-clock budget.
-- `--target NAME`, `--harness-id ID`, or `--target-file PATH` reruns a narrower
-  slice.
-- `--engine builtin,afl++` runs both engines for native C/C++ targets when AFL++
-  is installed.
-- `--sbom` writes SBOM, CycloneDX, vulnerability, VEX, and CSV artifacts at the
-  end of the sweep.
-- `--debug` captures a backtrace for any bhf-internal panic and enriches the
+- `--languages c,cpp,ada,csharp,javascript` limits the sweep to those
+  languages; without it, every language found in the tree is swept.
+- `--max-targets 25` stops once 25 targets have been fuzzed, taking
+  candidates in rank order.
+- `--campaign-time 3600` caps the whole run at 3600 seconds (one hour): no
+  new target starts after that.
+- `--target NAME`, `--harness-id ID` or `--target-file PATH` re-runs a
+  narrower slice.
+- `--engine builtin,afl++` runs both engines on each C, C++, COBOL, Fortran,
+  Rust and Ada target when AFL++ is installed.
+- `--sbom` writes the SBOM, CycloneDX, vulnerability, VEX and CSV files into
+  `<work-dir>/sbom/` at the end of the sweep.
+- `--debug` records a backtrace for any panic inside bhf and adds it to the
   bug report (see "When BHF itself errors" below).
 
-Missing language toolchains are reported as skipped or failed build lanes; they
-do not require network access. Install only the toolchains for the languages you
-intend to fuzz.
+A target whose language toolchain is not installed is reported as not
+built, with the reason, and the sweep goes on. Install the toolchains for
+the languages you intend to fuzz.
 
-For broken or incomplete Ada/C/C++ source drops, see
-`AUTO-OFFLINE-RUNBOOK.md` in this distribution. It gives the strongest
-known-build and unknown-build commands, explains which recovery flags combine,
-and keeps the `--force` fallback in a separate evidence bucket. After install,
-the same file is available at `/opt/bhf/docs/AUTO-OFFLINE-RUNBOOK.md` when
-the default prefix is used.
+For broken or incomplete Ada, C and C++ source drops, see
+`AUTO-OFFLINE-RUNBOOK.md` in this distribution, or
+`/opt/bhf/docs/AUTO-OFFLINE-RUNBOOK.md` after installing with the default
+prefix. It gives the commands for a known and an unknown build command,
+explains which recovery flags combine, and keeps the `--force` fallback in a
+separate work directory.
 
 ## Read Results
 
-The main outputs are under the work directory:
-
-- `auto/summary.txt` - outcome summary, throughput, coverage, and artifact paths
-- `auto/run.md` - human-readable report
-- `auto/run.json` - machine-readable report
-- `auto/bug-report.md` / `auto/bug-report.json` - BHF's OWN internal defects,
-  written only when BHF itself panicked or a codegen bug occurred (see below)
-- `findings/` - saved crashing or policy-relevant test cases
-- `harnesses/` and `build/` - generated harnesses and compiled outputs
-- `sbom/` - supply-chain outputs when `--sbom` is used
-
-Start with:
+Start with `results/INDEX.md` in the work directory:
 
 ```sh
-less bhf_work/auto/run.md
+less bhf_work/results/INDEX.md
 ```
 
-To report a BHF build/harness limitation without exposing project names or
-typing many one-off command results, run this while the campaign is running or
-after it completes:
+The main outputs:
+
+- `results/INDEX.md`: the findings grouped by root cause, with severity,
+  location, evidence, fix advice and the replay command
+- `results/findings.json`, `results/findings.csv`, `results/findings.sarif`:
+  the same findings, machine-readable
+- `results/findings/<finding-id>/`: one finding's evidence (`finding.json`,
+  `testcase.bin`, `min_testcase.bin`, `sanitizer.log`, `replay.py`)
+- `auto/summary.txt`: what built, fuzzed or was skipped, and why
+- `auto/run.md` and `auto/run.json`: the campaign report, human-readable and
+  machine-readable; use `auto/run.json` for CI ingestion and dashboards
+- `auto/missing-deps.txt`: dependencies the tree needs that this host lacks
+- `auto/bug-report.md` and `auto/bug-report.json`: defects in bhf itself,
+  written when bhf panicked or its code generation failed, and on every
+  `--debug` run (see below)
+- `harnesses/<harness-id>/`: the generated harnesses and their builds
+- `sbom/`: the supply-chain files, when `--sbom` is used
+
+`docs/finding-report-fields.md` describes every file and field.
+
+To report a bhf build or harness limitation without sharing project names,
+run this while the campaign runs or after it ends:
 
 ```sh
 bhf-bug-report /path/to/bhf_work
 ```
 
-It writes and prints one size-capped `bhf-support-report.txt`. The report is
-derived from per-target structured checkpoints; it omits source, harnesses, and
-corpus inputs and replaces project paths and identifiers with typed placeholders.
-
-Use `auto/run.json` for CI ingestion, dashboards, and repeatable triage.
+It writes and prints one size-capped `bhf-support-report.txt`, built from the
+per-target result checkpoints. The report leaves out source, harnesses and
+corpus inputs, and replaces project paths and identifiers with typed
+placeholders.
 
 ## When BHF itself errors: `--debug` and the bug report
 
-If BHF *itself* fails on your tree — an internal panic, or a harness its own
-codegen left broken — it records that as a bug report instead of only crashing,
-and keeps sweeping past the bad file. This is distinct from findings (bugs in
-your target) and from `missing-deps.txt` (dependencies your environment lacks):
-the bug report is BHF's OWN defects, boiled down to what a maintainer needs.
+When bhf itself fails on your tree (an internal panic, or a harness its own
+code generation left broken), it records the failure as a bug report and
+carries on past the bad file. The bug report lists bhf's own defects, boiled
+down to what a maintainer needs. Findings are bugs in your target, and
+`auto/missing-deps.txt` lists dependencies your environment lacks.
 
-- A BHF-internal panic while parsing or fuzzing ONE file is caught at that
-  file/target boundary — the run records it and continues instead of aborting.
-- When a run hits any internal defect, BHF writes
+- A panic inside bhf while it parses or fuzzes one file is caught at that
+  file or target; the run records it and continues.
+- When a run hits any internal defect, bhf writes
   `<work-dir>/auto/bug-report.json` and `bug-report.md` and prints a one-line
-  pointer. A clean run writes neither.
+  pointer to them. A clean run writes neither, unless `--debug` is set.
 
-Add `--debug` to capture a backtrace per panic (it sets `RUST_BACKTRACE` for
-you), which pins the exact source line:
+Add `--debug` to record a backtrace for each panic (it sets `RUST_BACKTRACE`
+for you), which names the exact source line:
 
 ```sh
 bhf auto --debug /path/to/source-tree --work-dir bhf_work
 # → bhf_work/auto/bug-report.md
 ```
 
-`bug-report.md` lists each issue with its category (`PANIC` / `codegen`), the
-source file and target, the language, the BHF version + commit, and (under
-`--debug`) the backtrace. Send that file — or a single entry — to get the defect
-fixed; it carries everything needed to reproduce.
+`bug-report.md` lists each issue with its category (`PANIC` or `codegen`),
+the source file and target, the language, the bhf version and commit, and,
+with `--debug`, the backtrace. Send that file, or one entry from it, to get
+the defect fixed.
 
 ## Updating this install (data-safe)
 
-Re-running `install.sh` from a newer package updates this install in place; you
-do not uninstall first. It stages and validates before replacing the prefix.
-It **replaces** the binaries + runtime trees, **preserves** `<prefix>/packs/` and
-`<prefix>/corpora/`, and **backs up** the previous install to
-`<prefix>.backup.<timestamp>` (roll back with `mv`). Your run outputs under any
-`--work-dir` live outside the prefix and are never touched. See `README-DIST.md`
-for the full update walkthrough.
+Running `install.sh` from a newer package updates this install in place; you
+do not uninstall first. It stages and checks the new files before it
+replaces the prefix. It **replaces** the binaries, runtimes and
+documentation, **keeps** `<prefix>/packs/` and `<prefix>/corpora/`, and
+**backs up** the previous install to `<prefix>.backup.<timestamp>` (roll back
+with `mv`). Work directories live outside the prefix and are left alone.
+`README-DIST.md` has the details.
 
 ## Generate Reports and CSV
 
-`bhf auto` writes the primary run report automatically:
+`bhf auto` writes `results/INDEX.md`, `results/findings.json`,
+`results/findings.csv` and `results/findings.sarif`, and the campaign report
+in `auto/run.md` and `auto/run.json`. To rebuild `results/` from the saved
+findings, and add a JUnit report in `results/report/`:
 
-- `bhf_work/auto/run.md` - human-readable campaign report
-- `bhf_work/auto/run.json` - machine-readable campaign report
-- `bhf_work/auto/findings.csv` - one row per root-cause finding group
+```sh
+bhf report --work-dir bhf_work --junit
+```
 
-To render a separate findings report bundle from saved findings, use
-`bhf report`. This is useful when you want spreadsheet, SARIF, or JUnit
-outputs for triage, CI, or compliance systems:
+To write a separate report set into another directory, for spreadsheets,
+CI or compliance systems:
 
 ```sh
 bhf report \
-  --findings bhf_work/findings \
+  --findings bhf_work/results/findings \
   --out bhf_work/reports \
   --run last \
   --csv \
@@ -796,15 +837,14 @@ bhf report \
 
 That command writes:
 
-- `bhf_work/reports/last.md`
-- `bhf_work/reports/last.json`
-- `bhf_work/reports/last.csv`
-- `bhf_work/reports/last.sarif`
-- `bhf_work/reports/last.junit.xml`
+- `bhf_work/reports/run-last.md`
+- `bhf_work/reports/run-last.json`
+- `bhf_work/reports/run-last.csv`
+- `bhf_work/reports/run-last.sarif`
+- `bhf_work/reports/run-last.junit.xml`
 
-For supply-chain reporting, `bhf auto --sbom` writes SBOM artifacts at the
-end of the sweep. You can also generate them directly from a source tree or work
-directory:
+`bhf auto --sbom` writes the supply-chain files at the end of the sweep. To
+generate them directly from a source tree or a work directory:
 
 ```sh
 bhf sbom /path/to/source-tree \
@@ -812,7 +852,8 @@ bhf sbom /path/to/source-tree \
   --emit sbom,cyclonedx,vulnerabilities,openvex,csv
 ```
 
-That command writes JSON SBOM/VEX/vulnerability artifacts plus CSV projections:
+That command writes the SBOM, CycloneDX, vulnerability and OpenVEX JSON
+files, and their CSV projections:
 
 - `bhf_work/sbom/sbom.json`
 - `bhf_work/sbom/cyclonedx.json`
@@ -821,79 +862,87 @@ That command writes JSON SBOM/VEX/vulnerability artifacts plus CSV projections:
 - `bhf_work/sbom/sbom.csv`
 - `bhf_work/sbom/vulnerabilities.csv`
 
-If you installed a real offline CVE database in a content pack, pass it with
-`--vuln-db /opt/bhf/packs/<pack-id>/cve/sbom-cves.json`. Without a CVE
-database, SBOM inventory still works, but vulnerability match outputs are empty.
+Vulnerability matching needs an advisory database. Build one from OSV or NVD
+files you brought to the host with `bhf pack import-osv --out cves.json
+<files>` or `bhf pack import-nvd --out cves.json <files>`, or take one from a
+content pack, and pass it with `--vuln-db`. With no database, bhf still
+writes the SBOM inventory, and the vulnerability files list no matches.
 
 ## Fuzz and Replay a Specific Harness
 
-`bhf auto` is the normal entry point, but you can continue fuzzing a built
-harness directly:
+`bhf auto` is the usual entry point, but you can keep fuzzing a harness it
+built:
 
 ```sh
 # --time accepts duration suffixes; 10m means 10 minutes.
-bhf fuzz bhf_work --harness H-EXAMPLE --time 10m --seed-input smoke
+bhf fuzz bhf_work --harness <harness-id> --time 10m
 ```
 
-Replay a finding from a report:
+The harness IDs are the directory names under `bhf_work/harnesses/`, such as
+`H-C0003-0CE90D8D`. To reproduce a finding:
 
 ```sh
-bhf replay --finding bhf_work/findings/F-0001
+bhf replay bhf_work/results/findings/<finding-id>
 ```
 
-If automatic harness resolution cannot find the binary, pass it explicitly:
+`bhf replay` prints `MATCH` and exits 0 when the input crashes the same way
+again, and exits 3 for `MISMATCH` and 4 for `UNVERIFIED`. When it cannot find
+the harness binary on its own, pass it:
 
 ```sh
-bhf replay --finding bhf_work/findings/F-0001 \
-  --harness bhf_work/build/H-EXAMPLE/main
+bhf replay bhf_work/results/findings/<finding-id> \
+  --harness bhf_work/harnesses/<harness-id>/main
 ```
 
 ## Runtime Shim
 
-The shim is armed for native Ada, C, C++, Rust, Go, COBOL, and Fortran runs plus
-Python, Perl, Ruby, Lua, and PHP interpreter processes. If the CLI cannot find
-the shim automatically, point it at the installed copy:
+The shim runs in native Ada, C, C++, Rust, Go, COBOL and Fortran harnesses
+and in the Python, Perl, Ruby, Lua and PHP interpreter processes. If bhf
+cannot find it, point it at the installed copy:
 
 ```sh
 export BHF_RUNTRACE_SHIM=/opt/bhf/libbhf_runtrace.so
 ```
 
-Java, C#, JavaScript, and TypeScript fuzzing do not load the LD_PRELOAD shim
-because interposing their managed runtime processes would mostly observe the
-launcher/runtime rather than target behavior. Cross-compiled and emulated runs
-also leave it disabled.
+Java, C#, JavaScript and TypeScript harnesses run without the shim; their
+runtimes supply coverage and crash signals, and the Java and Node.js drivers
+check their own sinks. Cross-compiled and emulated runs also run without it.
 
 ## Daemon and IDE Use
 
-`bhf-daemon` is installed for IDE thin clients, JSON-RPC integrations, and
-five read-only MCP tools. Run the daemon from the installed prefix or through
-the symlink configured by the installer:
+`bhf-daemon` serves IDE thin clients and JSON-RPC integrations, and three
+read-only MCP tools: `bhf_scan` (Ada structure scan), `bhf_list_targets`
+(ranked Ada, C and C++ targets) and `bhf_load_findings` (finding lookup).
+Run it from the prefix or through the installed symlink:
 
 ```sh
 bhf-daemon
-# MCP stdio transport for an approved local agent host:
+# MCP over stdio, for a local agent host you approve:
 bhf-daemon --mcp
 ```
 
-Use the CLI for batch and CI jobs. Use default daemon mode when an editor owns
-BHF sessions, or `--mcp` for read-only static scan, target ranking, harness
-preflight, report summary, and finding lookup. MCP does not build or fuzz.
+Use the CLI for batch and CI jobs. Use the default daemon mode when an editor
+owns the bhf sessions, and `--mcp` for the read-only tools. Building,
+fuzzing and replaying stay CLI actions. `docs/site/daemon.md` describes the
+methods and options.
 
 ## Offline Content
 
 The installer verifies and installs the content pack from
 `content/packs/current`. Installed packs live under `/opt/bhf/packs/`.
 
-A content pack is an offline bundle of BHF data with SHA-256 payload checks and,
-in authenticated mode, an Ed25519 signature verified against an independently
-provisioned public key. A legacy digest alone does not authenticate its publisher. This distribution
-uses it for the built-in rule catalog, offline CVE databases, and optional seed
-corpora. Bundle a content pack when the destination machine cannot fetch updates
-from the network, when you need a repeatable evidence trail for exactly which
-rules and vulnerability data were used, or when you want to move customer- or
-program-specific corpora through the same verified install path as the tool.
+A content pack is an offline bundle of BHF data with SHA-256 payload checks
+and, in authenticated mode, an Ed25519 signature checked against a public
+key you provision separately; only the signature identifies the publisher.
+The pack holds bhf's static-analysis rule catalog, an SBOM CVE database, a
+binary CVE database and a seed archive. In a bundle built without CVE data or
+seeds, as the release workflow builds it, the two databases and the seed
+archive are empty; `docs/site/offline-deployment.md` shows how a producer
+adds them. A pack pins the rules and vulnerability data a host uses, and
+carries program-specific corpora through the same verified install path as
+the tool.
 
-To inspect or verify a pack manually:
+To inspect or verify a pack yourself:
 
 ```sh
 bhf pack verify content/packs/current/update-pack.json \
@@ -901,13 +950,12 @@ bhf pack verify content/packs/current/update-pack.json \
   --policy /path/from/trusted-channel/policy.json --require-authenticated
 ```
 
-If you installed bundled seeds with `--install-seeds`, pass them into a run with:
-
-Seeds are example input files that initialize the fuzz corpus before mutation
-starts. Good seeds are valid or nearly-valid messages, files, packets, records,
-or API payloads for the target parser. Installing seeds is useful because it can
-reach format gates faster, preserve known-good regression inputs, and share a
-common starting corpus across offline machines.
+Seeds are example input files that start the fuzz corpus before mutation
+begins. Good seeds are valid or nearly valid messages, files, packets,
+records or API payloads for the target parser. They get past format checks
+sooner, keep known-good regression inputs, and give offline machines a
+shared starting corpus. If you installed seeds with `--install-seeds`, pass
+them to a run with:
 
 ```sh
 bhf auto /path/to/source-tree \

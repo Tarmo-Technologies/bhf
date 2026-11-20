@@ -260,13 +260,17 @@ def _positive(value):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--archive", type=Path)
-    parser.add_argument("--signature", type=Path)
-    parser.add_argument("--trusted-public-key", type=Path)
-    parser.add_argument("--verified-copy", type=Path)
-    parser.add_argument("--max-archive-bytes", type=_positive, default=DEFAULT_MAX_ARCHIVE_BYTES)
-    parser.add_argument("--openssl", default="openssl")
-    parser.add_argument("--openssl-timeout", type=_positive, default=DEFAULT_OPENSSL_TIMEOUT)
+    parser.add_argument("--archive", type=Path, help="the distribution archive (.tar.gz) to verify")
+    parser.add_argument("--signature", type=Path, help="its detached 64-byte Ed25519 signature (.sig)")
+    parser.add_argument("--trusted-public-key", type=Path,
+                        help="the publisher's public key: a file of 64 lowercase hex characters, obtained separately")
+    parser.add_argument("--verified-copy", type=Path,
+                        help="write the exact verified bytes to this new path (an existing file is never replaced)")
+    parser.add_argument("--max-archive-bytes", type=_positive, default=DEFAULT_MAX_ARCHIVE_BYTES,
+                        help="largest archive accepted, in bytes (default: 4 GiB)")
+    parser.add_argument("--openssl", default="openssl", help="the OpenSSL executable to run (default: openssl on PATH)")
+    parser.add_argument("--openssl-timeout", type=_positive, default=DEFAULT_OPENSSL_TIMEOUT,
+                        help="seconds each OpenSSL call may take, 1 to 120 (default: 15)")
     parser.add_argument("--self-test", action="store_true", help="check local crypto support without archive input")
     parser.add_argument("--json", action="store_true", help="write a machine-readable result, including operational failures")
     args = parser.parse_args(argv)
