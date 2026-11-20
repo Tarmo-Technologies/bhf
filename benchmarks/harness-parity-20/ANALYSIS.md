@@ -1,11 +1,11 @@
-# Auto-harness parity audit — 2026-08-14
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+# Auto-harness parity results (2026-08-14)
 
 ## Outcome
 
-The current generator now builds, fuzzes, and produces a comparable expert
-measurement on every project in the pinned native parser/decompressor suite.
-It is not universally equal to expert manual harnessing, but the former major
-harnessability and protocol gaps are closed.
+On the 30 pinned C and C++ parser and decompressor projects, bhf's generated
+harness builds, fuzzes and gives a measurement comparable with the expert
+harness for every project.
 
 - 30 pinned real projects were attempted; all 30 produced comparable
   auto/expert implementation-line measurements.
@@ -15,15 +15,16 @@ harnessability and protocol gaps are closed.
 - Generated harnesses covered 50,340 comparable implementation lines versus
   48,742 for the expert harnesses. The mean generated/expert ratio was 1.106
   and the median was 1.001.
-- Ratio alone is not parity: the authoritative gap signal is the set of
-  expert-only lines. The 30 comparisons now contain 123 expert-only lines, down
-  from 440. No remaining project has more than 40, and 19 have none.
+- The gap measure is the set of expert-only lines, because the ratio can
+  exceed 1 while the expert still covers lines the generated harness misses.
+  The 30 comparisons contain 123 expert-only lines, down from 440. No project
+  has more than 40, and 19 have none.
 
-An earlier large validated improvement was libpng. Before
-public field-precondition mining, the zeroed `png_image` failed its version gate
-and covered 44 comparable lines versus the expert's 521, with 504 expert-only
-lines. Mining and declaration-checking `image.version = PNG_IMAGE_VERSION`
-moved the final result to 596 versus 530, with only three expert-only lines.
+An earlier large improvement was libpng. Before public field-precondition
+mining, the zeroed `png_image` failed its version gate and covered 44
+comparable lines against the expert's 521, with 504 expert-only lines. Mining
+and declaration-checking `image.version = PNG_IMAGE_VERSION` moved the result
+to 596 against 530, with three expert-only lines.
 
 The gap-closing pass added six further real-code results:
 
@@ -64,8 +65,8 @@ real expert harnesses and closed their missing semantics:
   configuration as evidence that the example intentionally uses API defaults,
   rather than injecting unrelated setters with fuzz-decoded values.
 
-The ten-project expansion exercised different API shapes rather than adding
-near-duplicates: annotated image buffers, POSIX regex output objects, C++
+The ten-project expansion adds new API shapes: annotated image buffers, POSIX
+regex output objects, C++
 multi-file overloads, header-inline object lifecycles, Lua VM state, streaming
 CSV finalization, and parser-owned result graphs. All ten now build, enter the
 selected target, fuzz, and produce comparable expert coverage. Five have no
@@ -84,7 +85,7 @@ The largest before/after movements were:
   through header-inline `init → target → destroy` lifecycle recovery.
 - PCRE2 moved from an uncompilable return-type declaration, then an unsafe
   destructor-only sequence, to a direct zero-flag compile harness with guarded
-  `regfree`: 2,813/2,696 lines and only eight expert-only lines.
+  `regfree`: 2,813/2,696 lines and eight expert-only lines.
 - Snappy, cmark, and tomlc99 reached exact parity; Lua exceeds its expert
   baseline after unrelated lexical test calls were excluded from the protocol.
 
@@ -92,13 +93,13 @@ The largest before/after movements were:
 
 After the 30-project table was frozen, the libcsv residual exposed a general
 protocol-selection error: its mined example used the library defaults, but the
-generic operation alphabet still added every same-family setter. Three fresh,
-independent 15-second comparisons after the fix each produced the same result:
-214 generated lines versus 197 expert lines, zero expert-only lines, and 17
-generated-only lines. The emitted lifecycle is the expert-shaped
-`init → parse → fini → free` sequence and contains no unevidenced setter. The
-checked 30-project table remains the reproducible five-second suite result; this
-focused measurement is recorded separately rather than mixing campaign lengths.
+generic operation alphabet still added every same-family setter. After the
+fix, a 15-second comparison gives 214 generated lines against 197 expert
+lines, zero expert-only lines and 17 generated-only lines, and the result
+repeats on fresh runs. The emitted lifecycle is the expert-shaped
+`init → parse → fini → free` sequence, with no setter the example lacks. The
+checked 30-project table is the five-second suite result; this 15-second
+measurement is kept apart so the table uses one campaign length.
 
 ## Method
 
@@ -115,13 +116,13 @@ both harnesses. The oracle compares covered `source:line` coordinates only in
 project-owned implementation translation units instrumented in both binaries;
 expert drivers, generated harness code, and repair stubs are excluded.
 
-This is a short, deterministic parity screen, not a claim about asymptotic bug
-yield. Longer multi-seed campaigns, sanitizer findings, execution rate, and
-semantic invariant quality should be a second benchmark dimension. Replaying
-one common corpus isolates harness semantics, but can favor either harness when
-the two map the same bytes into different argument structures.
+The suite is a short, deterministic screen of line coverage. Longer
+multi-seed campaigns, sanitizer findings, execution rate and semantic
+invariants belong to a second benchmark (see shortcoming 5 below). Replaying
+one common corpus isolates harness semantics, and can favour either harness
+when the two map the same bytes into different argument structures.
 
-## High-value levers implemented
+## Generator changes behind these results
 
 - Declaration-checked C protocol traces now retain input offsets, length
   transforms, byte predicates, comparison ranges, result masks, prior-call
@@ -170,14 +171,15 @@ the two map the same bytes into different argument structures.
   admitted, while targets without a retained trace keep exploratory setters.
 - Direct `if/else` protocol arms retain complementary input/result predicates,
   so mutually exclusive expert operations no longer become one impossible
-  lexical sequence. The miner deliberately leaves arbitrary CFGs out of scope.
+  lexical sequence. The miner handles direct two-arm alternatives; arbitrary
+  control flow is shortcoming 1 below.
 - Expert coverage builds recover direct source closures from the generated
   Makefile, closing multi-file oracle failures such as Snappy without adding
   project-specific source lists.
 - `BHF_EXPERT_COVERED_LINES` supplies the same oracle for any language whose
   expert runner can emit `source:line` coverage. It accepts a single file or a
-  per-harness directory, so interpreted/JVM ecosystems are not forced through a
-  fake C/C++ build path.
+  per-harness directory, so interpreted and JVM ecosystems use their own
+  coverage tools.
 - Scalar control flags are inferred from declaration names and flag typedefs,
   including common abbreviations, without mistaking aggregate configuration
   objects for bitmasks.
@@ -194,70 +196,53 @@ the two map the same bytes into different argument structures.
   and TSan replay stops the remaining corpus when its global timeout budget is
   exhausted instead of spending a fresh timeout on every input.
 
-## Remaining shortcomings, ordered by value
+## Remaining shortcomings, highest value first
 
-1. **Trace richer control flow rather than lexical call lists.** The current
-   miner represents useful predicates, repetitions, and direct two-arm
-   alternatives, but cannot yet retain `else if` conjunctions, early exits, or
-   arbitrary loop topology. A small declaration-checked CFG/SSA slice around
-   the selected call would reduce residual alternative states without copying
-   entire upstream harnesses.
+1. **Trace richer control flow than lexical call lists.** The miner records
+   predicates, repetitions and direct two-arm alternatives. It does not record
+   `else if` conjunctions, early exits or arbitrary loop topology. A small
+   declaration-checked CFG/SSA slice around the selected call would reduce
+   the remaining alternative states without copying whole upstream
+   harnesses.
 
 2. **Generalize exact public recipes from declarations and documentation.** The
-   narrow library recipes are intentionally signature-gated and safe, but a new
-   library with the same public protocol will not automatically inherit them.
-   Promote their common pieces—out-handle success predicates, macro-shaped
-   constructors, dimension probes, output cleanup, and terminal conditions—into
-   declaration-checked protocol IR.
+   library recipes are signature-gated, so a new library with the same public
+   protocol does not inherit them. Promote their common pieces (out-handle
+   success predicates, macro-shaped constructors, dimension probes, output
+   cleanup and terminal conditions) into declaration-checked protocol IR.
 
 3. **Bootstrap format-valid corpora and measure lane stability.** libarchive's
    remaining 40 lines fluctuate in five-second campaigns even though the
    corresponding expert operations are present. Seed each retained protocol
    lane with minimal public-format exemplars, repeat seeds, and report confidence
-   intervals so corpus luck is not mistaken for a harness deficit.
+   intervals that separate corpus luck from a harness deficit.
 
-4. **Model multi-plane and callback-owned output geometry.** The new checked
-   geometry path covers interleaved decode-into APIs. Planar image/audio outputs,
-   caller-supplied row callbacks, and APIs whose probe returns a richer public
-   descriptor still need a bounded allocation graph rather than independent
-   pointer guesses.
+4. **Model multi-plane and callback-owned output geometry.** The checked
+   geometry path covers interleaved decode-into APIs. Planar image and audio
+   outputs, caller-supplied row callbacks, and APIs whose probe returns a
+   richer public descriptor need a bounded allocation graph in place of
+   independent pointer guesses.
 
 5. **Measure semantic and bug-finding parity.** Add multiple deterministic
    seeds and 30–120 second campaigns, compare edge sets plus sanitizer/oracle
    findings, and track time-to-first unique state. Keep expert-only lines as a
-   regression gate; a generated-only line surplus must never erase a distinct
+   regression gate, so a surplus of generated-only lines cannot hide a missing
    expert path.
 
-## Audit of code pushed today
+## Validation
 
-The audit covered the day's functional commits: `8879267` (`fix(idl): parse the
-IDL projects ship, and emit Ada that GNAT accepts`), `3533b5c` (`feat(auto):
-close expert harness parity gaps`), and this follow-up. The automated dependency
-updates were also included in the workspace build. “Bug-free” cannot be proven
-by testing, but the changed parser/emitter, auto-harness, replay, and GNAT-backed
-paths are passing.
+Two regressions were caught and fixed before these results were recorded. The
+first WebP geometry version rejected malformed probe inputs before target
+entry; it now keeps a safe generic capacity and stride fallback. The first
+typedef-aware flag rule also pinned real enum modes and Windows `BOOL`
+inputs; it is now restricted to direct integers or explicitly flag-shaped
+scalar or enum typedefs. Real-project reruns confirm target entry for every
+updated row.
 
-The follow-up validation caught and fixed two regressions before publication.
-The first WebP geometry version rejected malformed probe inputs before target
-entry; it now retains a safe generic capacity/stride fallback. The first
-typedef-aware flag rule also pinned real enum modes and Windows `BOOL` inputs;
-it is now restricted to direct integers or explicitly flag-shaped scalar/enum
-typedefs. Real-project reruns verify target entry for every updated row.
-
-- The final CLI, harness-generator, and C-parser library suites passed: 1,634,
-  597, and 69 tests respectively. The broader workspace library validation also
-  passed its 80 runtrace-shim tests and all IDL/fake-CORBA unit tests.
-- A fresh five-project real-code regression slice kept Expat, libarchive, zlib,
-  libucl, and libcsv buildable, target-entered, fuzzed, and expert-comparable;
-  zlib/libucl remained exact, libcsv retained zero expert-only lines, and
-  libarchive's known residual remained 40 lines.
-- `m10_fake_corba`: 17/17 passed, including legacy/annotated IDL mapping and
-  GNAT-available build paths.
-- `auto_legacy_audit_fixes`: 2/2 passed, including mixed K&R/ANSI discovery and
-  Ada target entry.
-- `ioctl_control_plane`: 1/1 passed.
-- Release build, formatter check, diff whitespace check, and benchmark-runner
-  Python smoke check passed.
+A five-project real-code regression slice (Expat, libarchive, zlib, libucl,
+libcsv) stayed buildable, target-entered, fuzzed and expert-comparable:
+zlib and libucl stayed exact, libcsv kept the zero expert-only lines of its
+post-fix rerun, and libarchive's residual stayed at 40 lines.
 
 The exact final per-project measurements are in `results/results.tsv` and the
 compact table is in `results/summary.md`.

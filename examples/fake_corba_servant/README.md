@@ -2,9 +2,11 @@
 
 # Fake CORBA Servant Fixture
 
-This fixture exercises fake CORBA servant fuzzing. `Bar_Impl.Compute` raises
-and swallows `Foo.BadInput`; M10 generates the missing `Foo` package and base
-fake CORBA packages so the servant can build without a real ORB.
+Fixture for fuzzing a CORBA servant without a real ORB. `Bar_Impl.Compute`
+raises and swallows `Foo.BadInput` when its string argument is `"neg"`.
+`bhf fake-corba` generates the missing `Foo` package and the base fake CORBA
+packages, so the servant builds.
 
-M12 generates a servant-direct harness, feeds the `"neg"` testcase through the
-fake-CORBA build, and emits a finding for the handled `Foo.BadInput` path.
+`crates/cli/tests/m10_fake_corba.rs` generates a servant-direct harness,
+builds it when GNAT is installed, feeds it the `"neg"` testcase, and checks
+that bhf emits a finding for the handled `Foo.BadInput`.

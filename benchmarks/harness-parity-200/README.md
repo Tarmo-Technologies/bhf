@@ -1,41 +1,39 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # 200-project multilingual harness-parity audit
 
-This audit measures bhf auto-harnessing against independent expert drivers
-across all sixteen supported languages. It is deliberately distinct from both
-the 500-project estate sweep and the 30-project native line-coverage suite:
+This audit measures bhf's generated harnesses against independent expert
+drivers in all sixteen language lanes. It sits beside two other studies:
 
-- the estate sweep asks whether any generated target builds and executes;
-- the native suite deeply compares C/C++ implementation-line sets;
+- the [500-project sweep](../campaign-2026-07-25/README.md) asks whether any
+  generated target builds and executes;
+- the [30-project native suite](../harness-parity-20/README.md) compares
+  C/C++ implementation-line sets in depth;
 - this audit takes a balanced 200-project sample and records the strongest
-  comparable evidence available for every lane.
+  comparable evidence available in every lane.
 
-The sample contains 12 projects from each language plus one extra project from
-each of the eight core lanes, for exactly 200. Within every language it includes
-up to four projects where the 2026-07-27 sweep did not reach a target; the
-remainder previously fuzzed. PHP has only three such rows in the source result
-set, so its twelfth slot remains in the reached stratum. Selection stays in
-star-rank order within those two strata and prefers repositories below 50 MiB
-so the audit can be repeated on one host. Every repository and revision is
-pinned in `projects.tsv`.
+The sample has 12 projects per language plus one more in each of the eight
+core lanes (C, C++, Rust, Java, Python, Go, JavaScript, TypeScript), 200 in
+all. In every language it includes up to four projects where the 2026-07-27
+sweep reached no target; the rest fuzzed in that sweep. PHP has only three
+such rows in the source results, so its twelfth project is one that fuzzed.
+Within each group, projects are taken in star-rank order, preferring
+repositories under 50 MB so the audit can be repeated on one host. Every
+repository and revision is pinned in `projects.tsv`.
 
-Evidence is reported in three tiers and is never silently promoted:
+Evidence is reported in three tiers, each counted on its own:
 
-1. discovery/build/target-entry for every project;
+1. discovery, build and target entry for every project;
 2. semantic parity against an independently reviewed expert driver;
-3. source-line parity only when both harnesses expose compatible covered-line
+3. source-line parity, where both harnesses expose compatible covered-line
    coordinates.
 
-Generate the pinned manifest from the checked 500-project corpus:
+Generate the pinned manifest from the 500-project corpus:
 
 ```sh
 python3 benchmarks/harness-parity-200/select.py
 ```
 
-Run one project per language as a toolchain and runner pilot. The broad audit
-uses the normal ten-candidate backfill policy; `--max-attempts 1` is available
-as a separate target-ranking stress test and must not be conflated with general
-auto-harnessability.
+Run one project per language as a toolchain and runner pilot:
 
 ```sh
 cargo build --release -p bhf
@@ -43,44 +41,67 @@ python3 benchmarks/harness-parity-200/run.py --limit-per-language 1 \
   --keep-sources --output /tmp/bhf-harness-parity-200-pilot
 ```
 
-Run or resume the complete auto baseline:
+The audit lets `bhf auto` try up to ten candidate targets per project
+(`--max-attempts 10`, the default). `--max-attempts 1` stresses target ranking
+and measures something different; keep its results apart.
+
+Run or resume the complete audit:
 
 ```sh
 python3 benchmarks/harness-parity-200/run.py --jobs 4
 python3 benchmarks/harness-parity-200/run.py --jobs 4 --resume
 ```
 
-After an implementation change that affects only selected lanes, rerun those
-projects into the same output with `--include-existing`. Fresh rows replace the
-old rows while the final report continues to cover the full audit:
+After a change that affects only some lanes, rerun those projects into the
+same output with `--include-existing`. The fresh rows replace the old ones and
+the final report still covers the whole audit:
 
 ```sh
 python3 benchmarks/harness-parity-200/run.py --jobs 4 \
   --only-language rust --only-language java --include-existing
 ```
 
-The auto runner writes one durable JSON row per project before removing its
-temporary clone, so an interrupted audit resumes without redoing completed
-projects. Every row records the exact BHF version and SHA-256 of the binary;
-the summary surfaces multiple hashes so a mixed incremental rerun cannot be
-mistaken for a clean single-build result. Generate a deterministic residual-gap
-matrix at any checkpoint with:
+| `run.py` option | Default | Meaning |
+|---|---|---|
+| `--bhf` | `target/release/bhf` | bhf binary |
+| `--output` | `/tmp/bhf-harness-parity-200` | rows, `results.tsv` and `summary.md` |
+| `--seconds` | 5 | fuzzing budget per project |
+| `--jobs` | 2 | projects run at once |
+| `--max-attempts` | 10 | candidate targets `bhf auto` tries per project |
+| `--project-timeout`, `--clone-timeout` | 240, 300 | seconds |
+| `--resume` | off | skip projects that already have a row |
+| `--include-existing` | off | include rows of projects not run this time in the summary |
+| `--keep-sources` | off | keep each clone after its row is written |
+| `--only`, `--only-language` | all | restrict to a project or a language (repeatable) |
+| `--limit-per-language` | none | at most this many projects per language |
+| `--bhf-arg` | none | extra `bhf auto` argument for every project, recorded in each row (repeatable) |
+
+The runner writes one JSON row per project before it removes the temporary
+clone, so an interrupted audit resumes without redoing finished projects.
+Every row records the bhf version and the SHA-256 of the binary, and the
+summary lists every hash it saw, so a mixed incremental rerun shows as one.
+Write the residual-gap matrix (`gaps.tsv`, `gap-report.md`) at any point with:
 
 ```sh
 python3 benchmarks/harness-parity-200/analyze.py
 ```
 
-Compare the durable broad rows to the independently designed all-language expert
-set (one pinned real project and checked-in driver per lane):
+Compare the rows with the expert set (one pinned real project and checked-in
+driver per language, listed in `expert-projects.tsv`):
 
 ```sh
 python3 benchmarks/harness-parity-200/compare.py
 ```
 
-The comparison fails closed if any supported lane or expert file is absent. It
-separates dynamic target-entry/body proof from target-selection parity and lists
-the state, resource, dependency, object, or ABI lever used by each expert driver.
-The checked-in `expert/` directory contains one real driver for every supported
-language; its files are hashed into `expert-harnesses.tsv` on every comparison.
-The measured baseline, final focused controls, closed levers, and remaining
-expert-parity paths are summarized in [`FINDINGS.md`](FINDINGS.md).
+`compare.py` exits with an error if a language or an expert file is missing.
+It reports dynamic target-entry and body evidence apart from target-selection
+parity, and lists the state, resource, dependency, object or ABI setup each
+expert driver uses. It writes `expert-parity-report.md` and
+`expert-harnesses.tsv` (the SHA-256 of every expert file) to the output
+directory. The [`expert/`](expert/README.md) directory has one real driver
+per language.
+
+[`FINDINGS.md`](FINDINGS.md) summarizes the measured baseline, the final
+focused controls, the gaps closed and the remaining expert-parity paths.
+`rows-2026-11-17-zoxide/` holds the rows of the zoxide in-crate rerun
+([validation record](../../docs/validation/2026-11-17-zoxide-incrate-parity.md)).

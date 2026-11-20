@@ -1,34 +1,34 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
-# Effectiveness benchmarks: two separate experiments (issue #85)
+# Effectiveness benchmarks: two experiments
 
-bhf makes two different claims and they need two different studies. Conflating
-them is how a benchmark starts lying. This document describes both, how to run
-the powered versions offline, and exactly what is *not* yet established.
+Two questions about bhf need two separate studies: how good its fuzzing
+engine is, and how well it writes harnesses from source. This page describes
+both experiments, how to run them offline, and the scope of each result.
 
-| | Experiment 1 — engine quality | Experiment 2 — auto-harness productivity |
+| | Experiment 1: engine quality | Experiment 2: auto-harness productivity |
 |---|---|---|
 | Question | Given a fixed harness, how good is bhf's engine vs other engines? | From a raw source checkout, how well does bhf auto-produce a useful harness? |
 | Driver | `benchmarks/engine-comparison/trade_study.py` | `benchmarks/harness-parity-20/run.py` |
 | Model | FuzzBench-style: many trials, shared coverage oracle, independent crash oracle, distributions | End-to-end setup study: checkout → build recovery → body execution → comparison |
 | Renderer | `analyze_trade_study.py` | `summary.md` + `run-metadata.json` |
 
-The two must never be merged into one headline number: Experiment 1 holds the
-harness fixed to isolate the engine; Experiment 2 varies the harness on purpose.
+Report the two as separate numbers. Experiment 1 holds the harness fixed to
+isolate the engine; Experiment 2 varies the harness on purpose.
 
-## Experiment 1 — engine quality (FuzzBench-style)
+## Experiment 1: engine quality (FuzzBench-style)
 
-Reuses the reviewed machinery already in `trade_study.py`/`run.py`: one fixed
-harness per target drives every engine, every engine's final corpus is merged
-through ONE shared libFuzzer-sancov binary (so coverage edges are directly
-comparable), and every saved crash plus final corpus is replayed through ONE
-independent ASan/UBSan oracle (so crash-find is engine-neutral). Build/setup time
-is separated from campaign time.
+`trade_study.py` and `run.py` drive every engine with one fixed harness per
+target. Every engine's final corpus is merged through one shared
+libFuzzer-sancov binary, so coverage edges are comparable across engines, and
+every saved crash and final corpus is replayed through one independent
+ASan/UBSan oracle, so a crash counts the same whichever engine found it.
+Build and setup time are recorded apart from campaign time.
 
-What issue #85 added on top:
+The study also provides:
 
-- **Pluggable target set** (`targets.py`). With no `--manifest` the study runs the
-  four checked-in controlled gates exactly as before. With `--manifest` it runs
-  pinned **real-code** targets through the identical machinery.
+- **Pluggable target set** (`targets.py`). With no `--manifest` the study runs
+  the four checked-in controlled gates. With `--manifest` it runs pinned
+  **real-code** targets through the same machinery.
 - **Distribution reporting** (`stats.py`). `aggregate()` reports, per-target AND
   pooled across targets: a Wilson 95% interval for crash-find over *valid
   campaigns only*; median + interquartile range + full range + a deterministic
@@ -36,12 +36,12 @@ What issue #85 added on top:
   time; and the count of distinct confirmed-defect signatures.
 - **Failures stay visible.** Every trial is classified (`confirmed_crash`,
   `censored_no_crash`, `build_failed`, `supervisor_timeout`, `incomplete`,
-  `unsupported`) and the per-engine `outcomes` breakdown is printed, so the
-  effective sample size behind a rate is never hidden. Right-censored no-crash
-  campaigns keep their censor time.
-- **Native counters are not a shared unit.** `native_execs_per_s` is reported
-  per-engine with `comparable_across_engines: false`; it is never pooled.
-- **Coverage over time** (#256). While a campaign runs, the study copies the
+  `unsupported`) and the per-engine `outcomes` breakdown is printed, so every
+  rate shows the sample size behind it. Right-censored no-crash campaigns keep
+  their censor time.
+- **Native counters stay per engine.** `native_execs_per_s` is reported per
+  engine with `comparable_across_engines: false` and is never pooled.
+- **Coverage over time.** While a campaign runs, the study copies the
   engine's on-disk corpus at 10, 25, 50 and 75% of the budget
   (`stats.CHECKPOINT_FRACTIONS`; libFuzzer's corpus dir, AFL++'s queue,
   honggfuzz's output corpus, and for bhf the `BHF_LIVE_CORPUS_DIR` it is
@@ -52,19 +52,20 @@ What issue #85 added on top:
   summary's `coverage_over_time` gives each fraction's distribution over the
   trials. A trial that ended early (libFuzzer stops at its first crash) is
   missing from the later points, which their `n` shows.
-- **Retained findings** (#256). After a campaign every crash input the engine
+- **Retained findings.** After a campaign every crash input the engine
   kept (libFuzzer's `crash-*` artifacts, AFL++'s `crashes/`, honggfuzz's crash
   dir, bhf's `results/findings/*/testcase.bin`), at most 64, is replayed
   through the oracle. A row's `retained_findings` gives how many were kept,
   replayed and confirmed, and how many distinct normalized diagnostics the
-  confirmed ones give (a grouping aid, not a defect count); the summary has
-  the distributions of the confirmed count and of the diagnostics. It shows
-  what an engine keeps past its first crash: libFuzzer stops there, AFL++ and
-  bhf go on.
+  confirmed ones give (a grouping aid for triage); the summary has the
+  distributions of the confirmed count and of the diagnostics. It shows what
+  an engine keeps past its first crash: libFuzzer stops there, AFL++ and bhf
+  go on.
 
 ### Running Experiment 1
 
-Builtin controlled fixtures (the historical default, needs the engines installed):
+The four built-in controlled fixtures (the default; needs the engines
+installed):
 
 ```sh
 cargo build --release -p bhf
@@ -105,7 +106,7 @@ relative to the manifest file unless absolute.
 |---|---|---|
 | `name` | yes | unique target id |
 | `kind` | no (`self_contained`) | `self_contained` real code, or `builtin_fixture` |
-| `status` | no (`runnable`) | `runnable`, `requires_build_recipe`, or `manual`; only `runnable` is built — others become visible `unsupported` rows |
+| `status` | no (`runnable`) | `runnable`, `requires_build_recipe`, or `manual`; only `runnable` is built; the others become `unsupported` rows |
 | `upstream` | yes for real code | `{url, commit}` provenance pin |
 | `sources` | yes if runnable without a `recipe` | translation units compiled with the harness adapter; one must define `target_one_input` (or set `target_callback`) |
 | `recipe` | no | a build recipe in `recipes.py` that supplies `sources`, `include_dirs` and `extra_cflags` from the fetched checkout at run time |
@@ -115,7 +116,7 @@ relative to the manifest file unless absolute.
 | `seed_dir` | no | seed corpus (defaults to the shared 8-byte zero seed) |
 | `budget_s`, `max_len` | no | per-target overrides |
 | `sanitizer_policy` | no (`asan_ubsan`) | oracle/fuzz sanitizer selection, pinned per target |
-| `bhf_harness_mode` | no (`generated`) | `generated` (bhf writes its own harness — only honest on a self-contained TU) or `provided` (harness held fixed across engines — the correct engine-quality mode) |
+| `bhf_harness_mode` | no (`generated`) | `generated` (bhf writes its own harness; use it only for a self-contained translation unit) or `provided` (the same harness for every engine; use it to compare engines) |
 
 To promote a `requires_build_recipe` target to `runnable`: fetch its sources
 (step 2 above), write a small adapter `.c` that includes the library header and
@@ -131,8 +132,8 @@ checkout `--fetch` cloned at the pin, checks the SHA-256 of every file it uses,
 generates whatever the project's own build would, checks the generated files
 too, and returns the adapter (`adapters/<name>_adapter.c`) and the project's
 translation units, include dirs and flags. A checksum mismatch stops the run:
-a moved pin or a changed generator is not the variant the manifest names.
-Generated files live under `<workdir>/recipes/<name>/`.
+the manifest names one exact variant, and a moved pin or a changed generator
+gives a different one. Generated files live under `<workdir>/recipes/<name>/`.
 
 | Recipe | Builds |
 |---|---|
@@ -148,26 +149,32 @@ source by its file name and RE2 has its own `re2.cc`; two sources with one
 name stop the run. A recipe's libraries (`link_flags`) follow the sources on
 every compiler line, and reach bhf as `bhf build --ldflags`.
 
-A smoke build, `BHF_TRADE_STUDY_SOURCES=<fetch root> python3 -m unittest
-test_runner`, prepares every recipe and builds and runs its libFuzzer harness.
+A smoke build prepares every recipe and builds and runs its libFuzzer harness:
 
-## Experiment 2 — auto-harness productivity
+```sh
+BHF_TRADE_STUDY_SOURCES=<fetch root> python3 -m unittest discover \
+  -s benchmarks/engine-comparison -p test_runner.py
+```
 
-`harness-parity-20/run.py` drives bhf `auto` from a clean pinned checkout of each
-real project and compares the generated harness's project-line coverage against a
-reviewed expert harness at the identical revision (`BHF_BLIND_EXPERT_HARNESSES=1`
-hides the project's own fuzz driver from mining). Issue #85 added:
+## Experiment 2: auto-harness productivity
+
+[`harness-parity-20/run.py`](../harness-parity-20/README.md) runs `bhf auto`
+from a clean pinned checkout of each real project and compares the generated
+harness's project-line coverage against a reviewed expert harness at the same
+revision (`BHF_BLIND_EXPERT_HARNESSES=1` hides the project's own fuzz driver
+from recipe mining). The runner records:
 
 - **Setup separated from campaign.** `setup_wall_s` (clone/fetch/checkout) and
-  `auto_wall_s` (the single `bhf auto`, covering discovery + build recovery +
-  harness generation + fuzz) are recorded per project; a finer build-vs-fuzz
-  split is surfaced when bhf emits it.
+  `auto_wall_s` (the single `bhf auto`: discovery, build recovery, harness
+  generation and fuzzing) per project, and a finer build-versus-fuzz split
+  when bhf emits one.
 - **A funnel that counts every attempted project.** `attempted → checkout_ok →
   produced_result → body_executed → expert_comparable → parity_or_better`, with
-  *projects attempted* as the denominator at every stage. A project that fails to
-  check out or build is a stage that drops out, never a row that is removed.
-- **Provenance.** `run-metadata.json` pins the binary sha256/version, git commit,
-  host, config, and every project commit.
+  *projects attempted* as the denominator at every stage. A project that fails
+  to check out or build stays in the table and drops out at that stage.
+- **Provenance.** `run-metadata.json` records the binary's SHA-256 and
+  version, the git commit, the host, the configuration and every project
+  commit.
 
 ```sh
 cargo build --release -p bhf
@@ -175,25 +182,23 @@ python3 benchmarks/harness-parity-20/run.py --seconds 15 --jobs 2 \
   --output /path/to/output
 ```
 
-"Useful retained findings" in the issue's sense (confirmed crash/sanitizer
-findings, not just coverage parity) is measured per engine by Experiment 1
-(`retained_findings`); this coverage-parity suite does not capture it.
+Experiment 2 measures coverage parity. Confirmed crash and sanitizer findings
+per engine are measured by Experiment 1 (`retained_findings`).
 
-## Limitations (what is not established)
+## Scope of the results
 
-- **Supported niche + measured advantage.** The controlled gates show bhf's
-  engine reaches gate-guarded bugs competitively on micro-fixtures; the
-  harness-parity suite shows bhf auto-generates harnesses whose project-line
-  coverage reaches expert parity on a pinned real-code set. Neither establishes a
-  general "industry-leading effectiveness" claim on arbitrary production targets.
-  State the niche and the measured number; do not extrapolate.
-- **No licensed-tool comparison.** No Mayhem (or other licensed tool) evaluation
-  has been run; make no such parity claim without an actual authorized run.
-- **Real-code multi-file builds.** The single clang/afl-cc/hfuzz-cc invocation
-  cannot configure an arbitrary project build; a target without a build recipe
-  ships as `requires_build_recipe` (visible `unsupported` rows).
-- **bhf provided harness.** With `bhf_harness_mode=provided` (the correct
-  engine-quality mode for real code) the bhf lane wraps the same
+- **What each experiment measures.** The controlled gates measure how bhf's
+  engine reaches gate-guarded bugs in micro-fixtures. The harness-parity suite
+  measures the project-line coverage of bhf's generated harnesses against
+  expert harnesses on a pinned real-code set. Quote each result with the
+  target set it was measured on.
+- **Engines compared.** bhf's built-in engine, AFL++, libFuzzer and honggfuzz.
+- **Real-code multi-file builds.** Each engine's build is a single clang,
+  `afl-cc` or `hfuzz-cc` invocation. A target whose project build needs more
+  than that has a recipe in `recipes.py`, or ships as `requires_build_recipe`
+  and shows as an `unsupported` row.
+- **bhf with a provided harness.** With `bhf_harness_mode=provided` (the mode
+  for comparing engines on real code) the bhf lane wraps the same
   `harnesses/libfuzzer.c` every other engine builds:
   `bhf generate-harness harnesses/libfuzzer.c --target LLVMFuzzerTestOneInput
   --id H-PROVIDED --output <work>/harnesses`, with each target source as
@@ -206,8 +211,8 @@ findings, not just coverage parity) is measured per engine by Experiment 1
 
 ## CI boundary
 
-The powered campaign drivers are deliberately NOT in any workflow. `ci.yml`
-runs the deterministic classification/stats/manifest tests in
+No workflow runs the campaign drivers. `ci.yml` runs the deterministic
+classification, statistics and manifest tests in
 `benchmarks/engine-comparison/test_runner.py` ("Test the engine-comparison
 scripts"), before bhf is built, so they build and fuzz nothing; the provided-
 harness smoke among them runs only where a bhf binary (`$BHF_TRADE_STUDY_BHF`,
@@ -217,11 +222,11 @@ else `target/release/bhf`) and clang exist:
 python3 -m unittest discover -s benchmarks/engine-comparison -p 'test_*.py'
 ```
 
-Powered real-code studies are run offline/scheduled and publish their immutable
-evidence (raw rows, hashes, commands, analysis doc) separately.
+Full real-code studies run offline or on a schedule and publish their evidence
+(raw rows, hashes, commands, analysis) separately.
 
-## Dependency note
+## Dependencies
 
-These drivers are intentionally standard-library only (dataclasses + strict
-validation that raises descriptive errors, not Pydantic) so the offline powered
-study runs on a bare `python3` with no third-party install on the benchmark host.
+The drivers use only the Python standard library (dataclasses, with strict
+validation that raises descriptive errors), so a study runs on a bare
+`python3` with nothing else installed on the benchmark host.

@@ -2,12 +2,14 @@
 
 # Kernel guest replies
 
-`replies/` holds what bhf's executor (`c_runtime/kernel_executor.c`) sent
-back for four programs, recorded in the guest `bhf kernel run` boots: the
-kernel and `widget.ko` that `scripts/ci/build-kcov-guest-kernel.sh` builds
-(Linux 6.12.118, KCOV and KASAN), under QEMU 8.2.2 with tcg, one boot, in
-this order. Each `NAME.prog` is the program, in the executor's format, and
-`NAME.reply` the REPLY message's payload (no header).
+`replies/` holds what bhf's in-guest executor
+([`c_runtime/kernel_executor.c`](../../../c_runtime/kernel_executor.c)) sent
+back for four programs, recorded in one boot in the order of the table
+below. The guest is the one `bhf kernel run` starts, with the kernel and
+`widget.ko` that `scripts/ci/build-kcov-guest-kernel.sh` builds (Linux
+6.12.118, KCOV and KASAN), under QEMU 8.2.2 with TCG. Each `NAME.prog` is the
+program in the executor's format, and `NAME.reply` is the REPLY message's
+payload without its header.
 
 | Name | Program |
 |---|---|
@@ -21,9 +23,10 @@ addresses, and the module's are where it loaded on that boot.
 
 # Kernel guest console logs
 
-`console/` holds the serial console of guests that `bhf kernel run`
-booted, each from the executor's `ready` line (the boot before it left
-out) to the guest's end, as the parser of `bhf kernel fuzz` reads them:
+`console/` holds the serial console of guests that `bhf kernel run` booted,
+as the parser of `bhf kernel fuzz` reads them. Each log runs from the
+executor's `ready` line to the guest's end; the boot messages before `ready`
+are cut.
 
 | Log | Kernel | What ran |
 |---|---|---|
@@ -38,7 +41,8 @@ out) to the guest's end, as the parser of `bhf kernel fuzz` reads them:
 The KASAN kernel is the one `scripts/ci/build-kcov-guest-kernel.sh`
 builds. The KCSAN kernel is the same release with the same recipe, KASAN
 off and `CONFIG_KCSAN`, `CONFIG_KUNIT` and `CONFIG_KCSAN_KUNIT_TEST` on.
-`bugs.c` is the module whose ioctl commands make the bugs, built against
-each with `-fmacro-prefix-map` so its WARNING names `drivers/misc/bugs.c`.
+`console/bugs.c` is the module whose ioctl commands trigger the bugs. It is
+built against each kernel with `-fmacro-prefix-map`, so its WARNING names
+`drivers/misc/bugs.c`.
 Every guest booted with `panic_on_warn=1`, so each log ends at the panic
 its report caused.

@@ -1,9 +1,12 @@
-## Against the tool for each job
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+# bhf against the usual tool for each job
 
-Measured on the same twelve projects, cloned once and read by every tool
-(`benchmarks/campaign-2026-07-25/compare-*.json`).
+Measured on twelve projects from the 500-project sweep, cloned once and read
+by every tool. `compare.py` produced the numbers; the raw values are in
+`compare-sloc.json`, `compare-sbom.json` and `compare-static.json` in this
+directory.
 
-### Line counting, against cloc (the accuracy reference) and tokei
+## Line counting, against cloc (the reference) and tokei
 
 | Project | bhf | cloc | tokei | bhf time | cloc time |
 |---|---:|---:|---:|---:|---:|
@@ -20,13 +23,13 @@ Measured on the same twelve projects, cloned once and read by every tool
 | tmuxinator | 1,342 | 7,123 | 5,174 | 0.01s | 0.35s |
 | fd | 6,779 | 8,570 | 7,525 | 0.01s | 0.37s |
 
-Total wall: bhf 0.74s, cloc 6.91s — **9x faster**. bhf counts
-less than cloc on purpose: vendored trees, `node_modules`, `.venv` and test
-directories are pruned, because the number that matters is the code it would fuzz.
-This comparison is also what exposed six lanes the counter did not know about at
-all (PHP, Ruby, Lua, C#, COBOL, Fortran); the numbers above are after that fix.
+Total wall time: bhf 0.74s, cloc 6.91s, about 9x faster. bhf prunes vendored
+trees, `node_modules`, `.venv` and test directories, so it counts the code it
+would fuzz and its totals are lower than cloc's. This comparison exposed six
+languages the counter did not recognise (PHP, Ruby, Lua, C#, COBOL, Fortran);
+the numbers above are from after that fix.
 
-### SBOM, against syft
+## SBOM, against syft
 
 | Project | bhf components | syft components | bhf time | syft time |
 |---|---:|---:|---:|---:|
@@ -43,36 +46,36 @@ all (PHP, Ruby, Lua, C#, COBOL, Fortran); the numbers above are after that fix.
 | tmuxinator | 0 | 4 | 0.51s | 18.72s |
 | fd | 130 | 137 | 0.9s | 24.51s |
 
-Total wall: bhf 12.43s, syft 349.26s — **28x faster**. Counts differ
-in both directions: bhf reads declared manifests with evidence grading, syft also
-fingerprints vendored binaries. This comparison found a gemspec parser that required
-parentheses, so every gemspec-driven Ruby project reported zero components; the
-numbers above are after that fix.
+Total wall time: bhf 12.43s, syft 349.26s, about 28x faster. The counts differ
+in both directions: bhf reads declared manifests and grades each component's
+evidence, and syft also fingerprints vendored binaries. This comparison found
+a gemspec parser that required parentheses, so every gemspec-driven Ruby
+project reported zero components; the numbers above are from after that fix.
 
-### Static analysis, against cppcheck, flawfinder, bandit and gosec
+## Static analysis, against cppcheck, flawfinder, gosec and bandit
 
-| Project | Lane | bhf | time | competitor | time |
-|---|---|---:|---:|---:|---:|
-| cJSON | c | 40 | 2.79s | cppcheck 223 | 740.23s |
-| jansson | c | 34 | 0.29s | cppcheck 88 | 47.24s |
-| leveldb | cpp | 22 | 0.42s | cppcheck 78 | 4.56s |
-| tinyxml2 | cpp | 10 | 0.92s | cppcheck 49 | 20.94s |
-| mkcert | go | 10 | 0.02s | gosec 19 | 1.18s |
-| gson | java | 5 | 0.49s | no comparable tool | — |
-| inspect.lua | lua | 2 | 0.01s | no comparable tool | — |
-| MySQLTuner-perl | perl | 6 | 0.21s | no comparable tool | — |
-| monolog | php | 0 | 0.08s | no comparable tool | — |
-| requests | python | 23 | 0.17s | bandit 708 | 1.48s |
-| tmuxinator | ruby | 5 | 0.03s | no comparable tool | — |
-| fd | rust | 7 | 0.07s | no comparable tool | — |
+| Project | Lane | bhf | time | cppcheck, gosec or bandit | time | flawfinder | time |
+|---|---|---:|---:|---:|---:|---:|---:|
+| cJSON | c | 40 | 2.79s | cppcheck 223 | 740.23s | 112 | 0.34s |
+| jansson | c | 34 | 0.29s | cppcheck 88 | 47.24s | 123 | 0.31s |
+| leveldb | cpp | 22 | 0.42s | cppcheck 78 | 4.56s | 147 | 0.37s |
+| tinyxml2 | cpp | 10 | 0.92s | cppcheck 49 | 20.94s | 71 | 0.13s |
+| mkcert | go | 10 | 0.02s | gosec 19 | 1.18s | — | — |
+| gson | java | 5 | 0.49s | — | — | — | — |
+| inspect.lua | lua | 2 | 0.01s | — | — | — | — |
+| MySQLTuner-perl | perl | 6 | 0.21s | — | — | — | — |
+| monolog | php | 0 | 0.08s | — | — | — | — |
+| requests | python | 23 | 0.17s | bandit 708 | 1.48s | — | — |
+| tmuxinator | ruby | 5 | 0.03s | — | — | — | — |
+| fd | rust | 7 | 0.07s | — | — | — | — |
 
-bhf runs between 6x and 265x faster (cJSON: 2.8s against cppcheck's 740s) and
-reports far fewer findings — 23 against bandit's 708 on requests. Fewer is the intent,
-not a gap: the rules are precision-first, and an earlier campaign adjudicated the
-false-positive rate directly (`docs/site/sast-comparison.md`). Six lanes are now
-counted but still have no static rules of their own; that remains open.
+bhf runs 9x to 265x faster than cppcheck, gosec and bandit (cJSON: 2.8s
+against cppcheck's 740s). flawfinder, a lexical scanner, is faster than bhf on
+three of the four C and C++ projects. bhf reports
+fewer findings than any of them, for example 23 against bandit's 708 on
+requests: its rules favour precision, and an earlier campaign measured their
+false-positive rate ([`docs/site/sast-comparison.md`](../../docs/site/sast-comparison.md)).
+`static-scan` has no rules specific to PHP, Ruby, Lua, C#, COBOL or Fortran.
 
-Half the corpus has no comparable tool at all: there is no mainstream analyser or
-fuzzer in this class for Ada, COBOL, Fortran, Lua or Perl, which is the point of the
-sixteen-lane table above.
-
+`compare.py` runs no other static analyser on the Java, Lua, Perl, PHP, Ruby
+and Rust projects, so those rows show bhf's count only.
