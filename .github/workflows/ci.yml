@@ -368,12 +368,25 @@ jobs:
       - name: Install cargo-nextest
         run: bash scripts/ci/install-nextest.sh
 
+      # cli_md_common_flow runs cli.md's Ada pipeline as written; without
+      # GNAT it skips as a pass.
+      - name: Install GNAT for the Ada common-flow contract
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gnat gprbuild
+          gnatmake --version | head -1
+          gprbuild --version | head -1
+
       - name: Test the release and docs contracts
         env:
           RAYON_NUM_THREADS: "1"
-        # Builds only the contract binaries (and the library tests), not
-        # every bhf integration test.
-        run: cargo nextest run --locked -p bhf --lib --test 'm19_*' --test offline_dist_scripts --test release_bundle_manifest --test custom_harness_flow --no-fail-fast --profile ci -E 'binary(/^m19_/) | binary(=offline_dist_scripts) | binary(=release_bundle_manifest) | (binary(=custom_harness_flow) & test(/::the_guides_do_not_repeat_retired_claims$|::the_sanitizer_guide_says_which_emulated_children_name_each_key_once$/)) | (kind(lib) & test(/::the_docs_list_every_config_key$|::the_help_and_docs_list_every_cross_lane$/))'
+        # Builds only the contract binaries (and the library tests of bhf,
+        # bhf-daemon and lang_profile), not every bhf integration test.
+        # scripts/ci/tests/test_doc_contracts.py finds every test that reads
+        # a documentation page (license_audit_subcommand_exits_zero_for_current_repo
+        # reads THIRD_PARTY.md through license_policy) and fails when this
+        # filter misses one.
+        run: cargo nextest run --locked -p bhf -p bhf-daemon -p lang_profile --lib --test 'm19_*' --test offline_dist_scripts --test release_bundle_manifest --test custom_harness_flow --test auto_exit_codes_docs --test cli_md_common_flow --test collector_help --test command_help_cli --test fuzz_grammar_help --no-fail-fast --profile ci -E 'binary(/^m19_/) | binary(=offline_dist_scripts) | binary(=release_bundle_manifest) | binary(=auto_exit_codes_docs) | binary(=cli_md_common_flow) | binary(=collector_help) | binary(=command_help_cli) | binary(=fuzz_grammar_help) | (binary(=custom_harness_flow) & test(/::the_guides_do_not_repeat_retired_claims$|::the_sanitizer_guide_says_which_emulated_children_name_each_key_once$/)) | (kind(lib) & test(/::the_docs_list_every_config_key$|::the_docs_list_only_config_keys_that_exist$|::the_config_help_lists_every_config_key$|::the_help_and_docs_list_every_cross_lane$|::auto_md_lists_every_default_skip$|::vulnerability_coverage_names_the_lanes_with_and_without_sink_oracles$|::the_shipped_board_profile_template_loads$|::the_daemon_docs_list_the_tools_tools_list_advertises$|::the_readme_names_the_report_only_dialects$|::license_audit_subcommand_exits_zero_for_current_repo$/))'
 
       - name: Summarize the nextest report
         if: ${{ always() }}

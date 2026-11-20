@@ -41,12 +41,7 @@ under crates, fixtures, benchmarks and `vendor/` as test input. Unknown files,
 and a failed or partial `git diff`, select full CI. The documentation and
 website exemptions are listed one by one in the script.
 
-The release and docs contract tests (the `m19_*`, `offline_dist_scripts` and
-`release_bundle_manifest` binaries, and the tests that check a guide against
-the code) read `README.md`, `INSTALL.md` and `docs/site/*.md` and take
-seconds. `build-test` runs them on every code change. A documentation-only
-change, which skips the heavy jobs, runs them in the `doc-contracts` job, and
-`PASS_DOCS_ONLY` requires that job to pass; a full run may skip it.
+The release and docs contract tests (the `m19_*`, `offline_dist_scripts` and `release_bundle_manifest` binaries, and the tests that check a guide against the code) read `README.md`, `INSTALL.md` and `docs/site/*.md` and take seconds. `build-test` runs the library tests and those three groups of binaries on every code change. A documentation-only change, which skips the heavy jobs, runs the `doc-contracts` job instead: it runs every test that reads a documentation page (a file under `docs/` or a Markdown page at the repository root), in the `bhf`, `bhf-daemon` and `lang_profile` crates, and the help-text contracts `command_help_cli` and `the_config_help_lists_every_config_key`, with GNAT installed so `cli_md_common_flow` runs the Ada pipeline in `docs/site/cli.md`. It also runs `license_audit_subcommand_exits_zero_for_current_repo`, which audits the repository and so reads `THIRD_PARTY.md`. `scripts/ci/tests/test_doc_contracts.py` finds those tests by scanning the Rust sources, lists the tests that read a page through library code, and fails when the job's filter misses one. `PASS_DOCS_ONLY` requires that job to pass; a full run may skip it.
 
 Each Windows native test command is followed by an exit-code check, so a
 later successful test cannot hide an earlier failed command. CI Cargo
