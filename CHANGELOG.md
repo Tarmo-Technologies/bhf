@@ -5,6 +5,29 @@
 ## Unreleased
 
 ### Added
+- `bhf kernel import CRASHES... --work-dir DIR [--source-root DIR]` turns
+  syzkaller crash directories (or a syz-manager workdir) into findings
+  under `results/findings/F-KERNEL-*` (#349): the crash class, rule and CWE
+  from the title, syzkaller's title as the finding's, the stack, access and
+  object from the report, and `repro.c`/`repro.syz` as the reproducer, with
+  the reproduce command to run in the test VM (`syz-execprog` takes the
+  options syz-repro recorded atop `repro.prog`, in syz-manager's Go form or
+  the dashboard's JSON) and a `syscall` entry path rather than a harness
+  input. Re-importing updates the finding. `bhf.findings.v1` gains the `kernel import` producer and the
+  `console_log`, `repro_syz` and `repro_c` evidence roles (additive; an
+  older copy of the schema rejects them).
+- `bhf kernel syzlang SOURCE... --out DIR` writes the syzkaller description
+  of a Linux driver's ioctl interface (#348): the handlers a `struct
+  file_operations` registers, the `_IO`/`_IOR`/`_IOW`/`_IOWR` commands their
+  `switch (cmd)` dispatches on (through the calls that pass `cmd` on), the
+  argument structs and unions from the driver's own definitions (bit-fields,
+  packing, anonymous members, big-endian and always-aligned types), and the
+  device node, as `dev_<name>.txt`, with `dev_<name>.txt.const` holding each
+  command's number for the nine architectures syzkaller builds for Linux
+  (loong64 included), so no `syz-extract` run is needed. Each struct and
+  union is laid out as C does and as syzkaller will, per architecture; a
+  command whose argument type the source does not define, or whose layout
+  syzkaller cannot match, is left out with the reason.
 - `bhf auto --symcc` builds a SymCC variant of each native C/C++ harness
   (#324): the generated Makefiles gain a `symcc` goal (`main_symcc`, built by
   `SYMCC_CC`/`SYMCC_CXX`, default `symcc`/`sym++`), and run.json records it as
@@ -42,6 +65,26 @@
   `transport_profile.json` a `throughput` block (additive); `bhf replay`
   still restores before every input, and the session lane refuses
   `reset=persistent`.
+- `qemu-system:` takes `reset=fast,dirty_log=PATH`, a dirty-page fast
+  snapshot (#347): before each input a `system_reset` (a gdbstub monitor
+  command checked by the registers it leaves, else QMP) brings back the CPUs
+  and devices, and bhf writes back only the RAM pages the last run wrote,
+  which its QEMU TCG plugin (`crates/target_transport/qemu_plugin/`, loaded with
+  `-plugin`) logs, so a crash or hang needs no `loadvm`. A page is learned
+  from one `loadvm` the first time a run writes it; the baseline is the
+  machine as a reset leaves it, and memory goes by physical address. The
+  plugin runs inside QEMU (GPL-2.0), so `external-tools` now allows the
+  `qemu_plugin` subprocess id and `strict-permissive` refuses `reset=fast`;
+  a run with no log builds the plugin under `<work>/qemu-plugin/` and says
+  how to load it. On a Cortex-M core the plugin logs a bit-band alias store
+  as the RAM word it writes, and bhf restores the exception frames still
+  stacked at the stop; a frame stacked and unstacked before the stop in a
+  page no store wrote, and a device's DMA, are not restored (listed in
+  `transport_profile.json`'s `limitations`). A log no plugin in that QEMU
+  writes, or one a second session empties, stops the run, and `--workers`
+  specs that share a `dirty_log=` are refused. `TargetObservation` gains
+  `reset` (kind, time, pages; additive), `bhf replay` restores with `loadvm`,
+  and the session lane refuses `reset=fast`.
 - `bhf fuzz --target-transport renode:monitor=HOST:PORT,gdb=HOST:PORT[,snapshot=PATH]`
   fuzzes firmware on a Renode board (#340): Renode's telnet monitor saves the
   baseline with `Save` and restores it with `Load` before each input, and gdb
@@ -81,6 +124,34 @@
   (`BHF_DESOCKET`, `BHF_FAKE_CLOCK`) in a new `shim_env` block, and replay,
   minimize, env-capsule, the capsule's `verify-poc` and `replay.py` set them
   again.
+- bhf builds and fuzzes natively on Apple Silicon Macs from source (#344): a
+  new `macos-build` CI job, which CI acceptance requires, builds the
+  workspace for `aarch64-apple-darwin` on `macos-15` and runs a `bhf auto` C
+  smoke. The builtin engine's coverage and CmpLog maps now work on macOS, and
+  the C driver and generated C/C++ harnesses leave out the weak references
+  Mach-O cannot link there: those to the runtrace shim's hooks, and the one
+  to a project's `LLVMFuzzerInitialize`, which a weak no-op definition
+  replaces (in the driver and in a passthrough harness's own `main`). The
+  runtrace shim is built for Linux only, and a native target fuzzed without
+  one (on macOS and Windows, which never locate one now, or on Linux with
+  none installed) records `fidelity.runtime_shim` (`not_exercised`, with the
+  reason) on its run.json entry, the campaign rollup and its findings
+  (additive).
+- `bhf fuzz --differential-harness PATH` (#345) runs every input of the
+  builtin engine's loop through a second build of the harness as well, and
+  compares the two on how each run ended and on a hash of what it observed:
+  the bytes the target hands the driver's new `bhf_diff_observe(ptr, len)`,
+  a generated harness's target return value, and `bhf_run_one`'s. The
+  second build's persistent process runs every input the fuzzed build's runs
+  (its CmpLog, colorization and calibration re-runs too) and both start over
+  when either dies, so a target that keeps state matches itself. A
+  disagreement that holds when both re-run the input in fresh processes, with
+  twice `--timeout`, and each build repeats its own run, is a BHF-301 finding
+  with a `differential` block (`mode: in_loop`); one a work dir already holds
+  is listed in `duplicates_of_existing` instead, and `bhf replay` of it runs
+  both builds (`UNVERIFIED` without the second). An input that grows either
+  build's coverage is kept. The run summary gains a `differential` block
+  (additive).
 
 ### Changed
 - The in-crate lane for private Rust targets (#83) is `bhf auto
@@ -2969,6 +3040,45 @@
   `binary rehost` (a value added to the `bhf.findings.v1` schema's
   `producer` enum) and the reproduce command `bhf replay findings/<id>`;
   they get no `replay.py`.
+- `bhf binary rehost` serves the firmware's peripheral reads from MMIO models
+  (#352): `--mmio ADDR[@PC]=MODEL` names a `passthrough` model (the read's
+  bytes come from the input) or a `constant:VALUE` model for a register, or
+  for one instruction's reads of it; `--mmio-models FILE` loads models a run
+  JSON or finding records; `--mmio-default zero|passthrough` sets what an
+  unmodelled register reads as (`passthrough` without `--input-buffer`,
+  which is now optional, and `zero` with it, as before; a models file that
+  records no `default` leaves it to that rule). Peripheral reads take the
+  input after the buffer's bytes (the buffer then takes at most the first
+  4096); a run that wants more stops as `input_exhausted`. A model for an
+  address `--ram` or an image segment maps is refused, since memory would
+  answer its reads. The setup in the run JSON and in each finding
+  (`rehost.setup.mmio`, absent in older findings, which replay as before)
+  records the models, so `bhf replay` runs the same models again; `input`
+  may now be null, a finding's `input` block gains `mmio_reads` and
+  `mmio_bytes` and modes `rehost-mmio` and `rehost-buffer+mmio`, and the run
+  JSON gains `mmio_reads`, all additive to `bhf.binary_rehost.run.v1` and
+  `bhf.rehost.v1`. The `rehost` crate gains `MmioConfig` and a recorded
+  trace of a run's peripheral reads (`Machine::trace_mmio`).
+- `bhf binary rehost` infers bit-extract MMIO models for status-register
+  polling loops (#381): before the campaign the seeds and an input of zeros
+  run with their peripheral reads recorded, a register one instruction reads
+  8 or more times in a row is a polling loop, and probes that flip one bit
+  of its read at a time find the bits that decide it. The instruction gets
+  a `bitextract` model feeding those bits from the input (a constant that
+  ends the loop when only an input buffer takes input), and inference
+  repeats past each loop to find the next. A loop whose read the
+  `passthrough` default already feeds from the input keeps it whole unless
+  it is shown to be a status poll (a bit ends it, it stores nothing new
+  between reads, and no value of the other bits changes its path), so a
+  data register a getter reads in a dispatch loop is not narrowed. `--mmio`
+  takes `bitextract:MASK`; `--no-mmio-inference` turns inference off. The
+  run JSON gains `mmio_inference` (the loops, masks, exit values, `writes`,
+  `not_a_poll`, rounds and probes), and inferred models carry
+  `"inferred": true` in the recorded setup, which `bhf replay` runs as
+  recorded and a `--mmio-models` rerun keeps; both additive. The `rehost`
+  crate gains `infer_polling_models`, `polling_loops`, `decide` and
+  `NotAPoll`, and its trace of peripheral reads records a digest of the
+  stores between them.
 - `bhf auto` fuzzes the Go native fuzz tests a project ships (#336): each
   `func FuzzXxx(f *testing.F)` in a `_test.go` file is a target, built
   against a stand-in for `testing` whose `f.Fuzz` hands bhf's inputs to the

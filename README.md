@@ -68,7 +68,9 @@ sink oracles ran.
 
 The Docker image includes all sixteen language toolchains and isolates the
 target's build system from the host. It builds for Linux x86-64 or ARM64 and runs
-through Docker Desktop on Windows and macOS.
+through Docker Desktop on Windows and macOS. bhf also builds and fuzzes natively
+on Apple Silicon Macs, without the Linux-only runtrace shim; see
+[macOS from source](docs/site/install.md#macos-apple-silicon-from-source).
 
 ```sh
 git clone https://github.com/Tarmo-Technologies/bhf.git && cd bhf

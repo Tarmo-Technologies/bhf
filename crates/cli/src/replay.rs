@@ -249,6 +249,24 @@ pub fn run(args: ReplayArgs) -> i32 {
         let lane = crate::binary_fuzz::replay_binary_outcome(&finding_dir, &harness);
         return finish_lane(&finding_dir, lane, output);
     }
+    // #345: a divergence `bhf fuzz --differential-harness` found in its loop
+    // replays through both builds, each run as this replay runs a harness.
+    if crate::differential::in_loop::is_in_loop_finding(&finding_dir) {
+        if debugger.is_some() {
+            return lane_debugger_error(&output);
+        }
+        let lane = crate::fuzz::replay_in_loop_divergence(&finding_dir, &harness, |build| {
+            harness_runner_for(
+                build,
+                args.qemu_user.clone(),
+                args.qemu_args.clone(),
+                args.sandbox,
+                args.sandbox_tool.clone(),
+                args.sandbox_strict,
+            )
+        });
+        return finish_lane(&finding_dir, lane, output);
+    }
     // One protocol detector for fuzz, replay and minimize: the harness's
     // sources are looked up in every harness dir of the work dir that holds
     // the finding, and a binary staged alone is recognised by what is compiled

@@ -22,7 +22,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[3]
 SHA = "a" * 40
-JOBS = ("changes", "ci-policy", "minimum-rust", "build-test", "arm64-build", "container-core", "container-full",
+JOBS = ("changes", "ci-policy", "minimum-rust", "build-test", "arm64-build", "macos-build", "container-core",
+        "container-full",
         "rhel7-build", "rhel-family-smoke", "ubuntu-release-smoke", "arm64-release-build", "windows-build",
         "windows-current-build")
 # Runs only for a documentation-only change.

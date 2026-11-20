@@ -48,16 +48,25 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use target_transport::fast_snapshot::{
+    DIRTY_PAGE_PLUGIN_LIBRARY_NAME, DIRTY_PAGE_PLUGIN_SOURCE, DIRTY_PAGE_PLUGIN_SOURCE_NAME,
+};
 use target_transport::{
     ExitKind, FaultKind, FullSystemReset, FullSystemTransport, GdbMemoryMap, GuestFaultStatus,
-    RunOutcome, TargetSession, TargetTransport, TransportError,
+    ResetKind, RunOutcome, TargetSession, TargetTransport, TransportError,
 };
 
 const CC: &str = "arm-none-eabi-gcc";
 const QEMU: &str = "qemu-system-arm";
 const QEMU_IMG: &str = "qemu-img";
+/// The host C compiler that builds the dirty-page plugin (#347).
+const HOST_CC: &str = "cc";
 
 const RING_CAP: usize = 512;
+
+/// The benchmarks take turns: run together (as `--ignored` runs them), each
+/// would time the other's guests too.
+static BENCHMARK: Mutex<()> = Mutex::new(());
 
 const HARNESS_LD: &str = r#"MEMORY {
   FLASH (rx)  : ORIGIN = 0x00000000, LENGTH = 4M
@@ -117,6 +126,16 @@ static void emit_crumb(uint32_t id){
 volatile uint8_t  bhf_input[64];
 volatile uint32_t bhf_fault_flag = 0;
 
+#ifdef BHF_STATE
+/* reset=fast's blind spots: RAM no image segment covers, so a machine reset
+   leaves it as the last run did. A word set through the SRAM bit-band alias,
+   which QEMU writes without a guest store: */
+#define STATE_WORD (*(volatile uint32_t *)0x20010000u)
+#define STATE_BIT  (*(volatile uint32_t *)(0x22000000u + (0x10000u << 5)))
+/* and the page a fault's exception frame reaches into, which no store writes. */
+#define FRAME_PAGE ((volatile uint32_t *)0x20020000u)
+#endif
+
 #ifdef BHF_PERSISTENT
 /* reset=persistent: done returns into the input loop in Reset_Handler. */
 __attribute__((noinline)) void harness_done(void){ __asm volatile("" ::: "memory"); }
@@ -137,11 +156,25 @@ void HardFault_Handler(void){
 static void run_one(void){
   emit_crumb(0x100);             /* always-taken prologue edges */
   emit_crumb(0x101);
+#ifdef BHF_STATE
+  if (STATE_WORD != 0) emit_crumb(0x5B);   /* an earlier run's bit-band store */
+  if ((FRAME_PAGE[0] | FRAME_PAGE[1] | FRAME_PAGE[2] | FRAME_PAGE[3]) != 0)
+    emit_crumb(0x5F);                      /* an earlier fault's frame */
+  STATE_BIT = 1;
+#endif
   uint8_t b = bhf_input[0];
   if (b == 0xF7) {
     emit_crumb(0x1FA);           /* "danger" edge, just before the fault */
     __asm volatile("udf #0");    /* REAL undefined instruction -> HardFault */
     emit_crumb(0x1FB);           /* must NOT be reached */
+#ifdef BHF_STATE
+  } else if (b == 0xF5) {
+    emit_crumb(0x1F5);
+    /* Fault on a stack whose 32-byte frame reaches 16 bytes into FRAME_PAGE;
+       the handler's own stores land below it. */
+    __asm volatile("movw r0, #0x0010\n\tmovt r0, #0x2002\n\tmov sp, r0\n\tudf #1"
+                   ::: "r0", "memory");
+#endif
   } else if (b == 0x42) {
     emit_crumb(0x200);
     emit_crumb(0x201);
@@ -179,6 +212,36 @@ struct LiveTarget {
 }
 
 fn boot(dir: &TempDir, elf: &std::path::Path) -> LiveTarget {
+    boot_with_plugin(dir, elf, None)
+}
+
+/// Build the dirty-page QEMU plugin (`reset=fast`, #347) in `dir`.
+fn build_dirty_page_plugin(dir: &TempDir) -> PathBuf {
+    let source = dir.join(DIRTY_PAGE_PLUGIN_SOURCE_NAME);
+    let library = dir.join(DIRTY_PAGE_PLUGIN_LIBRARY_NAME);
+    std::fs::write(&source, DIRTY_PAGE_PLUGIN_SOURCE).expect("write the plugin source");
+    let built = Command::new(HOST_CC)
+        .args(["-shared", "-fPIC", "-O2", "-Wall", "-Werror", "-o"])
+        .arg(&library)
+        .arg(&source)
+        .arg("-lpthread")
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {HOST_CC}: {e}"));
+    assert!(
+        built.status.success(),
+        "{HOST_CC} failed to build the dirty-page plugin: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    library
+}
+
+/// [`boot`], with QEMU loading the dirty-page `plugin` and its `log` when
+/// given.
+fn boot_with_plugin(
+    dir: &TempDir,
+    elf: &std::path::Path,
+    plugin: Option<(&Path, &Path)>,
+) -> LiveTarget {
     let scratch = dir.join("scratch.qcow2");
     let created = Command::new(QEMU_IMG)
         .args(["create", "-f", "qcow2"])
@@ -208,14 +271,28 @@ fn boot(dir: &TempDir, elf: &std::path::Path) -> LiveTarget {
         ))
         .arg("-qmp")
         .arg(format!("unix:{},server,nowait", qmp_path.display()))
+        .args(
+            plugin
+                .map(|(plugin, log)| {
+                    [
+                        "-plugin".to_owned(),
+                        format!("{},log={}", plugin.display(), log.display()),
+                    ]
+                })
+                .into_iter()
+                .flatten(),
+        )
         .spawn()
         .unwrap_or_else(|e| panic!("failed to spawn {QEMU}: {e}"));
     let guard = ChildGuard::new(child, format!("{QEMU} mps2-an385 gdb:{gdb_port}"));
     eprintln!(
         "live_fullsystem: launched `{QEMU} -M mps2-an385 -kernel {} -S -gdb tcp::{gdb_port} \
-         -drive if=none,file=<scratch.qcow2>,format=qcow2,id=sc0 -qmp unix:{},server,nowait`",
+         -drive if=none,file=<scratch.qcow2>,format=qcow2,id=sc0 -qmp unix:{},server,nowait{}`",
         elf.display(),
-        qmp_path.display()
+        qmp_path.display(),
+        plugin
+            .map(|(plugin, log)| format!(" -plugin {},log={}", plugin.display(), log.display()))
+            .unwrap_or_default()
     );
     LiveTarget {
         _qemu: guard,
@@ -449,6 +526,11 @@ enum Image {
     /// `-DBHF_SPIN_DONE`, `-O1`: `harness_done` is one `b.n .`, a branch to
     /// itself.
     SpinningDone,
+    /// `-DBHF_STATE`, `-O0`: each run sets a word through the bit-band alias
+    /// and input `0xF5` faults with its frame reaching into a page no store
+    /// writes, both in RAM no image segment covers; a run that finds either
+    /// left from an earlier one emits a crumb for it.
+    State,
 }
 
 /// Build the harness as `image`.
@@ -462,6 +544,7 @@ fn build_image(dir: &TempDir, image: Image) -> PathBuf {
         Image::Plain => (None, "-O0"),
         Image::Persistent => (Some("-DBHF_PERSISTENT"), "-O0"),
         Image::SpinningDone => (Some("-DBHF_SPIN_DONE"), "-O1"),
+        Image::State => (Some("-DBHF_STATE"), "-O0"),
     };
     let mut cc = Command::new(CC);
     cc.args([
@@ -526,10 +609,22 @@ struct Rig {
     harness_done: u64,
     fault_flag: u64,
     sent: Arc<Mutex<Vec<u8>>>,
+    /// The dirty-page log QEMU's plugin writes, when it loads one.
+    dirty_log: Option<PathBuf>,
 }
 
 impl Rig {
     fn boot(dir: &TempDir, elf: &Path) -> Self {
+        Self::boot_with_plugin(dir, elf, None)
+    }
+
+    /// Boot with the dirty-page plugin at `plugin` loaded, its log in `dir`.
+    fn boot_fast(dir: &TempDir, elf: &Path, plugin: &Path) -> Self {
+        Self::boot_with_plugin(dir, elf, Some(plugin))
+    }
+
+    fn boot_with_plugin(dir: &TempDir, elf: &Path, plugin: Option<&Path>) -> Self {
+        let dirty_log = plugin.map(|_| dir.join("dirty.log"));
         let map = GdbMemoryMap {
             input_address: common::nm_symbol("nm", elf, "bhf_input"),
             ring_address: common::nm_symbol("nm", elf, "adafuzz_probe_memory_buffer"),
@@ -541,12 +636,14 @@ impl Rig {
             ),
             ring_capacity: RING_CAP,
         };
+        let target = boot_with_plugin(dir, elf, plugin.zip(dirty_log.as_deref()));
         Self {
-            target: boot(dir, elf),
+            target,
             map,
             harness_done: common::nm_symbol("nm", elf, "harness_done") & !1,
             fault_flag: common::nm_symbol("nm", elf, "bhf_fault_flag"),
             sent: Arc::new(Mutex::new(Vec::new())),
+            dirty_log,
         }
     }
 
@@ -570,14 +667,19 @@ impl Rig {
             stream.set_nodelay(true)?;
             Ok(stream)
         };
-        FullSystemTransport::new(connect_qmp, connect_gdb, self.map, "bhf_base")
-            .expect("build FullSystemTransport")
-            .with_harness_breakpoint(self.harness_done, 2)
-            .with_fault_status(GuestFaultStatus::new(self.fault_flag, 4, 0).expect("fault word"))
-            .with_exec_deadline(Some(deadline))
-            .with_reset(reset)
-            .arm()
-            .expect("arm the live full-system target")
+        let mut transport =
+            FullSystemTransport::new(connect_qmp, connect_gdb, self.map, "bhf_base")
+                .expect("build FullSystemTransport")
+                .with_harness_breakpoint(self.harness_done, 2)
+                .with_fault_status(
+                    GuestFaultStatus::new(self.fault_flag, 4, 0).expect("fault word"),
+                )
+                .with_exec_deadline(Some(deadline))
+                .with_reset(reset);
+        if let Some(log) = &self.dirty_log {
+            transport = transport.with_dirty_log(log);
+        }
+        transport.arm().expect("arm the live full-system target")
     }
 }
 
@@ -772,6 +874,9 @@ fn live_fullsystem_persistent_loop_outruns_a_loadvm_per_input() {
         eprintln!("{reason}");
         return;
     }
+    let _turn = BENCHMARK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     // Each mode gets the window in slices taken in turn, so a change in the
     // host's load meets both alike.
     const SLICE: Duration = Duration::from_millis(500);
@@ -822,5 +927,275 @@ fn live_fullsystem_persistent_loop_outruns_a_loadvm_per_input() {
         persistent_runs >= 3 * loadvm_runs,
         "reset=persistent ran {persistent_runs} inputs in {secs}s, loadvm per input \
          {loadvm_runs}: under 3x"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// reset=fast: the dirty-page fast snapshot (#347)
+// ---------------------------------------------------------------------------
+
+/// The tools the fast snapshot's live tests need: the RV-3 set and a host C
+/// compiler for the plugin.
+const FAST_TOOLS: [&str; 4] = [CC, QEMU, QEMU_IMG, HOST_CC];
+
+#[test]
+fn live_fullsystem_fast_snapshot_brings_a_fault_back_without_a_loadvm() {
+    if let Err(reason) = gate(
+        "live_fullsystem_fast_snapshot_brings_a_fault_back_without_a_loadvm",
+        &FAST_TOOLS,
+    ) {
+        eprintln!("{reason}");
+        return;
+    }
+    let dir = TempDir::new("bhf-live-fs-fast").expect("temp dir");
+    let plugin = build_dirty_page_plugin(&dir);
+    let elf = build_image(&dir, Image::Plain);
+    let rig = Rig::boot_fast(&dir, &elf, &plugin);
+    let mut session = rig.arm(FullSystemReset::Fast, Duration::from_secs(10));
+
+    // Two faults in a row: a HardFault leaves the CPU in handler mode with the
+    // fault active, and a second one there would lock the core up, so the
+    // second fault's handler running shows the reset cleared the first.
+    let script = [
+        0x42, 0x00, 0xF7, 0xF7, 0x42, 0x00, 0xF7, 0x42, 0xF7, 0xF7, 0x00,
+    ];
+    let mut kinds = Vec::new();
+    for (index, byte) in script.into_iter().enumerate() {
+        let outcome = run(&mut session, byte);
+        let reset = outcome.target.reset;
+        eprintln!(
+            "live_fullsystem fast: input={byte:#04x} edges={:x?} exit={:?} reset={reset:?} \
+             loadvms={}",
+            outcome.coverage_edges,
+            outcome.exit,
+            loadvms(&rig.sent)
+        );
+        assert_eq!(
+            outcome.coverage_edges,
+            edges(byte, false),
+            "input {index}: {byte:#04x}"
+        );
+        if byte == 0xF7 {
+            assert_eq!(outcome.exit, ExitKind::Crash, "input {index}");
+            assert_eq!(
+                outcome.fault.expect("the HardFault carries a fault").kind,
+                FaultKind::CpuException
+            );
+        } else {
+            assert_eq!(outcome.exit, ExitKind::Ok, "input {index}: {outcome:?}");
+            assert!(
+                outcome.fault.is_none(),
+                "the fault word was put back: {outcome:?}"
+            );
+        }
+        assert_eq!(
+            reset.is_none(),
+            index == 0,
+            "every input but the first resets"
+        );
+        kinds.extend(reset.map(|reset| reset.kind));
+    }
+    // A loadvm only while bhf learns the pages a run writes: the first reset,
+    // and at most one more for a page only the fault path writes.
+    let full = kinds
+        .iter()
+        .filter(|kind| **kind == ResetKind::Full)
+        .count();
+    assert_eq!(
+        kinds[0],
+        ResetKind::Full,
+        "the first reset learns the pages"
+    );
+    assert!(full <= 2, "{kinds:?}");
+    assert_eq!(loadvms(&rig.sent), full);
+    // Every reset after the first fault's page was learned is a dirty-page one,
+    // the resets after a fault included.
+    assert!(
+        kinds[4..].iter().all(|kind| *kind == ResetKind::DirtyPages),
+        "{kinds:?}"
+    );
+}
+
+/// The reset latency the dirty-page fast snapshot buys over a `loadvm`, both
+/// measured here on the same image and inputs, faults included (run nightly
+/// by scripts/hil-emu.sh).
+#[test]
+#[ignore = "benchmark: run with --ignored (nightly, live QEMU)"]
+fn live_fullsystem_fast_snapshot_resets_ten_times_faster_than_loadvm() {
+    if let Err(reason) = gate(
+        "live_fullsystem_fast_snapshot_resets_ten_times_faster_than_loadvm",
+        &FAST_TOOLS,
+    ) {
+        eprintln!("{reason}");
+        return;
+    }
+    let _turn = BENCHMARK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Each mode gets the window in slices taken in turn, so a change in the
+    // host's load meets both alike.
+    const SLICE: Duration = Duration::from_millis(500);
+    const SLICES: u32 = 6;
+    const INPUTS: [u8; 3] = [0x42, 0x00, 0xF7];
+    let build = TempDir::new("bhf-live-fs-fast-bench").expect("temp dir");
+    let plugin = build_dirty_page_plugin(&build);
+    let elf = build_image(&build, Image::Plain);
+    let loadvm_dir = TempDir::new("bhf-live-fs-fast-bench-loadvm").expect("temp dir");
+    let loadvm_rig = Rig::boot(&loadvm_dir, &elf);
+    let fast_dir = TempDir::new("bhf-live-fs-fast-bench-fast").expect("temp dir");
+    let fast_rig = Rig::boot_fast(&fast_dir, &elf, &plugin);
+    let mut loadvm = loadvm_rig.arm(FullSystemReset::Loadvm, Duration::from_secs(10));
+    let mut fast = fast_rig.arm(FullSystemReset::Fast, Duration::from_secs(10));
+
+    /// The reset times of the runs in a slice, by kind.
+    #[derive(Default)]
+    struct Resets {
+        full: Vec<Duration>,
+        dirty_pages: Vec<Duration>,
+    }
+    let slice = |session: &mut Box<dyn TargetSession>, resets: &mut Resets, runs: &mut usize| {
+        let start = Instant::now();
+        while start.elapsed() < SLICE {
+            let byte = INPUTS[*runs % INPUTS.len()];
+            let outcome = run(session, byte);
+            let expected = if byte == 0xF7 {
+                ExitKind::Crash
+            } else {
+                ExitKind::Ok
+            };
+            assert_eq!(outcome.exit, expected, "input {byte:#04x}: {outcome:?}");
+            assert_eq!(outcome.coverage_edges, edges(byte, false), "run {runs}");
+            let reset = outcome
+                .target
+                .reset
+                .expect("every measured run follows a reset");
+            match reset.kind {
+                ResetKind::Full => resets.full.push(reset.time),
+                ResetKind::DirtyPages => resets.dirty_pages.push(reset.time),
+            }
+            *runs += 1;
+        }
+    };
+    // Warm up: the fast snapshot learns the pages these inputs write, and
+    // each guest's code is translated once, before anything is measured.
+    for byte in INPUTS.iter().cycle().take(3 * INPUTS.len()) {
+        run(&mut loadvm, *byte);
+        run(&mut fast, *byte);
+    }
+
+    let (mut loadvm_resets, mut fast_resets) = (Resets::default(), Resets::default());
+    let (mut loadvm_runs, mut fast_runs) = (0_usize, 0_usize);
+    for _ in 0..SLICES {
+        slice(&mut loadvm, &mut loadvm_resets, &mut loadvm_runs);
+        slice(&mut fast, &mut fast_resets, &mut fast_runs);
+    }
+    assert!(loadvm_resets.dirty_pages.is_empty());
+    assert!(
+        fast_resets.full.is_empty(),
+        "once warm, no fast reset needs a loadvm: {} did",
+        fast_resets.full.len()
+    );
+
+    let mean = |times: &[Duration]| times.iter().sum::<Duration>() / times.len().max(1) as u32;
+    let loadvm_mean = mean(&loadvm_resets.full);
+    let fast_mean = mean(&fast_resets.dirty_pages);
+    let ratio = loadvm_mean.as_secs_f64() / fast_mean.as_secs_f64().max(f64::MIN_POSITIVE);
+    let secs = (SLICE * SLICES).as_secs_f64();
+    eprintln!(
+        "live_fullsystem fast bench: window={secs}s loadvm: {loadvm_runs} runs ({:.1} exec/s), \
+         mean reset {loadvm_mean:?}; fast: {fast_runs} runs ({:.1} exec/s), mean reset \
+         {fast_mean:?}; reset latency {ratio:.1}x lower",
+        loadvm_runs as f64 / secs,
+        fast_runs as f64 / secs,
+    );
+    assert!(
+        fast_mean * 10 <= loadvm_mean,
+        "reset=fast's mean reset took {fast_mean:?}, a loadvm {loadvm_mean:?}: not 10x lower"
+    );
+}
+
+/// The edges a run of `byte` takes in the [`Image::State`] harness when it
+/// starts from the baseline: `0xF5` faults on a moved stack.
+fn state_edges(byte: u8) -> Vec<u32> {
+    match byte {
+        0xF5 => vec![0x100, 0x101, 0x1F5, 0xFA17],
+        byte => edges(byte, false),
+    }
+}
+
+#[test]
+fn live_fullsystem_fast_snapshot_restores_bitband_stores_and_fault_frames() {
+    if let Err(reason) = gate(
+        "live_fullsystem_fast_snapshot_restores_bitband_stores_and_fault_frames",
+        &FAST_TOOLS,
+    ) {
+        eprintln!("{reason}");
+        return;
+    }
+    let dir = TempDir::new("bhf-live-fs-fast-state").expect("temp dir");
+    let plugin = build_dirty_page_plugin(&dir);
+    let elf = build_image(&dir, Image::State);
+    let rig = Rig::boot_fast(&dir, &elf, &plugin);
+    let mut session = rig.arm(FullSystemReset::Fast, Duration::from_secs(10));
+
+    // Every run sets the bit-band word; 0xF5 stacks a frame into a page no
+    // store writes. A run that finds either from the run before emits 0x5B
+    // or 0x5F, which a run from the baseline, as under loadvm, never does.
+    let script = [0x42, 0xF5, 0x42, 0x00, 0xF5, 0xF5, 0x42, 0x00, 0xF5, 0x42];
+    let mut kinds = Vec::new();
+    for (index, byte) in script.into_iter().enumerate() {
+        let outcome = run(&mut session, byte);
+        eprintln!(
+            "live_fullsystem fast state: input={byte:#04x} edges={:x?} exit={:?} reset={:?}",
+            outcome.coverage_edges, outcome.exit, outcome.target.reset
+        );
+        assert_eq!(
+            outcome.coverage_edges,
+            state_edges(byte),
+            "input {index} ({byte:#04x}) did not run from the baseline"
+        );
+        let expected = if byte == 0xF5 {
+            ExitKind::Crash
+        } else {
+            ExitKind::Ok
+        };
+        assert_eq!(outcome.exit, expected, "input {index}: {outcome:?}");
+        kinds.extend(outcome.target.reset.map(|reset| reset.kind));
+    }
+    // Once the pages are learned the resets are fast, those after a fault
+    // included.
+    assert!(
+        kinds[3..].iter().all(|kind| *kind == ResetKind::DirtyPages),
+        "{kinds:?}"
+    );
+}
+
+#[test]
+fn live_fullsystem_fast_snapshot_refuses_a_log_no_plugin_writes() {
+    if let Err(reason) = gate(
+        "live_fullsystem_fast_snapshot_refuses_a_log_no_plugin_writes",
+        &[CC, QEMU, QEMU_IMG],
+    ) {
+        eprintln!("{reason}");
+        return;
+    }
+    // QEMU without the plugin, and a well-formed log from some other run at
+    // dirty_log=: no store would be logged, so state would carry from one
+    // input to the next. The first reset after a run refuses it.
+    let dir = TempDir::new("bhf-live-fs-fast-stale").expect("temp dir");
+    let elf = build_image(&dir, Image::Plain);
+    let mut rig = Rig::boot(&dir, &elf);
+    let log = dir.join("stale.log");
+    target_transport::testsupport::DirtyLogFile::create(&log, 8, 64).expect("write a stale log");
+    rig.dirty_log = Some(log);
+    let mut session = rig.arm(FullSystemReset::Fast, Duration::from_secs(10));
+    assert_eq!(run(&mut session, 0x42).exit, ExitKind::Ok);
+    let message = session
+        .run_input(&[0x42])
+        .expect_err("a log no plugin writes is refused")
+        .to_string();
+    assert!(
+        message.contains("no dirty-page plugin saw it run") && message.contains("-plugin"),
+        "{message}"
     );
 }

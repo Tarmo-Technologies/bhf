@@ -17,12 +17,109 @@
 //! whether it is invoked at all.
 //!
 //! Missing tools are skipped (like a missing toolchain), never fatal.
+//!
+//! The same gate covers bhf's QEMU dirty-page plugin (#347), the TCG plugin
+//! the qemu-system lane's `reset=fast` reads its dirty-page log from: it runs
+//! inside QEMU (GPL-2.0), so only a profile that allows the `qemu_plugin`
+//! subprocess id builds or uses it ([`qemu_plugin_gate`],
+//! [`build_qemu_dirty_page_plugin`]).
 
 use config::Profile;
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
+
+/// The license-profile subprocess id of bhf's QEMU dirty-page plugin, which
+/// `qemu-system:...,reset=fast` reads (#347).
+pub(crate) const QEMU_PLUGIN_SUBPROCESS_ID: &str = "qemu_plugin";
+
+/// The license profile the dirty-page plugin runs under: the one
+/// `BHF_PROFILE` names, else `external-tools`, which asking for `reset=fast`
+/// opts into (as `--symcc` and `--external-tools` do).
+pub(crate) fn qemu_plugin_profile() -> Profile {
+    qemu_plugin_profile_from(std::env::var("BHF_PROFILE").ok().as_deref())
+}
+
+fn qemu_plugin_profile_from(value: Option<&str>) -> Profile {
+    value
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(Profile::ExternalTools)
+}
+
+/// Whether `profile` lets bhf build and use its plugin inside QEMU; `Err`
+/// says why not.
+pub(crate) fn qemu_plugin_gate(profile: Profile) -> Result<(), String> {
+    if subprocess_allowed(profile.allowed_subprocesses(), QEMU_PLUGIN_SUBPROCESS_ID) {
+        return Ok(());
+    }
+    Err(format!(
+        "reset=fast runs bhf's dirty-page plugin inside QEMU (GPL-2.0), which the `{}` \
+         license profile does not allow; set BHF_PROFILE=external-tools or research-lab, or \
+         use reset=loadvm",
+        profile.as_str()
+    ))
+}
+
+/// The C compiler that builds the plugin: `CC`, else `cc`.
+fn plugin_compiler() -> String {
+    std::env::var("CC")
+        .ok()
+        .filter(|cc| !cc.trim().is_empty())
+        .unwrap_or_else(|| "cc".to_owned())
+}
+
+/// Write the dirty-page plugin's source into `out_dir` and build it with the
+/// host C compiler, returning the shared object to load into
+/// `qemu-system-*` with `-plugin`. `BHF_QEMU_PLUGIN_VERSION` sets the plugin
+/// API version it declares, for a QEMU past 8.x.
+pub(crate) fn build_qemu_dirty_page_plugin(out_dir: &Path) -> Result<PathBuf, String> {
+    use target_transport::fast_snapshot::{
+        DIRTY_PAGE_PLUGIN_LIBRARY_NAME, DIRTY_PAGE_PLUGIN_SOURCE, DIRTY_PAGE_PLUGIN_SOURCE_NAME,
+    };
+    if !cfg!(unix) {
+        // The plugin shares its log with bhf through POSIX mmap.
+        return Err(
+            "the dirty-page plugin builds on a Linux or macOS host only; \
+                    use reset=loadvm or reset=persistent here"
+                .to_owned(),
+        );
+    }
+    std::fs::create_dir_all(out_dir)
+        .map_err(|error| format!("create {}: {error}", out_dir.display()))?;
+    let source = out_dir.join(DIRTY_PAGE_PLUGIN_SOURCE_NAME);
+    std::fs::write(&source, DIRTY_PAGE_PLUGIN_SOURCE)
+        .map_err(|error| format!("write {}: {error}", source.display()))?;
+    let library = out_dir.join(DIRTY_PAGE_PLUGIN_LIBRARY_NAME);
+    let compiler = plugin_compiler();
+    let mut command = Command::new(&compiler);
+    command.args(["-shared", "-fPIC", "-O2", "-o"]);
+    command.arg(&library).arg(&source).arg("-lpthread");
+    if let Ok(version) = std::env::var("BHF_QEMU_PLUGIN_VERSION") {
+        let version: u32 = version
+            .trim()
+            .parse()
+            .map_err(|_| format!("BHF_QEMU_PLUGIN_VERSION={version:?} is not a number"))?;
+        command.arg(format!("-DBHF_QEMU_PLUGIN_VERSION={version}"));
+    }
+    let built = crate::command_output::capture_with_timeout(
+        &mut command,
+        Duration::from_secs(120),
+        1024 * 1024,
+    )
+    .map_err(|error| format!("run {compiler}: {error}"))?;
+    if built.timed_out {
+        return Err(format!("{compiler} did not build the plugin within 120 s"));
+    }
+    if !built.output.status.success() {
+        return Err(format!(
+            "{compiler} failed to build {}: {}",
+            source.display(),
+            String::from_utf8_lossy(&built.output.stderr).trim()
+        ));
+    }
+    Ok(library)
+}
 
 fn max_external_tool_output_bytes() -> usize {
     crate::resource_limits::dynamic_bytes(
@@ -511,6 +608,107 @@ mod tests {
             Profile::ExternalTools.allowed_subprocesses(),
             "gosec"
         ));
+    }
+
+    /// #347: bhf's plugin runs inside QEMU (GPL-2.0), so strict-permissive
+    /// refuses `reset=fast`; external-tools and research-lab allow it, and
+    /// asking for it without BHF_PROFILE opts into external-tools.
+    #[test]
+    fn only_the_external_tool_profiles_allow_the_qemu_plugin() {
+        let refused = qemu_plugin_gate(Profile::StrictPermissive).unwrap_err();
+        assert!(
+            refused.contains("strict-permissive") && refused.contains("BHF_PROFILE=external-tools"),
+            "{refused}"
+        );
+        assert_eq!(qemu_plugin_gate(Profile::ExternalTools), Ok(()));
+        assert_eq!(qemu_plugin_gate(Profile::ResearchLab), Ok(()));
+        assert_eq!(qemu_plugin_profile_from(None), Profile::ExternalTools);
+        assert_eq!(
+            qemu_plugin_profile_from(Some("strict-permissive")),
+            Profile::StrictPermissive
+        );
+    }
+
+    /// #347: off Unix the plugin is not built: it maps its log with POSIX mmap.
+    #[cfg(not(unix))]
+    #[test]
+    fn the_qemu_dirty_page_plugin_is_refused_off_unix() {
+        let dir = crate::test_support::TestDir::new("qemu-plugin");
+        let refused = build_qemu_dirty_page_plugin(&dir.join("out")).unwrap_err();
+        assert!(refused.contains("Linux or macOS host only"), "{refused}");
+        assert!(!dir.join("out").exists());
+    }
+
+    /// #347: a callback that runs before `qemu_plugin_install` has mapped the
+    /// log records nothing, where it dereferenced the unmapped log before.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_plugins_callbacks_record_nothing_before_the_log_is_mapped() {
+        if which::which(plugin_compiler()).is_err() {
+            eprintln!("skipping: no host C compiler");
+            return;
+        }
+        use target_transport::fast_snapshot::DIRTY_PAGE_PLUGIN_SOURCE;
+        let dir = crate::test_support::TestDir::new("qemu-plugin-unmapped");
+        std::fs::write(dir.join("plugin.c"), DIRTY_PAGE_PLUGIN_SOURCE).unwrap();
+        std::fs::write(
+            dir.join("driver.c"),
+            "#include \"plugin.c\"\n\
+             int main(void) {\n\
+             \x20 mark(1, 0);\n\
+             \x20 mark_range(0x20000000u, 8, 0);\n\
+             \x20 mark_alias(0x22000000u, 4, 0);\n\
+             \x20 return 0;\n\
+             }\n",
+        )
+        .unwrap();
+        let driver = dir.join("driver");
+        // The QEMU API the plugin calls is QEMU's own; the driver calls none
+        // of it.
+        let built = Command::new(plugin_compiler())
+            .current_dir(dir.path())
+            .args(["-fsanitize=undefined", "-fno-sanitize-recover=all", "-o"])
+            .arg(&driver)
+            .args([
+                "driver.c",
+                "-lpthread",
+                "-Wl,--unresolved-symbols=ignore-all",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let run = Command::new(&driver).output().unwrap();
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+
+    /// #347: the plugin source builds to a shared object exporting what QEMU
+    /// looks up when it loads a plugin.
+    #[cfg(unix)]
+    #[test]
+    fn the_qemu_dirty_page_plugin_builds_with_the_host_compiler() {
+        if which::which(plugin_compiler()).is_err() {
+            eprintln!("skipping: no host C compiler");
+            return;
+        }
+        let dir = crate::test_support::TestDir::new("qemu-plugin");
+        let library = build_qemu_dirty_page_plugin(&dir.join("out")).unwrap();
+        let bytes = std::fs::read(&library).unwrap();
+        assert_eq!(&bytes[..4], b"\x7fELF", "a shared object");
+        for symbol in [b"qemu_plugin_version".as_slice(), b"qemu_plugin_install"] {
+            assert!(
+                bytes.windows(symbol.len()).any(|window| window == symbol),
+                "{} is exported",
+                String::from_utf8_lossy(symbol)
+            );
+        }
     }
 
     /// Writing an external finding produces a static-classified record the report

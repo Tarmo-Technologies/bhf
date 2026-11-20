@@ -62,6 +62,24 @@ fn mingw_gcc() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("gcc"))
 }
 
+/// The lines of a failed build that say what failed when none names a link
+/// problem: make's own `Error N`, and a shell's `not found` for a compiler it
+/// could not run.
+fn build_failure_lines(output: &str) -> String {
+    output
+        .lines()
+        .filter(|l| l.to_ascii_lowercase().contains("error") || l.contains("not found"))
+        .take(3)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// `path` as make's recipe shell can run it: a POSIX `sh` (w64devkit's or
+/// MSYS's make) reads `\` as an escape, and `cmd.exe` takes `/` as well.
+fn make_command_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
 /// A stable, per-project `.mod` directory under the work dir (keyed on the source
 /// root), shared across every harness of the project so the module graph is built
 /// once.
@@ -1151,7 +1169,7 @@ fn link_with_project_closure(
         let mut make = Command::new("make");
         make.current_dir(hdir).env("AUTO_EXTRA_LDFLAGS", &ldflags);
         if cfg!(windows) {
-            make.env("CC", mingw_gcc())
+            make.env("CC", make_command_path(&mingw_gcc()))
                 .env("BHF_CC_FAMILY", "gcc")
                 .env(crate::build::MAKE_BHF_CFLAGS, WINDOWS_C_FLAGS);
         }
@@ -1242,12 +1260,7 @@ fn link_with_project_closure(
             .take(3)
             .collect();
         if lines.is_empty() {
-            last_output
-                .lines()
-                .filter(|l| l.contains("error"))
-                .take(2)
-                .collect::<Vec<_>>()
-                .join("; ")
+            build_failure_lines(&last_output)
         } else {
             lines.join("; ")
         }
@@ -1327,6 +1340,24 @@ end module m
         let symbols = defined_symbols(modern);
         assert!(symbols.contains(&"scale_it_".to_owned()), "{symbols:?}");
         assert!(symbols.contains(&"walk_".to_owned()), "{symbols:?}");
+    }
+
+    #[test]
+    fn a_compiler_path_reaches_make_with_forward_slashes() {
+        assert_eq!(
+            make_command_path(Path::new(r"C:\Strawberry\c\bin\gcc.exe")),
+            "C:/Strawberry/c/bin/gcc.exe"
+        );
+        assert_eq!(make_command_path(Path::new("gcc")), "gcc");
+    }
+
+    #[test]
+    fn a_build_that_could_not_run_its_compiler_says_so() {
+        let output = "sh: C:Strawberrycbingcc.exe: not found\n\
+                      make: *** [Makefile:353: bhf_driver.o] Error 127\n";
+        let detail = build_failure_lines(output);
+        assert!(detail.contains("not found"), "{detail}");
+        assert!(detail.contains("Error 127"), "{detail}");
     }
 
     #[test]

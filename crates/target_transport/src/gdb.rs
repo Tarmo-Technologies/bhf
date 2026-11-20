@@ -71,6 +71,12 @@ const MAX_UNSOLICITED_STOPS: usize = 16;
 const MAX_CONSOLE_PACKETS: usize = 100_000;
 /// Max total decoded console-output bytes retained while awaiting a stop reply.
 const MAX_CONSOLE_BYTES: usize = 1024 * 1024;
+/// Bytes of a target description asked for in one `qXfer:features:read`.
+const DESCRIPTION_CHUNK: usize = 0x800;
+/// Upper bound on one target-description annex.
+const MAX_DESCRIPTION_BYTES: usize = 256 * 1024;
+/// Upper bound on the annexes `target.xml` includes that are read.
+const MAX_DESCRIPTION_ANNEXES: usize = 16;
 
 /// The file descriptor the semihosting coverage probe writes its event stream
 /// to (`Semihosting_File_Descriptor` in
@@ -176,9 +182,11 @@ fn hex_byte(value: u8) -> String {
 }
 
 fn to_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for &byte in bytes {
-        out.push_str(&hex_byte(byte));
+        out.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        out.push(char::from(DIGITS[usize::from(byte & 0xf)]));
     }
     out
 }
@@ -319,20 +327,46 @@ fn is_timeout_err(err: &TransportError) -> bool {
 /// Low-level framed RSP connection over any byte channel.
 pub struct GdbConnection<C> {
     channel: C,
+    /// Bytes read from the channel and not yet consumed: a packet is read a
+    /// buffer at a time, not a byte per `read`.
+    buffer: Vec<u8>,
+    consumed: usize,
 }
+
+/// The most a [`GdbConnection`] reads from its channel at once.
+const READ_CHUNK: usize = 4096;
 
 impl<C: Read + Write> GdbConnection<C> {
     /// Wrap a byte channel.
     pub fn new(channel: C) -> Self {
-        Self { channel }
+        Self {
+            channel,
+            buffer: Vec::new(),
+            consumed: 0,
+        }
     }
 
     fn read_byte(&mut self) -> Result<Option<u8>> {
-        let mut buf = [0_u8; 1];
-        match self.channel.read(&mut buf)? {
-            0 => Ok(None),
-            _ => Ok(Some(buf[0])),
+        if self.consumed == self.buffer.len() {
+            self.buffer.resize(READ_CHUNK, 0);
+            self.consumed = 0;
+            let read = match self.channel.read(&mut self.buffer) {
+                Ok(read) => read,
+                Err(error) => {
+                    // Nothing was read (a read deadline, an interrupt): a
+                    // read after it must not be served the empty buffer.
+                    self.buffer.clear();
+                    return Err(error.into());
+                }
+            };
+            self.buffer.truncate(read);
+            if read == 0 {
+                return Ok(None);
+            }
         }
+        let byte = self.buffer[self.consumed];
+        self.consumed += 1;
+        Ok(Some(byte))
     }
 
     fn read_byte_required(&mut self, context: &str) -> Result<u8> {
@@ -634,6 +668,90 @@ impl<C: Read + Write> GdbClient<C> {
         );
         let response = self.command(packet.as_bytes())?;
         self.expect_ok(&response, "memory write")
+    }
+
+    /// Switch `m`/`M` between guest-physical and guest-virtual addresses with
+    /// QEMU's `Qqemu.PhyMemMode` packet (#347). A stub that does not know it
+    /// (any other than QEMU's) answers empty, which is an error here.
+    pub fn set_physical_memory_mode(&mut self, physical: bool) -> Result<()> {
+        let packet = if physical {
+            b"Qqemu.PhyMemMode:1".as_slice()
+        } else {
+            b"Qqemu.PhyMemMode:0".as_slice()
+        };
+        let response = self.command(packet)?;
+        if response.is_empty() {
+            return Err(TransportError::gdb(
+                "the gdbstub has no physical-memory mode (Qqemu.PhyMemMode); reset=fast needs \
+                 QEMU's",
+            ));
+        }
+        self.expect_ok(&response, "physical-memory mode")
+    }
+
+    /// Read register `number` (its gdb register number) via `p`, as the
+    /// target's bytes (#347).
+    pub fn read_register(&mut self, number: u32) -> Result<Vec<u8>> {
+        let response = self.command(format!("p{number:x}").as_bytes())?;
+        if response.is_empty() || is_error_reply(&response) {
+            return Err(TransportError::TargetError(format!(
+                "register {number} read: {:?}",
+                String::from_utf8_lossy(&response)
+            )));
+        }
+        from_hex(&response)
+    }
+
+    /// The stub's target description (#347): the `target.xml` annex, then
+    /// each annex it includes, in order, read with `qXfer:features:read`.
+    /// Empty when the stub has none.
+    pub fn read_target_description(&mut self) -> Result<Vec<String>> {
+        let Some(target) = self.read_feature_annex("target.xml")? else {
+            return Ok(Vec::new());
+        };
+        let includes: Vec<String> = target
+            .split("<xi:include href=\"")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next().map(str::to_owned))
+            .take(MAX_DESCRIPTION_ANNEXES)
+            .collect();
+        let mut documents = vec![target];
+        for annex in includes {
+            if let Some(document) = self.read_feature_annex(&annex)? {
+                documents.push(document);
+            }
+        }
+        Ok(documents)
+    }
+
+    /// One `qXfer:features:read` annex, or `None` when the stub does not
+    /// serve it.
+    fn read_feature_annex(&mut self, annex: &str) -> Result<Option<String>> {
+        let mut document = Vec::new();
+        loop {
+            let response = self.command(
+                format!(
+                    "qXfer:features:read:{annex}:{:x},{DESCRIPTION_CHUNK:x}",
+                    document.len()
+                )
+                .as_bytes(),
+            )?;
+            let (last, data) = match response.split_first() {
+                Some((b'l', data)) => (true, data),
+                Some((b'm', data)) => (false, data),
+                _ => return Ok(None),
+            };
+            // The packet layer has undone the binary escapes.
+            document.extend_from_slice(data);
+            if document.len() > MAX_DESCRIPTION_BYTES {
+                return Err(TransportError::gdb(format!(
+                    "target description {annex}: more than {MAX_DESCRIPTION_BYTES} bytes"
+                )));
+            }
+            if last || data.is_empty() {
+                return Ok(Some(String::from_utf8_lossy(&document).into_owned()));
+            }
+        }
     }
 
     /// Read the general register block via `g`.
@@ -2057,6 +2175,54 @@ mod tests {
         fn set_read_deadline(&self, _timeout: Option<Duration>) -> bool {
             false
         }
+    }
+
+    /// A channel whose reads come from `reads` in turn, each a whole chunk
+    /// or an error that fails that read; writes are dropped.
+    struct ChunkedReads {
+        reads: std::collections::VecDeque<std::io::Result<Vec<u8>>>,
+    }
+
+    impl Read for ChunkedReads {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.reads.pop_front() {
+                Some(Ok(bytes)) => {
+                    buf[..bytes.len()].copy_from_slice(&bytes);
+                    Ok(bytes.len())
+                }
+                Some(Err(error)) => Err(error),
+                None => Ok(0),
+            }
+        }
+    }
+
+    impl Write for ChunkedReads {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_connection_reads_packets_a_chunk_at_a_time_and_survives_a_failed_read() {
+        // An ack and two replies in one read are served in order; a read that
+        // times out leaves nothing stale behind for the next packet.
+        let reads = [
+            Ok(b"+$OK#9a$E01#a6".to_vec()),
+            Err(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+            Ok(b"$S05#b8".to_vec()),
+        ];
+        let mut connection = GdbConnection::new(ChunkedReads {
+            reads: reads.into_iter().collect(),
+        });
+        connection.send_packet(b"?").unwrap();
+        assert_eq!(connection.recv_packet().unwrap(), b"OK");
+        assert_eq!(connection.recv_packet().unwrap(), b"E01");
+        connection.recv_packet().expect_err("the read timed out");
+        assert_eq!(connection.recv_packet().unwrap(), b"S05");
+        assert_eq!(connection.recv_packet_opt().unwrap(), None);
     }
 
     #[test]

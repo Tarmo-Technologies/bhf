@@ -13,10 +13,11 @@
 #   RV-3  live_fullsystem     — FullSystemTransport end-to-end on emulated Cortex-M
 #                               (qemu-system-arm mps2-an385: savevm/loadvm snapshot
 #                                reset + coverage-ring readback + planted fault,
-#                                the reset=persistent loop, and its ignored
-#                                benchmark against a loadvm per input, which
-#                                runs nightly and by hand, not on a pull
-#                                request or a push)
+#                                the reset=persistent loop, the reset=fast
+#                                dirty-page snapshot (cc builds its QEMU
+#                                plugin), and their ignored benchmarks against
+#                                a loadvm per input, which run nightly and by
+#                                hand, not on a pull request or a push)
 #   RV-4  the pinned FreeRTOS task/queue profile and the FreeRTOS agent task
 #   RV-5  the reference agent's Zephyr sample (west + ZEPHYR_BASE, from
 #         scripts/ci/install-zephyr.sh)
@@ -115,9 +116,9 @@ echo
 
 echo "== RV-3: live_fullsystem (qemu-system-arm mps2-an385 snapshot) =="
 BHF_HIL_REQUIRE=1 cargo test --locked -p target_transport --test live_fullsystem -- --nocapture
-# The benchmark is a nightly check (#346): the schedule, a manual dispatch and
-# a local run take it; a pull request or a push does not wait on a shared
-# runner's timing.
+# The benchmarks are nightly checks (#346, #347): the schedule, a manual
+# dispatch and a local run take them; a pull request or a push does not wait
+# on a shared runner's timing.
 rv3_benchmark_runs() {
   case "${GITHUB_EVENT_NAME:-}" in
     pull_request | push) return 1 ;;
@@ -125,11 +126,11 @@ rv3_benchmark_runs() {
   esac
 }
 if rv3_benchmark_runs; then
-  echo "== RV-3 benchmark: reset=persistent against a loadvm per input (needs 3x) =="
+  echo "== RV-3 benchmarks against a loadvm per input: reset=persistent (needs 3x the runs), reset=fast (needs a tenth of the reset latency) =="
   BHF_HIL_REQUIRE=1 cargo test --locked -p target_transport --test live_fullsystem -- \
     --ignored --nocapture
 else
-  echo "== RV-3 benchmark: not run on ${GITHUB_EVENT_NAME} (it runs nightly) =="
+  echo "== RV-3 benchmarks: not run on ${GITHUB_EVENT_NAME} (they run nightly) =="
 fi
 echo
 

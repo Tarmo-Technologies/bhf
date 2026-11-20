@@ -257,6 +257,18 @@ impl SessionTransportPlan {
                         .to_owned(),
                 ));
             }
+            // The fast snapshot reads the dirty-page log of bhf's plugin in
+            // QEMU, and a session finding's replay rebuilds this transport:
+            // it would need that plugin again, where `bhf replay` of a
+            // finding restores with loadvm alone.
+            if plan.resets_fast() {
+                return Err(malformed(
+                    "the session lane does not take reset=fast, whose replay would need bhf's \
+                     dirty-page plugin in qemu-system again; leave reset= out to restore the \
+                     snapshot with loadvm before every message"
+                        .to_owned(),
+                ));
+            }
             return Ok(Self::Target {
                 spec: rest.to_owned(),
                 coverage_map: coverage_map.map(str::to_owned),
@@ -3314,6 +3326,42 @@ equals = 226
             Some(map),
         )
         .is_ok());
+    }
+
+    /// #347: the session lane refuses `reset=fast`: a session finding's
+    /// replay rebuilds the stored transport, so it would need the dirty-page
+    /// plugin in QEMU as the campaign did. A stored spec is refused on
+    /// replay as it is on a campaign.
+    #[test]
+    fn a_target_transport_session_refuses_a_fast_qemu_system_reset() {
+        let map = "input=0x1000,input_cap=64,ring=0x4000,write=0x5000,wrapped=0x5100,cap=64";
+        let spec = "transport:qemu-system:qmp=127.0.0.1:1,gdb=127.0.0.1:2,reset=fast,\
+                    dirty_log=/tmp/dirty.log";
+        let error = SessionTransportPlan::parse_with_map(spec, Some(map))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not take reset=fast"), "{error}");
+
+        let meta = SessionArtifactMeta {
+            schema: SESSION_ARTIFACT_SCHEMA.to_owned(),
+            profile_sha256: String::new(),
+            profile_toml: String::new(),
+            transport: spec.to_owned(),
+            transport_kind: "transport".to_owned(),
+            reset: "reconnect".to_owned(),
+            reset_fidelity: String::new(),
+            rule_id: None,
+            oracle: String::new(),
+            reply_timeout_ms: None,
+            server_cmd: None,
+            coverage_map: Some(map.to_owned()),
+            runtime_signature: None,
+            runtrace_mode: None,
+        };
+        let error = build_live_transport(&meta, &toy_model())
+            .err()
+            .expect("a stored reset=fast spec is refused on replay");
+        assert!(error.contains("does not take reset=fast"), "{error}");
     }
 
     /// #261: over a target transport, a session's messages reach the target

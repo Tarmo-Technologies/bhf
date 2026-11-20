@@ -71,10 +71,21 @@ static void _bhf_jpeg_error_exit(j_common_ptr cinfo) {
 {%- endif %}
 
 /* Keep value-returning lifecycle calls observable when a source-local target is
- * visible to the optimizer; `(void)result` alone permits dead-code removal. */
+ * visible to the optimizer; `(void)result` alone permits dead-code removal.
+ * Where bhf's driver is linked, each value also joins the exec's differential
+ * observation (bhf_diff_result in c_runtime/bhf_driver.c). */
+#if defined(BHF_EXTERNAL_DRIVER) && (defined(__GNUC__) || defined(__clang__))
+void bhf_diff_result(int type_class, const void *value, size_t size);
+#define BHF_DIFF_RESULT(value) \
+    bhf_diff_result(__builtin_classify_type(value), (const void *)&(value), sizeof(value))
+#else
+#define BHF_DIFF_RESULT(value) ((void)0)
+#endif
 #if defined(__GNUC__) || defined(__clang__)
-#define BHF_KEEP_RESULT(value) \
-    __asm__ __volatile__("" : : "g"(&(value)) : "memory")
+#define BHF_KEEP_RESULT(value) do { \
+    __asm__ __volatile__("" : : "g"(&(value)) : "memory"); \
+    BHF_DIFF_RESULT(value); \
+} while (0)
 #else
 #define BHF_KEEP_RESULT(value) ((void)(value))
 #endif
@@ -201,8 +212,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size);
 /* Auto-injected by bhf: republish fuzz input to the Linux runtrace shim so
  * fuzz-driven mode can route the current iteration's bytes into fake fds /
  * socket peers / dlopen stubs. Windows has no preload shim and must not emit a
- * COFF weak reference: multiple weak defaults conflict under link.exe. */
-#if defined(BHF_WINDOWS_CRT)
+ * COFF weak reference: multiple weak defaults conflict under link.exe. Nor
+ * macOS, which has no shim either: Mach-O fails the link of a weak reference
+ * to a symbol no image defines. */
+#if defined(BHF_WINDOWS_CRT) || defined(__APPLE__)
 #define BHF_PUBLISH_INPUT(data, size) ((void)0)
 #else
 extern void bhf_shim_set_fuzz_input(const uint8_t *data, size_t size) __attribute__((weak));

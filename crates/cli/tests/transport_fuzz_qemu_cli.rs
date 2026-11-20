@@ -313,6 +313,28 @@ impl Fixture {
         persistent: bool,
         ports: Option<(u16, u16)>,
     ) -> Option<Self> {
+        Self::boot_full(test, dir, cmplog, semihosting, persistent, ports, &[])
+    }
+
+    /// The plain fixture, with QEMU given `qemu_args` too (a `-plugin`).
+    fn boot_with_qemu_args(
+        test: &str,
+        dir: &Path,
+        ports: Option<(u16, u16)>,
+        qemu_args: &[String],
+    ) -> Option<Self> {
+        Self::boot_full(test, dir, false, false, false, ports, qemu_args)
+    }
+
+    fn boot_full(
+        test: &str,
+        dir: &Path,
+        cmplog: bool,
+        semihosting: bool,
+        persistent: bool,
+        ports: Option<(u16, u16)>,
+        qemu_args: &[String],
+    ) -> Option<Self> {
         for tool in [CC, QEMU, QEMU_IMG, NM] {
             if !tool_present(tool) {
                 eprintln!("SKIP {test}: {tool} not on PATH");
@@ -388,6 +410,7 @@ impl Fixture {
             ))
             .arg("-qmp")
             .arg(format!("tcp:127.0.0.1:{qmp_port},server,nowait"))
+            .args(qemu_args)
             .spawn()
             .unwrap_or_else(|e| panic!("spawn {QEMU}: {e}"));
         let guard = ChildGuard(child);
@@ -819,6 +842,114 @@ fn cli_qemu_system_persistent_reset_finds_the_fault_and_records_executions_per_s
     assert!(
         replay.status.success() && replay_stdout.contains("MATCH"),
         "bhf replay of a persistent finding: {replay_stdout}\n{}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+}
+
+/// #347: `reset=fast` end to end. Without the plugin's log, `bhf fuzz` builds
+/// the dirty-page plugin and says how to load it; with QEMU running it, the
+/// campaign finds the planted fault, and the inputs after it run clean from
+/// the baseline with no `loadvm` between them. The finding replays on a
+/// fresh guest without the plugin.
+#[test]
+fn cli_qemu_system_fast_reset_builds_its_plugin_finds_the_fault_and_replays() {
+    let test = "cli_qemu_system_fast_reset_builds_its_plugin_finds_the_fault_and_replays";
+    if !tool_present("cc") {
+        eprintln!("SKIP {test}: cc not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    let work = dir.join("work");
+    let log = dir.join("dirty.log");
+    let seeds = [0x42_u8, 0x00, 0xF7, 0x42, 0x00, 0x42];
+    let fuzz = |fixture: &Fixture| {
+        let mut fuzz = Command::new(bhf_bin());
+        fuzz.env_remove("BHF_PROFILE")
+            .args([
+                "fuzz",
+                "--target-transport",
+                &format!("{},reset=fast,dirty_log={}", fixture.spec(), log.display()),
+            ])
+            .args(["--transport-coverage-map", &fixture.coverage_map(64)])
+            .args(["--harness", "cortex-m-fixture"]);
+        for (i, byte) in seeds.iter().enumerate() {
+            let seed = dir.join(format!("seed-{i}.bin"));
+            std::fs::write(&seed, [*byte]).unwrap();
+            fuzz.arg("--seed-file").arg(seed);
+        }
+        fuzz.args(["--iterations", &seeds.len().to_string(), "--time", "60s"])
+            .args(["--timeout", "10s"])
+            .arg(&work)
+            .output()
+            .expect("run bhf fuzz")
+    };
+
+    // QEMU without the plugin: bhf builds it and refuses the run.
+    let Some(plain) = Fixture::boot(test, dir) else {
+        return;
+    };
+    let out = fuzz(&plain);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    let plugin = work.join("qemu-plugin/libbhf_qemu_dirty_pages.so");
+    assert!(plugin.is_file(), "{stderr}");
+    let load = format!("{},log={}", plugin.display(), log.display());
+    assert!(stderr.contains(&format!("-plugin {load}")), "{stderr}");
+    let ports = (plain.qmp_port, plain.gdb_port);
+    drop(plain);
+
+    // QEMU with it, as the message says.
+    let fixture =
+        Fixture::boot_with_qemu_args(test, dir, Some(ports), &["-plugin".to_owned(), load])
+            .expect("tools were present a moment ago");
+    let out = fuzz(&fixture);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "bhf fuzz reset=fast failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let summary: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("summary JSON: {e}\n{stdout}"));
+    assert_eq!(summary["executions"], seeds.len(), "{summary:#}");
+    // One crash: the fault word and the exception state went back with the
+    // reset, so the inputs after the fault are clean.
+    assert_eq!(summary["crashes"], 1, "{summary:#}");
+    let findings = summary["findings"].as_array().expect("findings array");
+    assert_eq!(findings.len(), 1, "{summary:#}");
+    let finding = work
+        .join("results/findings")
+        .join(findings[0].as_str().unwrap());
+    let profile: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(finding.join("transport_profile.json")).unwrap())
+            .unwrap();
+    assert!(
+        profile["reset_mechanism"]
+            .as_str()
+            .is_some_and(|reset| reset.starts_with("dirty-page fast snapshot")),
+        "{profile:#}"
+    );
+    assert!(
+        profile["limitations"]
+            .as_str()
+            .is_some_and(|limits| limits.contains("reset=fast")),
+        "{profile:#}"
+    );
+
+    // A replay restores with loadvm: a fresh guest without the plugin.
+    drop(fixture);
+    let _fresh = Fixture::boot_opts(test, dir, false, false, false, Some(ports))
+        .expect("tools were present a moment ago");
+    let replay = Command::new(bhf_bin())
+        .arg("replay")
+        .arg(&finding)
+        .output()
+        .expect("run bhf replay");
+    let replay_stdout = String::from_utf8_lossy(&replay.stdout);
+    assert!(
+        replay.status.success() && replay_stdout.contains("MATCH"),
+        "bhf replay of a reset=fast finding: {replay_stdout}\n{}",
         String::from_utf8_lossy(&replay.stderr)
     );
 }

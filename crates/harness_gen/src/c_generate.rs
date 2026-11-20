@@ -7340,6 +7340,259 @@ mod tests {
         }
     }
 
+    /// A generated harness built with bhf's driver hands the target's return
+    /// value to the driver's differential observation (#345): the run's
+    /// record holds one observation, and two builds whose targets return
+    /// different values observe different things on the same input.
+    #[cfg(unix)]
+    #[test]
+    fn a_generated_harness_observes_the_targets_return_value() {
+        let clang_ok = Command::new("clang")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !clang_ok {
+            eprintln!("skipping: clang unavailable");
+            return;
+        }
+        let (_root_guard, root) = temp_dir("diff result");
+        let runtime = root.join("c_runtime");
+        copy_c_runtime_to(&runtime);
+        let source = root.join("record.c");
+        fs::write(
+            &source,
+            "#include <stddef.h>\n\
+             int parse_record(const unsigned char *data, size_t len) {\n\
+             \x20   return len ? data[0] + OFFSET : -1;\n\
+             }\n",
+        )
+        .unwrap();
+        let out = root.join("harnesses/H-RESULT");
+        let mut args = direct_args("parse_record", out.clone());
+        args.source_path = source.clone();
+        args.params = vec![
+            CParameter {
+                name: "data".to_owned(),
+                c_type: "const unsigned char *".to_owned(),
+            },
+            CParameter {
+                name: "len".to_owned(),
+                c_type: "size_t".to_owned(),
+            },
+        ];
+        args.target_sources = vec![source.clone()];
+        args.c_runtime_include = runtime.clone();
+        generate_c_direct_harness(args).expect("harness generates");
+        let input = root.join("input.bin");
+        fs::write(&input, b"R").unwrap();
+        // The record a build with `OFFSET` writes for `input`.
+        let observe = |offset: u32| -> Vec<u8> {
+            let bin = root.join(format!("main-{offset}"));
+            let built = Command::new("clang")
+                .current_dir(&out)
+                .args(["-O1", "-DBHF_EXTERNAL_DRIVER", "-I"])
+                .arg(&runtime)
+                .arg(format!("-DOFFSET={offset}"))
+                .arg("-o")
+                .arg(&bin)
+                .arg("main.c")
+                .arg(&source)
+                .arg(runtime.join("bhf_driver.c"))
+                .output()
+                .unwrap();
+            assert!(
+                built.status.success(),
+                "{}",
+                String::from_utf8_lossy(&built.stderr)
+            );
+            let record = root.join(format!("record-{offset}"));
+            let ran = Command::new(&bin)
+                .arg(&input)
+                .env("BHF_DIFF_SHM", &record)
+                .output()
+                .unwrap();
+            assert!(ran.status.success(), "{ran:?}");
+            fs::read(&record).unwrap()
+        };
+        let word = |record: &[u8], at: usize| {
+            u32::from_ne_bytes([record[at], record[at + 1], record[at + 2], record[at + 3]])
+        };
+        let first = observe(0);
+        assert_eq!(first.len(), 16);
+        assert_eq!(word(&first, 12), 1, "the run returned");
+        assert_eq!(word(&first, 8), 1, "one observation: the target's result");
+        assert_eq!(
+            observe(0)[..8],
+            first[..8],
+            "the same build observes the same"
+        );
+        assert_ne!(observe(1)[..8], first[..8], "another result, another hash");
+    }
+
+    /// The undefined weak symbols of `main.c` in `dir`, compiled with `flags`
+    /// (with `runtime` on the include path).
+    #[cfg(target_os = "linux")]
+    fn undefined_weak_symbols(dir: &Path, runtime: &Path, flags: &[&str]) -> Vec<String> {
+        let object = dir.join("main.o");
+        let built = Command::new("clang")
+            .current_dir(dir)
+            .args(["-O1", "-c", "-I"])
+            .arg(runtime)
+            .args(flags)
+            .arg("-o")
+            .arg(&object)
+            .arg("main.c")
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "{flags:?}: {}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let symbols = Command::new("nm").arg(&object).output().unwrap();
+        let mut weak: Vec<String> = String::from_utf8_lossy(&symbols.stdout)
+            .lines()
+            .filter_map(|line| {
+                // An undefined weak symbol is `w` (or `v`, an object) with no address.
+                let mut fields = line.split_whitespace();
+                match (fields.next(), fields.next(), fields.next()) {
+                    (Some("w" | "v"), Some(name), None) => Some(name.to_owned()),
+                    _ => None,
+                }
+            })
+            .collect();
+        weak.sort();
+        weak
+    }
+
+    /// The predefined macros of a macOS build in place of Linux's.
+    #[cfg(target_os = "linux")]
+    const MACOS_PREDEFINES: &[&str] = &[
+        "-D__APPLE__",
+        "-D__MACH__",
+        "-U__ELF__",
+        "-U__linux__",
+        "-U__linux",
+        "-Ulinux",
+        "-U__gnu_linux__",
+    ];
+
+    /// A macOS build of the generated harness references no symbol only
+    /// weakly: Mach-O fails the link of a weak reference to a symbol no image
+    /// defines, and the runtrace shim whose hooks the harness references
+    /// weakly on Linux is not built for macOS. The harness is compiled here
+    /// with the predefined macros of a macOS build in place of Linux's.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_macos_build_of_the_harness_makes_no_unresolvable_weak_reference() {
+        let tools = ["clang", "nm"].iter().all(|tool| {
+            Command::new(tool)
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        });
+        if !tools {
+            eprintln!("skipping: clang/nm unavailable");
+            return;
+        }
+        let (_root_guard, root) = temp_dir("macho weak");
+        let runtime = root.join("c_runtime");
+        copy_c_runtime_to(&runtime);
+        let out = root.join("harnesses/H-WEAK");
+        let source = root.join("record.c");
+        fs::write(
+            &source,
+            "#include <stddef.h>\n\
+             int parse_record(const unsigned char *data, size_t len) {\n\
+             \x20   return len ? data[0] : 0;\n\
+             }\n",
+        )
+        .unwrap();
+        let mut args = direct_args("parse_record", out.clone());
+        args.source_path = source.clone();
+        args.params = vec![
+            CParameter {
+                name: "data".to_owned(),
+                c_type: "const unsigned char *".to_owned(),
+            },
+            CParameter {
+                name: "len".to_owned(),
+                c_type: "size_t".to_owned(),
+            },
+        ];
+        args.target_sources = vec![source];
+        args.c_runtime_include = runtime.clone();
+        generate_c_direct_harness(args).expect("harness generates");
+        let linux = undefined_weak_symbols(&out, &runtime, &["-DBHF_EXTERNAL_DRIVER"]);
+        assert!(
+            linux.iter().any(|name| name == "bhf_shim_set_fuzz_input"),
+            "{linux:?}"
+        );
+        let macos = undefined_weak_symbols(
+            &out,
+            &runtime,
+            &[&["-DBHF_EXTERNAL_DRIVER"], MACOS_PREDEFINES].concat(),
+        );
+        assert_eq!(macos, Vec::<String>::new());
+    }
+
+    /// The same for a passthrough harness around a project's
+    /// `LLVMFuzzerTestOneInput` built without bhf's driver, as the AFL++ lane
+    /// and a capsule's build script build it: its own `main` calls the
+    /// project's `LLVMFuzzerInitialize` when the project defines one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_macos_build_of_a_standalone_passthrough_harness_makes_no_unresolvable_weak_reference() {
+        let tools = ["clang", "nm"].iter().all(|tool| {
+            Command::new(tool)
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        });
+        if !tools {
+            eprintln!("skipping: clang/nm unavailable");
+            return;
+        }
+        let (_root_guard, root) = temp_dir("macho weak passthrough");
+        let runtime = root.join("c_runtime");
+        copy_c_runtime_to(&runtime);
+        let out = root.join("harnesses/H-WEAK-PT");
+        let source = root.join("fuzz_record.c");
+        fs::write(
+            &source,
+            "#include <stddef.h>\n#include <stdint.h>\n\
+             int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {\n\
+             \x20   return size && data[0] == 'Q';\n\
+             }\n",
+        )
+        .unwrap();
+        let mut args = direct_args("LLVMFuzzerTestOneInput", out.clone());
+        args.target = cfunction("LLVMFuzzerTestOneInput");
+        args.source_path = source.clone();
+        args.params = vec![
+            CParameter {
+                name: "data".to_owned(),
+                c_type: "const uint8_t *".to_owned(),
+            },
+            CParameter {
+                name: "size".to_owned(),
+                c_type: "size_t".to_owned(),
+            },
+        ];
+        args.target_sources = vec![source];
+        args.c_runtime_include = runtime.clone();
+        generate_c_direct_harness(args).expect("harness generates");
+        for lane in [&[][..], &["-DBHF_AFL"][..]] {
+            let linux = undefined_weak_symbols(&out, &runtime, lane);
+            assert!(
+                linux.iter().any(|name| name == "LLVMFuzzerInitialize"),
+                "{lane:?}: {linux:?}"
+            );
+            let macos = undefined_weak_symbols(&out, &runtime, &[lane, MACOS_PREDEFINES].concat());
+            assert_eq!(macos, Vec::<String>::new(), "{lane:?}");
+        }
+    }
+
     /// A source tree, include dir and runtime dir whose paths contain spaces and
     /// parentheses must generate, build and run, not be refused or word-split.
     #[test]
@@ -10494,9 +10747,9 @@ mod tests {
         assert!(main.contains("LLVMFuzzerTestOneInput"));
         assert!(
             main.contains(
-                "#if defined(BHF_WINDOWS_CRT)\n#define BHF_PUBLISH_INPUT(data, size) ((void)0)"
+                "#if defined(BHF_WINDOWS_CRT) || defined(__APPLE__)\n#define BHF_PUBLISH_INPUT(data, size) ((void)0)"
             ) && main.contains("BHF_PUBLISH_INPUT(Data, Size);"),
-            "Windows harnesses must omit the Linux-only weak runtrace hook:\n{main}"
+            "Windows and macOS harnesses must omit the Linux-only weak runtrace hook:\n{main}"
         );
         // (const char *, size_t) gets pair-detected as a buffer/length view over
         // Data + Size: the callee is GIVEN the length and must respect it, so the

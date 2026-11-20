@@ -115,9 +115,22 @@
 // Keep a value-returning target call observable even when its result is not
 // otherwise consumed. Source-local/header-only targets are visible to the
 // optimizer; a plain `(void)R` lets it delete a pure parser call entirely.
+// Where bhf's driver is linked, the value also joins the exec's differential
+// observation (bhf_diff_result in c_runtime/bhf_driver.c), so `bhf fuzz
+// --differential-harness` compares two builds on what the target returned.
+#if defined(BHF_EXTERNAL_DRIVER) && (defined(__GNUC__) || defined(__clang__))
+extern "C" void bhf_diff_result(int type_class, const void *value, size_t size);
+#define BHF_DIFF_RESULT(value) \
+    bhf_diff_result(__builtin_classify_type(value), (const void *)std::addressof(value), \
+                    sizeof(value))
+#else
+#define BHF_DIFF_RESULT(value) ((void)0)
+#endif
 #if defined(__GNUC__) || defined(__clang__)
-#define BHF_KEEP_RESULT(value) \
-    __asm__ __volatile__("" : : "g"(std::addressof(value)) : "memory")
+#define BHF_KEEP_RESULT(value) do { \
+    __asm__ __volatile__("" : : "g"(std::addressof(value)) : "memory"); \
+    BHF_DIFF_RESULT(value); \
+} while (0)
 #else
 #define BHF_KEEP_RESULT(value) ((void)(value))
 #endif
@@ -154,8 +167,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size);
 // Auto-injected by bhf: republish fuzz input to the Linux runtrace shim so
 // fuzz-driven mode can route the current iteration's bytes into fake fds /
 // socket peers / dlopen stubs. Windows has no preload shim and must not emit a
-// COFF weak reference: multiple weak defaults conflict under link.exe.
-#if defined(BHF_WINDOWS_CRT)
+// COFF weak reference: multiple weak defaults conflict under link.exe. Nor
+// macOS, which has no shim either: Mach-O fails the link of a weak reference
+// to a symbol no image defines.
+#if defined(BHF_WINDOWS_CRT) || defined(__APPLE__)
 #define BHF_PUBLISH_INPUT(data, size) ((void)0)
 #else
 extern "C" void bhf_shim_set_fuzz_input(const uint8_t *data, size_t size) __attribute__((weak));
@@ -303,7 +318,18 @@ BHF_NOCOV static void bhf_win_install_crash_handler(void) {
 #endif
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size);
+#if defined(__APPLE__)
+/* Mach-O links a weak reference only to a definition that exists (a symbol no
+ * image defines is an undefined-symbol error), so a weak no-op definition
+ * stands in, and the project's own LLVMFuzzerInitialize replaces it. */
+extern "C" __attribute__((weak)) int LLVMFuzzerInitialize(int *argc, char ***argv) {
+    (void)argc;
+    (void)argv;
+    return 0;
+}
+#else
 extern "C" int LLVMFuzzerInitialize(int *argc, char ***argv) __attribute__((weak));
+#endif
 
 #if !defined(BHF_AFL)
 extern "C" {

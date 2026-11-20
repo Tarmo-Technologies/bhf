@@ -108,6 +108,7 @@ pub(super) fn run(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String> {
         hangs: None,
         stability: None,
         symcc: None,
+        differential: None,
         workers: None,
     };
     write_run_summary(&prepared.work_dir, &summary)?;

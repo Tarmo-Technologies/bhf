@@ -870,6 +870,10 @@ pub fn value_for_finding(mode: RunMode, raw: &Value, finding_json_path: Option<&
     .unwrap_or_else(|_| json!({ "mode": mode.as_str(), "verdict": "unknown" }))
 }
 
+/// The `kind` of a kernel crash `bhf kernel import` wrote
+/// (`results::import_syzkaller::KERNEL_CRASH_KIND`).
+const KERNEL_CRASH_KIND: &str = "kernel_crash";
+
 fn entry_path_from(raw: &Value) -> Option<EntryPath> {
     let signal = attacker_reachable_signal(raw);
     let basis = raw
@@ -902,6 +906,27 @@ fn entry_path_from(raw: &Value) -> Option<EntryPath> {
                     .filter(|basis| basis.is_object())
                     .cloned()
             }),
+        });
+    }
+    // A kernel crash syzkaller found (`bhf kernel import`) was reached
+    // through the syscalls its program made in the test VM, not through a
+    // harness input: its entry is that program, the reproducer or else the
+    // console log of the programs syzkaller ran.
+    if raw.get("kind").and_then(Value::as_str) == Some(KERNEL_CRASH_KIND) {
+        let source = ["repro_syz", "repro_c", "console_log"]
+            .iter()
+            .find_map(|key| string_at(raw, &["paths", key]))
+            .unwrap_or_else(|| "syzkaller".to_owned());
+        let target = string_at(raw, &["target", "subprogram"])
+            .or_else(|| string_at(raw, &["kernel", "function"]))
+            .unwrap_or_else(|| "kernel".to_owned());
+        return Some(EntryPath {
+            kind: "syscall".to_owned(),
+            source,
+            target,
+            evidence: Vec::new(),
+            attacker_reachable: signal,
+            reachability_basis: basis,
         });
     }
     let target = target_name(raw);

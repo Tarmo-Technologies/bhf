@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod ioctl;
+pub use ioctl::{
+    parse_ioctl_facts, CCall, CDispatchFunction, CInitializer, CIoctlFacts, CMacroDef, CRecordDef,
+    CRecordField, CSwitch, CValue,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CParamDescriptor {
     pub name: String,

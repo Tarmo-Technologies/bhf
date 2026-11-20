@@ -624,6 +624,9 @@ fn target_fidelity(
     .map(|names| names.trim().replace(',', ", "))
     .filter(|names| !names.is_empty())
     .map(|names| format!("browser globals ({names})"));
+    // A native pass that found no runtrace shim (none is built for this
+    // platform, or none is installed) recorded why beside the harness.
+    facts.runtime_shim_unavailable = crate::auto::shim_path::recorded_unavailable(&r.harness_dir);
     // A cross-built harness ran under the emulator recorded beside it: it
     // ran its own target, with only the sanitizers its build armed.
     let harness = r.harness_dir.join("main");
@@ -5584,6 +5587,138 @@ mod tests {
         assert!(sf["caveat"].as_str().unwrap_or_default().contains("arch"));
 
         std::fs::remove_dir_all(&work).ok();
+    }
+
+    /// A native target whose fuzz pass found no runtrace shim (none is built
+    /// for the platform, as on macOS, or none is installed) records the
+    /// shim-unavailable fidelity, with the reason, on its run.json entry, the
+    /// campaign rollup and each of its findings; a target fuzzed with the
+    /// shim records none.
+    #[test]
+    fn a_target_fuzzed_without_a_built_shim_records_the_shim_unavailable_fidelity() {
+        use crate::auto::attempt::{AttemptResult, Outcome, PassRun};
+        use crate::auto::pass::Pass;
+
+        let work = crate::test_support::TestDir::new("report-no-shim");
+        let findings = work.join("results").join("findings");
+        for (id, harness) in [("F-0000-noshim", "H-NOSHIM"), ("F-0001-shim", "H-SHIM")] {
+            let dir = findings.join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("finding.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "id": id,
+                    "harness_id": harness,
+                    "rule_id": "BHF-201",
+                    "classification": "runtime_crash",
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let built = |harness: &str, finding: &str| {
+            let mut c = cand(harness);
+            c.name = harness.to_owned();
+            AttemptResult {
+                candidate: c,
+                outcome: Outcome::BuiltAndFuzzed {
+                    repairs: vec![],
+                    retries: 0,
+                    per_pass_budget_secs: 60,
+                    total_wall_budget_secs: 60,
+                    executions_per_sec: 9.0,
+                    passes: vec![PassRun {
+                        pass: Pass::Empty,
+                        engine: "builtin".to_owned(),
+                        executions: 9,
+                        target_entry_observed: true,
+                        coverage_edges: 80,
+                        coverage_instrumentation: None,
+                        elapsed_secs: 1.0,
+                        executions_per_sec: 9.0,
+                        findings: vec![finding.to_owned()],
+                        hangs: None,
+                    }],
+                    runtrace_events: vec![],
+                },
+                harness_dir: work.join("harnesses").join(harness),
+            }
+        };
+        let without = built("H-NOSHIM", "F-0000-noshim");
+        let with = built("H-SHIM", "F-0001-shim");
+        std::fs::create_dir_all(&without.harness_dir).unwrap();
+        std::fs::create_dir_all(&with.harness_dir).unwrap();
+        // The fuzz pass's own decision: no shim was built, so none is loaded.
+        let mut env = Vec::new();
+        crate::auto::attempt::preload_runtrace_shim(&mut env, &without.harness_dir, None, false);
+        assert!(env.iter().all(|(key, _)| key != "LD_PRELOAD"), "{env:?}");
+        let shim = work.join("libbhf_runtrace_shim.so");
+        std::fs::write(&shim, b"shim").unwrap();
+        let mut env = Vec::new();
+        crate::auto::attempt::preload_runtrace_shim(
+            &mut env,
+            &with.harness_dir,
+            Some(shim.as_path()),
+            false,
+        );
+        assert!(env.iter().any(|(key, _)| key == "LD_PRELOAD"), "{env:?}");
+
+        write_reports(
+            std::path::Path::new("/tmp"),
+            &[without, with],
+            &work,
+            "T0",
+            "T1",
+            false,
+            actionability::RunMode::Reporting,
+            0,
+            0,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let reason = crate::auto::shim_path::unavailable_reason();
+        let read = |path: std::path::PathBuf| -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+        };
+        let finding = read(findings.join("F-0000-noshim").join("finding.json"));
+        assert_eq!(
+            finding["fidelity"]["runtime_shim"]["status"], "not_exercised",
+            "{finding}"
+        );
+        assert_eq!(
+            finding["fidelity"]["runtime_shim"]["reason"],
+            reason.as_str()
+        );
+        // A gap in fuzzing depth, not in the target platform: no caveat.
+        assert!(finding.get("fidelity_caveat").is_none(), "{finding}");
+        let shimmed = read(findings.join("F-0001-shim").join("finding.json"));
+        assert!(
+            shimmed["fidelity"].get("runtime_shim").is_none(),
+            "{shimmed}"
+        );
+
+        let run = read(work.join("auto/run.json"));
+        let target = |harness: &str| {
+            run["targets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|target| target["harness_id"] == harness)
+                .cloned()
+                .unwrap_or_else(|| panic!("no {harness} in {run}"))
+        };
+        assert_eq!(
+            target("H-NOSHIM")["fidelity"]["runtime_shim"]["status"],
+            "not_exercised"
+        );
+        assert!(target("H-SHIM")["fidelity"].get("runtime_shim").is_none());
+        assert_eq!(
+            run["summary"]["fidelity"]["dimensions"]["runtime_shim"]["reason"],
+            reason.as_str()
+        );
     }
 
     /// Regression: a finding a post-pass DELETED from disk (COBOL crash

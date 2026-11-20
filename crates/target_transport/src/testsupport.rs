@@ -15,6 +15,8 @@
 //! * [`MockRenodeMonitor`] — a minimal Renode telnet monitor: `pause`,
 //!   `Save`/`Load` and `machine StartGdbServer`, with Renode's telnet
 //!   negotiation, echo, colours and error text.
+//! * [`DirtyLogFile`] — writes the dirty-page log the way the QEMU plugin of
+//!   [`crate::fast_snapshot`] does, so `reset=fast` runs against the mocks.
 //! * [`encode_event_stream`] / [`simulate_ring`] — build `BHF_EVENTS` byte
 //!   streams and simulate the Ada ring buffer for the coverage-reader tests.
 
@@ -25,7 +27,8 @@ use crate::outcome::{ExitKind, Fault, RunOutcome};
 use event_log::Event;
 use serde_json::Value;
 use std::collections::VecDeque;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 
 // ---------------------------------------------------------------------------
@@ -321,6 +324,20 @@ pub struct MockGdbStub<C: Read + Write> {
     /// Whether it sends Renode's unprompted `S05`s (see
     /// [`MockGdbStub::with_unsolicited_stops`]).
     unsolicited_stops: bool,
+    /// Where the run writes are logged by page, as the QEMU dirty-page plugin
+    /// logs a guest's stores (see [`MockGdbStub::with_dirty_log`]).
+    dirty_log: Option<DirtyLogFile>,
+    /// The register block each `c` leaves (see
+    /// [`MockGdbStub::with_run_registers`]).
+    run_registers: Option<Vec<u8>>,
+    /// The target description annexes served by `qXfer:features:read`.
+    description: Vec<(String, String)>,
+    /// Registers `p` reads, by number, as 32-bit values: their values now,
+    /// those a monitor reset puts back, and those successive `c`s leave (see
+    /// [`MockGdbStub::with_register`]).
+    numbered: std::collections::BTreeMap<u32, u32>,
+    numbered_baseline: std::collections::BTreeMap<u32, u32>,
+    numbered_per_c: VecDeque<Vec<(u32, u32)>>,
 }
 
 impl<C: Read + Write> MockGdbStub<C> {
@@ -341,7 +358,53 @@ impl<C: Read + Write> MockGdbStub<C> {
             file_io: Vec::new(),
             monitor: true,
             unsolicited_stops: false,
+            dirty_log: None,
+            run_registers: None,
+            description: Vec::new(),
+            numbered: std::collections::BTreeMap::new(),
+            numbered_baseline: std::collections::BTreeMap::new(),
+            numbered_per_c: VecDeque::new(),
         }
+    }
+
+    /// Serve `annexes` (`(name, document)`, `target.xml` among them) for
+    /// `qXfer:features:read`, as a stub with a target description does.
+    pub fn with_target_description(mut self, annexes: &[(&str, &str)]) -> Self {
+        self.description = annexes
+            .iter()
+            .map(|(name, document)| ((*name).to_owned(), (*document).to_owned()))
+            .collect();
+        self
+    }
+
+    /// Serve register `number` for `p` as the 32-bit `value`, which a monitor
+    /// reset (`qRcmd`) puts back.
+    pub fn with_register(mut self, number: u32, value: u32) -> Self {
+        self.numbered.insert(number, value);
+        self.numbered_baseline.insert(number, value);
+        self
+    }
+
+    /// Successive `c`s leave the numbered registers of each entry with those
+    /// values, as runs that stop in different places do.
+    pub fn with_registers_per_c(mut self, runs: Vec<Vec<(u32, u32)>>) -> Self {
+        self.numbered_per_c = runs.into();
+        self
+    }
+
+    /// Leave `registers` as the register block after each `c`, as a run that
+    /// stops somewhere other than where it started does.
+    pub fn with_run_registers(mut self, registers: Vec<u8>) -> Self {
+        self.run_registers = Some(registers);
+        self
+    }
+
+    /// Log the pages of each run write in `log`, as QEMU's dirty-page plugin
+    /// logs the guest's stores (`reset=fast`). Memory the debugger writes is
+    /// not logged, as the plugin does not see it.
+    pub fn with_dirty_log(mut self, log: DirtyLogFile) -> Self {
+        self.dirty_log = Some(log);
+        self
     }
 
     /// Send an unprompted `S05` as the debugger connects and another after
@@ -433,6 +496,31 @@ impl<C: Read + Write> MockGdbStub<C> {
         self
     }
 
+    /// `qXfer:features:read:ANNEX:OFFSET,LENGTH`: `m` and a chunk, or `l`
+    /// and the rest; an annex it does not have is an empty reply.
+    fn handle_feature_read(&self, packet: &[u8]) -> Vec<u8> {
+        let request = String::from_utf8_lossy(&packet[b"qXfer:features:read:".len()..]);
+        let Some((annex, span)) = request.rsplit_once(':') else {
+            return b"E00".to_vec();
+        };
+        let Some(document) = self
+            .description
+            .iter()
+            .find_map(|(name, document)| (name == annex).then_some(document))
+        else {
+            return Vec::new();
+        };
+        let Some((offset, length)) = parse_addr_len(span.as_bytes()) else {
+            return b"E00".to_vec();
+        };
+        let bytes = document.as_bytes();
+        let start = (offset as usize).min(bytes.len());
+        let end = (start + length).min(bytes.len());
+        let mut reply = vec![if end == bytes.len() { b'l' } else { b'm' }];
+        reply.extend_from_slice(&bytes[start..end]);
+        reply
+    }
+
     fn handle_read(&self, packet: &[u8]) -> Vec<u8> {
         // packet == b"m<addr>,<len>"
         let Some((addr, len)) = parse_addr_len(&packet[1..]) else {
@@ -498,6 +586,20 @@ impl<C: Read + Write> MockGdbStub<C> {
                                 region.data[offset..offset + data.len()].copy_from_slice(&data);
                             }
                         }
+                        if let Some(log) = &self.dirty_log {
+                            log.record(address, data.len())
+                                .map_err(TransportError::from)?;
+                        }
+                    }
+                    if let Some(log) = &self.dirty_log {
+                        // The guest ran: the plugin saw it.
+                        log.saw_access().map_err(TransportError::from)?;
+                    }
+                    if let Some(registers) = &self.run_registers {
+                        self.registers = registers.clone();
+                    }
+                    for (number, value) in self.numbered_per_c.pop_front().unwrap_or_default() {
+                        self.numbered.insert(number, value);
                     }
                     // File-I/O requests, each answered before the run goes on:
                     // the debugger reads the buffer with `m` and replies `F`.
@@ -586,11 +688,32 @@ impl<C: Read + Write> MockGdbStub<C> {
                 b'R' => { /* restart: RSP defines no reply for `R`. */ }
                 // A monitor command: a line of output, then OK.
                 b'q' if self.monitor && packet.starts_with(b"qRcmd,") => {
+                    // The mock's monitor command resets the machine.
+                    self.numbered = self.numbered_baseline.clone();
                     self.connection.send_packet(b"O6f6b0a")?;
                     self.connection.send_packet(b"OK")?;
                 }
+                b'q' if packet.starts_with(b"qXfer:features:read:") => {
+                    let reply = self.handle_feature_read(&packet);
+                    self.connection.send_packet(&reply)?;
+                }
+                b'p' => {
+                    let number = std::str::from_utf8(&packet[1..])
+                        .ok()
+                        .and_then(|number| u32::from_str_radix(number, 16).ok());
+                    let reply = match number.and_then(|number| self.numbered.get(&number)) {
+                        Some(value) => hex(&value.to_le_bytes()).into_bytes(),
+                        None => b"E14".to_vec(),
+                    };
+                    self.connection.send_packet(&reply)?;
+                }
                 b'Z' | b'z' => self.connection.send_packet(b"OK")?, // (in|re)move breakpoint
-                _ => self.connection.send_packet(b"")?,             // unsupported
+                // QEMU's physical-memory mode for `m`/`M`: the mock's
+                // memory has one address space.
+                b'Q' if packet.starts_with(b"Qqemu.PhyMemMode:") => {
+                    self.connection.send_packet(b"OK")?
+                }
+                _ => self.connection.send_packet(b"")?, // unsupported
             }
         }
         Ok(())
@@ -636,7 +759,10 @@ fn unhex(bytes: &[u8]) -> Option<Vec<u8>> {
 /// command and answers:
 ///
 /// * `human-monitor-command` — logged as `hmp:<command-line>`; answered with
-///   `{"return": ""}` (an empty HMP output, i.e. `savevm`/`loadvm` success).
+///   `{"return": ""}` (an empty HMP output, i.e. `savevm`/`loadvm` success),
+///   or with the output [`MockQmpServer::with_hmp_output`] scripted for it.
+/// * `system_reset` — logged; answered with a `RESET` event and then
+///   `{"return": {}}`, in the order QEMU 8.2 sends them.
 /// * any other command (`qmp_capabilities`, `stop`, `cont`, …) — logged by its
 ///   `execute` name; answered with `{"return": {}}`.
 ///
@@ -644,12 +770,25 @@ fn unhex(bytes: &[u8]) -> Option<Vec<u8>> {
 pub struct MockQmpServer<C: Read + Write> {
     channel: C,
     log: Arc<Mutex<Vec<String>>>,
+    /// HMP command lines and the output each answers with.
+    hmp_output: Vec<(String, String)>,
 }
 
 impl<C: Read + Write> MockQmpServer<C> {
     /// Build a server over `channel`; `log` records each executed command.
     pub fn new(channel: C, log: Arc<Mutex<Vec<String>>>) -> Self {
-        Self { channel, log }
+        Self {
+            channel,
+            log,
+            hmp_output: Vec::new(),
+        }
+    }
+
+    /// Answer the HMP command line `command` (`info roms`) with `output`.
+    pub fn with_hmp_output(mut self, command: &str, output: &str) -> Self {
+        self.hmp_output
+            .push((command.to_owned(), output.to_owned()));
+        self
     }
 
     fn read_byte(&mut self) -> Result<Option<u8>> {
@@ -706,10 +845,21 @@ impl<C: Read + Write> MockQmpServer<C> {
                         .and_then(Value::as_str)
                         .unwrap_or("");
                     self.log.lock().unwrap().push(format!("hmp:{command_line}"));
-                    self.send_line(br#"{"return":""}"#)?;
+                    let output = self
+                        .hmp_output
+                        .iter()
+                        .find(|(command, _)| command == command_line)
+                        .map_or("", |(_, output)| output.as_str());
+                    let reply = serde_json::json!({ "return": output }).to_string();
+                    self.send_line(reply.as_bytes())?;
                 }
                 Some(command) => {
                     self.log.lock().unwrap().push(command.to_string());
+                    if command == "system_reset" {
+                        self.send_line(
+                            br#"{"timestamp":{"seconds":0,"microseconds":0},"event":"RESET","data":{"guest":false,"reason":"host-qmp-system-reset"}}"#,
+                        )?;
+                    }
                     self.send_line(br#"{"return":{}}"#)?;
                 }
                 None => {
@@ -718,6 +868,125 @@ impl<C: Read + Write> MockQmpServer<C> {
                     )?;
                 }
             }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The QEMU plugin's dirty-page log
+// ---------------------------------------------------------------------------
+
+/// A dirty-page log file written the way the QEMU plugin of
+/// [`crate::fast_snapshot`] writes one: its header, then each page written
+/// since bhf last emptied the log, once, until the log is full and says it
+/// overflowed.
+#[derive(Debug, Clone)]
+pub struct DirtyLogFile {
+    path: PathBuf,
+}
+
+/// The plugin log's header bytes.
+const DIRTY_LOG_HEADER: usize = 88;
+
+impl DirtyLogFile {
+    /// Create (or truncate) the log at `path`, as the plugin does when QEMU
+    /// loads it.
+    pub fn create(path: &Path, page_bits: u32, capacity: u32) -> io::Result<Self> {
+        let mut bytes = Vec::with_capacity(DIRTY_LOG_HEADER + capacity as usize * 8);
+        bytes.extend_from_slice(&crate::fast_snapshot::DIRTY_LOG_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&crate::fast_snapshot::DIRTY_LOG_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&page_bits.to_le_bytes());
+        bytes.extend_from_slice(&capacity.to_le_bytes());
+        bytes.resize(DIRTY_LOG_HEADER + capacity as usize * 8, 0);
+        std::fs::write(path, bytes)?;
+        Self::open(path)
+    }
+
+    /// A writer for the log at `path`.
+    pub fn open(path: &Path) -> io::Result<Self> {
+        Ok(Self {
+            path: path.to_owned(),
+        })
+    }
+
+    /// The log's path.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn header(file: &mut std::fs::File) -> io::Result<[u8; DIRTY_LOG_HEADER]> {
+        let mut header = [0_u8; DIRTY_LOG_HEADER];
+        file.seek(SeekFrom::Start(0))?;
+        file.read_exact(&mut header)?;
+        Ok(header)
+    }
+
+    fn file(&self) -> io::Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.path)
+    }
+
+    /// The guest made a memory access: acknowledge the log's epoch, as the
+    /// plugin does on the first access it sees in one.
+    pub fn saw_access(&self) -> io::Result<()> {
+        let mut file = self.file()?;
+        let header = Self::header(&mut file)?;
+        let epoch = u64::from_le_bytes(header[16..24].try_into().expect("8 bytes"));
+        file.seek(SeekFrom::Start(32))?;
+        file.write_all(&epoch.wrapping_add(1).to_le_bytes())
+    }
+
+    /// The bit-band windows bhf put in the header, as `(alias, size,
+    /// source)`, the unused ones left out.
+    pub fn bitband_windows(&self) -> io::Result<Vec<(u64, u64, u64)>> {
+        let header = Self::header(&mut self.file()?)?;
+        let word = |at: usize| u64::from_le_bytes(header[at..at + 8].try_into().expect("8 bytes"));
+        Ok((0..crate::fast_snapshot::BITBAND_WINDOWS)
+            .map(|index| 40 + index * 24)
+            .map(|at| (word(at), word(at + 8), word(at + 16)))
+            .filter(|(_, size, _)| *size != 0)
+            .collect())
+    }
+
+    /// Log the pages a store of `len` bytes at `address` writes.
+    pub fn record(&self, address: u64, len: usize) -> io::Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let mut file = self.file()?;
+        let header = Self::header(&mut file)?;
+        let word = |at: usize| u32::from_le_bytes(header[at..at + 4].try_into().expect("4 bytes"));
+        let (page_bits, capacity, mut count) = (word(8), word(12), word(24));
+        let mut pages = vec![0_u8; count as usize * 8];
+        file.read_exact(&mut pages)?;
+        let mut recorded: Vec<u64> = pages
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|page| u64::from_le_bytes(*page))
+            .collect();
+        let first = address >> page_bits;
+        let last = (address + len as u64 - 1) >> page_bits;
+        for page in first..=last {
+            if recorded.contains(&page) {
+                continue;
+            }
+            if count >= capacity {
+                file.seek(SeekFrom::Start(28))?;
+                file.write_all(&1_u32.to_le_bytes())?;
+                continue;
+            }
+            file.seek(SeekFrom::Start(
+                DIRTY_LOG_HEADER as u64 + u64::from(count) * 8,
+            ))?;
+            file.write_all(&page.to_le_bytes())?;
+            count += 1;
+            recorded.push(page);
+            file.seek(SeekFrom::Start(24))?;
+            file.write_all(&count.to_le_bytes())?;
         }
         Ok(())
     }

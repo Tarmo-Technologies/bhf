@@ -75,6 +75,9 @@ impl Profile {
                 "gnatcheck",
                 // #324: SymCC (GPL-3.0), the concolic lane of `auto --symcc`.
                 "symcc",
+                // #347: bhf's dirty-page plugin, run inside QEMU (GPL-2.0) by
+                // the qemu-system lane's `reset=fast`.
+                "qemu_plugin",
             ],
             Self::ResearchLab => &["*"],
         }
@@ -125,6 +128,18 @@ mod tests {
             .allowed_subprocesses()
             .contains(&"symcc"));
         assert_eq!(Profile::ResearchLab.allowed_subprocesses(), &["*"]);
+    }
+
+    /// #347: bhf's dirty-page plugin runs inside QEMU (GPL-2.0), under
+    /// external-tools and research-lab only.
+    #[test]
+    fn only_the_external_tool_profiles_allow_the_qemu_plugin() {
+        assert!(!Profile::StrictPermissive
+            .allowed_subprocesses()
+            .contains(&"qemu_plugin"));
+        assert!(Profile::ExternalTools
+            .allowed_subprocesses()
+            .contains(&"qemu_plugin"));
     }
 
     #[test]

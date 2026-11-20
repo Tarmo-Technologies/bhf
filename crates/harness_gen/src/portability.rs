@@ -33,7 +33,7 @@ pub const PORTABILITY_DOC_NAME: &str = "PORTABILITY.md";
 pub const LIBFUZZER_SHIM_NAME: &str = "bhf_libfuzzer.c";
 
 /// The C-ABI libFuzzer adapter, shared verbatim by every lane that produces a
-/// libFuzzer binary (C, C++, Rust). It provides the two symbols a
+/// libFuzzer binary (C, C++, Rust). It provides the symbols a
 /// `-fsanitize=fuzzer` link needs that the bhf harness does not define on its
 /// own once the native fork-server driver is left out:
 ///
@@ -41,7 +41,9 @@ pub const LIBFUZZER_SHIM_NAME: &str = "bhf_libfuzzer.c";
 ///   stable `bhf_run_one(data, size)`;
 /// - a no-op `bhf_target_enter` — the harness calls this boundary hook when it is
 ///   compiled for an external driver (`-DBHF_EXTERNAL_DRIVER`); the real counting
-///   definition lives in `bhf_driver.c`, which a libFuzzer build does not link.
+///   definition lives in `bhf_driver.c`, which a libFuzzer build does not link;
+/// - a no-op `bhf_diff_result`, the hook the same harness hands each target
+///   result to for the differential observation `bhf_driver.c` makes.
 ///
 /// `bhf_run_one` has C linkage in every lane (the C/C++ harness declares it
 /// `extern "C"`; the Rust staticlib exports it `#[no_mangle] extern "C"`), so a
@@ -62,6 +64,15 @@ extern int bhf_run_one(const uint8_t *data, size_t size);
 /* The harness calls this boundary hook under -DBHF_EXTERNAL_DRIVER; the counting
  * definition is in bhf_driver.c, which a libFuzzer build intentionally omits. */
 void bhf_target_enter(void) {}
+
+/* Likewise the hook that hands each target result to the differential
+ * observation of `bhf fuzz --differential-harness`, which a libFuzzer build
+ * does not make. */
+void bhf_diff_result(int type_class, const void *value, size_t size) {
+    (void)type_class;
+    (void)value;
+    (void)size;
+}
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     return bhf_run_one(data, size);

@@ -51,7 +51,7 @@ pub mod manifest {
 #[cfg(not(target_os = "linux"))]
 mod stub {
     // Empty cdylib on macOS / Windows. The auto loop's
-    // shim_path::locate() will probably still find the .so/.dylib,
-    // but none of the symbols override anything, so the audit is
-    // a no-op.
+    // shim_path::locate() never returns it there (it locates a shim on
+    // Linux only), so a native pass runs without one and records why
+    // in its fidelity (runtime_shim).
 }

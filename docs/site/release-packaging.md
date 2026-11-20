@@ -31,7 +31,9 @@ preload libraries are Linux-only and use package-local targets, so they remain
 separate Linux cdylib assets rather than empty Windows artifacts. The
 all-in-one `bhf-dist-*` bundle is published for x86_64 only; on aarch64 use the
 component archives or installers. macOS and Windows-on-Arm artifacts are not
-currently published.
+currently published; CI's `macos-build` job builds bhf natively for
+`aarch64-apple-darwin` on a `macos-15` runner, without the Linux-only preload
+libraries, and runs a `bhf auto` smoke there.
 
 The GitHub Release contains the all-in-one Linux `install.sh` bundle,
 per-component platform archives, Unix shell installers, and PowerShell

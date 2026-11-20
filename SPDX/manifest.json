@@ -1335,6 +1335,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/c_parser/src/ioctl.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/c_parser/src/lib.rs",
       "license": "Apache-2.0"
     },
@@ -1924,6 +1928,10 @@
     },
     {
       "path": "crates/cli/src/introspect.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/kernel.rs",
       "license": "Apache-2.0"
     },
     {
@@ -3155,6 +3163,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/fuzz_differential_in_loop.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/fuzz_extension_stages.rs",
       "license": "Apache-2.0"
     },
@@ -3232,6 +3244,14 @@
     },
     {
       "path": "crates/cli/tests/java_driver_noise.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/kernel_import_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/kernel_syzlang_cli.rs",
       "license": "Apache-2.0"
     },
     {
@@ -4591,6 +4611,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/rehost/src/infer.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/rehost/src/lib.rs",
       "license": "Apache-2.0"
     },
@@ -4600,6 +4624,10 @@
     },
     {
       "path": "crates/rehost/src/memory.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/rehost/src/mmio.rs",
       "license": "Apache-2.0"
     },
     {
@@ -4615,7 +4643,23 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/rehost/tests/fixture_dispatch.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/rehost/tests/fixture_faults.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/rehost/tests/fixture_mmio.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/rehost/tests/fixture_uart.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/rehost/tests/fixtures/dispatch.c",
       "license": "Apache-2.0"
     },
     {
@@ -4627,7 +4671,15 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/rehost/tests/fixtures/mmio.c",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/rehost/tests/fixtures/startup.c",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/rehost/tests/fixtures/uart.c",
       "license": "Apache-2.0"
     },
     {
@@ -4736,6 +4788,10 @@
     },
     {
       "path": "crates/results/src/confirmation.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/src/import_syzkaller.rs",
       "license": "Apache-2.0"
     },
     {
@@ -5151,6 +5207,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/target_transport/qemu_plugin/bhf_qemu_dirty_pages.c",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/target_transport/src/agent.rs",
       "license": "Apache-2.0"
     },
@@ -5168,6 +5228,10 @@
     },
     {
       "path": "crates/target_transport/src/error.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/target_transport/src/fast_snapshot.rs",
       "license": "Apache-2.0"
     },
     {
@@ -5807,6 +5871,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "docs/validation/2026-11-19-fullsystem-fast-snapshot.md",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "docs/validation/2026-11-19-fullsystem-persistent-loop.md",
       "license": "Apache-2.0"
     },
@@ -6324,6 +6392,10 @@
     },
     {
       "path": "tests/fixtures/government_legacy_patterns/gpr/scenario_app.gpr",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/kernel_widget/linux/drivers/misc/widget.c",
       "license": "Apache-2.0"
     },
     {

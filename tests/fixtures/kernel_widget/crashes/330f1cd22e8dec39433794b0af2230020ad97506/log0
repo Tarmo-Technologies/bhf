@@ -1,0 +1,94 @@
+Warning: Permanently added '10.0.2.15' (ED25519) to the list of known hosts.
+2026/11/18 10:42:17 fuzzer started
+2026/11/18 10:42:17 dialing manager at 10.0.2.10:41245
+2026/11/18 10:42:18 syscalls: 412
+2026/11/18 10:42:18 code coverage: enabled
+2026/11/18 10:42:18 comparison tracing: enabled
+2026/11/18 10:42:18 executing program 0:
+r0 = openat$widget(0xffffffffffffff9c, &(0x7f0000000000)='/dev/widget\x00', 0x2, 0x0)
+ioctl$WIDGET_IOC_SET_CONFIG(r0, 0x40205701, &(0x7f0000000080)={0x1, 0x0, 0x3, 0x0, "77696467657430000000000000000000", 0x3b9aca00})
+2026/11/18 10:42:18 executing program 0:
+r0 = openat$widget(0xffffffffffffff9c, &(0x7f0000000000)='/dev/widget\x00', 0x2, 0x0)
+ioctl$WIDGET_IOC_XFER(r0, 0xc0285703, &(0x7f0000000040)={0x4, 0x10, "000102030405060708090a0b0c0d0e0f", @crc=0x0, 0x0})
+[  112.453829][ T5104] ==================================================================
+[  112.453829][ T5104] BUG: KASAN: slab-out-of-bounds in widget_copy_at drivers/misc/widget.c:46 [inline]
+[  112.453829][ T5104] BUG: KASAN: slab-out-of-bounds in widget_do_xfer drivers/misc/widget.c:60 [inline]
+[  112.453829][ T5104] BUG: KASAN: slab-out-of-bounds in widget_ioctl+0x5b1/0x6d0 drivers/misc/widget.c:98
+[  112.453829][ T5104] Write of size 16 at addr ffff88801f2a3c68 by task syz-executor.0/5104
+[  112.453829][ T5104] 
+[  112.453829][ T5104] CPU: 1 PID: 5104 Comm: syz-executor.0 Not tainted 6.6.0-syzkaller #0
+[  112.453829][ T5104] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.16.2-debian-1.16.2-1 04/01/2014
+[  112.453829][ T5104] Call Trace:
+[  112.453829][ T5104]  <TASK>
+[  112.453829][ T5104]  __dump_stack lib/dump_stack.c:88 [inline]
+[  112.453829][ T5104]  dump_stack_lvl+0xd9/0x1b0 lib/dump_stack.c:106
+[  112.453829][ T5104]  print_address_description mm/kasan/report.c:364 [inline]
+[  112.453829][ T5104]  print_report+0xc4/0x620 mm/kasan/report.c:475
+[  112.453829][ T5104]  kasan_report+0xda/0x110 mm/kasan/report.c:588
+[  112.453829][ T5104]  check_region_inline mm/kasan/generic.c:181 [inline]
+[  112.453829][ T5104]  kasan_check_range+0xef/0x190 mm/kasan/generic.c:187
+[  112.453829][ T5104]  __asan_memcpy+0x3c/0x60 mm/kasan/shadow.c:106
+[  112.453829][ T5104]  widget_copy_at drivers/misc/widget.c:46 [inline]
+[  112.453829][ T5104]  widget_do_xfer drivers/misc/widget.c:60 [inline]
+[  112.453829][ T5104]  widget_ioctl+0x5b1/0x6d0 drivers/misc/widget.c:98
+[  112.453829][ T5104]  vfs_ioctl fs/ioctl.c:51 [inline]
+[  112.453829][ T5104]  __do_sys_ioctl fs/ioctl.c:871 [inline]
+[  112.453829][ T5104]  __se_sys_ioctl fs/ioctl.c:857 [inline]
+[  112.453829][ T5104]  __x64_sys_ioctl+0x18f/0x210 fs/ioctl.c:857
+[  112.453829][ T5104]  do_syscall_x64 arch/x86/entry/common.c:50 [inline]
+[  112.453829][ T5104]  do_syscall_64+0x3f/0x110 arch/x86/entry/common.c:80
+[  112.453829][ T5104]  entry_SYSCALL_64_after_hwframe+0x63/0xcd
+[  112.453829][ T5104] RIP: 0033:0x7f3c1a47cae9
+[  112.453829][ T5104] Code: 28 00 00 00 75 05 48 83 c4 28 c3 e8 e1 20 00 00 90 48 89 f8 48 89 f7 48 89 d6 48 89 ca 4d 89 c2 4d 89 c8 4c 8b 4c 24 08 0f 05 <48> 3d 01 f0 ff ff 73 01 c3 48 c7 c1 b0 ff ff ff f7 d8 64 89 01 48
+[  112.453829][ T5104] RSP: 002b:00007f3c1b1f80c8 EFLAGS: 00000246 ORIG_RAX: 0000000000000010
+[  112.453829][ T5104] RAX: ffffffffffffffda RBX: 00007f3c1a59bf80 RCX: 00007f3c1a47cae9
+[  112.453829][ T5104] RDX: 0000000020000040 RSI: 00000000c0285703 RDI: 0000000000000003
+[  112.453829][ T5104] RBP: 00007f3c1a4c847a R08: 0000000000000000 R09: 0000000000000000
+[  112.453829][ T5104] R10: 0000000000000000 R11: 0000000000000246 R12: 0000000000000000
+[  112.453829][ T5104] R13: 000000000000000b R14: 00007f3c1a59bf80 R15: 00007ffd4e6a3c38
+[  112.453829][ T5104]  </TASK>
+[  112.453829][ T5104] 
+[  112.453829][ T5104] Allocated by task 5104:
+[  112.453829][ T5104]  kasan_save_stack+0x33/0x50 mm/kasan/common.c:45
+[  112.453829][ T5104]  kasan_set_track+0x25/0x30 mm/kasan/common.c:52
+[  112.453829][ T5104]  ____kasan_kmalloc mm/kasan/common.c:374 [inline]
+[  112.453829][ T5104]  __kasan_kmalloc+0xa2/0xb0 mm/kasan/common.c:383
+[  112.453829][ T5104]  kmalloc include/linux/slab.h:600 [inline]
+[  112.453829][ T5104]  kzalloc include/linux/slab.h:721 [inline]
+[  112.453829][ T5104]  widget_open+0x4b/0x110 drivers/misc/widget.c:27
+[  112.453829][ T5104]  misc_open+0x30f/0x380 drivers/char/misc.c:165
+[  112.453829][ T5104]  chrdev_open+0x26d/0x6e0 fs/char_dev.c:414
+[  112.453829][ T5104]  do_dentry_open+0x8d4/0x18d0 fs/open.c:929
+[  112.453829][ T5104]  do_open fs/namei.c:3639 [inline]
+[  112.453829][ T5104]  path_openat+0x1d0a/0x2b70 fs/namei.c:3796
+[  112.453829][ T5104]  do_filp_open+0x1d1/0x430 fs/namei.c:3823
+[  112.453829][ T5104]  do_sys_openat2+0x176/0x1e0 fs/open.c:1422
+[  112.453829][ T5104]  do_sys_open fs/open.c:1437 [inline]
+[  112.453829][ T5104]  __do_sys_openat fs/open.c:1453 [inline]
+[  112.453829][ T5104]  __se_sys_openat fs/open.c:1448 [inline]
+[  112.453829][ T5104]  __x64_sys_openat+0x175/0x210 fs/open.c:1448
+[  112.453829][ T5104]  do_syscall_x64 arch/x86/entry/common.c:50 [inline]
+[  112.453829][ T5104]  do_syscall_64+0x3f/0x110 arch/x86/entry/common.c:80
+[  112.453829][ T5104]  entry_SYSCALL_64_after_hwframe+0x63/0xcd
+[  112.453829][ T5104] 
+[  112.453829][ T5104] The buggy address belongs to the object at ffff88801f2a3c00
+[  112.453829][ T5104]  which belongs to the cache kmalloc-128 of size 128
+[  112.453829][ T5104] The buggy address is located 0 bytes to the right of
+[  112.453829][ T5104]  allocated 104-byte region [ffff88801f2a3c00, ffff88801f2a3c68)
+[  112.453829][ T5104] 
+[  112.453829][ T5104] The buggy address belongs to the physical page:
+[  112.453829][ T5104] page:ffffea00007ca8c0 refcount:1 mapcount:0 mapping:0000000000000000 index:0x0 pfn:0x1f2a3
+[  112.453829][ T5104] flags: 0xfff00000000800(slab|node=0|zone=1|lastcpupid=0x7ff)
+[  112.453829][ T5104] page_type: 0xffffffff()
+[  112.453829][ T5104] raw: 00fff00000000800 ffff888012841a00 ffffea0000851d80 dead000000000003
+[  112.453829][ T5104] raw: 0000000000000000 0000000000100010 00000001ffffffff 0000000000000000
+[  112.453829][ T5104] page dumped because: kasan: bad access detected
+[  112.453829][ T5104] 
+[  112.453829][ T5104] Memory state around the buggy address:
+[  112.453829][ T5104]  ffff88801f2a3b00: fa fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+[  112.453829][ T5104]  ffff88801f2a3b80: fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc
+[  112.453829][ T5104] >ffff88801f2a3c00: 00 00 00 00 00 00 00 00 00 00 00 00 00 fc fc fc
+[  112.453829][ T5104]                                                           ^
+[  112.453829][ T5104]  ffff88801f2a3c80: fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc
+[  112.453829][ T5104]  ffff88801f2a3d00: fa fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+[  112.453829][ T5104] ==================================================================

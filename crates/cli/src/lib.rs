@@ -76,6 +76,7 @@ mod generate_harness;
 mod git_diff;
 mod instrument;
 mod introspect;
+mod kernel;
 mod license_audit;
 pub mod list_fakes;
 pub mod list_oracles;
@@ -159,6 +160,7 @@ COMMANDS BY AREA (run `bhf <command> --help` for details):
   Crash triage  corpus, minimize, replay, capsule, verify-poc, env-capsule,
                 differential, relational, cmplog, explain, cartography, decode-args
   Binaries      binary (scan, adapter, fuzz, rehost — no source)
+  Kernel        kernel (syzlang, import — Linux drivers with syzkaller)
   Projects      project (validate, list, run, import-ossfuzz),
                 extension (validate, evaluate)
   Supply chain  sbom, license-audit, static-scan, sloc, extract-state-machines
@@ -283,6 +285,10 @@ enum Command {
     /// No-source analysis of compiled binaries & firmware: scan (CVE/SBOM), fuzz (black-box), rehost (Cortex-M firmware in an emulator), and the adapter stubs
     Binary(BinaryArgs),
 
+    // ── Kernel drivers: syzkaller ───────────────────────────────────────────
+    /// Linux kernel drivers with syzkaller: generate syzlang descriptions of a driver's ioctl interface from its source (syzlang), import syzkaller crash reports into results (import)
+    Kernel(kernel::KernelArgs),
+
     // ── External project/target profiles ────────────────────────────────────
     /// Define, validate, and run an external project/target-profile manifest (bhf.project.v1) kept outside the source tree: validate, list, run
     Project(project::ProjectArgs),
@@ -387,7 +393,7 @@ enum BinaryCommand {
     Adapter(binary_adapter::BinaryAdapterArgs),
     /// Fuzz a standalone executable with no source (stdin/seed inputs, sandbox, timeouts, black-box)
     Fuzz(binary_fuzz::BinaryFuzzArgs),
-    /// Fuzz an unmodified Cortex-M firmware image (ELF or raw) in bhf's emulator: input in a fixed buffer, edge coverage, invalid access / bad PC / HardFault findings
+    /// Fuzz an unmodified Cortex-M firmware image (ELF or raw) in bhf's emulator: input in a fixed buffer or through MMIO-modelled peripheral reads, edge coverage, invalid access / bad PC / HardFault findings
     Rehost(binary_rehost::BinaryRehostArgs),
 }
 
@@ -536,6 +542,7 @@ where
         // results layout (via `project::run`), so it is NOT wrapped in the
         // `with_results` producer bracket.
         Some(Command::Project(project_args)) => project::run(project_args),
+        Some(Command::Kernel(kernel_args)) => kernel::run(kernel_args),
         // `bhf extension` manages its own work dir, findings, and run provenance
         // (via `extension::run`), so it is NOT wrapped in the `with_results`
         // producer bracket (mirroring `bhf project`).

@@ -8,12 +8,14 @@
 //! (with the M4's halfword multiplies and saturation, without its SIMD and
 //! floating-point instructions), the banked stack pointers, the IT state,
 //! `SVC` exception entry and return, the System Control Block registers a
-//! start-up file writes (`VTOR`, `CCR`, `CPACR`, `AIRCR`), and semihosting
-//! output and exit. Interrupts, the MPU and privilege checks are not.
+//! start-up file writes (`VTOR`, `CCR`, `CPACR`, `AIRCR`), semihosting
+//! output and exit, and peripheral reads through the MMIO models
+//! (`mmio.rs`). Interrupts, the MPU and privilege checks are not.
 
 use crate::coverage::EdgeMap;
 use crate::fault::{Fault, FaultKind};
 use crate::memory::{Memory, Miss};
+use crate::mmio::Mmio;
 use crate::IdleReason;
 use std::collections::HashMap;
 
@@ -60,9 +62,46 @@ pub(crate) enum Trap {
     SystemReset {
         pc: u32,
     },
+    /// A peripheral read wanted more input than the run had left.
+    InputExhausted {
+        pc: u32,
+        address: u32,
+    },
 }
 
 pub(crate) type Step = Result<(), Trap>;
+
+/// What [`Core::save`] keeps.
+pub(crate) struct Saved {
+    r: [u32; 16],
+    pc: u32,
+    next_pc: u32,
+    /// N, Z, C, V, Q and `EPSR.T`.
+    flags: [bool; 6],
+    it: u8,
+    ipsr: u32,
+    primask: bool,
+    faultmask: bool,
+    basepri: u32,
+    control: u32,
+    other_sp: u32,
+    active: Vec<u32>,
+    event: bool,
+    monitor: bool,
+    ppb: HashMap<u32, u32>,
+    vtor: u32,
+    ccr: u32,
+    cpacr: u32,
+    block_end: bool,
+    direct_branch: bool,
+    pending_exception: Option<u32>,
+    pending_return: Option<u32>,
+    last_pc: Option<u32>,
+    instructions: u64,
+    blocks: u64,
+    /// Bytes of semihosting output written.
+    output: usize,
+}
 
 /// Whether the architecture lets code run from `address`: the Code, SRAM
 /// and external RAM regions do; peripheral, device and system space never.
@@ -100,6 +139,8 @@ pub(crate) struct Core {
     event: bool,
     monitor: bool,
     pub(crate) mem: Memory,
+    /// What peripheral registers read as.
+    pub(crate) mmio: Mmio,
     /// Words the private peripheral bus holds, other than the cached ones.
     ppb: HashMap<u32, u32>,
     vtor_reset: u32,
@@ -120,7 +161,7 @@ pub(crate) struct Core {
 }
 
 impl Core {
-    pub(crate) fn new(mem: Memory, vtor: u32) -> Self {
+    pub(crate) fn new(mem: Memory, mmio: Mmio, vtor: u32) -> Self {
         Self {
             r: [0; 16],
             pc: 0,
@@ -142,6 +183,7 @@ impl Core {
             event: false,
             monitor: false,
             mem,
+            mmio,
             ppb: HashMap::new(),
             vtor_reset: vtor,
             vtor,
@@ -194,6 +236,110 @@ impl Core {
         self.instructions = 0;
         self.blocks = 1;
         self.output.clear();
+    }
+
+    /// The core's state between two instructions, to go back to with
+    /// [`Core::restore`]. Memory and the peripheral reads keep their own
+    /// marks; the edge map is left out, since nothing a run does depends on
+    /// it.
+    pub(crate) fn save(&self) -> Saved {
+        // Every field is named, so a field added to the core has to be
+        // saved or left out here on purpose.
+        let Self {
+            r,
+            pc,
+            next_pc,
+            n,
+            z,
+            c,
+            v,
+            q,
+            thumb,
+            it,
+            ipsr,
+            primask,
+            faultmask,
+            basepri,
+            control,
+            other_sp,
+            active,
+            event,
+            monitor,
+            mem: _,
+            mmio: _,
+            ppb,
+            vtor_reset: _,
+            vtor,
+            ccr,
+            cpacr,
+            edges: _,
+            block_end,
+            direct_branch,
+            pending_exception,
+            pending_return,
+            last_pc,
+            instructions,
+            blocks,
+            output,
+        } = self;
+        Saved {
+            r: *r,
+            pc: *pc,
+            next_pc: *next_pc,
+            flags: [*n, *z, *c, *v, *q, *thumb],
+            it: *it,
+            ipsr: *ipsr,
+            primask: *primask,
+            faultmask: *faultmask,
+            basepri: *basepri,
+            control: *control,
+            other_sp: *other_sp,
+            active: active.clone(),
+            event: *event,
+            monitor: *monitor,
+            ppb: ppb.clone(),
+            vtor: *vtor,
+            ccr: *ccr,
+            cpacr: *cpacr,
+            block_end: *block_end,
+            direct_branch: *direct_branch,
+            pending_exception: *pending_exception,
+            pending_return: *pending_return,
+            last_pc: *last_pc,
+            instructions: *instructions,
+            blocks: *blocks,
+            output: output.len(),
+        }
+    }
+
+    /// Go back to the state `saved` holds.
+    pub(crate) fn restore(&mut self, saved: &Saved) {
+        self.r = saved.r;
+        self.pc = saved.pc;
+        self.next_pc = saved.next_pc;
+        [self.n, self.z, self.c, self.v, self.q, self.thumb] = saved.flags;
+        self.it = saved.it;
+        self.ipsr = saved.ipsr;
+        self.primask = saved.primask;
+        self.faultmask = saved.faultmask;
+        self.basepri = saved.basepri;
+        self.control = saved.control;
+        self.other_sp = saved.other_sp;
+        self.active.clone_from(&saved.active);
+        self.event = saved.event;
+        self.monitor = saved.monitor;
+        self.ppb.clone_from(&saved.ppb);
+        self.vtor = saved.vtor;
+        self.ccr = saved.ccr;
+        self.cpacr = saved.cpacr;
+        self.block_end = saved.block_end;
+        self.direct_branch = saved.direct_branch;
+        self.pending_exception = saved.pending_exception;
+        self.pending_return = saved.pending_return;
+        self.last_pc = saved.last_pc;
+        self.instructions = saved.instructions;
+        self.blocks = saved.blocks;
+        self.output.truncate(saved.output);
     }
 
     // ---- registers and flags ----------------------------------------------
@@ -455,8 +601,13 @@ impl Core {
             return Ok(self.ppb_read(address, size));
         }
         if (PERIPHERAL_BASE..PERIPHERAL_END).contains(&address) {
-            // No peripheral is modelled: every register reads as zero.
-            return Ok(0);
+            return self
+                .mmio
+                .read(address, self.pc, size, self.instructions)
+                .map_err(|_| Trap::InputExhausted {
+                    pc: self.pc,
+                    address,
+                });
         }
         if let Some((byte, bit)) = self.mem.bitband(address) {
             let value = self.mem.read(byte, 1).unwrap_or(0);
@@ -472,7 +623,12 @@ impl Core {
             return Err(self.fault(FaultKind::Unaligned, Some(address)));
         }
         match self.mem.write(address, size, value) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if self.mmio.tracing() {
+                    self.mmio.note_store(address, size, value);
+                }
+                Ok(())
+            }
             Err(Miss::ReadOnly) => Err(self.fault(FaultKind::WriteReadOnly, Some(address))),
             Err(Miss::Unmapped) => self.store_outside_memory(address, size, value),
         }
@@ -492,7 +648,7 @@ impl Core {
             return self.ppb_write(address, size, value);
         }
         if (PERIPHERAL_BASE..PERIPHERAL_END).contains(&address) {
-            // No peripheral is modelled: the write goes nowhere.
+            // Peripheral writes go nowhere.
             return Ok(());
         }
         if let Some((byte, bit)) = self.mem.bitband(address) {
@@ -503,7 +659,12 @@ impl Core {
                 old & !(1 << bit)
             };
             return match self.mem.write(byte, 1, new) {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    if self.mmio.tracing() {
+                        self.mmio.note_store(address, size, value);
+                    }
+                    Ok(())
+                }
                 Err(_) => Err(self.fault(FaultKind::WriteReadOnly, Some(address))),
             };
         }

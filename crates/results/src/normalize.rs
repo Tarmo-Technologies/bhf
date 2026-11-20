@@ -29,7 +29,7 @@ const MAX_HASH_BYTES: u64 = 64 * 1024 * 1024;
 const TITLE_MAX: usize = 160;
 
 /// Evidence files we surface, in display order: (role, file name).
-const EVIDENCE_FILES: [(&str, &str); 9] = [
+const EVIDENCE_FILES: [(&str, &str); 12] = [
     ("finding", "finding.json"),
     ("testcase", "testcase.bin"),
     ("testcase_minimized", "min_testcase.bin"),
@@ -41,6 +41,10 @@ const EVIDENCE_FILES: [(&str, &str); 9] = [
     // The runtrace events of the replay that recorded the finding's
     // comparison evidence: this one input's environment use.
     ("runtrace", "runtrace.jsonl"),
+    // An imported syzkaller crash: the console log and the reproducers.
+    ("console_log", crate::import_syzkaller::CONSOLE_FILE),
+    ("repro_syz", crate::import_syzkaller::SYZ_REPRO_FILE),
+    ("repro_c", crate::import_syzkaller::C_REPRO_FILE),
 ];
 
 pub fn kind_for(id: &str, raw: &Value) -> Kind {
@@ -182,13 +186,20 @@ pub fn from_finding_report(
         location.as_ref(),
         exception.name.as_deref(),
     );
-    let title = title_for(
-        &message,
-        a.cwe_name.as_deref().or(rule.name.as_deref()),
-        exception.name.as_deref(),
-        location.as_ref(),
-        &f.id,
-    );
+    let kernel = crate::import_syzkaller::is_kernel_crash(raw);
+    // An imported kernel crash goes by syzkaller's title, as its reports and
+    // dashboards name it.
+    let title = if kernel && !message.trim().is_empty() {
+        truncate(message.lines().next().unwrap_or("").trim(), TITLE_MAX)
+    } else {
+        title_for(
+            &message,
+            a.cwe_name.as_deref().or(rule.name.as_deref()),
+            exception.name.as_deref(),
+            location.as_ref(),
+            &f.id,
+        )
+    };
     // The key persisted at emit first (see `persisted_cluster_key_full`),
     // then the loader's. The confirm pass also writes a crash's cluster key
     // onto the static rows it confirms, without frames. Never the run-local
@@ -201,13 +212,19 @@ pub fn from_finding_report(
     let rehost =
         kind == Kind::Binary && raw.get("kind").and_then(Value::as_str) == Some(REHOST_FAULT_KIND);
     // The generic replay.py runs a host harness, which a rehosted firmware
-    // image is not: `bhf replay` is its reproducer.
+    // image or a kernel crash is not: `bhf replay` or the crash's own
+    // reproducer is.
     let evidence = evidence_for(&finding_dir, &f.id).map(|mut evidence| {
-        if rehost {
+        if rehost || kernel {
             evidence.files.retain(|file| file.role != "replay_script");
         }
         evidence
     });
+    let has_evidence = |role: &str| {
+        evidence
+            .as_ref()
+            .is_some_and(|e| e.files.iter().any(|file| file.role == role))
+    };
     if matches!(kind, Kind::Fuzz | Kind::Runtime) {
         caveats.extend(actionability::harness_state_caveats(
             raw,
@@ -230,6 +247,8 @@ pub fn from_finding_report(
         kind,
         producer: if rehost {
             REHOST_PRODUCER.to_owned()
+        } else if kernel {
+            crate::import_syzkaller::PRODUCER.to_owned()
         } else {
             producer_for(kind, &f.id).to_owned()
         },
@@ -242,7 +261,11 @@ pub fn from_finding_report(
         rule,
         title,
         message,
-        explanation: a.explanation.clone(),
+        explanation: if kernel {
+            crate::import_syzkaller::explanation(raw).or_else(|| a.explanation.clone())
+        } else {
+            a.explanation.clone()
+        },
         impact: Some(a.impact.as_str().to_owned()),
         confidence: Confidence {
             level: if forced || build_fidelity.is_some() {
@@ -293,6 +316,13 @@ pub fn from_finding_report(
             // from an imported directory.
             command: if rehost {
                 Some(format!("bhf replay findings/{}", f.id))
+            } else if kernel {
+                crate::import_syzkaller::reproduce_command(
+                    &f.id,
+                    raw,
+                    has_evidence("repro_c"),
+                    has_evidence("repro_syz"),
+                )
             } else {
                 has_replay.then(|| format!("{REPLAY_PYTHON} findings/{}/replay.py", f.id))
             },

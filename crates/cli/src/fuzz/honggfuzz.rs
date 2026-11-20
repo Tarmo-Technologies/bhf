@@ -366,6 +366,7 @@ fn run_with(prepared: PreparedFuzzRun, honggfuzz: &Path) -> Result<FuzzRunSummar
         hangs: None,
         stability: None,
         symcc: None,
+        differential: None,
         workers: None,
     };
     write_run_summary(&prepared.work_dir, &summary)?;
