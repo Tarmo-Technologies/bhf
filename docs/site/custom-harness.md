@@ -331,6 +331,8 @@ set to bhf's driver, so every fuzz target it links is a bhf harness, with no
 ```sh
 bhf project import-ossfuzz path/to/libfoo --work-dir bhf_work
 bhf fuzz bhf_work --harness parse_record_fuzzer --time 60s
+# or every imported fuzzer, with the targets bhf generates for the tree:
+bhf auto path/to/libfoo --work-dir bhf_work
 ```
 
 `build.sh` runs in bubblewrap or firejail, without network and with writes

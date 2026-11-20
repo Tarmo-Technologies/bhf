@@ -8609,6 +8609,7 @@ const C_CONTEXT_VARIANTS: &[ContextVariant] = &[
     ("RTSAN", "$(RTSAN_CC)", "$(RTSAN_CFLAGS)", true, false),
     ("COV", "$(COV_CC)", "$(COV_CFLAGS)", true, false),
     ("DIFF", "$(DIFF_CC)", "$(DIFF_CFLAGS)", true, false),
+    ("SYMCC", "$(SYMCC_CC)", "$(SYMCC_CFLAGS)", true, false),
     ("PROV", "$(CC)", "$(BHF_CFLAGS) $(CFLAGS)", true, true),
     ("WINAFL", "$(CC)", "$(WINAFL_CFLAGS)", true, true),
 ];
@@ -8627,6 +8628,15 @@ const CPP_CONTEXT_VARIANTS: &[ContextVariant] = &[
     ),
     ("COV", "$(COV_CXX)", "$(COV_CXXFLAGS)", true, false),
     ("DIFF", "$(DIFF_CXX)", "$(DIFF_CXXFLAGS)", true, false),
+    // sym++ runs only once told which C++ library to take (see
+    // BHF_SYMCC_STDLIB in the C++ Makefile), for each unit as for the link.
+    (
+        "SYMCC",
+        "$(BHF_SYMCC_STDLIB) $(SYMCC_CXX)",
+        "$(SYMCC_CXXFLAGS)",
+        true,
+        false,
+    ),
     ("WINAFL", "$(CXX)", "$(WINAFL_CXXFLAGS)", true, true),
 ];
 
@@ -23214,6 +23224,125 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             status.success() && harness.join("main").is_file(),
             "the default goal must compile and link the per-TU flag graph"
         );
+    }
+
+    /// #324: `make symcc` of a C++ harness with a compile-database row
+    /// compiles that row's object with sym++ told which C++ library to take,
+    /// as it links: the stand-in, like sym++, refuses to run otherwise.
+    #[cfg(unix)]
+    #[test]
+    fn cpp_symcc_lane_compiles_each_database_unit_with_the_stdlib_choice() {
+        use std::os::unix::fs::PermissionsExt;
+        if !have_tool("make") {
+            bhfeprintln!("skipping: make not on PATH");
+            return;
+        }
+        let root = temp_dir("cpp-per-tu-symcc");
+        let src = root.join("src");
+        fs::create_dir_all(&src).unwrap();
+        let widget = src.join("widget.cpp");
+        let support = src.join("support.cpp");
+        fs::write(
+            src.join("widget.hpp"),
+            "#pragma once\nint widget_scale(int value);\nint parse_record(const char *data);\n",
+        )
+        .unwrap();
+        fs::write(
+            &widget,
+            "#include \"widget.hpp\"\nint parse_record(const char *data) { return data ? widget_scale(2) : 0; }\n",
+        )
+        .unwrap();
+        fs::write(
+            &support,
+            "#include \"widget.hpp\"\nint widget_scale(int value) { return value * 3; }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("compile_commands.json"),
+            format!(
+                r#"[
+{{"directory":"{}","file":"{}","arguments":["g++","-I",".","-DWIDGET=1","-std=c++17","-c","{}"]}},
+{{"directory":"{}","file":"{}","arguments":["g++","-I",".","-DSUPPORT=1","-std=c++17","-c","{}"]}}
+]"#,
+                json_text(&src),
+                json_text(&widget),
+                json_text(&widget),
+                json_text(&src),
+                json_text(&support),
+                json_text(&support)
+            ),
+        )
+        .unwrap();
+        run(GenerateHarnessArgs {
+            source: widget,
+            target: Some("parse_record".to_owned()),
+            target_line: None,
+            output: root.join("out"),
+            id: Some("H-CPP-SYMCC-TU".to_owned()),
+            kind: "direct".to_owned(),
+            source_roots: Vec::new(),
+            project: None,
+            source_trees: Vec::new(),
+            extra_sources: Vec::new(),
+            extra_includes: Vec::new(),
+            cleanup: None,
+            template_instantiate: Vec::new(),
+            tree_type_defs: None,
+            decoder_limits: Default::default(),
+            force: false,
+            archive_backed: false,
+            environment: None,
+        })
+        .unwrap();
+        let harness = root.join("out/H-CPP-SYMCC-TU");
+        let fragment = fs::read_to_string(harness.join("build_context_objects.mk")).unwrap();
+        let objects: Vec<String> = fragment
+            .lines()
+            .find_map(|line| line.strip_prefix("CONTEXT_SYMCC_OBJECTS = "))
+            .unwrap_or_else(|| panic!("no SymCC object graph in:\n{fragment}"))
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        assert!(!objects.is_empty(), "{fragment}");
+
+        // sym++ at SymCC 522c480: no C++ library chosen, no compile.
+        let compiler = root.join("sym++");
+        fs::write(
+            &compiler,
+            "#!/bin/sh\n\
+             if [ -z \"$SYMCC_REGULAR_LIBCXX\" ] && [ -z \"$SYMCC_LIBCXX_PATH\" ]; then\n\
+             echo 'Please set SYMCC_LIBCXX_PATH to the directory containing libc++ or confirm usage of the system library by setting SYMCC_REGULAR_LIBCXX!' >&2\n\
+             exit 255\nfi\n\
+             printf '%s\\n' \"$*\" >> \"$BHF_ARGV_LOG\"\nprev=\n\
+             for arg in \"$@\"; do [ \"$prev\" = -o ] && : > \"$arg\"; prev=$arg; done\n",
+        )
+        .unwrap();
+        fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
+        let log = root.join("argv.log");
+        let build = std::process::Command::new("make")
+            .arg("-C")
+            .arg(&harness)
+            .arg("symcc")
+            .arg(format!("SYMCC_CXX={}", compiler.display()))
+            .arg("CXX=/nonexistent/c++")
+            .arg("BHF_CXX_FAMILY=clang")
+            .env_remove("SYMCC_REGULAR_LIBCXX")
+            .env_remove("SYMCC_LIBCXX_PATH")
+            .env("BHF_ARGV_LOG", &log)
+            .output()
+            .unwrap();
+        assert!(build.status.success(), "{build:?}");
+        assert!(harness.join("main_symcc").is_file());
+        let calls = fs::read_to_string(&log).unwrap();
+        for object in &objects {
+            assert!(
+                calls
+                    .lines()
+                    .any(|call| call.ends_with(&format!("-o {object}"))),
+                "{object} not compiled by sym++:\n{calls}"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

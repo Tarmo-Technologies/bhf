@@ -247,6 +247,16 @@ impl SessionTransportPlan {
                         .to_owned(),
                 ));
             }
+            // Each message is one execution: the persistent loop would carry
+            // guest state from one message, and one session, into the next.
+            if plan.continues_the_guest_loop() {
+                return Err(malformed(
+                    "the session lane does not take reset=persistent, which would carry guest \
+                     state from one message and one session into the next; leave reset= out to \
+                     restore the snapshot before every message"
+                        .to_owned(),
+                ));
+            }
             return Ok(Self::Target {
                 spec: rest.to_owned(),
                 coverage_map: coverage_map.map(str::to_owned),
@@ -3285,6 +3295,25 @@ equals = 226
                 target: Default::default(),
             })
         }
+    }
+
+    /// #346: the session lane refuses `reset=persistent`, which would carry
+    /// guest state from one message, and one session, into the next.
+    #[test]
+    fn a_target_transport_session_refuses_a_persistent_qemu_system_reset() {
+        let map = "input=0x1000,input_cap=64,ring=0x4000,write=0x5000,wrapped=0x5100,cap=64";
+        let error = SessionTransportPlan::parse_with_map(
+            "transport:qemu-system:qmp=127.0.0.1:1,gdb=127.0.0.1:2,done=0x1a8,reset=persistent",
+            Some(map),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("does not take reset=persistent"), "{error}");
+        assert!(SessionTransportPlan::parse_with_map(
+            "transport:qemu-system:qmp=127.0.0.1:1,gdb=127.0.0.1:2,done=0x1a8,reset=loadvm",
+            Some(map),
+        )
+        .is_ok());
     }
 
     /// #261: over a target transport, a session's messages reach the target

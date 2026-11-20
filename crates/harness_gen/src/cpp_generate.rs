@@ -2816,6 +2816,78 @@ mod tests {
         crate::fuzzing_build_mode::assert_every_target_compile_defines_it(&mk, "/tmp/source.cpp");
     }
 
+    /// #324: the C++ Makefile has a `symcc` lane: `main_symcc` is the
+    /// harness compiled by `sym++` for bhf's own driver, which `sym++ -x c`
+    /// compiles, with neither the sanitizers nor the edge coverage of `main`.
+    #[test]
+    fn the_cpp_makefile_has_a_symcc_lane() {
+        let (_out_guard, out) = temp_dir("cpp_symcc_lane");
+        let args = cpp_args_for(
+            &out,
+            "H-CPP-SYMCC",
+            cppfunction("parse_record"),
+            &[("data", "const uint8_t *"), ("size", "size_t")],
+            &[],
+            "#include <cstddef>\n#include <cstdint>\n\
+             int parse_record(const uint8_t *data, size_t size);\n",
+        );
+        let result = generate_cpp_direct_harness(args).unwrap();
+        let mk = fs::read_to_string(&result.makefile).unwrap();
+        let line = |prefix: &str| {
+            mk.lines()
+                .find(|line| line.starts_with(prefix))
+                .unwrap_or_else(|| panic!("no `{prefix}` line:\n{mk}"))
+                .to_owned()
+        };
+        assert_eq!(line("SYMCC_CXX ?="), "SYMCC_CXX ?= sym++");
+        assert_eq!(
+            line("SYMCC_CXXFLAGS ?="),
+            "SYMCC_CXXFLAGS ?= -O1 -g -std=$(CXX_STD) -Wno-reserved-user-defined-literal"
+        );
+        assert_eq!(line("symcc:"), "symcc: main_symcc$(EXEEXT)");
+        assert_eq!(
+            line("main_symcc$(EXEEXT):"),
+            "main_symcc$(EXEEXT): main.cpp $(BHF_SYMCC_DRIVER) bhf_lanes.stamp \
+             $(CONTEXT_SYMCC_OBJECTS) $(REPAIR_CONTEXT_SYMCC_OBJECTS)"
+        );
+        assert_eq!(
+            line("\t$(BHF_SYMCC_STDLIB) $(SYMCC_CXX) $(SYMCC_CXXFLAGS)"),
+            "\t$(BHF_SYMCC_STDLIB) $(SYMCC_CXX) $(SYMCC_CXXFLAGS) $(SECTION_FLAGS) $(CXX_COMPAT_FLAGS_CLANG) \
+             $(FEATURE_TEST_FLAGS) $(BHF_FUZZING_BUILD_MODE_FLAGS) $(COMPILE_DB_FLAGS) \
+             $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) \
+             $(BHF_TOOLCHAIN_CXX_CPPFLAGS) -DBHF_EXTERNAL_DRIVER -o $@ main.cpp \
+             $(CONTEXT_SYMCC_OBJECTS) $(REPAIR_CONTEXT_SYMCC_OBJECTS) $(AUTO_EXTRA_SOURCES) \
+             $(BHF_SYMCC_DRIVER) $(BUILD_CONTEXT_LDFLAGS) $(call BHF_SECTION_LDFLAGS,$(SYMCC_CXX)) \
+             $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LIBS)"
+        );
+        assert_eq!(
+            line("BHF_SYMCC_DRIVER ="),
+            "BHF_SYMCC_DRIVER = $(call bhf_lane_driver,bhf_driver_symcc.o,$(SYMCC_CXX) -x c)"
+        );
+        assert!(
+            line("\t$(BHF_SYMCC_STDLIB) $(SYMCC_CXX) -x c $(BHF_DRIVER_CFLAGS)")
+                .ends_with("-c -o $@ $(BHF_DRIVER_SOURCE)")
+        );
+        // sym++ takes the system C++ library unless SYMCC_LIBCXX_PATH names
+        // the libc++ SymCC instrumented.
+        assert_eq!(
+            line("BHF_SYMCC_STDLIB ="),
+            "BHF_SYMCC_STDLIB = $(if $(SYMCC_LIBCXX_PATH),,SYMCC_REGULAR_LIBCXX=1)"
+        );
+        assert!(line(".PHONY: all").contains(" symcc "), "{mk}");
+        assert!(line("BHF_BINARIES =").ends_with(" main_symcc"), "{mk}");
+        let clean = line("\trm -f main$(EXEEXT)");
+        for file in [
+            "main_symcc$(EXEEXT)",
+            " main_symcc ",
+            " bhf_driver_symcc.o ",
+        ] {
+            assert!(clean.contains(file), "clean misses {file}: {clean}");
+        }
+        assert!(line("BHF_LANE_TOOLCHAIN_ID =").contains("$(SYMCC_CXX)"));
+        assert!(line("BHF_DRIVER_ID =").contains("$(SYMCC_CXX)"));
+    }
+
     #[test]
     fn static_member_uses_qualified_call_without_receiver() {
         let (_out_guard, out) = temp_dir("cpp-static-member");
@@ -3979,7 +4051,7 @@ mod tests {
         assert!(makefile.contains("ifeq ($(origin CXX), default)"));
         assert!(makefile.contains("CXX = clang++"));
         assert!(makefile.contains(
-            ".PHONY: all afl afl_cmplog winafl libfuzzer cfi rtsan msan cov diff syntaxcheck clean"
+            ".PHONY: all afl afl_cmplog winafl libfuzzer cfi rtsan msan cov diff symcc syntaxcheck clean"
         ));
         assert!(makefile.contains("winafl: main_winafl"));
         // The MSan lane builds against the instrumented libc++ BHF_MSAN_LIBCXX

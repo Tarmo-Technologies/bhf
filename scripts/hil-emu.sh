@@ -12,7 +12,11 @@
 #   RV-2  live_gdb            — the real RSP client against a real qemu-arm gdbstub
 #   RV-3  live_fullsystem     — FullSystemTransport end-to-end on emulated Cortex-M
 #                               (qemu-system-arm mps2-an385: savevm/loadvm snapshot
-#                                reset + coverage-ring readback + planted fault)
+#                                reset + coverage-ring readback + planted fault,
+#                                the reset=persistent loop, and its ignored
+#                                benchmark against a loadvm per input, which
+#                                runs nightly and by hand, not on a pull
+#                                request or a push)
 #   RV-4  the pinned FreeRTOS task/queue profile and the FreeRTOS agent task
 #   RV-5  the reference agent's Zephyr sample (west + ZEPHYR_BASE, from
 #         scripts/ci/install-zephyr.sh)
@@ -111,6 +115,22 @@ echo
 
 echo "== RV-3: live_fullsystem (qemu-system-arm mps2-an385 snapshot) =="
 BHF_HIL_REQUIRE=1 cargo test --locked -p target_transport --test live_fullsystem -- --nocapture
+# The benchmark is a nightly check (#346): the schedule, a manual dispatch and
+# a local run take it; a pull request or a push does not wait on a shared
+# runner's timing.
+rv3_benchmark_runs() {
+  case "${GITHUB_EVENT_NAME:-}" in
+    pull_request | push) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+if rv3_benchmark_runs; then
+  echo "== RV-3 benchmark: reset=persistent against a loadvm per input (needs 3x) =="
+  BHF_HIL_REQUIRE=1 cargo test --locked -p target_transport --test live_fullsystem -- \
+    --ignored --nocapture
+else
+  echo "== RV-3 benchmark: not run on ${GITHUB_EVENT_NAME} (it runs nightly) =="
+fi
 echo
 
 echo "== RV-4: pinned FreeRTOS task/queue transport and CLI replay =="

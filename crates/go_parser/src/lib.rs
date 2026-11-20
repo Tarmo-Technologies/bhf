@@ -391,6 +391,179 @@ fn is_type_node(kind: &str) -> bool {
     )
 }
 
+/// A Go native fuzz test: a top-level `func FuzzXxx(f *testing.F)` in a
+/// `_test.go` file, the entry point `go test -fuzz` runs.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GoFuzzTest {
+    pub name: String,
+    /// 1-based line of `func`.
+    pub line: u32,
+    /// The file's package (`parser`, or `parser_test` for an external test).
+    pub package: String,
+}
+
+/// Whether `name` is a fuzz test's name as `go test` reads it: `Fuzz`, or
+/// `Fuzz` followed by anything but a lowercase letter (`FuzzParse`,
+/// `Fuzz_parse`; not `Fuzzy`).
+fn is_fuzz_test_name(name: &str) -> bool {
+    name.strip_prefix("Fuzz")
+        .is_some_and(|rest| !rest.chars().next().is_some_and(char::is_lowercase))
+}
+
+/// The local name the file gives the standard `testing` package: `testing`,
+/// its alias, or `.` for a dot import. `None` when the file does not import it.
+fn testing_import_name(root: tree_sitter::Node<'_>, bytes: &[u8]) -> Option<String> {
+    import_specs(root, bytes)
+        .into_iter()
+        .find(|(_, path, _)| path == "testing")
+        .map(|(name, _, _)| name.unwrap_or_else(|| "testing".to_owned()))
+}
+
+/// Every import spec of the file: (local name, unquoted path, the path
+/// literal's byte range).
+fn import_specs(
+    root: tree_sitter::Node<'_>,
+    bytes: &[u8],
+) -> Vec<(Option<String>, String, std::ops::Range<usize>)> {
+    let mut specs = Vec::new();
+    let mut cursor = root.walk();
+    for decl in root.children(&mut cursor) {
+        if decl.kind() != "import_declaration" {
+            continue;
+        }
+        let mut stack = vec![decl];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "import_spec" {
+                let Some(path) = node.child_by_field_name("path") else {
+                    continue;
+                };
+                let literal = node_text(path, bytes);
+                let unquoted = literal
+                    .strip_prefix(['"', '`'])
+                    .and_then(|rest| rest.strip_suffix(['"', '`']))
+                    .unwrap_or(literal)
+                    .to_owned();
+                let name = node
+                    .child_by_field_name("name")
+                    .map(|name| node_text(name, bytes).to_owned());
+                specs.push((name, unquoted, path.byte_range()));
+                continue;
+            }
+            let mut inner = node.walk();
+            stack.extend(node.children(&mut inner));
+        }
+    }
+    specs.sort_by_key(|(_, _, range)| range.start);
+    specs
+}
+
+/// Parse the native fuzz tests a Go test file declares: each top-level,
+/// non-generic `func FuzzXxx(f *testing.F)` with no result, `testing` being
+/// whatever the file imports the standard package as.
+pub fn parse_go_fuzz_tests(source: &str) -> Result<Vec<GoFuzzTest>, GoParseError> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_go::LANGUAGE.into())
+        .map_err(|_| GoParseError::Grammar)?;
+    let tree = parser.parse(source, None).ok_or(GoParseError::Parse)?;
+    let root = tree.root_node();
+    let bytes = source.as_bytes();
+    let Some(testing) = testing_import_name(root, bytes) else {
+        return Ok(Vec::new());
+    };
+    let fuzz_type = if testing == "." {
+        "*F".to_owned()
+    } else {
+        format!("*{testing}.F")
+    };
+    let package = find_package(root, bytes).unwrap_or_else(|| "main".to_owned());
+    let mut out = Vec::new();
+    let mut cursor = root.walk();
+    for func in root.children(&mut cursor) {
+        if func.kind() != "function_declaration"
+            || func.child_by_field_name("type_parameters").is_some()
+            || func.child_by_field_name("result").is_some()
+        {
+            continue;
+        }
+        let Some(name) = func
+            .child_by_field_name("name")
+            .map(|name| node_text(name, bytes))
+        else {
+            continue;
+        };
+        if !is_fuzz_test_name(name) {
+            continue;
+        }
+        let Some(params) = func.child_by_field_name("parameters") else {
+            continue;
+        };
+        let decls: Vec<_> = params
+            .children(&mut params.walk())
+            .filter(|child| {
+                matches!(
+                    child.kind(),
+                    "parameter_declaration" | "variadic_parameter_declaration"
+                )
+            })
+            .collect();
+        let [decl] = decls.as_slice() else {
+            continue;
+        };
+        let names = decl
+            .children(&mut decl.walk())
+            .filter(|child| child.kind() == "identifier")
+            .count();
+        let ty = decl
+            .child_by_field_name("type")
+            .map(|ty| collapse_ws(node_text(ty, bytes)))
+            .unwrap_or_default();
+        if decl.kind() != "parameter_declaration" || names > 1 || ty != fuzz_type {
+            continue;
+        }
+        out.push(GoFuzzTest {
+            name: name.to_owned(),
+            line: func.start_position().row as u32 + 1,
+            package: package.clone(),
+        });
+    }
+    Ok(out)
+}
+
+/// The import paths of a Go source file, in source order.
+pub fn parse_go_imports(source: &str) -> Result<Vec<String>, GoParseError> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_go::LANGUAGE.into())
+        .map_err(|_| GoParseError::Grammar)?;
+    let tree = parser.parse(source, None).ok_or(GoParseError::Parse)?;
+    Ok(import_specs(tree.root_node(), source.as_bytes())
+        .into_iter()
+        .map(|(_, path, _)| path)
+        .collect())
+}
+
+/// `source` with its import of the standard `testing` package pointed at
+/// `replacement` instead, keeping the local name it is imported under and
+/// every line where it was, or `None` when the file does not import
+/// `testing`. The replacement package must be named `testing` for an import
+/// without an alias to keep resolving.
+pub fn rewrite_testing_import(source: &str, replacement: &str) -> Option<String> {
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
+    let tree = parser.parse(source, None)?;
+    let (_, _, range) = import_specs(tree.root_node(), source.as_bytes())
+        .into_iter()
+        .find(|(_, path, _)| path == "testing")?;
+    let mut out = String::with_capacity(source.len() + replacement.len());
+    out.push_str(&source[..range.start]);
+    out.push('"');
+    out.push_str(replacement);
+    out.push('"');
+    out.push_str(&source[range.end..]);
+    Some(out)
+}
+
 /// Count tree-sitter ERROR nodes.
 pub fn count_parse_errors(source: &str) -> usize {
     let mut parser = tree_sitter::Parser::new();
@@ -696,5 +869,86 @@ type Alias Header
     #[test]
     fn counts_parse_errors() {
         assert_eq!(count_parse_errors("package x\nfunc ok() {}\n"), 0);
+    }
+
+    const FUZZ_TEST: &str = "package parser\n\
+        \n\
+        import (\n\
+        \t\"bytes\"\n\
+        \t\"testing\"\n\
+        )\n\
+        \n\
+        func FuzzParse(f *testing.F) {\n\
+        \tf.Add([]byte(\"seed\"))\n\
+        \tf.Fuzz(func(t *testing.T, data []byte) { _ = bytes.MinRead })\n\
+        }\n\
+        \n\
+        func Fuzz_copy_at(f *testing.F) {}\n\
+        func Fuzzy(f *testing.F) {}\n\
+        func FuzzTwo(f *testing.F, n int) {}\n\
+        func FuzzT(t *testing.T) {}\n\
+        func FuzzResult(f *testing.F) error { return nil }\n\
+        func FuzzGeneric[T any](f *testing.F) {}\n\
+        func (w Widget) FuzzMethod(f *testing.F) {}\n\
+        func TestParse(t *testing.T) {}\n";
+
+    #[test]
+    fn finds_the_native_fuzz_tests_of_a_test_file() {
+        let tests = parse_go_fuzz_tests(FUZZ_TEST).unwrap();
+        let found: Vec<(&str, u32, &str)> = tests
+            .iter()
+            .map(|t| (t.name.as_str(), t.line, t.package.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [("FuzzParse", 8, "parser"), ("Fuzz_copy_at", 13, "parser")]
+        );
+    }
+
+    #[test]
+    fn a_fuzz_test_takes_testing_f_under_the_name_the_file_imports_it_as() {
+        let aliased = "package parser_test\nimport tst \"testing\"\n\
+                       func FuzzParse(f *tst.F) {}\nfunc FuzzOther(f *testing.F) {}\n";
+        let tests = parse_go_fuzz_tests(aliased).unwrap();
+        assert_eq!(tests.len(), 1, "{tests:?}");
+        assert_eq!(tests[0].name, "FuzzParse");
+        assert_eq!(tests[0].package, "parser_test");
+        // Without the testing import there is no fuzz test.
+        let unimported = "package parser\nfunc FuzzParse(f *testing.F) {}\n";
+        assert!(parse_go_fuzz_tests(unimported).unwrap().is_empty());
+    }
+
+    #[test]
+    fn imports_are_listed_in_source_order() {
+        let imports = parse_go_imports(
+            "package p\nimport \"os\"\nimport (\n\tw \"example.com/widget/codec\"\n\t`strings`\n)\n",
+        )
+        .unwrap();
+        assert_eq!(imports, ["os", "example.com/widget/codec", "strings"]);
+    }
+
+    #[test]
+    fn the_testing_import_is_rewritten_in_place() {
+        let rewritten = rewrite_testing_import(FUZZ_TEST, "example.com/h/bhftesting").unwrap();
+        assert!(
+            rewritten.contains("\t\"example.com/h/bhftesting\"\n"),
+            "{rewritten}"
+        );
+        assert!(!rewritten.contains("\"testing\""), "{rewritten}");
+        assert_eq!(rewritten.lines().count(), FUZZ_TEST.lines().count());
+        assert_eq!(
+            parse_go_imports(&rewritten).unwrap(),
+            ["bytes", "example.com/h/bhftesting"]
+        );
+        let aliased = rewrite_testing_import(
+            "package p\nimport tst \"testing\"\n",
+            "example.com/h/bhftesting",
+        )
+        .unwrap();
+        assert_eq!(
+            aliased,
+            "package p\nimport tst \"example.com/h/bhftesting\"\n"
+        );
+        assert!(rewrite_testing_import("package p\nimport \"os\"\n", "x").is_none());
     }
 }

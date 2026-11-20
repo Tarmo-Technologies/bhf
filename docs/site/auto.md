@@ -88,6 +88,7 @@ is to bound the recursion depth.
 | `--campaign-time <SECS>` | unset (run all) | Whole-**run** budget across all targets. Default: an OUTER wall-clock cap — once exceeded, `auto` stops STARTING new (ranked) targets (the in-flight one finishes) and reports how many of the N discovered were reached. With `--min-target-time`, switches to SPLIT mode (see below). Bounds *how long* a huge-tree sweep runs |
 | `--min-target-time <SECS>` | unset | SPLIT-mode floor, used **only** with `--campaign-time` (errors otherwise): divide the campaign budget across the N attempted targets — each gets `max(min, campaign / N)` of fuzz time, and only the top `floor(campaign / per_target)` ranked targets are attempted (the rest logged unfuzzed), never less than this floor. Overrides `--per-target-time` |
 | `--jobs <N>` / `-j <N>` | half the host's cores (at least 1, at most 8; `BHF_DEFAULT_JOBS` overrides) | Build+fuzz up to N targets CONCURRENTLY via a bounded worker pool; `--jobs 1` runs one at a time. Child allowance is `jobs × --rss-limit-mb`, so with both defaults (half the cores, a quarter of memory each) the children alone may reach well over half the host's memory; total peak also includes the parent declaration index/results, compilers, and the OS. Results aggregate deterministically regardless of completion order |
+| `--workers-per-target <N>` | `1` | Run each target's builtin fuzz passes on N cores (#332): every pass is a campaign of N `bhf fuzz` workers, each in its own copy of the work dir, which share the corpus entries they keep as they run (every `BHF_SYNC_INTERVAL_MS`, default 10000, as `bhf fuzz --workers` does) and whose queues and findings merge into the target's (`corpus/<id>/queue`, `results/findings`) when the pass ends; the workers' trees are removed once every finding is merged. The pass's run summary (`fuzz_runs/<id>-latest.json`) gains a `workers` block (each worker's executions, queue entries and the peer entries it ran), its `hangs`, `fresh_reruns` and `symcc` counts are the workers' summed and its `stability` the least stable worker's, `run.json` and `run.md` count the workers' executions and hangs together, and with `--symcc` each worker's `symcc-import.log` lines end in `<work>/symcc-import.log`. With `--jobs J` that is up to J × N fuzz processes, each with `--rss-limit-mb`. A cross-built target run under an emulator and the AFL++ engine keep one worker; `--per-target-finding-count` is checked between passes, not inside one |
 | `--passes <SET>` | all (`empty,rng,fuzz`) | Restrict the per-target cascade to a comma list of passes (`empty`, `rng`, `fuzz`). E.g. `--passes fuzz` runs only the fuzz-driven pass — ~3× the throughput of the full 3-pass cascade. Mutually exclusive with `--single-pass` |
 | `--single-pass` | off | Convenience for `--passes fuzz`: run ONLY the fuzz-driven pass per target |
 | `--max-repair-rounds <N>` | `16` | Ceiling on build-fail → repair → retry rounds per target. The default covers all 95 successful clean/damaged samples in the strengthened 53-repository matrix (p95 6, p99/max 14 rounds); the no-progress early-break still applies, so it is a cap, not a fixed cost |
@@ -142,6 +143,7 @@ is to bound the recursion depth.
 | `--deps-only` | off | Build each target as far as possible, emit the missing-dependency manifest, and SKIP fuzzing — the fast "what does this tree need?" scan |
 | `--static` | off | Run the static analyzer over the WHOLE tree in addition to fuzzing — not only as a fallback when a target can't be built/fuzzed. Findings (classification `static_scan`, ids `F-STATIC-*`) merge into the unified report (findings.csv, run.json, SARIF) next to the fuzz findings, so a target that built+fuzzed still gets static coverage and files with no fuzzable subprogram are analyzed too. Same engine as the standalone `bhf static-scan`. BHF's own generated harnesses/stubs under the work-dir are excluded, and dependency/build/cache trees such as `node_modules`, virtualenvs, `dist`, vendored deps, and generated JS `compiled/` bundles are pruned before analysis — the scan reports the target tree, not scaffolding or dependency payloads |
 | `--external-tools` | off | Also drive installed EXTERNAL analyzers (gosec/Bandit/semgrep/GNATcheck) as **subprocesses** (never linked), parse their SARIF into the report (ids `F-EXT-*`), and let the fuzz-confirmation join confirm/downgrade them too. Each tool runs only if the active license profile (`BHF_PROFILE`, default `strict-permissive`) permits its subprocess — the default runs NONE, so the default profile never invokes a GPL tool; set `BHF_PROFILE=external-tools` to opt in. Missing tools are skipped. Implies `--static` |
+| `--symcc` | off | Build a SymCC variant of each native C/C++ harness (`make symcc` → `main_symcc`, compiled by SymCC's `symcc` for C and `sym++` for C++), the concolic lane that solves a comparison against a value the input holds only after hashing or modular arithmetic. SymCC is GPL-3.0 and runs only as a subprocess, under a license profile that permits it: `BHF_PROFILE=external-tools` or `research-lab`; without `BHF_PROFILE` the flag opts into `external-tools`, and `strict-permissive` refuses it (with a note). Needs `symcc` and `sym++` on PATH (`scripts/ci/install-symcc.sh` builds them), or `SYMCC_CC`/`SYMCC_CXX` naming them; `sym++` uses the system C++ library unless `SYMCC_LIBCXX_PATH` names a libc++ SymCC instrumented. A harness whose SymCC build fails is fuzzed without it, and `run.json` `targets[].lanes.symcc` says why. Each builtin pass of a harness with the lane runs a solver loop (#331): once the pass's corpus has not grown for `BHF_SYMCC_PLATEAU_MS` (default 5000), its newest entries SymCC has not run (`BHF_SYMCC_ENTRIES` per round, default 8) run through `main_symcc` (each for at most `BHF_SYMCC_TIMEOUT_MS`, default 10000, under the harness's sandbox and with `--rss-limit-mb` as its address-space limit), and every input SymCC solves that the pass does not have runs next and stays in the corpus when it adds coverage. A line after the pass says what SymCC solved; `fuzz_runs/<id>-latest.json` has the pass's `symcc` counts and `<work>/symcc-import.log` each input it gave. Three SymCC runs in a row that fail or time out without an input stop the loop for that pass. `BHF_SYMCC=1` does the same as the flag, and turns the loop on for `bhf fuzz` of a harness with `main_symcc` beside it |
 | `--sbom` | off | Write an evidence-graded SBOM and VEX bundle at the end of the run into `<work>/sbom/` (`sbom.json`, `cyclonedx.json`, `vulnerabilities.json`, `openvex.json`, `sbom.csv`). The tree's components are enriched with the run's `auto/run.json`, so libraries a harness drove are marked exercised. `bhf sbom` gives finer `--emit` and `--ecosystems` control |
 | `--sloc <FILE>` | unset | Write a per-language SLOC breakdown (files, total, comments, blanks, SLOC) of the tree, then run as usual. A relative path lands in `<work>/auto/`; a `.json` name writes JSON, anything else a text table |
 | `--force` / `--force-fuzz` | off | Adds a SECOND pass. The sweep first runs exactly as it would without the flag, then re-attempts only the targets that did not reach the fuzz phase — forced: a best-effort driver for opaque/function-pointer/unknown params, stubs for whatever the compiler reports undefined, and no hard failure (report-only is the floor). The managed lanes have their own force paths: Go drives an undrivable parameter as its type's zero value and calls a method on a zero receiver, and C# allocates a receiver whose type has no accessible parameterless constructor without running one. A forced retry may only ever *replace* a target's outcome by fuzzing it, so `--force` cannot lower the fuzzed count; it also cannot rescue a target whose parameters were never the problem. Findings from a forced build are floored to **Low** confidence with a `forced` note and counted separately — a forced crash may be a stub artifact, not a real defect. With `--resume` over a finished campaign it keeps every target that already fuzzed and forces only the rest, without repeating the unforced attempt. Persistence honors `--max-repair-rounds`; does not imply `--static` |
@@ -513,6 +515,7 @@ discoverable and drivable, each C/C++/Rust/Ada harness dir
 | Lane | Black-box (Mayhem base-exe / AFL file) | libFuzzer | AFL++ persistent |
 |---|---|---|---|
 | C / C++ | `make` → `./main <file>` | `make libfuzzer` → `./main_libfuzzer` | `make afl` → `./main_afl`, `make afl_cmplog` → `./main_afl_cmplog` (`-c`) |
+| C / C++ (SymCC, `--symcc`) | `make symcc` → `SYMCC_INPUT_FILE=<file> SYMCC_OUTPUT_DIR=<dir> ./main_symcc <file>` writes the inputs SymCC solved into `<dir>` | — | — |
 | COBOL / Fortran | `./main <file>` (built by default) | — | `make afl AUTO_EXTRA_LDFLAGS="$(cat lane-ldflags.txt)"` → `./main_afl` |
 | Rust | `./main <file>` (built by default) | `./build-libfuzzer.sh` → `./main_libfuzzer` | `./build-afl.sh` → `./main_afl`, `./main_afl_cmplog` (`-c`) |
 | Ada | `./main < input` (stdin) | — | `bhf auto --engine afl++` links `build/<id>/main_afl` (fork server, input on stdin, `BHF_CRASH_ON_FINDING=1`) |
@@ -579,7 +582,7 @@ Per-file dispatch by extension:
 | `.java` | `java_parser::parse_java_methods` | `target_rank::rank_java_targets` |
 | `.py` | `python_parser::parse_python_functions` | `target_rank::rank_python_targets` |
 | `.pl`, `.pm` | `perl_parser::parse_perl_subs` | `target_rank::rank_perl_targets` |
-| `.go` (skips `_test.go`) | `go_parser::parse_go_functions` | `target_rank::rank_go_targets` |
+| `.go` (skips `_test.go`, whose fuzz tests are [provided harnesses](#provided-harnesses)) | `go_parser::parse_go_functions` | `target_rank::rank_go_targets` |
 | `.cob`, `.cbl`, `.cobol`, `.cble` | lane-specific `parse_cobol` | byte-buffer `LINKAGE` / `USING` eligibility |
 | `.f`, `.for`, `.f77`, `.f90`, `.f95`, `.f03`, `.f08` | lane-specific `parse_fortran` | character-argument eligibility |
 | `.cs` | lane-specific `parse_csharp` | public byte/string/stream input methods |
@@ -590,6 +593,104 @@ Per-file dispatch by extension:
 
 Candidates with unsupported parameter types are dropped before the attempt
 loop runs, so the report does not carry pre-doomed entries.
+
+### Provided harnesses
+
+A harness the project already ships is fuzzed too, as it is: it states how
+the project means its code to be fuzzed, so it is found where the walk above
+does not look (`_test.go` files, `fuzz/` and test directories), it ranks
+ahead of every generated target, and it starts from the seeds that come with
+it. `bhf auto` prints `provided harnesses: N the project ships (...)` after
+discovery, `run.json` marks each one with `targets[].provided_harness` (see
+[`run.json`](#runjson)), and the summary lists them under `Provided
+harnesses`. The walk for them skips the work dir, build output, VCS and other
+hidden directories, vendored dependencies (`vendor/`, `third_party/`, ...),
+`testdata/` and every `--exclude-dir`, and for Go fuzz tests a directory whose
+name starts with `_`, which the go tool ignores too; `--languages`,
+`--target` and the other filters apply to them as to any target. The note on
+what discovery skipped by default does not count their files, since the run
+fuzzes them.
+
+- **Go native fuzz tests.** A top-level `func FuzzXxx(f *testing.F)` in a
+  `_test.go` file, the entry point `go test -fuzz` runs, is a target named
+  `FuzzXxx` (`H-G` id). `go test` runs it with its own engine, so bhf builds
+  it the way OSS-Fuzz builds native Go fuzzers: the test file is copied into
+  its package as an ordinary source, with its `testing` import pointed at a
+  stand-in package whose `f.Fuzz` hands bhf's inputs to the fuzz target, and
+  a generated `main` runs the fuzz test in its package's directory, as `go
+  test` does. The package and what it imports from its module are copied
+  into the harness dir (`bhf_module/`), each file with a `//line` directive
+  naming the original, so `go build -cover` gives edge coverage and a panic
+  names the project's file and line; the scanned tree is not written to. An
+  external test (`package x_test`) is copied into a harness package of its
+  own. When the fuzz test needs a helper another test file of its package
+  defines, the build is retried with the package's other test files, and an
+  external test's then with its package's internal test files too, compiled
+  into the package's copy as `go test` compiles them (an `export_test.go`
+  that exports what the external test calls). The
+  fuzz target's arguments (`[]byte`, `string`, `bool`, the integer types,
+  `float32`, `float64`) are decoded from each input in the layout bhf's
+  generated Go harnesses use: a `[]byte` or `string` takes the rest of the
+  input when it is the last argument, else one length byte and that many
+  bytes; a `bool` or `byte` one byte; any other integer, and a float, 8
+  bytes, little-endian. The fuzz test's `f.Add` seeds and the files of its
+  seed corpus, `testdata/fuzz/FuzzXxx/` in the `go test fuzz v1` encoding,
+  are written in that layout to `harnesses/<id>/provided-seeds/` and start
+  the fuzz passes; one that is not of the fuzz target's argument types is
+  counted in the record's `notes`. A recovered panic is a finding, and so is
+  a failure the fuzz target reports through its `*testing.T` (`t.Error`,
+  `t.Fatal`), as it is to `go test`; `t.Skip` skips the input. A fuzz test
+  that fails or skips before reaching `f.Fuzz` is skipped with the reason.
+- **Atheris harnesses.** The function a Python file registers with
+  `atheris.Setup(sys.argv, TestOneInput)` (however it imports `atheris` or
+  `Setup`, positionally or as `test_one_input=`), a module-level `def`, is a
+  target named after it (`H-P` id); the file's other functions are harness
+  glue, not targets. Atheris runs a harness under libFuzzer, so bhf runs it
+  under its own Python driver instead, and Atheris need not be installed:
+  the harness dir holds a stand-in `atheris` module, ahead of an installed
+  one, whose `Setup` and `Fuzz` only record and return when bhf imports the
+  harness file (its `if __name__ == "__main__":` block does not run), whose
+  `instrument_imports`, `instrument_func` and `instrument_all` change
+  nothing (bhf's tracer measures line-edge coverage over the whole tree),
+  and whose `FuzzedDataProvider` decodes `Consume*` values from the front of
+  the input: text as Atheris does, a first byte choosing ASCII, UTF-16 or
+  UTF-32, and integers as little-endian two's complement. The harness file
+  runs with the tree and its `src/` on the module path, as an installed
+  project would be. As under Atheris, every exception the function lets
+  escape is a finding, a `ValueError` or the library's own exception class
+  included (a generated Python harness takes those for input rejections);
+  `SystemExit` and `KeyboardInterrupt` are not. A finding's stack starts
+  past the harness file's frames, so it is located in the code that raised
+  it, unless the harness raised it itself. The `<stem>.dict` beside the
+  harness joins its dictionary, and the files of its seed corpus
+  (`<stem>_seed_corpus/`, `<stem>_corpus/`, `corpus/<stem>/` or
+  `seeds/<stem>/` beside it) are copied as they are to
+  `harnesses/<id>/provided-seeds/` and start the fuzz passes. A harness file
+  that cannot be imported, or that uses a part of the `atheris` API the
+  stand-in lacks, is skipped with the reason.
+- **Imported OSS-Fuzz fuzzers.** When the work dir holds a
+  `bhf project import-ossfuzz` of the tree (or of a tree that holds it, or
+  that it holds; see [Importing an OSS-Fuzz
+  build](cli.md#importing-an-oss-fuzz-build)), each fuzzer it registered is a
+  target named after it, in the C or C++ file named after it that defines
+  `LLVMFuzzerTestOneInput` (`H-C` or `H-X` id, which names the
+  registration, so it is the same from run to run). Its binary, already
+  built by the project's `build.sh` with bhf's driver, is staged from
+  `<work>/ossfuzz/out/` as the harness, nothing is generated or rebuilt, and
+  it starts from its unpacked seed corpus, with the dictionaries the import
+  merged for it and the `max_len`, `timeout` and `rss_limit_mb` of its
+  `.options` in place of the run's `--max-len`, per-input timeout and memory
+  limit. A generated target in the same file, such as the passthrough
+  harness of its `LLVMFuzzerTestOneInput`, is the same fuzzer and is not
+  fuzzed again. A fuzzer the build linked with `-fsanitize=fuzzer` rather
+  than `$LIB_FUZZING_ENGINE` is skipped with the reason (`bhf project run`
+  runs it); an import of another tree is left out with a note. A fresh run
+  refreshes `<work>/build/` but keeps the import's registrations there, and
+  a run over another tree archives the earlier run but leaves the import
+  (`<work>/ossfuzz/` and those registrations) in place. The import builds
+  with a `-fdebug-prefix-map` from its `$SRC/<name>` copy to the tree, so a
+  finding is located in the tree's files; a fuzzer imported by an earlier
+  release names the copy until it is imported again.
 
 C and C++ harnesses are Makefile-based. Auto uses `clang` / `clang++` for the
 default coverage-guided sanitizer build unless `CC` / `CXX` are set. See
@@ -805,6 +906,21 @@ The top-level `summary` carries `fuzz_confirmed` — how many static findings a
 fuzz/oracle hit confirmed at the same source site (omitted when zero). See
 [Fuzz-confirmation](#fuzz-confirmation).
 
+A target that is a harness the project ships ([Provided
+harnesses](#provided-harnesses)) carries `targets[].provided_harness`:
+`origin` (`go-fuzz-test`, `atheris` or `ossfuzz-import`), `entry` (the
+fuzz test's name, the function registered with `atheris.Setup`, or the
+imported fuzzer's name), `source` (the file that defines it), `seeds` (how
+many starting inputs came with it), `seed_sources` (its seed corpus
+directories), `dictionaries` and `dictionary_tokens` (the dictionaries that
+came with it, merged into its harness's `dictionary.txt`, and their token
+count; omitted when none did), `options` (an imported fuzzer's `max_len`,
+`timeout_secs` and `rss_limit_mb`, which its fuzz passes use; omitted when
+it has none) and `notes` (what came with it that could not be used, and
+why). The top-level `summary.provided_harnesses`
+counts them (omitted when zero), and `run.md` tags each one's row
+`[provided harness: <origin>, N seed(s)]`.
+
 The top-level `seeds` block records where the run's seeds came from:
 `source` (`user`, `mined` or `none`), `count`, `mining` (`ran`,
 `skipped_user_seeds` or `disabled`) and `manifest`, the path of the per-seed
@@ -901,7 +1017,9 @@ different tree with a work directory an earlier run used (the default
 included, to `<work>/archived/<UTC time>-<tree name>/` and prints
 `bhf auto: note: <work> held a run over <other tree>; moved it to ...` before
 it starts, so `results/` and the console report only the current tree.
-Nothing is deleted, and a run over the same tree keeps its findings.
+Nothing is deleted, and a run over the same tree keeps its findings. A
+`bhf project import-ossfuzz` in the work dir is not moved: it is the
+import's, not the earlier run's.
 
 The coverage-guided corpus is persisted to `corpus/<harness-id>/queue/`
 (content-hash-named, seeds included) at the end of each run (#401), so it

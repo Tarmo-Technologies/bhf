@@ -84,6 +84,13 @@ _EXPECTED = _expected_exceptions()
 # bug classes (RecursionError, IndexError; __module__ == "builtins") never match,
 # so real faults still surface.
 _TARGET_PKG = os.environ.get("BHF_TARGET_PACKAGE", "")
+# A harness the project wrote itself (an Atheris TestOneInput) decides what a
+# bug is: as under Atheris, every exception it lets escape is a finding, its
+# input-rejection and library exceptions included.
+_EVERY_EXCEPTION = os.environ.get("BHF_PY_EVERY_EXCEPTION") == "1"
+# The files of such a harness, which only hand the input on to the project's
+# code: a finding report names them so its stack starts past their frames.
+_GLUE_FILES = [p for p in os.environ.get("BHF_PY_GLUE_FILES", "").split(os.pathsep) if p]
 
 
 def _is_library_exception(exc):
@@ -96,6 +103,8 @@ def _is_library_exception(exc):
 def _is_finding(exc):
     if isinstance(exc, CONTROL_EXC):
         return False
+    if _EVERY_EXCEPTION:
+        return True
     if type(exc).__name__ in _EXPECTED:
         return False
     if isinstance(exc, REJECTION_EXC):
@@ -113,6 +122,8 @@ def _report_finding(exc):
     sys.stderr.write(
         "== bhf python finding: {0}: {1}\n".format(type(exc).__name__, exc)
     )
+    for path in _GLUE_FILES:
+        sys.stderr.write("== bhf python glue: {0}\n".format(path))
     traceback.print_exc()
     sys.stderr.flush()
 

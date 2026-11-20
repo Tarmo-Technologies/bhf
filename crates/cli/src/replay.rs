@@ -47,7 +47,9 @@ pub struct ReplayArgs {
     /// raw output to `<finding>/replay.log`; a replay of another harness than
     /// the finding's own (another build's sha256, or another file when no
     /// build is recorded) that does not MATCH writes
-    /// `<finding>/replay-other-harness.log` instead.
+    /// `<finding>/replay-other-harness.log` instead. For a `bhf binary
+    /// rehost` finding it is the firmware image to run in place of the one
+    /// the finding records.
     #[arg(long)]
     pub harness: Option<PathBuf>,
 
@@ -222,6 +224,16 @@ pub fn run(args: ReplayArgs) -> i32 {
             args.transport_endpoint.as_deref(),
             usize::from(args.stability_runs),
         );
+        return finish_lane(&finding_dir, lane, output);
+    }
+    // A rehosted-firmware finding replays its testcase through the emulator
+    // and machine setup it records; `--harness` names another image to run.
+    if crate::binary_rehost::is_rehost_finding(&finding_dir) {
+        if debugger.is_some() {
+            return lane_debugger_error(&output);
+        }
+        let lane =
+            crate::binary_rehost::replay_rehost_outcome(&finding_dir, args.harness.as_deref());
         return finish_lane(&finding_dir, lane, output);
     }
     // The finding already records where its harness was built; resolve it so the
@@ -1234,7 +1246,7 @@ struct ReplaySummary {
     verdict: &'static str,
     finding: FindingRef,
     /// The replay lane of a finding that is not replayed through a C/C++ or
-    /// Ada harness: `binary`, `session`, `collector` or `transport`.
+    /// Ada harness: `binary`, `rehost`, `session`, `collector` or `transport`.
     #[serde(skip_serializing_if = "Option::is_none")]
     lane: Option<&'static str>,
     recorded_rule: Option<String>,
@@ -1901,7 +1913,7 @@ pub(crate) const EXIT_UNVERIFIED: i32 = 4;
 /// it prints a harness replay, records a match and keeps results/ current.
 #[derive(Debug, Default)]
 pub(crate) struct LaneReplay {
-    /// `binary`, `session`, `collector` or `transport`.
+    /// `binary`, `rehost`, `session`, `collector` or `transport`.
     pub(crate) lane: &'static str,
     pub(crate) matched: bool,
     /// The evidence matched, but nothing replayed the finding's input (it has

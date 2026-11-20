@@ -149,8 +149,9 @@ pub struct RunOutcome {
 
 /// What the target measured about one execution, read through the backend:
 /// how many cycles of its counter the run took (#251), and which task it
-/// says ran the input (#252). Each field is `None` when the backend was not
-/// asked to read it, or could not.
+/// says ran the input (#252); and, from the backend itself, the host time of
+/// the reported run when the call ran more than it (#346). Each field is
+/// `None` when the backend was not asked to read it, or could not.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TargetObservation {
     /// Target cycles from the input's delivery to the completion stop.
@@ -160,6 +161,11 @@ pub struct TargetObservation {
     /// The comparisons the input ran, from the firmware's CmpLog record
     /// (#386); empty when the spec names none.
     pub comparisons: Vec<crate::cmplog::Comparison>,
+    /// The host time of the run this outcome reports, when that is not the
+    /// whole [`crate::TargetSession::run_input`] call: a `reset=persistent`
+    /// continuation that is run again from the snapshot reports that run,
+    /// and this is its time (#346). `None`: the call's time is the run's.
+    pub host_run_time: Option<std::time::Duration>,
 }
 
 impl RunOutcome {

@@ -56,7 +56,8 @@ release (`fuzz.access`, `fuzz.access.parameter`, `fuzz.input_to_state`,
 evidence role)
 are optional in the schema, so documents written
 before them still validate; bhf always writes them. A validator holding the
-older schema rejects them. `reproduce.build.fidelity` is optional the same
+older schema rejects them. The `binary rehost` value of `producer` came
+later too, and an older schema rejects it. `reproduce.build.fidelity` is optional the same
 way, but written only for a finding whose harness build used fabricated
 inputs (below).
 
@@ -87,7 +88,7 @@ lines). INDEX.md says "Reached through N call stacks".
 |---|---|---|
 | `id` | string | unique within `results/` |
 | `kind` | enum | `fuzz`, `runtime`, `static`, `binary`, `differential`, `sca` |
-| `producer` | string | command that wrote it, inferred from the ID family |
+| `producer` | string | command that wrote it, inferred from the ID family; `binary rehost` for a `rehost_fault` record |
 | `rule` | `{id, slug, name}`, each nullable | `id` is `BHF-NNNN`, the static rule id, or `null` when no catalog rule matches |
 | `title` | string | one line, for lists |
 | `message` | string | tool message (addresses stripped) |
@@ -111,7 +112,7 @@ lines). INDEX.md says "Reached through N call stacks".
 | `fidelity` | `{stubs_used, forced, caveats[]}` | `forced` when the target ran forced-and-stub-heavy under `--force` |
 | `remediation` | string \| null | |
 | `patch_hints` | `[{title, guidance}]` | advisory, not a literal diff |
-| `reproduce` | `{harness_id, command, build}` \| null | `build`: `{sanitizers[], binary_sha256, build_id}`, plus `fidelity` when the harness compiled only after bhf supplied inputs the build context lacked; `command` is relative to `results/` |
+| `reproduce` | `{harness_id, command, build}` \| null | `build`: `{sanitizers[], binary_sha256, build_id}`, plus `fidelity` when the harness compiled only after bhf supplied inputs the build context lacked; `command` is relative to `results/`: it runs the finding's `replay.py`, or is `bhf replay findings/<id>` for a `binary rehost` finding |
 | `reproduce.build.fidelity` | `{level, context, fabricated[]}` (optional) | `level` is `reduced`; `context` is where the build context came from (`none`, `exact_tu_compile_database`, ...); each `fabricated` entry is `{kind, name, value}` with `kind` `macro`, `header`, `type`, or `include_dir` (a dir of real headers found by file name outside the scanned tree, which may be another project's). Such a finding's `confidence.level` is `low` and `fidelity.caveats` names what was fabricated: code compiled against a placeholder macro value or header can take paths the real build never does, so the finding may be false or not reproduce against the real build |
 | `evidence` | `{dir, files[]}` \| null | each file: `{role, path, sha256, size}` — roles: `finding`, `testcase`, `testcase_minimized`, `sanitizer_log`, `decoded`, `replay_script`, `repro_ada`, `byte_control`, `runtrace` (the runtrace events of the replay that recorded the comparison evidence) |
 | `fuzz` | `{exception, classification, harness_id, dialect, oracle, access, input_to_state, input_to_state_input, input_to_state_status, input_to_state_reason, input_to_state_search, arguments, sanitizer_second_opinion, lineage}` \| null | `exception`: `{name, message, sanitizer}`; see [Fuzz block](#fuzz-block) |

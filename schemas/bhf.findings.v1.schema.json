@@ -278,7 +278,7 @@
       "properties": {
         "id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
         "kind": { "$ref": "#/$defs/kind" },
-        "producer": { "enum": ["auto", "fuzz", "static-scan", "binary fuzz", "differential", "sbom"] },
+        "producer": { "enum": ["auto", "fuzz", "static-scan", "binary fuzz", "binary rehost", "differential", "sbom"] },
         "rule": {
           "type": "object",
           "additionalProperties": false,

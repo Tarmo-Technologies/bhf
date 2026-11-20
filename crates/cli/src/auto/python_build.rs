@@ -116,6 +116,14 @@ pub fn build_python_harness(
     harness_id: &str,
     source_root: &Path,
 ) -> PythonBuildResult {
+    // A project's own Atheris harness runs as it is written, not through a
+    // generated call.
+    if let Some(entry) = crate::auto::provided::atheris_entry(candidate) {
+        return match build_atheris_harness(candidate, &entry, work_dir, harness_id, source_root) {
+            Ok(()) => PythonBuildResult::Built,
+            Err((reason, skip)) => PythonBuildResult::Failed { reason, skip },
+        };
+    }
     let python = match select_interpreter(candidate.dialect, None) {
         Ok(python) => python,
         Err(reason) => return PythonBuildResult::Failed { reason, skip: true },
@@ -237,10 +245,413 @@ pub fn build_python_harness(
         }
     }
 
+    if let Err(reason) = write_launcher(
+        &auto_dir,
+        &python,
+        &import_root,
+        module.split('.').next().unwrap_or(&module),
+        &pythonpath,
+        &[],
+    ) {
+        return PythonBuildResult::Failed {
+            reason,
+            skip: false,
+        };
+    }
+    PythonBuildResult::Built
+}
+
+/// Build a project's Atheris harness, the function its file registers with
+/// `atheris.Setup` (`entry`), as a harness of this lane.
+///
+/// Atheris runs a harness under libFuzzer, which bhf's engine does not
+/// drive, so the harness runs as it is under bhf's driver instead: the
+/// harness dir holds a stand-in for the `atheris` module
+/// ([`ATHERIS_STAND_IN`]), ahead of an installed one on the module path,
+/// whose `Setup` and `Fuzz` only record and return when the harness file is
+/// imported, whose instrumentation calls leave coverage to bhf's tracer, and
+/// whose `FuzzedDataProvider` decodes values from the input; the generated
+/// harness module imports the harness file and calls the registered function
+/// with each input. As under Atheris, every exception the function lets
+/// escape is a finding (`BHF_PY_EVERY_EXCEPTION`), located past the harness
+/// file's own frames (`BHF_PY_GLUE_FILES`). Coverage is traced over
+/// the whole tree, since the code a harness drives is the project's, and
+/// the tree (and its `src/`) is on the module path, as an installed project
+/// would be.
+///
+/// The `<stem>.dict` beside the harness joins its dictionary, and the files
+/// of its seed corpus ([`atheris_seed_dirs`]) start the fuzz passes.
+fn build_atheris_harness(
+    candidate: &Candidate,
+    entry: &python_parser::AtherisEntry,
+    work_dir: &Path,
+    harness_id: &str,
+    source_root: &Path,
+) -> Result<(), (String, bool)> {
+    use crate::auto::provided;
+    // Atheris is Python 3 only.
+    let python = select_interpreter(None, None).map_err(|reason| (reason, true))?;
+    let runtime = locate_python_runtime().ok_or_else(|| {
+        (
+            "could not locate the bundled python_runtime/ (decode/cov/driver)".to_owned(),
+            false,
+        )
+    })?;
+    let auto_dir = crate::auto::layout::harness_dir(work_dir, harness_id);
+    let gen_pkg = auto_dir.join("bhfgen");
+    let stand_in = auto_dir.join("atheris");
+    for dir in [&gen_pkg, &stand_in] {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| (format!("create {}: {e}", dir.display()), false))?;
+    }
+    provided::clear(&auto_dir)
+        .map_err(|e| (format!("clear {}: {e}", auto_dir.display()), false))?;
+    for f in ["bhf_decode.py", "bhf_cov.py", "bhf_driver.py"] {
+        std::fs::copy(runtime.join(f), auto_dir.join(f))
+            .map_err(|e| (format!("copy runtime {f}: {e}"), false))?;
+    }
+    let harness_file = crate::workdir::plain_canonical(&candidate.source_path);
+    let tree = crate::workdir::plain_canonical(source_root);
+    let (import_root, module) = resolve_module(&harness_file, &tree);
+    let harness_path = gen_pkg.join("harness.py");
+    for (path, text) in [
+        (
+            gen_pkg.join("__init__.py"),
+            "# SPDX-License-Identifier: Apache-2.0\n".to_owned(),
+        ),
+        (stand_in.join("__init__.py"), ATHERIS_STAND_IN.to_owned()),
+        (
+            harness_path.clone(),
+            generate_atheris_harness(&module, &entry.callback),
+        ),
+    ] {
+        std::fs::write(&path, text)
+            .map_err(|e| (format!("write {}: {e}", path.display()), false))?;
+    }
+
+    // The module path: the stand-in and the generated harness, the harness
+    // file's own import root, then the tree and its `src/`.
+    let mut path_dirs: Vec<PathBuf> = vec![auto_dir.clone(), import_root];
+    for dir in [tree.clone(), tree.join("src")] {
+        if dir.is_dir() && !path_dirs.contains(&dir) {
+            path_dirs.push(dir);
+        }
+    }
+    let path_refs: Vec<&Path> = path_dirs.iter().map(PathBuf::as_path).collect();
+    let pythonpath = crate::launch_spec::search_path(&path_refs);
+
+    // Import the harness file (its module-level code runs, its `Setup` and
+    // `Fuzz` included) so one that cannot load here is a clean skip naming
+    // why, not a run of zero executions.
+    let smoke = crate::command_output::output_with_timeout(
+        Command::new(&python)
+            .arg("-B")
+            .arg("-c")
+            .arg("import bhfgen.harness")
+            .env("PYTHONPATH", &pythonpath)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .current_dir(&auto_dir)
+            .stdin(std::process::Stdio::null()),
+        Duration::from_secs(30),
+    )
+    .map_err(|e| (format!("could not run import smoke-test: {e}"), false))?;
+    if !smoke.status.success() {
+        return Err((
+            crate::auto::script_load_roots::unloadable_reason(
+                &module,
+                &String::from_utf8_lossy(&smoke.stderr),
+            ),
+            true,
+        ));
+    }
+
+    let mut record =
+        provided::ProvidedRecord::new(provided::Origin::Atheris, &entry.callback, &harness_file);
+    let seed_dirs = atheris_seed_dirs(&harness_file);
+    let (seeds, skipped) = provided::copy_seed_files(&auto_dir, &seed_dirs)
+        .map_err(|e| (format!("copy the harness's seeds: {e}"), false))?;
+    record.seeds = seeds;
+    record.seed_sources = seed_dirs;
+    if skipped > 0 {
+        record.notes.push(format!(
+            "{skipped} seed file(s) were left out: a symlink, or past the seed count or size limits"
+        ));
+    }
+    let dictionary = harness_file.with_extension("dict");
+    if dictionary.is_file() {
+        match provided::append_dictionaries(&auto_dir, std::slice::from_ref(&dictionary)) {
+            Ok(tokens) => {
+                record.dictionaries.push(dictionary);
+                record.dictionary_tokens = tokens;
+            }
+            Err(error) => record
+                .notes
+                .push(format!("{error}; the dictionary is left out")),
+        }
+    }
+
+    // The harness file only hands the input on: a finding is the code's it
+    // calls, unless the harness raised it itself.
+    let glue = harness_file.to_string_lossy();
+    write_launcher(
+        &auto_dir,
+        &python,
+        &tree,
+        "",
+        &pythonpath,
+        &[
+            ("BHF_PY_EVERY_EXCEPTION", "1"),
+            ("BHF_PY_GLUE_FILES", &glue),
+        ],
+    )
+    .map_err(|reason| (reason, false))?;
+    provided::write_record(&auto_dir, &record)
+        .map_err(|e| (format!("record the provided harness: {e}"), false))
+}
+
+/// The seed corpora an Atheris harness keeps beside it, by the names
+/// projects give them: `<stem>_seed_corpus/`, `<stem>_corpus/`,
+/// `corpus/<stem>/` and `seeds/<stem>/`.
+fn atheris_seed_dirs(harness_file: &Path) -> Vec<PathBuf> {
+    let (Some(dir), Some(stem)) = (
+        harness_file.parent(),
+        harness_file.file_stem().and_then(|stem| stem.to_str()),
+    ) else {
+        return Vec::new();
+    };
+    [
+        dir.join(format!("{stem}_seed_corpus")),
+        dir.join(format!("{stem}_corpus")),
+        dir.join("corpus").join(stem),
+        dir.join("seeds").join(stem),
+    ]
+    .into_iter()
+    .filter(|dir| dir.is_dir())
+    .collect()
+}
+
+/// The `bhfgen/harness.py` of an Atheris harness: it imports the harness
+/// file as `module` and hands each input to its registered `callback`.
+fn generate_atheris_harness(module: &str, callback: &str) -> String {
+    format!(
+        "# SPDX-License-Identifier: Apache-2.0\n\
+         # Generated by bhf (native Python lane) for the project's Atheris harness:\n\
+         # each input goes to the function it registers with atheris.Setup. Do not edit.\n\
+         import importlib\n\
+         import os\n\
+         \n\
+         _t = importlib.import_module(\"{module}\")\n\
+         _bhf_entry = getattr(_t, \"{callback}\")\n\
+         {probe}\
+         \n\
+         def bhf_run_one(data):\n\
+         \x20   _bhf_mark_target_entry()\n\
+         \x20   _bhf_entry(data)\n",
+        probe = TARGET_ENTRY_PROBE,
+    )
+}
+
+/// What every generated harness module defines ahead of `bhf_run_one`: the
+/// probe that marks the first entry into the target.
+const TARGET_ENTRY_PROBE: &str = "\n\
+     _bhf_target_entered = False\n\
+     \n\
+     def _bhf_mark_target_entry():\n\
+     \x20   global _bhf_target_entered\n\
+     \x20   if _bhf_target_entered:\n\
+     \x20       return\n\
+     \x20   path = os.environ.get(\"BHF_TARGET_ENTRY_SHM\")\n\
+     \x20   if not path:\n\
+     \x20       return\n\
+     \x20   try:\n\
+     \x20       with open(path, \"wb\") as entry:\n\
+     \x20           entry.write(b\"\\x01\")\n\
+     \x20       _bhf_target_entered = True\n\
+     \x20   except (IOError, OSError):\n\
+     \x20       pass\n\
+     \n";
+
+/// bhf's stand-in for the `atheris` module, which an Atheris harness imports.
+/// It covers the module's harness-facing API; an attribute it lacks fails the
+/// import smoke test, so such a harness skips with the reason.
+const ATHERIS_STAND_IN: &str = r#"# SPDX-License-Identifier: Apache-2.0
+"""bhf's stand-in for the `atheris` module, written beside a project's Atheris
+harness so the harness runs under bhf's driver. bhf's engine hands each input
+to the function the harness registers, and bhf's tracer measures coverage, so
+Setup and Fuzz only record and return, and the instrumentation calls change
+nothing. FuzzedDataProvider decodes values from the front of the input: text
+as Atheris does (a first byte choosing ASCII, UTF-16 or UTF-32), integers as
+little-endian two's complement."""
+import contextlib
+import math
+import sys
+
+ALL_REMAINING = sys.maxsize
+
+registered = []
+
+
+def Setup(args, test_one_input, **kwargs):
+    registered.append(test_one_input)
+    return list(args)
+
+
+def Fuzz():
+    return None
+
+
+def instrument_func(func):
+    return func
+
+
+def instrument_all():
+    return None
+
+
+@contextlib.contextmanager
+def instrument_imports(*args, **kwargs):
+    yield
+
+
+enabled_hooks = set()
+
+
+def Mutate(data, max_size):
+    return bytes(data)[:max_size]
+
+
+class FuzzedDataProvider(object):
+    def __init__(self, data):
+        self._data = bytes(data)
+        self._pos = 0
+
+    def remaining_bytes(self):
+        return len(self._data) - self._pos
+
+    def buffer(self):
+        return self._data[self._pos:]
+
+    def _take(self, count):
+        count = max(0, min(int(count), self.remaining_bytes()))
+        out = self._data[self._pos:self._pos + count]
+        self._pos += count
+        return out
+
+    def ConsumeBytes(self, count):
+        return self._take(count)
+
+    def _text(self, count, surrogates):
+        if count <= 0 or self.remaining_bytes() == 0:
+            return ""
+        spec = self._take(1)[0]
+        if spec & 1 == 0:
+            return "".join(chr(b & 0x7F) for b in self._take(count))
+        if spec & 2 == 0:
+            raw = self._take(count * 2)
+            points = [int.from_bytes(raw[i:i + 2], "little") for i in range(0, len(raw) - 1, 2)]
+        else:
+            raw = self._take(count * 4)
+            points = [int.from_bytes(raw[i:i + 4], "little") & 0x1FFFFF
+                      for i in range(0, len(raw) - 3, 4)]
+            points = [p if p <= 0x10FFFF else p & 0xFFFF for p in points]
+        if not surrogates:
+            points = [0xFFFD if 0xD800 <= p <= 0xDFFF else p for p in points]
+        return "".join(chr(p) for p in points)
+
+    def ConsumeUnicode(self, count):
+        return self._text(count, True)
+
+    def ConsumeUnicodeNoSurrogates(self, count):
+        return self._text(count, False)
+
+    def ConsumeString(self, count):
+        return self._text(count, True)
+
+    def ConsumeInt(self, size):
+        return int.from_bytes(self._take(size), "little", signed=True)
+
+    def ConsumeUInt(self, size):
+        return int.from_bytes(self._take(size), "little")
+
+    def ConsumeIntInRange(self, low, high):
+        if low > high:
+            raise ValueError("ConsumeIntInRange: min must not exceed max")
+        span = high - low
+        if span == 0:
+            return low
+        raw = self._take((span.bit_length() + 7) // 8)
+        return low + int.from_bytes(raw, "little") % (span + 1)
+
+    def ConsumeIntList(self, count, size):
+        return [self.ConsumeInt(size) for _ in range(count)]
+
+    def ConsumeIntListInRange(self, count, low, high):
+        return [self.ConsumeIntInRange(low, high) for _ in range(count)]
+
+    def ConsumeBool(self):
+        return bool(self.ConsumeUInt(1) & 1)
+
+    def ConsumeProbability(self):
+        return self.ConsumeUInt(8) / float(0xFFFFFFFFFFFFFFFF)
+
+    def ConsumeFloatInRange(self, low, high):
+        if low > high:
+            raise ValueError("ConsumeFloatInRange: min must not exceed max")
+        base, span = low, high - low
+        if math.isinf(span):
+            span = high / 2.0 - low / 2.0
+            if self.ConsumeBool():
+                base += span
+        return base + span * self.ConsumeProbability()
+
+    def ConsumeRegularFloat(self):
+        return self.ConsumeFloatInRange(-sys.float_info.max, sys.float_info.max)
+
+    def ConsumeFloat(self):
+        special = (0.0, -0.0, float("inf"), float("-inf"), float("nan"),
+                   sys.float_info.max, -sys.float_info.max, sys.float_info.min)
+        pick = self.ConsumeUInt(1)
+        if pick < len(special):
+            return special[pick]
+        return self.ConsumeRegularFloat()
+
+    def ConsumeFloatList(self, count):
+        return [self.ConsumeFloat() for _ in range(count)]
+
+    def ConsumeRegularFloatList(self, count):
+        return [self.ConsumeRegularFloat() for _ in range(count)]
+
+    def ConsumeProbabilityList(self, count):
+        return [self.ConsumeProbability() for _ in range(count)]
+
+    def ConsumeFloatListInRange(self, count, low, high):
+        return [self.ConsumeFloatInRange(low, high) for _ in range(count)]
+
+    def PickValueInList(self, values):
+        if not values:
+            raise ValueError("PickValueInList: the list is empty")
+        return values[self.ConsumeIntInRange(0, len(values) - 1)]
+"#;
+
+/// Write the launcher `harnesses/<id>/main` and its launch spec: the
+/// interpreter on bhf's driver, with the harness module, the coverage trace
+/// prefix, the target package and `pythonpath`, and `extra_env` after them.
+fn write_launcher(
+    auto_dir: &Path,
+    python: &Path,
+    trace_prefix: &Path,
+    package: &str,
+    pythonpath: &str,
+    extra_env: &[(&str, &str)],
+) -> Result<(), String> {
     // Emit the launcher `main`. Carries the BHF_FRAMED marker the engine greps
     // for; the interpreter inherits BHF_FRAMED + BHF_COV_SHM across the exec.
     let main_path = auto_dir.join("main");
     let driver = auto_dir.join("bhf_driver.py");
+    let extra: String = extra_env
+        .iter()
+        .map(|(key, value)| format!("{key}=\"{value}\" \\\n"))
+        .collect();
     let script = format!(
         "#!/bin/sh\n\
          # BHF_FRAMED BHF_PY_LAUNCHER bhf CPython driver launcher (native Python lane).\n\
@@ -254,11 +665,12 @@ pub fn build_python_harness(
          BHF_TRACE_PREFIX=\"{trace}\" \\\n\
          BHF_TARGET_PACKAGE=\"{pkg}\" \\\n\
          BHF_COVERED_LINES=\"{covered}\" \\\n\
+         {extra}\
          PYTHONDONTWRITEBYTECODE=1 \\\n\
          PYTHONPATH=\"{pythonpath}{separator}${{PYTHONPATH}}\" \\\n\
          exec \"{python}\" -B \"{driver}\" \"$@\"\n",
-        trace = import_root.display(),
-        pkg = module.split('.').next().unwrap_or(&module),
+        trace = trace_prefix.display(),
+        pkg = package,
         covered = auto_dir.join("covered-lines.txt").display(),
         pythonpath = pythonpath,
         // The host's separator: on Windows a `:` would join the inherited
@@ -267,60 +679,49 @@ pub fn build_python_harness(
         python = python.display(),
         driver = driver.display(),
     );
-    if let Err(e) = std::fs::write(&main_path, script) {
-        return PythonBuildResult::Failed {
-            reason: format!("write launcher {}: {e}", main_path.display()),
-            skip: false,
-        };
-    }
-    if let Err(e) = make_executable(&main_path) {
-        return PythonBuildResult::Failed {
-            reason: format!("chmod +x {}: {e}", main_path.display()),
-            skip: false,
-        };
-    }
+    std::fs::write(&main_path, script)
+        .map_err(|e| format!("write launcher {}: {e}", main_path.display()))?;
+    make_executable(&main_path).map_err(|e| format!("chmod +x {}: {e}", main_path.display()))?;
     // The same launch where the shell script cannot run (#305): a native
     // Windows host execs the interpreter on the driver with this
     // environment.
     let inherited = std::env::var("PYTHONPATH").unwrap_or_default();
+    let mut env = vec![
+        ("BHF_HARNESS_MODULE".to_owned(), "bhfgen.harness".to_owned()),
+        (
+            "BHF_TRACE_PREFIX".to_owned(),
+            trace_prefix.display().to_string(),
+        ),
+        ("BHF_TARGET_PACKAGE".to_owned(), package.to_owned()),
+        (
+            "BHF_COVERED_LINES".to_owned(),
+            auto_dir.join("covered-lines.txt").display().to_string(),
+        ),
+    ];
+    env.extend(
+        extra_env
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned())),
+    );
+    env.push(("PYTHONDONTWRITEBYTECODE".to_owned(), "1".to_owned()));
+    env.push((
+        "PYTHONPATH".to_owned(),
+        if inherited.is_empty() {
+            pythonpath.to_owned()
+        } else {
+            format!(
+                "{pythonpath}{}{inherited}",
+                if cfg!(windows) { ';' } else { ':' }
+            )
+        },
+    ));
     let launch = replay_min::Launch {
-        program: python.clone(),
+        program: python.to_path_buf(),
         args: vec!["-B".to_owned(), driver.display().to_string()],
-        env: vec![
-            ("BHF_HARNESS_MODULE".to_owned(), "bhfgen.harness".to_owned()),
-            (
-                "BHF_TRACE_PREFIX".to_owned(),
-                import_root.display().to_string(),
-            ),
-            (
-                "BHF_TARGET_PACKAGE".to_owned(),
-                module.split('.').next().unwrap_or(&module).to_owned(),
-            ),
-            (
-                "BHF_COVERED_LINES".to_owned(),
-                auto_dir.join("covered-lines.txt").display().to_string(),
-            ),
-            ("PYTHONDONTWRITEBYTECODE".to_owned(), "1".to_owned()),
-            (
-                "PYTHONPATH".to_owned(),
-                if inherited.is_empty() {
-                    pythonpath.clone()
-                } else {
-                    format!(
-                        "{pythonpath}{}{inherited}",
-                        if cfg!(windows) { ';' } else { ':' }
-                    )
-                },
-            ),
-        ],
+        env,
     };
-    if let Err(e) = crate::launch_spec::write(&main_path, &launch) {
-        return PythonBuildResult::Failed {
-            reason: format!("write launch spec in {}: {e}", auto_dir.display()),
-            skip: false,
-        };
-    }
-    PythonBuildResult::Built
+    crate::launch_spec::write(&main_path, &launch)
+        .map_err(|e| format!("write launch spec in {}: {e}", auto_dir.display()))
 }
 
 /// A resolved target: the matched function plus, for an instance method, the
@@ -727,29 +1128,14 @@ fn generate_harness(module: &str, func: &PyFunction, receiver: Option<&Receiver>
          import os\n\
          import bhf_decode\n\
          {import}\
-         \n\
-         _bhf_target_entered = False\n\
-         \n\
-         def _bhf_mark_target_entry():\n\
-         \x20   global _bhf_target_entered\n\
-         \x20   if _bhf_target_entered:\n\
-         \x20       return\n\
-         \x20   path = os.environ.get(\"BHF_TARGET_ENTRY_SHM\")\n\
-         \x20   if not path:\n\
-         \x20       return\n\
-         \x20   try:\n\
-         \x20       with open(path, \"wb\") as entry:\n\
-         \x20           entry.write(b\"\\x01\")\n\
-         \x20       _bhf_target_entered = True\n\
-         \x20   except (IOError, OSError):\n\
-         \x20       pass\n\
-         \n\
+         {probe}\
          \n\
          def bhf_run_one(data):\n\
          \x20   _c = bhf_decode.open_cursor(data)\n\
          {lines}    _bhf_mark_target_entry()\n\
          {call}",
         import = import,
+        probe = TARGET_ENTRY_PROBE,
         lines = lines,
         call = call,
     )
@@ -1135,6 +1521,168 @@ mod tests {
         let error =
             select_interpreter(Some(Dialect::Python2), Some(none.path().as_os_str())).unwrap_err();
         assert!(error.contains("no `python2` interpreter found"), "{error}");
+    }
+
+    #[test]
+    fn an_atheris_harness_module_calls_the_registered_function_after_the_entry_probe() {
+        let h = generate_atheris_harness("fuzz_records", "TestOneInput");
+        assert!(
+            h.contains("_t = importlib.import_module(\"fuzz_records\")\n"),
+            "{h}"
+        );
+        assert!(
+            h.contains("_bhf_entry = getattr(_t, \"TestOneInput\")\n"),
+            "{h}"
+        );
+        assert!(
+            h.ends_with(
+                "\ndef bhf_run_one(data):\n    _bhf_mark_target_entry()\n    _bhf_entry(data)\n"
+            ),
+            "{h}"
+        );
+        // The same entry probe as a generated harness's.
+        let generated = generate_harness("m", &func("f", &[("data", None)], false), None);
+        assert!(h.contains(TARGET_ENTRY_PROBE) && generated.contains(TARGET_ENTRY_PROBE));
+        assert!(
+            generated.contains("        pass\n\n\ndef bhf_run_one(data):\n"),
+            "{generated}"
+        );
+    }
+
+    /// The stand-in `atheris` decodes a FuzzedDataProvider's values from the
+    /// input, and its Setup and Fuzz return at once.
+    #[test]
+    fn the_atheris_stand_in_decodes_values_from_the_input() {
+        let Ok(python) = select_interpreter(None, None) else {
+            return; // no interpreter installed
+        };
+        let dir = crate::test_support::TestDir::new("py-atheris-stand-in");
+        std::fs::create_dir_all(dir.join("atheris")).unwrap();
+        std::fs::write(dir.join("atheris/__init__.py"), ATHERIS_STAND_IN).unwrap();
+        let script = "import sys, atheris\n\
+            assert atheris.Setup(['prog', '-runs=1'], len) == ['prog', '-runs=1']\n\
+            assert atheris.registered == [len] and atheris.Fuzz() is None\n\
+            with atheris.instrument_imports():\n    import json\n\
+            assert atheris.instrument_func(len) is len\n\
+            fdp = atheris.FuzzedDataProvider(b'\\x06\\xff\\x02AB\\x01\\x07\\x00XYZ')\n\
+            print(fdp.ConsumeIntInRange(0, 3), fdp.ConsumeInt(1), fdp.ConsumeUnicode(2),\n\
+            \x20     fdp.ConsumeBool(), fdp.ConsumeUInt(2), fdp.remaining_bytes(),\n\
+            \x20     fdp.ConsumeBytes(atheris.ALL_REMAINING), fdp.ConsumeInt(4),\n\
+            \x20     fdp.PickValueInList(['only']))\n";
+        let out = Command::new(&python)
+            .args(["-B", "-c", script])
+            .env("PYTHONPATH", dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // 6 % 4; 0xff as a signed byte; an ASCII spec byte, then "AB"; 1 & 1;
+        // 0x0007 little-endian; what is left; nothing left reads as 0.
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n"),
+            "2 -1 AB True 7 3 b'XYZ' 0 only\n"
+        );
+    }
+
+    /// An Atheris harness builds into a launcher that runs its registered
+    /// function on each input, with its seed corpus and dictionary, and
+    /// reports every exception it lets escape, a ValueError included.
+    #[cfg(unix)]
+    #[test]
+    fn an_atheris_harness_builds_and_every_exception_it_lets_escape_is_a_finding() {
+        if select_interpreter(None, None).is_err() || locate_python_runtime().is_none() {
+            return;
+        }
+        let root = crate::test_support::TestDir::new("py-atheris-build");
+        let tree = root.join("tree");
+        let write = |path: &Path, text: &[u8]| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write(
+            &tree.join("widget/__init__.py"),
+            b"def parse_record(data):\n    if data.startswith(b'BAD'):\n        \
+              raise ValueError('planted')\n    return len(data)\n",
+        );
+        let harness = tree.join("fuzz/fuzz_widget.py");
+        write(
+            &harness,
+            b"import sys\nimport atheris\n\nwith atheris.instrument_imports():\n    \
+              import widget\n\n\ndef TestOneInput(data):\n    widget.parse_record(data)\n\n\n\
+              def main():\n    atheris.Setup(sys.argv, TestOneInput)\n    atheris.Fuzz()\n\n\n\
+              if __name__ == '__main__':\n    main()\n",
+        );
+        write(&tree.join("fuzz/fuzz_widget.dict"), b"bad=\"BAD\"\n");
+        write(&tree.join("fuzz/corpus/fuzz_widget/one"), b"GOOD");
+        let found =
+            crate::auto::provided::discover(&tree, &crate::auto::discovery::DirFilter::default());
+        assert_eq!(found.len(), 1, "{found:?}");
+        let work = root.join("work");
+        let result = build_python_harness(&found[0], &work, "H-P1", &tree);
+        if let PythonBuildResult::Failed { reason, .. } = &result {
+            panic!("the Atheris harness did not build: {reason}");
+        }
+        let dir = crate::auto::layout::harness_dir(&work, "H-P1");
+        let record = crate::auto::provided::read_record(&dir).expect("a provided record");
+        assert_eq!(record.origin, crate::auto::provided::Origin::Atheris);
+        assert_eq!(record.entry, "TestOneInput");
+        assert_eq!(record.seeds, 1);
+        assert_eq!(record.dictionary_tokens, 1);
+        assert_eq!(
+            record.dictionaries,
+            [crate::workdir::plain_canonical(
+                &tree.join("fuzz/fuzz_widget.dict")
+            )]
+        );
+        assert_eq!(crate::auto::provided::load_seeds(&dir), [b"GOOD".to_vec()]);
+        assert!(std::fs::read_to_string(dir.join("dictionary.txt"))
+            .unwrap()
+            .contains("\"BAD\""));
+        let launcher = std::fs::read_to_string(dir.join("main")).unwrap();
+        assert!(
+            launcher.contains("BHF_PY_EVERY_EXCEPTION=\"1\""),
+            "{launcher}"
+        );
+
+        let replay = |input: &[u8]| {
+            let file = root.join("input");
+            std::fs::write(&file, input).unwrap();
+            Command::new(dir.join("main"))
+                .arg(&file)
+                .env_remove("BHF_FRAMED")
+                .output()
+                .unwrap()
+        };
+        let ok = replay(b"GOOD");
+        assert!(
+            ok.status.success(),
+            "{}",
+            String::from_utf8_lossy(&ok.stderr)
+        );
+        let bad = replay(b"BAD!");
+        let stderr = String::from_utf8_lossy(&bad.stderr);
+        assert_eq!(bad.status.code(), Some(86), "{stderr}");
+        assert!(
+            stderr.contains("== bhf python finding: ValueError: planted"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("in parse_record"), "{stderr}");
+        // The finding is the library's: the harness's own frame only handed
+        // the input on.
+        let report = corpus::sanitizer::parse_sanitizer_report(&stderr).expect("a Python finding");
+        let widget = crate::workdir::plain_canonical(&tree.join("widget/__init__.py"));
+        assert_eq!(
+            (
+                report.stack[0].function.as_str(),
+                report.stack[0].file.as_deref(),
+                report.stack[0].line
+            ),
+            ("parse_record", widget.to_str(), Some(3)),
+            "{stderr}"
+        );
     }
 
     #[test]

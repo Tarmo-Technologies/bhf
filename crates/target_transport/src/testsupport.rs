@@ -290,13 +290,24 @@ impl MemRegion {
 type FileIoRequest = (String, Option<(u64, Vec<u8>)>);
 
 /// A minimal gdbstub speaking the target side of the RSP: acks packets, answers
-/// `!`/`?`/`g`/`m`/`M`/`c`/`Z`/`z`, and records a per-iteration `R` reset. Serves
+/// `!`/`?`/`g`/`m`/`M`/`c`/`s`/`Z`/`z`, and records a per-iteration `R` reset. Serves
 /// memory reads/writes against scripted regions.
 pub struct MockGdbStub<C: Read + Write> {
     connection: GdbConnection<C>,
     regions: Vec<MemRegion>,
     log: Arc<Mutex<Vec<String>>>,
     stop_reply: Vec<u8>,
+    /// Stop replies for successive `c`s, before `stop_reply` takes over; an
+    /// empty one sends nothing, as a target that never stops.
+    stop_sequence: VecDeque<Vec<u8>>,
+    /// The reply to a single step `s`.
+    step_reply: Vec<u8>,
+    /// Whether a step `s` moves the program counter, modeled as the register
+    /// block's first byte going up by 2 (see [`MockGdbStub::with_step_in_place`]).
+    step_moves: bool,
+    /// For successive `c`s, whether that run skips the run writes, before
+    /// every later `c` writes them (see [`MockGdbStub::with_runs_that_write`]).
+    run_writes_per_c: VecDeque<bool>,
     registers: Vec<u8>,
     /// Raw payloads emitted as `O<hex>` console-output packets before the stop
     /// reply on a `c`, modeling a target that prints while it runs.
@@ -320,6 +331,10 @@ impl<C: Read + Write> MockGdbStub<C> {
             regions: Vec::new(),
             log,
             stop_reply: b"S05".to_vec(),
+            stop_sequence: VecDeque::new(),
+            step_reply: b"S05".to_vec(),
+            step_moves: true,
+            run_writes_per_c: VecDeque::new(),
             registers: vec![0_u8; 4],
             console_output: Vec::new(),
             run_writes: Vec::new(),
@@ -375,6 +390,38 @@ impl<C: Read + Write> MockGdbStub<C> {
     /// Override the stop-reply packet returned by `?` and `c`.
     pub fn with_stop_reply(mut self, reply: Vec<u8>) -> Self {
         self.stop_reply = reply;
+        self
+    }
+
+    /// Answer successive `c`s with `replies` in order, then with the stop
+    /// reply. An empty reply sends nothing: the target runs on and never
+    /// stops, so only a client's read deadline ends the wait.
+    pub fn with_stop_sequence(mut self, replies: Vec<Vec<u8>>) -> Self {
+        self.stop_sequence = replies.into();
+        self
+    }
+
+    /// Answer a single step `s` with `reply` (by default `S05`, a trap one
+    /// instruction on), as a stub that cannot step answers `E01`.
+    pub fn with_step_reply(mut self, reply: &[u8]) -> Self {
+        self.step_reply = reply.to_vec();
+        self
+    }
+
+    /// Leave the registers as they are on a step `s`, as a target parked on a
+    /// branch to itself (`b .`) does; by default a step moves the program
+    /// counter.
+    pub fn with_step_in_place(mut self) -> Self {
+        self.step_moves = false;
+        self
+    }
+
+    /// For successive `c`s, whether the run makes its run writes
+    /// ([`MockGdbStub::with_run_write`]): `false` models a target that comes
+    /// straight back to its stop without running. Every `c` past the list
+    /// writes them.
+    pub fn with_runs_that_write(mut self, writes: Vec<bool>) -> Self {
+        self.run_writes_per_c = writes.into();
         self
     }
 
@@ -444,7 +491,8 @@ impl<C: Read + Write> MockGdbStub<C> {
                     self.connection.send_packet(&reply)?;
                 }
                 b'c' => {
-                    for (address, data) in self.run_writes.clone() {
+                    let writes = self.run_writes_per_c.pop_front().unwrap_or(true);
+                    for (address, data) in self.run_writes.clone().into_iter().filter(|_| writes) {
                         for region in &mut self.regions {
                             if let Some(offset) = region.contains(address, data.len()) {
                                 region.data[offset..offset + data.len()].copy_from_slice(&data);
@@ -502,11 +550,26 @@ impl<C: Read + Write> MockGdbStub<C> {
                         packet.extend_from_slice(hex(chunk).as_bytes());
                         self.connection.send_packet(&packet)?;
                     }
-                    let reply = self.stop_reply.clone();
+                    let reply = self
+                        .stop_sequence
+                        .pop_front()
+                        .unwrap_or_else(|| self.stop_reply.clone());
+                    if reply.is_empty() {
+                        continue;
+                    }
                     self.connection.send_packet(&reply)?;
                     if self.unsolicited_stops {
                         self.connection.send_unacked(b"S05")?;
                     }
+                }
+                b's' => {
+                    if self.step_moves {
+                        if let Some(pc) = self.registers.first_mut() {
+                            *pc = pc.wrapping_add(2);
+                        }
+                    }
+                    let reply = self.step_reply.clone();
+                    self.connection.send_packet(&reply)?;
                 }
                 b'g' => {
                     let reply = hex(&self.registers).into_bytes();

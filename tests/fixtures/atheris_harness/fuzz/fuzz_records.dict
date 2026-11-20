@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+# The record magic and its flag byte.
+magic="REC"
+flag="!"

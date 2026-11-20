@@ -419,7 +419,10 @@ pub struct FuzzArgs {
     /// of the shared queue, or seed bytes the campaign wrote to a file (a
     /// seed's layout-prefixed variant, a programmatic seed). Read like
     /// `--seed-file`, but not a seed given to `bhf fuzz`, so its lineage
-    /// names what it was made from, not this copy. Internal.
+    /// names what it was made from, not this copy. A directory stands for
+    /// every file in it, in name order: the campaign hands over the shared
+    /// queue and its seed files that way, so a worker's command line stays
+    /// the same length however many there are. Internal.
     #[arg(long = "campaign-seed-file", hide = true)]
     pub campaign_seed_files: Vec<PathBuf>,
 
@@ -496,8 +499,15 @@ pub struct FuzzArgs {
     /// Extra environment variables to set on the harness Command.
     /// Populated by `bhf auto` to thread BHF_RUNTRACE_MODE,
     /// LD_PRELOAD, and per-finding env injections without polluting
-    /// the parent process env. Always empty for the CLI path.
-    #[arg(skip)]
+    /// the parent process env. A multi-worker campaign hands them to each
+    /// worker as `--harness-env KEY=VALUE` (#332), where `{work_dir}` stands
+    /// for the worker's own work dir; not meant to be given by hand.
+    #[arg(
+        long = "harness-env",
+        value_name = "KEY=VALUE",
+        value_parser = parse_harness_env,
+        hide = true
+    )]
     pub extra_env: Vec<(String, String)>,
 
     /// Load the runtime sink oracles via the LD_PRELOAD runtrace shim (#59), so a
@@ -569,8 +579,10 @@ pub struct FuzzArgs {
     /// `agent:tcp:HOST:PORT`, `agent:serial:/dev/ttyX[,baud=N]` (on-target agent),
     /// `gdb:HOST:PORT` (debug-probe/emulator gdbstub; needs
     /// `--transport-coverage-map`), and
-    /// `qemu-system:qmp=HOST:PORT,gdb=HOST:PORT[,snapshot=TAG]` (full-system;
-    /// needs `--transport-coverage-map`), and
+    /// `qemu-system:qmp=HOST:PORT,gdb=HOST:PORT[,snapshot=TAG][,reset=loadvm|persistent]`
+    /// (full-system; needs `--transport-coverage-map`; `reset=persistent`
+    /// continues a firmware's own input loop and restores only after a
+    /// crash, hang or inconclusive run, and needs `done=`), and
     /// `renode:monitor=HOST:PORT,gdb=HOST:PORT[,snapshot=PATH]` (a Renode
     /// board: its telnet monitor saves and loads the baseline; needs
     /// `--transport-coverage-map`). Live agent/gdb/qemu/renode backends are
@@ -1146,10 +1158,18 @@ pub(crate) struct FuzzRunSummary {
     /// (#232). Omitted when none was calibrated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) stability: Option<StabilitySummary>,
+    /// #331: what the pass's SymCC stage did: its rounds, the entries it ran
+    /// and the inputs it gave the pass. Omitted when the pass had none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) symcc: Option<crate::symcc::SymccRunSummary>,
+    /// #332: the workers a `bhf auto --workers-per-target` pass ran on and
+    /// the corpus they merged. Omitted for a pass on one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) workers: Option<CampaignRunSummary>,
 }
 
 /// Fresh-process re-runs of new corpus inputs during one fork-server pass.
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, serde::Deserialize)]
 pub(crate) struct FreshRerunSummary {
     /// Inputs queued for a re-run, including ones carried over from the last
     /// pass.
@@ -1449,6 +1469,10 @@ struct PreparedFuzzRun {
     /// builtin engine drives `oracle.evaluate` over the retained corpus after the
     /// run. `None` leaves fuzzing byte-for-byte unchanged.
     extension_manifest: Option<PathBuf>,
+    /// #331: the SymCC stage of a builtin pass, which runs the corpus entries
+    /// of a plateau through `main_symcc` and runs the inputs it solves.
+    /// `None` unless the run asked for SymCC and the harness has the lane.
+    symcc: Option<crate::symcc::SymccConfig>,
 }
 
 #[derive(Clone)]
@@ -2213,7 +2237,7 @@ pub(crate) fn run_one_target_programmatic_with_runner(
     // large seed is never truncated). Unset (non-auto callers / tests) keeps the
     // historical defaults.
     let largest_seed = seeds.iter().map(Vec::len).max().unwrap_or(0);
-    let args = FuzzArgs {
+    let mut args = FuzzArgs {
         work_dir: work_dir.to_path_buf(),
         harness: harness_id.to_owned(),
         engine: FuzzEngine::Builtin,
@@ -2280,10 +2304,471 @@ pub(crate) fn run_one_target_programmatic_with_runner(
         collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
         extension: None,
     };
+    // A provided harness's own options (an imported OSS-Fuzz fuzzer's
+    // `.options`) set its limits in place of the run's.
+    if let Some(options) = crate::auto::provided::fuzz_options(work_dir, harness_id) {
+        options.apply(&mut args.max_len, &mut args.timeout, &mut args.rss_limit_mb);
+    }
+    // #332: `bhf auto --workers-per-target N` runs each native pass as a
+    // campaign of N workers that share their corpus as they run.
+    if runner.is_none() {
+        if let Some(workers) = resolve_env_workers_per_target() {
+            return run_programmatic_campaign(args, workers);
+        }
+    }
     // A caller-supplied cross runner replaces the runner `prepare` would
     // resolve from the harness path (qemu-user / wine emulation).
     let prepared = prepare_with_runner(args, runner)?;
     run_builtin_with_progress(prepared, progress)
+}
+
+/// How many workers each builtin pass of a target runs on: the count `bhf
+/// auto --workers-per-target` publishes (#332). Unset, or one, runs the pass
+/// in process.
+pub(crate) const WORKERS_PER_TARGET_ENV: &str = "BHF_WORKERS_PER_TARGET";
+
+/// The workers [`WORKERS_PER_TARGET_ENV`] asks for, when more than one.
+fn resolve_env_workers_per_target() -> Option<u32> {
+    workers_per_target_from(std::env::var(WORKERS_PER_TARGET_ENV).ok().as_deref())
+}
+
+fn workers_per_target_from(value: Option<&str>) -> Option<u32> {
+    value?
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|&workers| workers > 1)
+}
+
+/// The harness env whose maps and logs a programmatic campaign carries back
+/// from its workers into the parent's: the edge map and the target-entry
+/// flag (each byte the largest any worker's copy holds), and the runtrace log
+/// (each worker's appended), which the caller reads as a single run's.
+const CAMPAIGN_MAPS: &[&str] = &["BHF_COV_SHM", "BHF_TARGET_ENTRY_SHM"];
+const CAMPAIGN_LOGS: &[&str] = &["BHF_RUNTRACE_LOG"];
+
+/// One worker of a programmatic campaign, in its run summary's `workers`.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct CampaignWorkerRun {
+    pub(crate) worker_id: u32,
+    pub(crate) completed: bool,
+    pub(crate) executions: usize,
+    pub(crate) elapsed_secs: f64,
+    /// Findings the worker recorded (merged into the parent's).
+    pub(crate) findings: usize,
+    /// Entries of the worker's own queue when it finished.
+    pub(crate) queue_entries: usize,
+    /// Entries of the other workers it ran as they found them (#277).
+    pub(crate) peer_imports: usize,
+}
+
+/// A pass `bhf auto --workers-per-target` ran on several workers (#332).
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct CampaignRunSummary {
+    pub(crate) workers: u32,
+    pub(crate) completed: u32,
+    /// Milliseconds between the workers' corpus syncs.
+    pub(crate) sync_interval_ms: u64,
+    /// Inputs of the workers' queues the merge added to the target's queue,
+    /// and those it already held.
+    pub(crate) merged_inputs: usize,
+    pub(crate) duplicate_inputs: usize,
+    /// Entries of the target's queue (`corpus/<id>/queue`) after the merge.
+    pub(crate) queue_entries: usize,
+    pub(crate) per_worker: Vec<CampaignWorkerRun>,
+}
+
+/// Run a programmatic builtin pass as a campaign of `workers` `bhf fuzz`
+/// workers (#332), each in its own copy of the work dir, that share the
+/// entries they keep as they run (#277), and return one summary for the pass:
+/// the workers' executions summed, their findings merged into the work dir's
+/// results, their queues merged into the target's, and the maps and logs of
+/// [`CAMPAIGN_MAPS`] and [`CAMPAIGN_LOGS`] carried back into the parent's, so
+/// the caller reads the pass as it reads one run.
+fn run_programmatic_campaign(mut args: FuzzArgs, workers: u32) -> Result<FuzzRunSummary, String> {
+    let work_dir = absolutize(&args.work_dir)?;
+    args.work_dir = work_dir.clone();
+    let harness_path = find_harness_executable(&work_dir, &args.harness, args.engine)?;
+    let (harness_dirs, harness_executable) =
+        worker_harness_layout(&work_dir, &args.harness, &harness_path);
+    // Every worker's harness gets the sanitizers' options with the rest of
+    // its env; a worker given no `--sanitizers` adds none of its own.
+    let sanitizers = parse_sanitizer_args(&args.sanitizers)?
+        .runtime_set()
+        .to_vec();
+    let sanitizer_env = sanitizer_env_for(&sanitizers);
+    args.extra_env.extend(sanitizer_env.iter().cloned());
+    // The pass proves its own target entry, as a run in process does: the
+    // workers' copies start from the parent's flag, cleared here.
+    reset_target_entry(&args.extra_env);
+    drop_seeds_the_queue_holds(&mut args);
+    worker_seed_files(&mut args, &harness_path)?;
+    let bhf_bin = match args.bhf_bin.clone() {
+        Some(path) => path,
+        None => std::env::current_exe()
+            .map_err(|error| format!("resolve current bhf executable: {error}"))?,
+    };
+    // The workers run on a whole-second `--time`: the pass's, to the nearest
+    // second, and at least one.
+    let time_budget = args
+        .time
+        .map(|time| Duration::from_secs(time.as_secs_f64().round().max(1.0) as u64))
+        .unwrap_or(Duration::ZERO);
+    let config = multicore_fuzz::MulticoreConfig {
+        work_dir: work_dir.clone(),
+        harness_id: args.harness.clone(),
+        workers: multicore_fuzz::WorkerCount::Fixed(workers),
+        per_worker_iterations: args
+            .iterations
+            .filter(|&iterations| iterations != usize::MAX)
+            .map(|iterations| iterations as u64),
+        time_budget,
+        bhf_bin,
+        per_worker_env: Vec::new(),
+        extra_worker_args: worker_passthrough_args(&args),
+        kill_grace: None,
+        harness_dirs,
+        harness_executable,
+        lineage_record_cap: corpus::lineage::record_cap(corpus_limits(args.max_len.max(1)).entries),
+    };
+    let campaign = multicore_fuzz::run_multicore(&config).map_err(|error| error.to_string())?;
+    report_failed_workers(&campaign);
+    let (_, merge) = merge_worker_findings(&work_dir, &campaign, WorkerDirs::RemovedOnceMerged);
+    let (duplicates_of_existing, duplicate_crashes_of_existing) =
+        campaign_duplicates_of_existing(&work_dir, &campaign, merge.as_ref());
+    let worker_dirs: Vec<&Path> = campaign
+        .per_worker
+        .iter()
+        .map(|worker| worker.work_dir.as_path())
+        .collect();
+    carry_back_worker_maps(&work_dir, &args.extra_env, &worker_dirs);
+    carry_back_symcc_imports(&work_dir, &worker_dirs);
+    let worker_summaries: Vec<Option<serde_json::Value>> = campaign
+        .per_worker
+        .iter()
+        .map(|worker| {
+            fs::read(worker.work_dir.join(multicore_fuzz::WORKER_STDOUT_LOG))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        })
+        .collect();
+    let queue_of = |dir: &Path| {
+        fs::read_dir(dir.join("corpus").join(&args.harness).join("queue"))
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0)
+    };
+    let per_worker: Vec<CampaignWorkerRun> = campaign
+        .per_worker
+        .iter()
+        .zip(&worker_summaries)
+        .map(|(worker, summary)| CampaignWorkerRun {
+            worker_id: worker.worker_id,
+            completed: worker.completed(),
+            executions: summary_usize(summary.as_ref(), "/executions"),
+            elapsed_secs: summary
+                .as_ref()
+                .and_then(|summary| summary.pointer("/elapsed_secs"))
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0),
+            findings: worker.new_findings,
+            queue_entries: queue_of(&worker.work_dir),
+            peer_imports: fs::read_to_string(worker.work_dir.join(peer_sync::IMPORT_LOG))
+                .map(|log| log.lines().count())
+                .unwrap_or(0),
+        })
+        .collect();
+    if campaign.workers_completed == 0 {
+        let why = campaign
+            .per_worker
+            .iter()
+            .find_map(|worker| worker.stderr_tail.clone())
+            .unwrap_or_else(|| "no worker said why".to_owned());
+        return Err(format!(
+            "none of the {} workers of the pass completed: {why}",
+            campaign.workers_started
+        ));
+    }
+    let first = worker_summaries.iter().flatten().next();
+    let text = |pointer: &str, default: &str| {
+        first
+            .and_then(|summary| summary.pointer(pointer))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(default)
+            .to_owned()
+    };
+    let flag = |pointer: &str| {
+        first
+            .and_then(|summary| summary.pointer(pointer))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
+    let executions: usize = per_worker.iter().map(|worker| worker.executions).sum();
+    let elapsed_secs = per_worker
+        .iter()
+        .map(|worker| worker.elapsed_secs)
+        .fold(0.0_f64, f64::max);
+    let merged = merge
+        .as_ref()
+        .map(|merge| merge.merged.clone())
+        .unwrap_or_default();
+    let queue_entries = queue_of(&work_dir);
+    // The workers' trees hold nothing the merge did not bring back once it
+    // merged every finding; the next pass makes them again.
+    if merge.as_ref().is_some_and(|merge| merge.failed == 0) {
+        for worker in campaign
+            .per_worker
+            .iter()
+            .filter(|worker| worker.completed())
+        {
+            let _ = fs::remove_dir_all(&worker.work_dir);
+        }
+    }
+    let summary = FuzzRunSummary {
+        schema_version: 1,
+        harness_id: args.harness.clone(),
+        engine: "builtin".to_owned(),
+        mode: args.mode,
+        harness_path: harness_path.clone(),
+        sandbox: replay_min::SandboxMetadata {
+            mode: text("/sandbox/mode", "none"),
+            strict: flag("/sandbox/strict"),
+            tool: first
+                .and_then(|summary| summary.pointer("/sandbox/tool"))
+                .and_then(serde_json::Value::as_str)
+                .map(PathBuf::from),
+        },
+        iterations_requested: args.effective_iterations(),
+        executions,
+        target_entry_observed: target_entry_from_env(&args.extra_env)
+            || worker_summaries.iter().flatten().any(|summary| {
+                summary
+                    .pointer("/target_entry_observed")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            }),
+        corpus_new: worker_summaries
+            .iter()
+            .map(|summary| summary_usize(summary.as_ref(), "/corpus_new"))
+            .sum(),
+        corpus_duplicates: worker_summaries
+            .iter()
+            .map(|summary| summary_usize(summary.as_ref(), "/corpus_duplicates"))
+            .sum(),
+        corpus_persisted: queue_entries,
+        execution: ExecutionRunSummary {
+            harness_protocol: text("/execution/harness_protocol", "unknown"),
+            forkserver: flag("/execution/forkserver"),
+            persistent: flag("/execution/persistent"),
+            persistent_iterations: None,
+        },
+        cmplog: CmpLogRunSummary {
+            enabled: flag("/cmplog/enabled"),
+            status: text("/cmplog/status", "disabled"),
+            log_path: args.cmplog_log.clone(),
+            entries: summary_usize(first, "/cmplog/entries"),
+            dictionary_tokens: summary_usize(first, "/cmplog/dictionary_tokens"),
+            seed_splice_candidates: summary_usize(first, "/cmplog/seed_splice_candidates"),
+        },
+        sanitizers: sanitizer_summary(&sanitizers, &sanitizer_env, false),
+        coverage: coverage_from_env(&args.extra_env, &harness_path),
+        findings: merged,
+        duplicates_of_existing,
+        duplicate_crashes_of_existing,
+        elapsed_secs,
+        executions_per_sec: executions_per_sec(executions, elapsed_secs),
+        afl: None,
+        winafl: None,
+        extension: None,
+        duplicate_sanitizer_hits: Default::default(),
+        unreproduced_sanitizer_hits: Default::default(),
+        fresh_reruns: campaign_fresh_reruns(
+            worker_summaries.iter().flatten(),
+            campaign.sync.unchecked_inputs,
+            &corpus::manager::unchecked_dir(&work_dir, &args.harness),
+        ),
+        hangs: campaign_hangs(worker_summaries.iter().flatten()),
+        stability: campaign_stability(worker_summaries.iter().flatten()),
+        symcc: crate::symcc::SymccRunSummary::sum_of(worker_summaries.iter().flatten()).map(
+            |mut symcc| {
+                symcc.binary = in_parent_tree(&symcc.binary, &worker_dirs, &work_dir);
+                symcc
+            },
+        ),
+        workers: Some(CampaignRunSummary {
+            workers: campaign.workers_started,
+            completed: campaign.workers_completed,
+            sync_interval_ms: std::env::var(multicore_fuzz::SYNC_INTERVAL_ENV)
+                .ok()
+                .and_then(|ms| ms.trim().parse().ok())
+                .unwrap_or(multicore_fuzz::DEFAULT_SYNC_INTERVAL.as_millis() as u64),
+            merged_inputs: campaign.sync.imported_inputs,
+            duplicate_inputs: campaign.sync.duplicate_inputs,
+            queue_entries,
+            per_worker,
+        }),
+    };
+    if let Some(hint) = summary.stability.as_ref().and_then(StabilitySummary::hint) {
+        bhfeprintln!("{hint}");
+    }
+    write_run_summary(&work_dir, &summary)?;
+    Ok(summary)
+}
+
+/// `path` in a worker's tree (one of `workers`) as the same path under the
+/// parent's `work_dir`, which outlives the worker's. Any other path stays.
+fn in_parent_tree(path: &Path, workers: &[&Path], work_dir: &Path) -> PathBuf {
+    workers
+        .iter()
+        .find_map(|worker| path.strip_prefix(worker).ok())
+        .map_or_else(|| path.to_path_buf(), |relative| work_dir.join(relative))
+}
+
+/// Append each worker's SymCC import log (#331) to the parent's
+/// `<work>/symcc-import.log`, and empty the worker's, so a worker tree a
+/// later campaign reuses does not give the same lines twice.
+fn carry_back_symcc_imports(work_dir: &Path, workers: &[&Path]) {
+    let logs: Vec<PathBuf> = workers
+        .iter()
+        .map(|worker| worker.join(crate::symcc::IMPORT_LOG))
+        .filter(|log| log.is_file())
+        .collect();
+    if logs.is_empty() {
+        return;
+    }
+    append_logs(&work_dir.join(crate::symcc::IMPORT_LOG), &logs);
+    for log in &logs {
+        let _ = fs::remove_file(log);
+    }
+}
+
+/// The `name` block of each worker's run summary that has one.
+fn worker_blocks<'a, T: serde::de::DeserializeOwned>(
+    summaries: impl Iterator<Item = &'a serde_json::Value>,
+    name: &str,
+) -> Vec<T> {
+    summaries
+        .filter_map(|summary| summary.get(name))
+        .filter_map(|block| serde_json::from_value(block.clone()).ok())
+        .collect()
+}
+
+/// A campaign pass's hangs (#207): its workers' counts summed. `None` when
+/// no worker's execution was killed at the per-input timeout.
+fn campaign_hangs<'a>(
+    summaries: impl Iterator<Item = &'a serde_json::Value>,
+) -> Option<HangRunSummary> {
+    let hangs: Vec<HangRunSummary> = worker_blocks(summaries, "hangs");
+    let first = hangs.first()?;
+    Some(HangRunSummary {
+        timeout_ms: first.timeout_ms,
+        observed: hangs.iter().map(|hangs| hangs.observed).sum(),
+        confirmed: hangs.iter().map(|hangs| hangs.confirmed).sum(),
+        cleared: hangs.iter().map(|hangs| hangs.cleared).sum(),
+        not_rerun: hangs.iter().map(|hangs| hangs.not_rerun).sum(),
+    })
+}
+
+/// A campaign pass's fresh-process re-runs: its workers' counts summed, and
+/// the inputs they left unchecked as the campaign holds them (`unchecked`,
+/// in `unchecked_dir`, where the next pass's workers get them). `None` when
+/// no worker re-ran any.
+fn campaign_fresh_reruns<'a>(
+    summaries: impl Iterator<Item = &'a serde_json::Value>,
+    unchecked: usize,
+    unchecked_dir: &Path,
+) -> Option<FreshRerunSummary> {
+    let reruns: Vec<FreshRerunSummary> = worker_blocks(summaries, "fresh_reruns");
+    if reruns.is_empty() {
+        return None;
+    }
+    Some(FreshRerunSummary {
+        submitted: reruns.iter().map(|reruns| reruns.submitted).sum(),
+        checked: reruns.iter().map(|reruns| reruns.checked).sum(),
+        reports: reruns.iter().map(|reruns| reruns.reports).sum(),
+        unchecked,
+        unchecked_dir: (unchecked > 0).then(|| unchecked_dir.to_path_buf()),
+    })
+}
+
+/// A campaign pass's stability: the calibration of its least stable
+/// worker, whose hint a pass on that worker alone would print. `None` when
+/// no worker calibrated an entry.
+fn campaign_stability<'a>(
+    summaries: impl Iterator<Item = &'a serde_json::Value>,
+) -> Option<StabilitySummary> {
+    worker_blocks::<StabilitySummary>(summaries, "stability")
+        .into_iter()
+        .min_by(|a, b| a.stability_pct.total_cmp(&b.stability_pct))
+}
+
+/// A count in a worker's run summary, 0 when it has none.
+fn summary_usize(summary: Option<&serde_json::Value>, pointer: &str) -> usize {
+    summary
+        .and_then(|summary| summary.pointer(pointer))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(0)
+}
+
+/// Bring the workers' copies of the maps and logs of `env` that
+/// [`CAMPAIGN_MAPS`] and [`CAMPAIGN_LOGS`] name back into the parent's
+/// files under `work_dir`: a worker's copy is the same path in its tree
+/// (`workers`, in worker order).
+fn carry_back_worker_maps(work_dir: &Path, env: &[(String, String)], workers: &[&Path]) {
+    for (key, value) in env {
+        let parent = PathBuf::from(value);
+        let Ok(relative) = parent.strip_prefix(work_dir) else {
+            continue;
+        };
+        let copies: Vec<PathBuf> = workers.iter().map(|dir| dir.join(relative)).collect();
+        if CAMPAIGN_MAPS.contains(&key.as_str()) {
+            merge_byte_maps(&parent, &copies);
+        } else if CAMPAIGN_LOGS.contains(&key.as_str()) {
+            append_logs(&parent, &copies);
+        }
+    }
+}
+
+/// Make `parent` hold, at each offset, the largest byte it or any of
+/// `copies` holds there; a missing file holds none.
+fn merge_byte_maps(parent: &Path, copies: &[PathBuf]) {
+    let mut merged = fs::read(parent).unwrap_or_default();
+    let mut changed = false;
+    for copy in copies {
+        let Ok(bytes) = fs::read(copy) else {
+            continue;
+        };
+        if merged.len() < bytes.len() {
+            merged.resize(bytes.len(), 0);
+            changed = true;
+        }
+        for (into, byte) in merged.iter_mut().zip(bytes) {
+            if byte > *into {
+                *into = byte;
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        let _ = fs::write(parent, merged);
+    }
+}
+
+/// Append each of `copies` to `parent`, in order.
+fn append_logs(parent: &Path, copies: &[PathBuf]) {
+    use std::io::Write as _;
+    let Ok(mut out) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(parent)
+    else {
+        return;
+    };
+    for copy in copies {
+        if let Ok(bytes) = fs::read(copy) {
+            let _ = out.write_all(&bytes);
+        }
+    }
 }
 
 /// Drive AFL++ against an already-built `main_afl` for `bhf auto`'s attempt
@@ -2819,7 +3304,8 @@ fn run_multicore_campaign(mut args: FuzzArgs) -> i32 {
         Ok(summary) => {
             report_failed_workers(&summary);
             // Merge before printing, so the summary says what the merge did.
-            let (merged, merge) = merge_worker_findings(&config.work_dir, &summary);
+            let (merged, merge) =
+                merge_worker_findings(&config.work_dir, &summary, WorkerDirs::Kept);
             let (duplicates_of_existing, duplicate_crashes_of_existing) =
                 campaign_duplicates_of_existing(&config.work_dir, &summary, merge.as_ref());
             let printed = MulticoreRunSummary {
@@ -3078,9 +3564,20 @@ fn incomplete_campaign_exit(outcome: NoWorkerCompleted, merged: i32) -> i32 {
 /// Move the workers' findings into the campaign's own results/findings, so
 /// the results bracket around this command indexes them. Returns the exit
 /// code and, when the merge ran, its report.
+/// What becomes of a campaign's worker trees once their findings merge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerDirs {
+    /// They stay (`bhf fuzz --workers`), duplicates and all.
+    Kept,
+    /// They are removed once every finding merged (`bhf auto
+    /// --workers-per-target`, #332).
+    RemovedOnceMerged,
+}
+
 fn merge_worker_findings(
     work_dir: &Path,
     summary: &multicore_fuzz::MulticoreSummary,
+    worker_dirs: WorkerDirs,
 ) -> (i32, Option<multicore_fuzz::MergeReport>) {
     let workers: Vec<PathBuf> = summary
         .per_worker
@@ -3089,7 +3586,7 @@ fn merge_worker_findings(
         .collect();
     match multicore_fuzz::merge_worker_findings(work_dir, &workers) {
         Ok(merge) => {
-            let code = merge_outcome(work_dir, &merge);
+            let code = merge_outcome(work_dir, &merge, worker_dirs);
             (code, Some(merge))
         }
         Err(error) => {
@@ -3149,14 +3646,31 @@ pub(crate) fn layout_prefixed_seeds(seeds: &[Vec<u8>], prefix: usize) -> Vec<Vec
     variants
 }
 
+/// Where a merge's duplicates of findings already merged are: left in the
+/// worker dirs, unless the campaign removes those once every finding merged.
+fn merged_duplicates_note(merge: &multicore_fuzz::MergeReport, worker_dirs: WorkerDirs) -> String {
+    if worker_dirs == WorkerDirs::RemovedOnceMerged && merge.failed == 0 {
+        format!(
+            "{} duplicate(s) of findings it holds, removed with the worker dirs",
+            merge.duplicates
+        )
+    } else {
+        format!("{} duplicate(s) left in worker dirs", merge.duplicates)
+    }
+}
+
 /// Report a merge on stderr; its exit code.
-fn merge_outcome(work_dir: &Path, merge: &multicore_fuzz::MergeReport) -> i32 {
+fn merge_outcome(
+    work_dir: &Path,
+    merge: &multicore_fuzz::MergeReport,
+    worker_dirs: WorkerDirs,
+) -> i32 {
     if !merge.merged.is_empty() || merge.duplicates > 0 {
         bhfeprintln!(
-            "bhf fuzz: merged {} worker finding(s) into {} ({} duplicate(s) left in worker dirs)",
+            "bhf fuzz: merged {} worker finding(s) into {} ({})",
             merge.merged.len(),
             corpus::layout::findings_dir(work_dir).display(),
-            merge.duplicates
+            merged_duplicates_note(merge, worker_dirs)
         );
     }
     if merge.dropped > 0 {
@@ -3186,11 +3700,14 @@ fn merge_outcome(work_dir: &Path, merge: &multicore_fuzz::MergeReport) -> i32 {
 }
 
 /// Workers receive their seeds through argv, which cannot carry arbitrary bytes
-/// (a NUL ends an argument; a non-UTF-8 `--seed-input` is rejected). Write the
-/// programmatic seed bytes to content-named files under the campaign dir and
-/// hand them over as `--campaign-seed-file`, which every worker reads byte for
-/// byte and does not take for a seed given to it: these files are bhf's
-/// copies, and the lineage names the seed each was made from.
+/// (a NUL ends an argument; a non-UTF-8 `--seed-input` is rejected) and holds
+/// only so many arguments (32,767 characters on Windows). Write the
+/// programmatic seed bytes to files under the campaign dir, numbered in the
+/// order given (each distinct seed once), and hand over their directory as
+/// one `--campaign-seed-file`, whose files every worker reads byte for byte
+/// and does not take for seeds given to it: these files are bhf's copies, and
+/// the lineage names the seed each was made from. The directory holds this
+/// campaign's seeds only.
 fn materialize_seed_bytes(args: &mut FuzzArgs) -> Result<(), String> {
     use sha2::{Digest, Sha256};
     if args.seed_bytes.is_empty() {
@@ -3201,18 +3718,71 @@ fn materialize_seed_bytes(args: &mut FuzzArgs) -> Result<(), String> {
         .join("fuzz_campaigns")
         .join(&args.harness)
         .join("seed_bytes");
+    match fs::remove_dir_all(&dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("clear seed dir '{}': {error}", dir.display())),
+    }
     fs::create_dir_all(&dir)
         .map_err(|error| format!("create seed dir '{}': {error}", dir.display()))?;
+    let mut written = HashSet::new();
     for bytes in std::mem::take(&mut args.seed_bytes) {
-        let path = dir.join(format!(
-            "{}.bin",
-            corpus::hex_lower(&Sha256::digest(&bytes))
-        ));
+        let digest = corpus::hex_lower(&Sha256::digest(&bytes));
+        if !written.insert(digest.clone()) {
+            continue;
+        }
+        let path = dir.join(format!("{:08}-{digest}.bin", written.len() - 1));
         fs::write(&path, &bytes)
             .map_err(|error| format!("write seed '{}': {error}", path.display()))?;
-        args.campaign_seed_files.push(path);
     }
+    args.campaign_seed_files.push(dir);
     Ok(())
+}
+
+/// The files `--campaign-seed-file` names: each one named, and every regular
+/// file of each directory named, in name order.
+fn campaign_seed_files(named: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    for path in named {
+        if !path.is_dir() {
+            files.push(path.clone());
+            continue;
+        }
+        let mut entries: Vec<PathBuf> = fs::read_dir(path)
+            .map_err(|error| format!("read campaign seed dir '{}': {error}", path.display()))?
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            .map(|entry| entry.path())
+            .collect();
+        entries.sort();
+        files.extend(entries);
+    }
+    Ok(files)
+}
+
+/// Drop the seed bytes the target's queue (`corpus/<id>/queue`) already
+/// holds: a campaign hands each worker the whole queue itself, so the
+/// entries the attempt loop reseeded from it would reach a worker twice.
+fn drop_seeds_the_queue_holds(args: &mut FuzzArgs) {
+    if args.seed_bytes.is_empty() {
+        return;
+    }
+    let queue = args
+        .work_dir
+        .join("corpus")
+        .join(&args.harness)
+        .join("queue");
+    let Ok(entries) = fs::read_dir(&queue) else {
+        return;
+    };
+    let queued: HashSet<corpus::lineage::Digest> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter_map(|entry| fs::read(entry.path()).ok())
+        .map(|bytes| corpus::lineage::digest(&bytes))
+        .collect();
+    args.seed_bytes
+        .retain(|bytes| !queued.contains(&corpus::lineage::digest(bytes)));
 }
 
 /// Hand a multi-worker campaign's seeds to its workers as files: the seeds
@@ -3330,7 +3900,75 @@ fn worker_passthrough_args(args: &FuzzArgs) -> Vec<String> {
     }
     out.push("--runtime-oracles".to_owned());
     out.push(runtime_oracle_mode_arg_name(args.runtime_oracles).to_owned());
+    // #332: the harness env a programmatic campaign was given, with the
+    // campaign's work dir written as the token each worker reads as its own.
+    for (key, value) in &args.extra_env {
+        out.push("--harness-env".to_owned());
+        out.push(format!(
+            "{key}={}",
+            work_dir_tokenized(value, &args.work_dir)
+        ));
+    }
     out
+}
+
+/// What `{work_dir}` in a `--harness-env` value stands for: the run's own
+/// work dir, so a worker's harness writes its maps and logs into the
+/// worker's copy of the harness dir, never the parent's.
+pub(crate) const WORK_DIR_TOKEN: &str = "{work_dir}";
+
+/// A `--harness-env KEY=VALUE` argument: the variable's name, then its value.
+fn parse_harness_env(value: &str) -> Result<(String, String), String> {
+    match value.split_once('=') {
+        Some((key, value)) if !key.is_empty() && !key.contains('\0') => {
+            Ok((key.to_owned(), value.to_owned()))
+        }
+        _ => Err(format!("expected KEY=VALUE, got {value:?}")),
+    }
+}
+
+/// `value` with each path that starts under the absolute `work_dir` (the
+/// whole value, or one of a list of paths split by `:`, `;`, `,`, `=` or a
+/// space) written from [`WORK_DIR_TOKEN`]. A relative work dir leaves the
+/// value as it is.
+fn work_dir_tokenized(value: &str, work_dir: &Path) -> String {
+    let dir = work_dir.display().to_string();
+    if dir.is_empty() || !work_dir.is_absolute() {
+        return value.to_owned();
+    }
+    let separator = std::path::MAIN_SEPARATOR;
+    let under = format!("{dir}{separator}");
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    let mut at_start = true;
+    while !rest.is_empty() {
+        let starts_path = at_start
+            && (rest.starts_with(&under)
+                || (rest.starts_with(&dir)
+                    && rest[dir.len()..]
+                        .chars()
+                        .next()
+                        .is_none_or(|next| matches!(next, ':' | ';' | ',' | '=' | ' '))));
+        if starts_path {
+            out.push_str(WORK_DIR_TOKEN);
+            rest = &rest[dir.len()..];
+            at_start = false;
+            continue;
+        }
+        let next = rest.chars().next().unwrap_or_default();
+        out.push(next);
+        rest = &rest[next.len_utf8()..];
+        at_start = matches!(next, ':' | ';' | ',' | '=' | ' ');
+    }
+    out
+}
+
+/// `env` with [`WORK_DIR_TOKEN`] in each value replaced by `work_dir`.
+fn expand_work_dir_token(env: Vec<(String, String)>, work_dir: &Path) -> Vec<(String, String)> {
+    let dir = work_dir.display().to_string();
+    env.into_iter()
+        .map(|(key, value)| (key, value.replace(WORK_DIR_TOKEN, &dir)))
+        .collect()
 }
 
 fn runtime_oracle_mode_arg_name(mode: crate::runtime_oracles::RuntimeOracleMode) -> &'static str {
@@ -3417,6 +4055,12 @@ fn prepare_with_runner(
     }
 
     let harness_path = find_harness_executable(&work_dir, &args.harness, args.engine)?;
+    // #331: the SymCC stage's runs take the harness's sandbox.
+    let sandbox = crate::symcc::Sandbox {
+        mode: args.sandbox,
+        tool: args.sandbox_tool.clone(),
+        strict: args.sandbox_strict,
+    };
     let runner = match runner {
         Some(runner) => runner,
         None => harness_runner_for(
@@ -3461,8 +4105,8 @@ fn prepare_with_runner(
     seeds.extend(args.seed_bytes);
     // The campaign's own copies: not seeds given to this `bhf fuzz`, so not
     // `operator_seeds`, and not prefixed again.
-    for seed_file in &args.campaign_seed_files {
-        seeds.push(read_seed_file_within(seed_file, args.max_len)?);
+    for seed_file in campaign_seed_files(&args.campaign_seed_files)? {
+        seeds.push(read_seed_file_within(&seed_file, args.max_len)?);
     }
     let mut symbolic_sources = Vec::new();
     let mut symbolic_source_bytes = 0usize;
@@ -3505,8 +4149,11 @@ fn prepare_with_runner(
     seeds.extend(crate::auto::go_build::load_structured_seed_inputs(
         &crate::auto::layout::harness_dir(&work_dir, &args.harness),
     )?);
+    seeds.extend(crate::auto::provided::load_seeds(
+        &crate::auto::layout::harness_dir(&work_dir, &args.harness),
+    ));
     bound_seed_corpus(&mut seeds, args.max_len.max(1));
-    let mut extra_env = args.extra_env;
+    let mut extra_env = expand_work_dir_token(args.extra_env, &work_dir);
     extra_env.extend(sanitizer_env.clone());
     apply_fuzz_child_env_overrides(&mut extra_env);
     // Under an emulator a sanitizer report must not abort: qemu-user dumps
@@ -3636,6 +4283,16 @@ fn prepare_with_runner(
     let local_cmp_map: Option<shared_map::SharedMapFile> = None;
 
     let afl_workers = afl_worker_count(args.engine, args.workers);
+    let symcc = if args.engine == FuzzEngine::Builtin {
+        crate::symcc::SymccConfig::for_run(
+            &harness_path,
+            runner.qemu_prefix().is_some(),
+            &sandbox,
+            args.rss_limit_mb,
+        )
+    } else {
+        None
+    };
     Ok(PreparedFuzzRun {
         work_dir,
         harness_id: args.harness,
@@ -3686,6 +4343,7 @@ fn prepare_with_runner(
         afl_max_len: None,
         afl_workers,
         extension_manifest: args.extension,
+        symcc,
     })
 }
 
@@ -4349,7 +5007,7 @@ impl Calibration {
 }
 
 /// The run's stability calibration (#232).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub(crate) struct StabilitySummary {
     /// The share of the edges calibration runs hit that every run of the
     /// same input hit, in percent: 100 for a target whose coverage depends
@@ -4802,6 +5460,17 @@ fn run_builtin_with_progress(
     if let Some(sync) = peer_sync.as_mut() {
         sync.skip_seeds(pool.len());
     }
+    // #331: on a plateau, the pool's newest entries run through SymCC and the
+    // inputs it solves run next.
+    let mut symcc_stage = prepared.symcc.take().map(|config| {
+        crate::symcc::SymccStage::new(
+            config,
+            &prepared.work_dir,
+            &prepared.harness_id,
+            prepared.max_len,
+            Instant::now(),
+        )
+    });
     let mut hangs = HangRunSummary {
         timeout_ms: u64::try_from(prepared.per_input_timeout.as_millis()).unwrap_or(u64::MAX),
         ..HangRunSummary::default()
@@ -5358,6 +6027,19 @@ fn run_builtin_with_progress(
             }
             _ => None,
         };
+        // Then an input SymCC solved, once the seeds have run.
+        let imported = imported.or_else(|| match symcc_stage.as_mut() {
+            Some(stage) if iteration >= initial_seed_count => {
+                stage.tick(
+                    Instant::now(),
+                    pool.len(),
+                    |index| (pool[index].bytes.as_slice(), pool[index].retired),
+                    pass_deadline,
+                );
+                stage.next_import()
+            }
+            _ => None,
+        });
         let input = if let Some(imported) = imported {
             parents = crate::fuzz_lineage::InputParents::Generated;
             imported
@@ -6285,6 +6967,8 @@ fn run_builtin_with_progress(
         fresh_reruns: (fresh_rerun_summary.submitted > 0).then_some(fresh_rerun_summary),
         hangs: (hangs.observed > 0).then_some(hangs),
         stability: calibration.summary(),
+        symcc: symcc_stage.as_ref().map(|stage| stage.summary().clone()),
+        workers: None,
     };
     if let Some(hint) = summary.stability.as_ref().and_then(StabilitySummary::hint) {
         bhfeprintln!("{hint}");
@@ -7812,6 +8496,8 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
         fresh_reruns: None,
         hangs: (hangs.observed > 0).then_some(hangs),
         stability: None,
+        symcc: None,
+        workers: None,
     };
     write_run_summary(&prepared.work_dir, &summary)?;
     Ok(summary)
@@ -16674,6 +17360,358 @@ exit 0
         assert_eq!(native_target_exe(&dir.join("missing")), None);
     }
 
+    /// #332: the harness env of a programmatic campaign reaches each worker,
+    /// with each path under the campaign's work dir written from the token
+    /// the worker reads as its own work dir: a worker's harness writes the
+    /// maps and logs of its own copy of the harness dir.
+    #[test]
+    fn the_harness_env_reaches_each_worker_rebased_onto_its_work_dir() {
+        use clap::Parser;
+        #[derive(clap::Parser)]
+        struct Wrap {
+            #[command(flatten)]
+            inner: FuzzArgs,
+        }
+        let root = tmpdir();
+        let work_dir = root.join("work");
+        let mut args = fuzz_args_for_worker_passthrough(&work_dir, StructuredInputMode::Off);
+        let harness_dir = work_dir.join("harnesses").join("H-X");
+        let map = harness_dir.join("coverage.shm").display().to_string();
+        args.extra_env = vec![
+            ("BHF_COV_SHM".to_owned(), map),
+            ("LD_PRELOAD".to_owned(), "/opt/bhf/libshim.so".to_owned()),
+            ("BHF_RUNTRACE_MODE".to_owned(), "rng".to_owned()),
+            ("WIDGET_ROOT".to_owned(), work_dir.display().to_string()),
+        ];
+        let passthrough = worker_passthrough_args(&args);
+        let sep = std::path::MAIN_SEPARATOR;
+        let tokenized =
+            format!("BHF_COV_SHM={WORK_DIR_TOKEN}{sep}harnesses{sep}H-X{sep}coverage.shm");
+        assert!(
+            passthrough
+                .windows(2)
+                .any(|pair| pair[0] == "--harness-env" && pair[1] == tokenized),
+            "{passthrough:?}"
+        );
+        let worker_dir = root.join("work").join("worker-H-X-1");
+        let worker_path = worker_dir.display().to_string();
+        let mut argv: Vec<String> =
+            vec!["fuzz".into(), worker_path, "--harness".into(), "H-X".into()];
+        argv.extend(passthrough);
+        let worker = Wrap::try_parse_from(&argv).unwrap().inner;
+        assert_eq!(worker.extra_env.len(), 4, "{:?}", worker.extra_env);
+        let expanded = expand_work_dir_token(worker.extra_env, &worker_dir);
+        let value = |key: &str| {
+            expanded
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+                .unwrap()
+        };
+        assert_eq!(
+            PathBuf::from(value("BHF_COV_SHM")),
+            worker_dir
+                .join("harnesses")
+                .join("H-X")
+                .join("coverage.shm")
+        );
+        assert_eq!(value("LD_PRELOAD"), "/opt/bhf/libshim.so");
+        assert_eq!(value("BHF_RUNTRACE_MODE"), "rng");
+        assert_eq!(PathBuf::from(value("WIDGET_ROOT")), worker_dir);
+
+        assert_eq!(
+            parse_harness_env("A=b=c"),
+            Ok(("A".to_owned(), "b=c".to_owned()))
+        );
+        assert!(parse_harness_env("NO_VALUE").is_err());
+        assert!(parse_harness_env("=x").is_err());
+    }
+
+    /// Only a path that starts under the work dir is written from the token:
+    /// one that merely contains the work dir's spelling further in, and every
+    /// value of a relative work dir, stay as they are.
+    #[test]
+    fn only_paths_under_the_work_dir_are_tokenized() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let root = tmpdir();
+        let work = root.join("w");
+        let under = work.join("harnesses").join("H-X").join("vp.shm");
+        let token = |rest: &str| format!("{WORK_DIR_TOKEN}{sep}{rest}");
+        assert_eq!(
+            work_dir_tokenized(&under.display().to_string(), &work),
+            token(&format!("harnesses{sep}H-X{sep}vp.shm"))
+        );
+        // The work dir's spelling inside another path.
+        let other = format!("{}{sep}opt{}{sep}lib.so", root.display(), work.display());
+        assert_eq!(work_dir_tokenized(&other, &work), other);
+        // A list of paths, as LD_PRELOAD holds.
+        let shim = format!("{sep}opt{sep}shim.so");
+        let list = format!("{shim}:{}", under.display());
+        assert_eq!(
+            work_dir_tokenized(&list, &work),
+            format!("{shim}:{}", token(&format!("harnesses{sep}H-X{sep}vp.shm")))
+        );
+        let relative = Path::new("w");
+        let value = format!("w{sep}harnesses{sep}H-X{sep}vp.shm");
+        assert_eq!(work_dir_tokenized(&value, relative), value);
+    }
+
+    #[test]
+    fn workers_per_target_runs_a_campaign_only_for_more_than_one() {
+        assert_eq!(workers_per_target_from(None), None);
+        assert_eq!(workers_per_target_from(Some("1")), None);
+        assert_eq!(workers_per_target_from(Some("0")), None);
+        assert_eq!(workers_per_target_from(Some("many")), None);
+        assert_eq!(workers_per_target_from(Some(" 2 ")), Some(2));
+    }
+
+    /// #332: once a campaign's workers have run, the parent's edge map and
+    /// target-entry flag hold every byte any worker's copy set, and its
+    /// runtrace log every worker's events, in worker order; other env and
+    /// paths outside the work dir are left alone.
+    #[test]
+    fn a_campaign_carries_the_workers_maps_and_logs_back() {
+        let root = tmpdir();
+        let work = root.join("work");
+        let rel = Path::new("harnesses").join("H-X");
+        let workers = [work.join("worker-H-X-0"), work.join("worker-H-X-1")];
+        for dir in [&work, &workers[0], &workers[1]] {
+            fs::create_dir_all(dir.join(&rel)).unwrap();
+        }
+        fs::write(work.join(&rel).join("coverage.shm"), [0, 1, 0, 0]).unwrap();
+        fs::write(workers[0].join(&rel).join("coverage.shm"), [2, 0, 0, 0]).unwrap();
+        fs::write(workers[1].join(&rel).join("coverage.shm"), [0, 0, 3]).unwrap();
+        fs::write(workers[1].join(&rel).join("target_entry.shm"), [1]).unwrap();
+        fs::write(workers[0].join(&rel).join("runtrace.jsonl"), "{\"w\":0}\n").unwrap();
+        fs::write(workers[1].join(&rel).join("runtrace.jsonl"), "{\"w\":1}\n").unwrap();
+        let outside = root.join("elsewhere.shm");
+        fs::write(&outside, [0]).unwrap();
+        let env: Vec<(String, String)> = [
+            ("BHF_COV_SHM", work.join(&rel).join("coverage.shm")),
+            (
+                "BHF_TARGET_ENTRY_SHM",
+                work.join(&rel).join("target_entry.shm"),
+            ),
+            ("BHF_RUNTRACE_LOG", work.join(&rel).join("runtrace.jsonl")),
+            ("BHF_VP_SHM", work.join(&rel).join("vp.shm")),
+            ("BHF_CMP_SHM", outside.clone()),
+        ]
+        .into_iter()
+        .map(|(key, path)| (key.to_owned(), path.display().to_string()))
+        .collect();
+        fs::write(workers[0].join(&rel).join("vp.shm"), [9]).unwrap();
+        let worker_dirs: Vec<&Path> = workers.iter().map(PathBuf::as_path).collect();
+        carry_back_worker_maps(&work, &env, &worker_dirs);
+        assert_eq!(
+            fs::read(work.join(&rel).join("coverage.shm")).unwrap(),
+            [2, 1, 3, 0]
+        );
+        assert_eq!(
+            fs::read(work.join(&rel).join("target_entry.shm")).unwrap(),
+            [1]
+        );
+        assert_eq!(
+            fs::read_to_string(work.join(&rel).join("runtrace.jsonl")).unwrap(),
+            "{\"w\":0}\n{\"w\":1}\n"
+        );
+        assert!(!work.join(&rel).join("vp.shm").exists());
+        assert_eq!(fs::read(&outside).unwrap(), [0]);
+    }
+
+    /// #332: a campaign pass reports its workers' hangs and fresh-process
+    /// re-runs summed, the inputs left unchecked as the campaign holds them,
+    /// and the stability of its least stable worker; a pass whose workers
+    /// had none of them has no such block.
+    #[test]
+    fn a_campaign_pass_sums_its_workers_hangs_reruns_and_stability() {
+        let worker = |observed: usize, confirmed: usize, stability_pct: f64| {
+            serde_json::json!({
+                "executions": 100,
+                "hangs": {
+                    "timeout_ms": 100,
+                    "observed": observed,
+                    "confirmed": confirmed,
+                    "cleared": 1,
+                    "not_rerun": observed - confirmed - 1,
+                },
+                "fresh_reruns": {
+                    "submitted": 3,
+                    "checked": 2,
+                    "reports": 1,
+                    "unchecked": 1,
+                    "unchecked_dir": "/w/worker-H-0/corpus/H/unchecked",
+                },
+                "stability": {
+                    "stability_pct": stability_pct,
+                    "calibrated_entries": 4,
+                    "reruns_per_entry": 3,
+                    "observed_edges": 50,
+                    "variable_edges": 5,
+                    "unstable_entries_dropped": 1,
+                },
+            })
+        };
+        let summaries = [
+            worker(5, 4, 95.0),
+            serde_json::json!({ "executions": 7 }),
+            worker(2, 1, 80.0),
+        ];
+        let hangs = campaign_hangs(summaries.iter()).expect("the workers' hangs");
+        assert_eq!(
+            hangs,
+            HangRunSummary {
+                timeout_ms: 100,
+                observed: 7,
+                confirmed: 5,
+                cleared: 2,
+                not_rerun: 0,
+            }
+        );
+        let held = Path::new("/w/corpus/H/unchecked");
+        let reruns = campaign_fresh_reruns(summaries.iter(), 2, held).unwrap();
+        assert_eq!(
+            (
+                reruns.submitted,
+                reruns.checked,
+                reruns.reports,
+                reruns.unchecked
+            ),
+            (6, 4, 2, 2)
+        );
+        assert_eq!(reruns.unchecked_dir.as_deref(), Some(held));
+        let none_held = campaign_fresh_reruns(summaries.iter(), 0, held).unwrap();
+        assert_eq!(none_held.unchecked_dir, None);
+        let stability = campaign_stability(summaries.iter()).unwrap();
+        assert_eq!(stability.stability_pct, 80.0);
+        assert!(stability.hint().is_some());
+
+        let quiet = [serde_json::json!({ "executions": 7 })];
+        assert_eq!(campaign_hangs(quiet.iter()), None);
+        assert!(campaign_fresh_reruns(quiet.iter(), 0, held).is_none());
+        assert!(campaign_stability(quiet.iter()).is_none());
+    }
+
+    /// #332, #331: the workers' SymCC import logs end in the parent's, in
+    /// worker order, and leave the workers' trees, so a reused tree does not
+    /// give its lines twice; a campaign without SymCC writes no log. A path in
+    /// a worker's tree is named in the parent's.
+    #[test]
+    fn a_campaign_carries_the_workers_symcc_imports_back() {
+        let root = tmpdir();
+        let work = root.join("work");
+        let workers = [work.join("worker-H-S-0"), work.join("worker-H-S-1")];
+        for dir in &workers {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let worker_dirs: Vec<&Path> = workers.iter().map(PathBuf::as_path).collect();
+        carry_back_symcc_imports(&work, &worker_dirs);
+        assert!(!work.join(crate::symcc::IMPORT_LOG).exists());
+
+        fs::write(workers[0].join(crate::symcc::IMPORT_LOG), "10 aa bb\n").unwrap();
+        fs::write(workers[1].join(crate::symcc::IMPORT_LOG), "20 cc dd\n").unwrap();
+        carry_back_symcc_imports(&work, &worker_dirs);
+        carry_back_symcc_imports(&work, &worker_dirs);
+        assert_eq!(
+            fs::read_to_string(work.join(crate::symcc::IMPORT_LOG)).unwrap(),
+            "10 aa bb\n20 cc dd\n"
+        );
+        assert!(!workers[0].join(crate::symcc::IMPORT_LOG).exists());
+
+        let binary = workers[1].join("harnesses/H-S/main_symcc");
+        assert_eq!(
+            in_parent_tree(&binary, &worker_dirs, &work),
+            work.join("harnesses/H-S/main_symcc")
+        );
+        let elsewhere = root.join("main_symcc");
+        assert_eq!(in_parent_tree(&elsewhere, &worker_dirs, &work), elsewhere);
+    }
+
+    /// The merge's line says where its duplicates are: left in the worker
+    /// dirs, unless the campaign removes those once every finding merged.
+    #[test]
+    fn the_merge_note_says_where_the_duplicates_are() {
+        let mut merge = multicore_fuzz::MergeReport {
+            duplicates: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            merged_duplicates_note(&merge, WorkerDirs::Kept),
+            "2 duplicate(s) left in worker dirs"
+        );
+        assert_eq!(
+            merged_duplicates_note(&merge, WorkerDirs::RemovedOnceMerged),
+            "2 duplicate(s) of findings it holds, removed with the worker dirs"
+        );
+        merge.failed = 1;
+        assert_eq!(
+            merged_duplicates_note(&merge, WorkerDirs::RemovedOnceMerged),
+            "2 duplicate(s) left in worker dirs"
+        );
+    }
+
+    /// #332: a campaign's workers get the target's queue and the pass's
+    /// seeds as directories, so their command line does not grow with the
+    /// seeds, and the seeds the queue already holds (the attempt loop's
+    /// reseeds) are not handed over twice. A worker reads each directory's
+    /// files, in the order the seeds were given.
+    #[test]
+    fn campaign_workers_get_their_seeds_in_a_bounded_command_line() {
+        let root = tmpdir();
+        let work = root.join("bhf_work");
+        let queue = work.join("corpus/H-SEEDS/queue");
+        fs::create_dir_all(&queue).unwrap();
+        let args_dir = tmpdir();
+        let mut args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Off);
+        args.work_dir = work.clone();
+        args.harness = "H-SEEDS".to_owned();
+        let mut seeds = Vec::new();
+        for n in 0..400u32 {
+            let bytes = format!("entry-{n}").into_bytes();
+            if n % 2 == 0 {
+                fs::write(queue.join(format!("{n:04}.bin")), &bytes).unwrap();
+            }
+            seeds.push(bytes);
+        }
+        seeds.push(b"entry-1".to_vec());
+        // What an earlier campaign left beside them.
+        let seed_dir = work
+            .join("fuzz_campaigns")
+            .join("H-SEEDS")
+            .join("seed_bytes");
+        fs::create_dir_all(&seed_dir).unwrap();
+        fs::write(seed_dir.join("stale.bin"), b"stale").unwrap();
+        args.seed_bytes = seeds;
+
+        drop_seeds_the_queue_holds(&mut args);
+        assert_eq!(args.seed_bytes.len(), 201, "the queued half is dropped");
+        materialize_seed_bytes(&mut args).unwrap();
+        let passthrough = worker_passthrough_args(&args);
+        let handed: Vec<&String> = passthrough
+            .windows(2)
+            .filter(|pair| pair[0] == "--campaign-seed-file")
+            .map(|pair| &pair[1])
+            .collect();
+        assert_eq!(handed, vec![&seed_dir.display().to_string()]);
+
+        let read: Vec<Vec<u8>> = campaign_seed_files(&args.campaign_seed_files)
+            .unwrap()
+            .iter()
+            .map(|file| fs::read(file).unwrap())
+            .collect();
+        let expected: Vec<Vec<u8>> = (0..400u32)
+            .filter(|n| n % 2 == 1)
+            .map(|n| format!("entry-{n}").into_bytes())
+            .collect();
+        assert_eq!(read, expected, "each seed once, in the order given");
+        assert_eq!(
+            campaign_seed_files(std::slice::from_ref(&queue))
+                .unwrap()
+                .len(),
+            200,
+            "the queue's directory stands for each of its entries"
+        );
+    }
+
     /// Every flag a multi-worker run accepts, but the two the parent carries
     /// out itself, reaches its workers.
     #[test]
@@ -16776,13 +17814,15 @@ exit 0
 
         let passthrough = worker_passthrough_args(&args);
         // bhf's copy, so not a seed given to the worker (`--seed-file`).
-        let files: Vec<&String> = passthrough
+        let files: Vec<PathBuf> = passthrough
             .windows(2)
             .filter(|pair| pair[0] == "--campaign-seed-file")
-            .map(|pair| &pair[1])
+            .map(|pair| PathBuf::from(&pair[1]))
             .collect();
         assert_eq!(files.len(), 1, "{passthrough:?}");
-        assert_eq!(fs::read(files[0]).unwrap(), seed);
+        let copies = campaign_seed_files(&files).unwrap();
+        assert_eq!(copies.len(), 1, "{copies:?}");
+        assert_eq!(fs::read(&copies[0]).unwrap(), seed);
         assert!(
             !passthrough.iter().any(|a| a == "--seed-file"),
             "{passthrough:?}"
@@ -18100,6 +19140,106 @@ exit 0
         write_c_libfuzzer_harness(work_dir, id, &script);
     }
 
+    /// #331: once a builtin pass's corpus stops growing, its SymCC stage runs
+    /// the entries through `main_symcc`, and the input the solver writes runs
+    /// in the pass: here the only input on which the harness crashes, which
+    /// no mutation of the seed finds in a short pass, becomes a finding. The
+    /// run summary says what the stage did.
+    #[test]
+    #[cfg(unix)]
+    fn a_plateaued_pass_runs_the_input_symcc_solves() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        let solved: Vec<u8> = (0..24u8).map(|n| n.wrapping_mul(37) ^ 0xa5).collect();
+        let expected = root.join("expected.bin");
+        fs::write(&expected, &solved).unwrap();
+        write_exact_match_harness(&work_dir, "H-SYMCC", &expected);
+        let recorded = root.join("recorded");
+        fs::create_dir_all(&recorded).unwrap();
+        fs::write(recorded.join("000000"), &solved).unwrap();
+        let solver = work_dir.join("build/H-SYMCC/main_symcc");
+        fs::write(
+            &solver,
+            format!(
+                "#!/bin/sh\ncp '{}'/* \"$SYMCC_OUTPUT_DIR\"/\n",
+                recorded.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&solver, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut args = afl_programmatic_args(
+            &work_dir,
+            "H-SYMCC",
+            vec![b"parse_record".to_vec()],
+            Some(Duration::from_secs(20)),
+            &[],
+            actionability::RunMode::Reporting,
+            0,
+            &[],
+            4096,
+        );
+        args.engine = FuzzEngine::Builtin;
+        args.iterations = Some(64);
+        args.stop_after_findings = Some(1);
+        let mut prepared = prepare(args).unwrap();
+        prepared.symcc = Some(crate::symcc::SymccConfig {
+            binary: solver.clone(),
+            runner: replay_min::HarnessRunner::direct(solver.clone()),
+            rss_limit_mb: 0,
+            plateau: Duration::ZERO,
+            run_timeout: Duration::from_secs(10),
+            entries_per_round: 8,
+        });
+        let summary = run_builtin_with_progress(prepared, None).unwrap();
+        assert_eq!(summary.findings.len(), 1, "{:?}", summary.findings);
+        let testcase = fs::read(
+            corpus::layout::finding_dir(&work_dir, &summary.findings[0]).join("testcase.bin"),
+        )
+        .unwrap();
+        assert_eq!(testcase, solved);
+        let symcc = summary.symcc.as_ref().expect("the stage's summary");
+        assert_eq!(symcc.binary, solver);
+        assert!(symcc.rounds >= 1, "{symcc:?}");
+        assert_eq!(symcc.inputs_imported, 1, "{symcc:?}");
+        let json = fs::read_to_string(work_dir.join("fuzz_runs/H-SYMCC-latest.json")).unwrap();
+        let recorded: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(recorded["symcc"]["inputs_imported"], 1, "{json}");
+    }
+
+    /// Without the SymCC stage the same short pass does not find that input:
+    /// the finding above is the stage's.
+    #[test]
+    #[cfg(unix)]
+    fn without_symcc_the_short_pass_misses_that_input() {
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        let solved: Vec<u8> = (0..24u8).map(|n| n.wrapping_mul(37) ^ 0xa5).collect();
+        let expected = root.join("expected.bin");
+        fs::write(&expected, &solved).unwrap();
+        write_exact_match_harness(&work_dir, "H-NOSYMCC", &expected);
+        let mut args = afl_programmatic_args(
+            &work_dir,
+            "H-NOSYMCC",
+            vec![b"parse_record".to_vec()],
+            Some(Duration::from_secs(20)),
+            &[],
+            actionability::RunMode::Reporting,
+            0,
+            &[],
+            4096,
+        );
+        args.engine = FuzzEngine::Builtin;
+        args.iterations = Some(64);
+        let prepared = prepare(args).unwrap();
+        assert!(prepared.symcc.is_none(), "the run did not ask for SymCC");
+        let summary = run_builtin_with_progress(prepared, None).unwrap();
+        assert!(summary.findings.is_empty(), "{:?}", summary.findings);
+        assert!(summary.symcc.is_none());
+        let json = fs::read_to_string(work_dir.join("fuzz_runs/H-NOSYMCC-latest.json")).unwrap();
+        assert!(!json.contains("\"symcc\""), "{json}");
+    }
+
     #[test]
     #[cfg(unix)]
     fn programmatic_run_feeds_non_utf8_seed_bytes_unchanged() {
@@ -18281,8 +19421,8 @@ exit 0
         args.seed_bytes = vec![b"QUEUED".to_vec()];
         worker_seed_files(&mut args, &harness).unwrap();
         let work = work_dir.display().to_string();
-        let queued_arg = queued.display().to_string();
-        // What the campaign adds for each shared-queue entry.
+        let queued_arg = queued.parent().unwrap().display().to_string();
+        // What the campaign adds for the shared queue.
         let mut argv = vec![
             "fuzz",
             work.as_str(),

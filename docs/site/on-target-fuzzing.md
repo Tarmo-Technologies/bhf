@@ -60,6 +60,7 @@ binary release.
 | A proprietary RTOS image | **Actual RTOS execution** | VxWorks/INTEGRITY/QNX scheduler | ⛔ unproven (bring the image + toolchain) |
 | An on-device agent (TCP/serial) | **On-target agent** | Real device; coverage over the agent protocol | ⛔ unproven: the host side ships; no target-side agent does yet ([#289](https://github.com/Tarmo-Technologies/bhf/issues/289)), so you write one to the frame format in §3c |
 | A physical board | **HIL** (hardware-in-the-loop) | Silicon | ⛔ unproven (`BHF_HIL_GDB`) |
+| Only a firmware image (ELF or flash dump), no source | **Rehosting** (`bhf binary rehost`, §9) | bhf's own Cortex-M interpreter: the real instructions, no peripherals or interrupts | ✅ fixture images in `crates/rehost/tests/fixtures/`: edge coverage that grows with the input, invalid-access, bad-PC and HardFault findings, `bhf replay` MATCH |
 
 ---
 
@@ -143,6 +144,10 @@ instead of the host libFuzzer/AFL lane. It is **additive**: absent, the host
 path is byte-for-byte unchanged. A malformed spec is a descriptive error. The
 memory-read transports (`gdb`, `qemu-system`) also need `--transport-coverage-map`
 to locate the input buffer and the on-target coverage ring.
+
+The run summary's `executions_per_sec` is the campaign's executions per second of
+wall-clock time, and each finding's `transport_profile.json` records it in a
+`throughput` block (`executions`, `elapsed_secs`, `executions_per_sec`).
 
 ### Coverage-map spec
 
@@ -292,11 +297,13 @@ A **board profile** keeps a board's specs in one file:
 on the board's UART). `docs/hil-boards/nucleo-f411re.toml` is the template and
 `docs/hil-bringup.md` the bring-up, step by step.
 
-### 3b. Full-system emulator (`qemu-system:qmp=…,gdb=…[,snapshot=TAG]`)
+### 3b. Full-system emulator (`qemu-system:qmp=…,gdb=…[,snapshot=TAG][,reset=…]`)
 
 The flagship path: boot a `qemu-system-*` guest, attach QMP + gdb, take a
 `savevm` baseline, then per input `loadvm`-reset → write input → run → read the
-coverage ring. Deterministic and reset-clean. The CLI parses **TCP** `HOST:PORT`
+coverage ring. Deterministic and reset-clean; `reset=persistent` trades the
+`loadvm` per input for the firmware's own input loop (see
+[Persistent loop](#persistent-loop)). The CLI parses **TCP** `HOST:PORT`
 endpoints for both `qmp=` and `gdb=` (there is no Unix-socket form), so expose
 QMP over TCP.
 
@@ -354,6 +361,71 @@ recorded SHA-256. FreeRTOS keeps no version string in an image unless the
 application references one; the reference profile's `app.c` keeps
 `bhf_kernel_version` for this. Without `firmware=`, the profile says that no
 identity was recorded.
+
+#### Persistent loop
+
+`reset=persistent` (it needs `done=`) restores the snapshot only before the
+first input and after a crash, a hang or an inconclusive run. After a clean
+run the guest stays at the `done=` breakpoint, and the next input continues
+the firmware's own loop: BHF steps the guest off the breakpoint (removing it
+for the step, as gdb does), empties the coverage ring, puts back the staging
+bytes a longer previous input left past a shorter one, writes the input and
+runs. `reset=loadvm`, the default, restores before every input.
+
+The firmware's done function must return, into a loop that reads the input
+region again and records the run's coverage:
+
+```c
+__attribute__((noinline)) void harness_done(void) { __asm volatile("" ::: "memory"); }
+
+void Reset_Handler(void) {
+  for (;;) {
+    run_one(bhf_input);   /* the code under test */
+    harness_done();       /* BHF stops here, and continues from here */
+  }
+}
+```
+
+- Everything else in the guest carries over from one clean input to the
+  next, as in any persistent-mode fuzzer: state the code under test keeps is
+  the firmware's to reset. Record faults in a `fault=` word. A fault handler
+  that returns through `done` with no fault word looks like a clean stop, and
+  BHF would continue from it.
+- A done function that branches to itself, such as a noinline `for (;;) {}`
+  built with optimization (one `b .`), is refused on the first continuation:
+  the step off it changes no register, so BHF stops the run with an error
+  that says to use `reset=loadvm` or make done return.
+- A continuation proves the loop when it comes back to `done` cleanly with
+  coverage. Until one has, any other continuation (one that crashes, hangs,
+  comes back with no coverage, or whose step off `done` does not trap) is
+  run again from the snapshot, and that run is the one reported, so a
+  firmware that does not loop neither misses a fault nor makes a false one.
+  The `--deadline` oracle times the reported run, not the discarded
+  continuation. The third continuation that crashes or hangs where its run
+  from the snapshot does not, comes back with no coverage, or does not step
+  off `done` stops the run with an error that says the done function does
+  not return into a loop. A firmware that records no coverage cannot prove
+  its loop and needs `reset=loadvm`.
+- QEMU reports each stop and resume of the guest to QMP. BHF reads the
+  monitor every 128 continuations so that backlog stays bounded.
+- `bhf replay` and its minimization restore the snapshot before every input,
+  so they run a persistent finding from the snapshot. A finding that needs
+  the inputs before it may not replay; its transport profile's `limitations`
+  says so, and its `reset_mechanism` names the persistent loop.
+- The session lane (`--session-transport transport:qemu-system:…`) refuses
+  `reset=persistent`: it would carry guest state from one message, and one
+  session, into the next.
+- On the RV-3 mps2-an385 image under QEMU 8.2.2, a `loadvm` per input ran
+  about 150 to 200 inputs per second and `reset=persistent` about 650 to 770
+  (3.8x on an idle host, 4.1x to 4.4x under some load, 8.5x on a heavily
+  loaded one), in `docs/validation/2026-11-19-fullsystem-persistent-loop.md`.
+  A larger guest costs more per `loadvm`, and the persistent loop does not.
+
+```sh
+bhf fuzz bhf_work --harness H-C0001 \
+  --target-transport "qemu-system:qmp=127.0.0.1:4444,gdb=127.0.0.1:3333,done=0x1a8,fault=0x20000100,reset=persistent" \
+  --transport-coverage-map input=0x2000020c,input_cap=64,ring=0x20000004,write=0x20000204,wrapped=0x20000208,cap=512
+```
 
 #### Renode boards
 
@@ -510,7 +582,8 @@ executions' edges feed the session lane's code channel (`coverage_source`
 the backend's stdout, which the agent does not have: a profile over the
 agent captures nothing from replies and its oracles are the faults. The
 `gdb` and `qemu-system` backends take `--transport-coverage-map` here as
-they do for `--target-transport`. `--session-reset reconnect` (the default)
+they do for `--target-transport`; `qemu-system` does not take
+`reset=persistent` here. `--session-reset reconnect` (the default)
 arms a fresh target session for each protocol session; `none` keeps one
 armed for the campaign.
 
@@ -734,7 +807,96 @@ Prerequisites (Debian/Ubuntu): `qemu-system-arm qemu-user qemu-utils
 gcc-arm-none-eabi libnewlib-dev libnewlib-arm-none-eabi gcc-arm-linux-gnueabihf gcc-powerpc64-linux-gnu binutils`.
 RV-1 through RV-3 were validated on QEMU in September 2026 (see
 `docs/validation/2026-09-27-hil-emu-live-qemu.md`). RV-4 passed locally on
-October 4, 2026; hosted HIL-emu workflow evidence remains pending.
+October 4, 2026; hosted HIL-emu workflow evidence remains pending. The script
+also runs the ignored RV-3 benchmark, which measures `reset=persistent`
+against a `loadvm` per input in one test and needs 3x
+(`docs/validation/2026-11-19-fullsystem-persistent-loop.md`), on the nightly
+schedule, a manual dispatch or a local run; a pull request or a push skips
+it.
+
+---
+
+## 9. Rehosting a firmware image (no source): `bhf binary rehost`
+
+When all you have is the image, a monolithic Cortex-M firmware ELF or a flash
+dump, `bhf binary rehost` runs it unmodified in bhf's own emulator (the
+`rehost` crate, an ARMv7-M Thumb-2 interpreter) instead of on the target. No
+source, toolchain, harness or instrumentation is involved.
+
+For each input the emulator resets the core the way the hardware does: the
+stack pointer and the reset vector come from the vector table. The input is
+written into a fixed buffer in the firmware's memory, the receive buffer its
+parser reads, with an optional length word. Execution runs until the core
+goes idle (`WFI`, `WFE`, a branch to itself), reaches an `--exit-at`
+address, exits through semihosting, requests a system reset, faults, or uses
+`--max-instructions`. Every basic block the core enters is counted in a
+64 KiB edge map that steers the builtin engine's mutator and power schedule.
+
+```sh
+# An ELF names its own symbols:
+bhf binary rehost firmware.elf --work-dir bhf_work \
+  --input-buffer rx_buf --input-length rx_len --inject-at main \
+  --seed-file seed.bin --iterations 20000
+
+# A raw image needs its load address, and addresses instead of symbols:
+bhf binary rehost firmware.bin --base 0x08000000 --work-dir bhf_work \
+  --input-buffer 0x20000008 --input-size 64 --inject-at 0x080000f0 \
+  --ram 0x20000000:0x20000
+```
+
+- Addresses are hex, `0x` optional, so a value copied from `nm` or `objdump`
+  output (`080000f0`) works as it is; a name the ELF's symbol table holds is
+  that symbol.
+- `--input-buffer` is an address or a symbol; `--input-size` defaults to
+  the symbol's size. `--inject-at` writes the input when the core first
+  reaches that address (usually `main`), after the start-up code has cleared
+  `.bss`; without it the input is written at reset, where a `.bss` buffer is
+  then zeroed. The run JSON's `input_not_delivered` counts the runs that
+  never reached `--inject-at` and so ignored their input. A run is the same
+  for every input until the input is written, so when no seed reaches it,
+  no run will: bhf warns on stderr. Check the address, and whether the
+  start-up code polls a peripheral first.
+- `--ram BASE:SIZE` (repeatable) maps RAM; the default is
+  `0x20000000:0x100000`, and an ELF's `.data` and `.bss` RAM is mapped as
+  well. An initial stack pointer outside RAM is refused before anything
+  runs. `--vector-table` overrides where the vector table is.
+- A run that faults is a finding under
+  `<work-dir>/results/findings/BF-NNNN/` (`kind: rehost_fault`,
+  `finding_kind: binary`, rule `BHF-501`), classified as:
+  - `invalid_access`: a load or store outside the image, its RAM, the
+    peripheral window and the system space, a store to read-only image
+    memory, or a misaligned multi-word access;
+  - `bad_pc`: a fetch from an address that holds no code (unmapped, or
+    peripheral or system space), a branch that cleared the Thumb bit, or an
+    invalid exception-return value;
+  - `hard_fault`: an undefined instruction (`UDF`, or an encoding ARMv7-M
+    leaves unallocated), a divide by zero with
+    `CCR.DIV_0_TRP` set, a coprocessor instruction with the coprocessor off,
+    `BKPT` with no debugger, or an `SVC` at a priority that cannot take it.
+
+  The finding records the fault (kind, PC, address, the branch that went
+  there, the registers), the testcase and the machine setup. Its
+  `crash.signature` is the class, the kind and the faulting instruction (for
+  a bad PC, the branch), so inputs that fault the same way are one finding.
+- `bhf replay <finding>` runs the testcase through the recorded setup again
+  and reports `MATCH` when it faults with the same signature; `--harness`
+  names another copy of the image to run. It is the reproduce command
+  `results/INDEX.md` and `findings.json` give for these findings (producer
+  `binary rehost`); they get no `replay.py`, which runs a host harness.
+
+**Fidelity.** The run JSON and every finding carry a `fidelity` block. The
+CPU runs the real instructions: the Cortex-M3/M4 integer set with the M4's
+halfword multiplies and saturation, the banked stack pointers, `SVC`
+exception entry and return, and the System Control Block registers start-up
+code writes. Peripherals are **not modelled**: their registers read as zero
+and drop writes, so firmware that polls a status bit spins until
+`--max-instructions`. Interrupts, the FPU, the M4's SIMD instructions, the
+MPU and privilege are not modelled either. An instruction outside the model
+ends the run as `unsupported` in the run JSON's `stops` and `unsupported`
+fields, never as a finding. An UNPREDICTABLE encoding (one that sets a bit
+the architecture says should be clear, say) runs as the instruction it
+encodes or ends the run as `unsupported`; QEMU takes a HardFault on many of
+them.
 
 ---
 

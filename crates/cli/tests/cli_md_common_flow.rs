@@ -134,13 +134,15 @@ fn the_common_flow_runs_as_written() {
     assert!(finding_id.is_some(), "the Ada block runs bhf fuzz");
     assert!(dir.join("bhf_work/reports/run-last.md").is_file());
 
-    // The second block's source tree and binaries: the example and the
-    // harness the first block built.
+    // The second block's source tree and binaries: the example, the
+    // harness the first block built, and a Cortex-M image to rehost.
     copy_example(&dir.join("path/to/src"));
     let harness: PathBuf = dir.join("bhf_work/build/H-PKG-PARSE/obj/main");
     for name in ["bin", "bin-or-firmware"] {
         fs::copy(&harness, dir.join("path/to").join(name)).unwrap();
     }
+    let firmware = Path::new(env!("CARGO_MANIFEST_DIR")).join("../rehost/tests/fixtures/magic.elf");
+    fs::copy(&firmware, dir.join("path/to/firmware.elf")).unwrap();
     let have_rizin = which::which("rizin").is_ok();
     for line in &blocks[1] {
         let run = run_line(dir, line, None);

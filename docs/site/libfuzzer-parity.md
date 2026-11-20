@@ -22,7 +22,7 @@ coming from `clang -fsanitize=fuzzer` know what to reach for.
 | `-max_total_time=N` | `--time 30s` (manual `fuzz`); `auto --per-target-time N` | Whole-campaign budget for a single manual `fuzz` run. Under `bhf auto`, `--per-target-time` (default 60s) is the per-target TOTAL fuzz wall, split evenly across the three passes (empty/rng/fuzz_driven) under one shared deadline — so the per-target wall ≈ this value, **not** × pass count. This is the per-target `-max_total_time` / AFL `-V` parity knob. |
 | stop-on-first-crash | `auto --per-target-finding-count 1` | Stop a target the instant it produces N distinct crash signatures (checked mid-pass; remaining passes skipped), or when its `--per-target-time` is spent. `1` ≈ libFuzzer stop-on-first-crash; unset (default) collects every finding within the budget. |
 | (whole-run wall cap) | `auto --campaign-time S` [+ `--min-target-time M`] | Outer wall-clock cap across ALL targets; with `--min-target-time` it instead splits the budget evenly across targets with a per-target floor. |
-| `-jobs=N` / `-workers=N` / `-fork=N` | `--workers N\|auto` | Multicore campaign; per-input length/timeout/RSS limits are passed through to every worker, and the workers share new corpus entries as they run (`BHF_SYNC_INTERVAL_MS`). |
+| `-jobs=N` / `-workers=N` / `-fork=N` | `--workers N\|auto`; `auto --workers-per-target N` | Multicore campaign; per-input length/timeout/RSS limits are passed through to every worker, and the workers share new corpus entries as they run (`BHF_SYNC_INTERVAL_MS`). `bhf auto` runs each target's builtin passes this way with `--workers-per-target N`, merging the workers' queues into the target's corpus. |
 | `-dict=FILE` | auto dictionary + `--cmplog-log` | A dictionary is mined automatically (string/byte literals) and from recovered comparison operands. |
 | `-use_value_profile=1` | cmplog / RedQueen (`--cmplog-log`) | See below. |
 | `inline-8bit-counters` / AFL `COUNT` buckets | always on (C/C++ driver) | Edge hit counts are bucketed (`1, 2, 3, 4-7, 8-15, …`) so a deeper loop or recursion is new coverage, not just edge presence (#420). |
@@ -114,7 +114,13 @@ The remaining value-profile-only case is a **transformed** comparison — the ma
 is a function of the input that never surfaces verbatim as an operand
 (`crc32(buf) == K`, `a == (b ^ K)` where the compiler folds the operand into a
 derived form, length/hash math). Neither input-to-state nor leading-byte
-comparison-progress can synthesize those; a future enhancement is hybrid concolic
-via optional symbolic-execution adapters (SymCC/KLEE, deferred post-1.0) on
-branches that stay cold, fed back as seeds. A full per-site distance metric over arbitrary transforms would be a
+comparison-progress can synthesize those. For C/C++, `bhf auto --symcc` (#324,
+#331) adds a hybrid concolic loop: each harness also builds with SymCC
+(`main_symcc`), and when a builtin pass's corpus stops growing, its newest
+entries run through SymCC, which solves the branch conditions they reached and
+writes an input per branch it can flip; those inputs run next in the pass and
+stay in the corpus when they add coverage, as AFL++'s SymCC custom mutator and
+LibAFL's concolic stage feed theirs. SymCC is GPL-3.0 and runs only as a
+subprocess, under a license profile that permits it (see [Licensing](../licensing/)).
+A full per-site distance metric over arbitrary transforms would be a
 further future addition, requiring comparison-distance instrumentation.

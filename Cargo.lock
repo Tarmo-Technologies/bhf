@@ -207,6 +207,7 @@ dependencies = [
  "python_parser",
  "rayon",
  "regex",
+ "rehost",
  "relational",
  "replay_min",
  "report",
@@ -1849,6 +1850,13 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "rehost"
+version = "0.3.0"
+dependencies = [
+ "thiserror",
+]
 
 [[package]]
 name = "relational"

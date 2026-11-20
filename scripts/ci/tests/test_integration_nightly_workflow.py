@@ -518,5 +518,48 @@ class RenodeLaneTests(unittest.TestCase):
             self.assertEqual(found.stdout.strip(), "ran", found)
 
 
+
+class PersistentLoopBenchmarkTests(unittest.TestCase):
+    """The reset=persistent benchmark runs in hil-emu on the nightly schedule
+    and by hand, not on a pull request or a push (#346)."""
+
+    def test_the_benchmark_runs_on_the_schedule_and_by_hand_only(self) -> None:
+        lane = (ROOT / "scripts/hil-emu.sh").read_text()
+        start = lane.index("rv3_benchmark_runs() {")
+        guard = lane[start : lane.index("\n}\n", start) + 3]
+        runs = {}
+        for event in ["schedule", "workflow_dispatch", "pull_request", "push", ""]:
+            env = {"PATH": os.environ.get("PATH", "")}
+            if event:
+                env["GITHUB_EVENT_NAME"] = event
+            result = subprocess.run(
+                ["/bin/bash", "-c", guard + "rv3_benchmark_runs && echo run || echo skip"],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            runs[event] = result.stdout.strip()
+        self.assertEqual(
+            runs,
+            {
+                "schedule": "run",
+                "workflow_dispatch": "run",
+                "pull_request": "skip",
+                "push": "skip",
+                "": "run",
+            },
+        )
+        self.assertIn(
+            "if rv3_benchmark_runs; then\n"
+            "  echo \"== RV-3 benchmark: reset=persistent against a loadvm per input (needs 3x) ==\"\n"
+            "  BHF_HIL_REQUIRE=1 cargo test --locked -p target_transport --test live_fullsystem -- \\\n"
+            "    --ignored --nocapture\n",
+            lane,
+        )
+        workflow = (ROOT / ".github/workflows/hil-emu.yml").read_text()
+        self.assertIn("  schedule:\n", workflow)
+        self.assertIn("run: scripts/hil-emu.sh", workflow)
+
+
 if __name__ == "__main__":
     unittest.main()

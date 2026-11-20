@@ -74,6 +74,9 @@ interpreter for the languages you select. For Windows C/C++, install VS Build
 Tools with the C++ workload (bhf finds it and its clang; no Developer shell
 needed) and GNU make; `--cc cl` builds the harnesses with cl.exe. A Visual
 Studio solution in the tree is imported for its include dirs and defines.
+Harnesses the project already ships (Go native fuzz tests, Atheris harnesses)
+are fuzzed first, from the seeds and dictionaries that come with them, and so
+are the fuzzers a `bhf project import-ossfuzz` registered in the work dir.
 Read results/INDEX.md for findings
 and auto/summary.txt for targets that built, fuzzed, or were skipped.
 Add --resume to the same command to continue a stopped run.";
@@ -327,6 +330,23 @@ pub struct AutoArgs {
     /// Ada targets build serially regardless: they share the staged source tree.
     #[arg(long = "jobs", short = 'j', default_value_t = default_auto_jobs(), value_name = "N")]
     pub jobs: usize,
+
+    /// Run each target's builtin fuzz passes on N cores (#332): every pass is
+    /// a campaign of N `bhf fuzz` workers, each in its own copy of the work
+    /// dir, that share the corpus entries they keep as they run (every
+    /// BHF_SYNC_INTERVAL_MS, default 10000) and whose queues and findings are
+    /// merged into the target's when the pass ends. With `--jobs J` that is
+    /// up to J x N fuzz processes, each with `--rss-limit-mb`. A cross-built
+    /// target that runs under an emulator, and the AFL++ engine, keep one.
+    /// `--per-target-finding-count` is checked between passes, not inside
+    /// one. Default 1: each pass runs in process.
+    #[arg(
+        long = "workers-per-target",
+        value_name = "N",
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub workers_per_target: u32,
 
     /// DEPRECATED no-op: discovery caching is now ON BY DEFAULT (this flag is
     /// accepted for back-compat and does nothing). See `--no-discovery-cache` to
@@ -790,6 +810,24 @@ pub struct AutoArgs {
     /// Implies `--static`.
     #[arg(long = "external-tools")]
     pub external_tools: bool,
+
+    /// Also build a SymCC variant of each native C/C++ harness (`make symcc`:
+    /// `main_symcc`, compiled by SymCC's `symcc`/`sym++`), the concolic lane
+    /// that solves comparisons on values the input holds only after hashing or
+    /// modular arithmetic. SymCC is GPL-3.0 and runs only as a subprocess,
+    /// under a license profile that permits it: `BHF_PROFILE=external-tools`
+    /// or `research-lab`; without `BHF_PROFILE` this flag opts into
+    /// `external-tools`, and `strict-permissive` refuses it. Needs `symcc`
+    /// (C) and `sym++` (C++) on PATH, or SYMCC_CC/SYMCC_CXX naming them; a
+    /// harness whose SymCC build fails is fuzzed without it, and
+    /// `targets[].lanes.symcc` in run.json says why. Each builtin pass of a
+    /// harness with the lane runs a solver loop: once the pass's corpus has not
+    /// grown for BHF_SYMCC_PLATEAU_MS (default 5000), its newest entries
+    /// (BHF_SYMCC_ENTRIES per round, default 8) run through `main_symcc`, each
+    /// for at most BHF_SYMCC_TIMEOUT_MS (default 10000), and the inputs SymCC
+    /// solves run next in the pass. `BHF_SYMCC=1` does the same as the flag.
+    #[arg(long = "symcc")]
+    pub symcc: bool,
 
     /// Force-fuzz mode: a SECOND phase over the targets the normal (unforced) run
     /// could not fuzz, so it can never lower the fuzzed count. Attempts a target
@@ -1479,6 +1517,28 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         }
         std::env::set_var("BHF_DEADLINE_MS", deadline.as_millis().to_string());
     }
+    // #332: --workers-per-target N reaches the builtin passes' programmatic
+    // runs, which run each pass on N workers.
+    if args.workers_per_target > 1 {
+        std::env::set_var(
+            crate::fuzz::WORKERS_PER_TARGET_ENV,
+            args.workers_per_target.to_string(),
+        );
+        bhfeprintln!(
+            "bhf auto: each target's builtin passes run on {} workers that share their corpus \
+             (up to {} fuzz processes with --jobs {})",
+            args.workers_per_target,
+            args.workers_per_target as usize * args.jobs.max(1),
+            args.jobs.max(1)
+        );
+    } else {
+        std::env::remove_var(crate::fuzz::WORKERS_PER_TARGET_ENV);
+    }
+    // #324: --symcc (or BHF_SYMCC=1) turns the SymCC lane on for every native
+    // C/C++ harness, when the license profile and the installed tools allow it.
+    if let Some(note) = crate::symcc::configure_run(args.symcc || crate::symcc::requested()) {
+        bhfeprintln!("bhf auto: {note}");
+    }
     // --cxx-expected-exception reaches the C++ harnesses through their env.
     if !args.cxx_expected_exceptions.is_empty() {
         std::env::set_var(
@@ -1838,9 +1898,32 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         args.discovery_cache.as_deref(),
         args.preprocess,
     )?;
-    if let Some(note) =
-        default_skips_note(&crate::auto::discovery::default_skips(&path, &dir_filter))
-    {
+    // The harnesses the project ships (Go native fuzz tests, Atheris
+    // harnesses) live where discovery of generated targets does not look,
+    // and the fuzzers a `bhf project import-ossfuzz` registered in the work
+    // dir are built already; they go first.
+    let mut provided = crate::auto::provided::discover(&path, &dir_filter);
+    let (imported, import_notes) =
+        crate::auto::provided::discover_imported(&work, &path, &dir_filter);
+    for note in &import_notes {
+        bhfeprintln!("{note}");
+    }
+    let imported_count = imported.len();
+    provided.extend(imported);
+    // The harness files the run fuzzes are not skipped, wherever they are.
+    let fuzzed: std::collections::HashSet<PathBuf> = provided
+        .iter()
+        .map(|candidate| candidate.source_path.clone())
+        .collect();
+    crate::auto::provided::merge_into(&mut candidates, provided);
+    if let Some(note) = crate::auto::provided::discovered_note(&candidates, imported_count) {
+        bhfeprintln!("{note}");
+    }
+    if let Some(note) = default_skips_note(&crate::auto::discovery::default_skips(
+        &path,
+        &dir_filter,
+        &fuzzed,
+    )) {
         bhfeprintln!("{note}");
     }
     if let Err(error) =
@@ -3622,7 +3705,8 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         stopped_by_operator,
     );
 
-    let rendered = summary.render();
+    let mut rendered = summary.render();
+    rendered.push_str(&crate::auto::provided::render_summary(&results));
     bhfeprintln!();
     // Findings are the operator's primary deliverable: show the severe digest
     // before campaign mechanics and blocker diagnostics.

@@ -5,6 +5,43 @@
 ## Unreleased
 
 ### Added
+- `bhf auto --symcc` builds a SymCC variant of each native C/C++ harness
+  (#324): the generated Makefiles gain a `symcc` goal (`main_symcc`, built by
+  `SYMCC_CC`/`SYMCC_CXX`, default `symcc`/`sym++`), and run.json records it as
+  `targets[].lanes.symcc`. SymCC (GPL-3.0) runs only as a subprocess under a
+  license profile that permits it; `external-tools` now allows `symcc`, and
+  `strict-permissive` refuses the flag with a note.
+- With `--symcc`, each builtin pass runs a solver loop (#331): once its corpus
+  has not grown for `BHF_SYMCC_PLATEAU_MS` (default 5 s), its newest entries
+  run through `main_symcc` and the inputs SymCC solves run next, so a
+  comparison on a hashed or modular-arithmetic value can be passed. SymCC's
+  runs take the harness's `--sandbox` and `--rss-limit-mb` (as an
+  address-space limit). A fuzz run summary gains an optional `symcc` block
+  (rounds, entries run, inputs generated and imported),
+  `<work>/symcc-import.log` lists each input, and `bhf fuzz` runs the loop
+  when `BHF_SYMCC=1` and the harness has `main_symcc` beside it.
+- `bhf auto --workers-per-target N` runs each target's builtin passes on N
+  workers (#332), which share their corpus as they run and whose queues and
+  findings merge into the target's when the pass ends. A pass's run summary
+  gains an optional `workers` block, and its `hangs`, `fresh_reruns`, `symcc`
+  and `stability` blocks are the workers' (counts summed; the least stable
+  worker's calibration). `bhf fuzz` takes a hidden
+  `--harness-env KEY=VALUE`, through which a campaign gives its workers the
+  harness env, `{work_dir}` standing for each worker's own work dir, and the
+  hidden `--campaign-seed-file` takes a directory for every file in it, so a
+  campaign (`bhf fuzz --workers` too) hands its workers the shared queue and
+  its seeds in a command line of fixed length.
+- `qemu-system:` takes `reset=persistent` (needs `done=`) (#346): between
+  clean inputs the guest continues its own input loop from the `done=`
+  breakpoint, with a `loadvm` only before the first input and after a crash,
+  hang or inconclusive run (about 4x the exec/s on the RV-3 image;
+  `reset=loadvm` stays the default). Until a continuation comes back to
+  `done=` with coverage, any other is run again from the snapshot; a `done`
+  that branches to itself, or a firmware that never proves its loop, is
+  refused. The transport summary gains `executions_per_sec` and each
+  `transport_profile.json` a `throughput` block (additive); `bhf replay`
+  still restores before every input, and the session lane refuses
+  `reset=persistent`.
 - `bhf fuzz --target-transport renode:monitor=HOST:PORT,gdb=HOST:PORT[,snapshot=PATH]`
   fuzzes firmware on a Renode board (#340): Renode's telnet monitor saves the
   baseline with `Save` and restores it with `Load` before each input, and gdb
@@ -2899,6 +2936,72 @@
   when bhf panics.
 
 ### Added
+- A `rehost` crate runs an unmodified Cortex-M firmware image in an emulator
+  (#351): an ELF, or a raw image at a base address, starts at the reset
+  vector with the stack pointer its vector table names. Each input is
+  written into a fixed buffer in the firmware's memory, with an optional
+  length word, at reset or when the core first reaches a given address (so
+  the start-up code's `.bss` clearing does not wipe it), and every basic
+  block the core enters is counted in a 64 KiB edge map. The emulator is
+  bhf's own ARMv7-M Thumb-2 interpreter: integer instructions, `SVC`
+  exceptions, the System Control Block registers start-up code writes, and
+  semihosting output and exit. Peripheral registers read as zero, and
+  interrupts and floating point are not modelled; an instruction outside
+  the model stops the run as unsupported rather than as a firmware fault,
+  while `UDF` and the encodings ARMv7-M leaves unallocated fault as
+  undefined instructions. Semihosting writes stop reading memory once the
+  64 KiB output is full.
+- `bhf binary rehost <IMAGE>` fuzzes an unmodified Cortex-M firmware image
+  in that emulator (#380): the input goes into a fixed buffer named by
+  address (hex, `0x` optional, as `nm` prints it) or ELF symbol
+  (`--input-buffer`, `--input-size`, `--input-length`, `--inject-at`; the
+  run JSON's `input_not_delivered` counts runs that never reached
+  `--inject-at`, and bhf warns when no seed does), RAM is
+  `--ram BASE:SIZE`, a raw image loads at `--base`, and the edge coverage
+  steers the builtin engine's mutator. A run that faults is a `kind: rehost_fault` finding
+  (`finding_kind: binary`, rule `BHF-501`) classified as `invalid_access`,
+  `bad_pc` or `hard_fault`, with the fault, the registers and the machine
+  setup; `bhf replay` runs its testcase through that setup again and
+  reports `MATCH` on the same fault signature (`--harness` names another
+  copy of the image). The run JSON is `bhf.binary_rehost.run.v1`, and it
+  and every finding carry a `fidelity` block saying peripherals and
+  interrupts are not modelled. In `results/` these findings have producer
+  `binary rehost` (a value added to the `bhf.findings.v1` schema's
+  `producer` enum) and the reproduce command `bhf replay findings/<id>`;
+  they get no `replay.py`.
+- `bhf auto` fuzzes the Go native fuzz tests a project ships (#336): each
+  `func FuzzXxx(f *testing.F)` in a `_test.go` file is a target, built
+  against a stand-in for `testing` whose `f.Fuzz` hands bhf's inputs to the
+  fuzz target, with `go build -cover` edge coverage, and started from its
+  `f.Add` seeds and its `testdata/fuzz/FuzzXxx` corpus. A panic, or a failure
+  the fuzz target reports through `t.Error`/`t.Fatal`, is a finding. An
+  external test that calls what its package's `export_test.go` exports
+  builds too. `testdata/` and `_`-prefixed directories are skipped, as the
+  go tool skips them. These
+  provided harnesses rank ahead of generated targets; `run.json` marks each
+  with `targets[].provided_harness` and counts them in
+  `summary.provided_harnesses` (both new, omitted otherwise).
+- `bhf auto` runs the Atheris harnesses a Python project ships (#337): the
+  function a file registers with `atheris.Setup` is a target, run under
+  bhf's Python driver with a stand-in `atheris` module (Atheris need not be
+  installed) whose `FuzzedDataProvider` decodes values from the input, and
+  started from its seed corpus with its `<stem>.dict`. As under Atheris,
+  every exception it lets escape is a finding, located in the code that
+  raised it rather than at the harness's call. `run.json` reports it with
+  `provided_harness.origin` `atheris`; the record gains `dictionaries` and
+  `dictionary_tokens` (omitted when empty).
+- `bhf auto` fuzzes the fuzzers a `bhf project import-ossfuzz` of the tree
+  registered in its work dir (#435): each one linked with bhf's driver is a
+  provided harness, staged from the import's `$OUT` with its unpacked seed
+  corpus, its merged dictionaries and its `.options` limits, and reported in
+  `run.json` with `provided_harness.origin` `ossfuzz-import` and the new
+  `provided_harness.options` (omitted when empty). A generated target in the
+  fuzzer's own source is not fuzzed again. A fresh run keeps the import's
+  `<work>/build/<name>` registrations instead of clearing them, and a run
+  over another tree no longer archives the import with the earlier run. The
+  import now builds with a `-fdebug-prefix-map` from its `$SRC` copy to the
+  tree, so findings name the project's files. The note on what discovery
+  skipped by default no longer counts the provided harnesses' files.
 - `bhf differential --metamorphic-transform` has a transform registry (#330):
   `append-newline`, `trailing-whitespace` (a space and a tab at the end of
   every line), `reorder-json-keys` (every JSON object's members in reverse

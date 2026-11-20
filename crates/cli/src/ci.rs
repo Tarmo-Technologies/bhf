@@ -308,6 +308,8 @@ fn auto_args_from_ci(args: &CiArgs, scoped_files: &[PathBuf]) -> AutoArgs {
         sbom: false,
         static_scan: false,
         external_tools: false,
+        symcc: false,
+        workers_per_target: 1,
         sloc: None,
         static_dynamic: false,
         no_minimize: false,

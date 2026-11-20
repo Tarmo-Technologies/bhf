@@ -48,6 +48,7 @@ members = [
     "crates/relational",
     "crates/replay_min",
     "crates/report",
+    "crates/rehost",
     "crates/results",
     "crates/runtrace_manifest",
     "crates/runtime_collector",

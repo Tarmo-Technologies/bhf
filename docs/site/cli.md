@@ -13,7 +13,7 @@ checks.
 | Whole-tree and manual pipeline | `auto`, `snippet`, `scan`, `list`, `generate-harness`, `build`, `fuzz`, `report`, `model` |
 | Build and instrumentation support | `stub`, `instrument`, `fake-corba` |
 | Corpus and crash triage | `corpus`, `minimize`, `replay`, `capsule`, `verify-poc`, `env-capsule`, `differential`, `relational`, `cmplog`, `explain`, `cartography`, `decode-args` |
-| Source-unavailable binaries | `binary` (`scan`, `adapter`, `fuzz`) |
+| Source-unavailable binaries | `binary` (`scan`, `adapter`, `fuzz`, `rehost`) |
 | External project profiles | `project` (`validate`, `list`, `run`) |
 | Out-of-process extensions | `extension` (`validate`, `evaluate`), and `fuzz --extension` |
 | Static and supply chain | `static-scan`, `sloc`, `sbom`, `license-audit`, `extract-state-machines` |
@@ -68,6 +68,7 @@ bhf introspect path/to/src --work-dir bhf_work
 bhf binary scan path/to/bin-or-firmware --out bhf_work/binary
 bhf --profile external-tools binary adapter path/to/bin --adapter rizin --out bhf_work/binary-adapter
 bhf binary fuzz path/to/bin --work-dir bhf_work --input-mode stdin --seed-input smoke
+bhf binary rehost path/to/firmware.elf --work-dir bhf_work --input-buffer rx_buf --inject-at main
 bhf clean bhf_work --build --corpus --reports
 ```
 
@@ -517,6 +518,17 @@ The two AFL++ modes also take:
 bhf binary fuzz ./parser --engine afl-qemu --input-mode file \
   --seed-file samples/record.bin --persistent-addr 0x4011b6 --time 10m
 ```
+
+`bhf binary rehost <IMAGE>` fuzzes an unmodified Cortex-M firmware image (an
+ELF, or a raw image with `--base`) in bhf's own emulator: each input is
+written into a fixed buffer (`--input-buffer`, an address or ELF symbol,
+with `--input-size`, `--input-length` and `--inject-at`), the core starts
+from the reset vector, and basic-block edge coverage steers the mutation.
+Addresses are hex, `0x` optional, as `nm` prints them. An invalid memory
+access, a bad PC or a HardFault is a `kind: rehost_fault` finding, which
+`bhf replay` reproduces through the recorded machine setup. Peripherals and
+interrupts are not modelled; see [On-target fuzzing §9](on-target-fuzzing.md)
+for the flags and the fidelity.
 
 `--runtime-oracles auto|on|off` (on `bhf fuzz` and `bhf binary fuzz`) loads the
 runtrace sink oracles via the `LD_PRELOAD` shim so a **clean-exit** semantic
@@ -1496,11 +1508,12 @@ so a run whose crashes were all known does not read as clean.
 - `--quiet` (`-q`) — print no progress lines. Without it the builtin engine prints a status line on stderr 2s into the run, then at doubling intervals up to every 30s: `bhf: fuzz: 8123 execs (4061/s) | corpus: 12 | findings: 0 | edges: 214 | elapsed: 2.0s`, with `| stability: N%` before the elapsed time once stability calibration has measured it. Workers of `--workers` run quiet.
 - Crashes in the loop are not symbolized: the builtin engine runs its own executions with `symbolize=0:abort_on_error=0` appended to the sanitizer options, tells crashes apart by their rule, kind and top five unsymbolized frames (`module+offset`), counts a crash whose signature was reported against that finding, and re-runs a new one in a fresh process with the symbolized options replays use, whose report becomes the finding. Symbolizing every crashing execution and aborting it through the kernel's core pattern took most of a second each, which left a target whose inputs mostly crash a few executions a second. `BHF_IN_LOOP_SYMBOLIZE=1` symbolizes in the loop again.
 - `BHF_LIVE_CORPUS_DIR=<dir>` — the builtin engine also writes each input it keeps into `<dir>` as it keeps it, named `<sha256>.bin` as the queue names it, so a tool watching a campaign sees the corpus grow (the engine trade study snapshots it for coverage over time). The queue itself is written when the pass ends, after its re-run checks, and leaves out what they rejected; the dir does not.
+- `BHF_SYMCC=1` — what `bhf auto --symcc` sets: when the harness has a `main_symcc` beside it (`make symcc`, see [C/C++](c-cpp.md)) and the license profile permits SymCC, the builtin engine runs a solver loop (#331). Once the pool has not grown for `BHF_SYMCC_PLATEAU_MS` (default 5000), its newest entries SymCC has not run (`BHF_SYMCC_ENTRIES` per round, default 8) run through `main_symcc`, each for at most `BHF_SYMCC_TIMEOUT_MS` (default 10000), under the harness's `--sandbox` (SymCC's build directory bound read-only, for its runtime library) and with `--rss-limit-mb` as its address-space limit (`RLIMIT_AS`; `main_symcc` has no sanitizer shadow), and each input SymCC writes that the pool does not have runs next, as a `--workers` peer's entry does. The run summary's `symcc` block counts the rounds, the entries SymCC ran and the inputs it gave, and `symcc-import.log` in the work dir lists each input with the entry it came from.
 - `--workers <N|auto>` — run multiple fuzz workers. While they run, the workers share their corpus: every `BHF_SYNC_INTERVAL_MS` (10 s by default; their syncs are spread over the interval) each writes the entries its pool kept to `fuzz_campaigns/<harness>/sync/worker-<id>/<sha256>.bin` and runs the ones the others wrote that it has not seen, keeping those that add coverage. An entry is written once, by the first worker to write it, and each worker logs what it imported to `sync-import.log` in its work dir. When the campaign ends, their findings move into `<work-dir>/results/findings` under fresh ids, one per crash cluster; duplicates stay in the worker dirs while the finding they duplicate is in `results/findings`. Once that finding is removed (or `results/` is wiped), the next campaign drops them instead of merging them back. With `--engine afl++`, `--workers N` runs N afl-fuzz instances in one output directory: `-M main`, which runs CmpLog, and `-S sec1`..`-S secN-1`, which sync each other's queues at start and then every quarter of `--time` (1 to 30 minutes; `AFL_SYNC_TIME` overrides it). `auto` runs one per core. Each instance logs to `afl_out/<harness>/afl-fuzz-<instance>.log`; their crashes and hangs are harvested and their queues taken into the corpus, and the summary's `afl.instances` names them.
 - `--fork-server` / `--no-fork-server` — persistent framed execution is the default for the builtin engine. Native drivers and the Java, Python, Perl, Go, C#, JavaScript/TypeScript, Ruby, Lua, and PHP launchers each keep one target runtime alive and feed it inputs over the same protocol. Every finding is replay-validated in a fresh process so a global-state artifact never escapes (#416), and every new corpus input is re-run once in a fresh process on a background thread before it is saved in the corpus queue (see [Sanitizers](./sanitizers.md)). `--no-fork-server` runs a fresh process per input — use it for a target that intentionally carries fuzz-relevant global state across calls. The persistent engine calibrates each input it would add to the corpus, as AFL++ does: it re-runs the input four times, each from a zeroed edge bitmap, and an edge one run hit and another did not is variable. An input whose runs differ is added only if every run hit an edge no calibrated input hit every time before; one whose only new coverage was variable edges is left out, and the re-runs' edges count as seen, so a state-dependent edge is not new coverage later. `stability` in `fuzz_runs/<harness>-latest.json` gives `stability_pct` (the share of the edges calibration saw that no run varied on), `variable_edges`, `calibrated_entries` and `unstable_entries_dropped`. Below 90% bhf prints a note that the harness keeps state between executions, with this flag as one remedy. A harness that speaks the framed protocol gets `--timeout`, but at least 10 s (never more than `--time`), to start its fork-server, so a slow start on a loaded machine does not drop the run to a fresh process per input; bhf prints a note if it still misses that. Any other harness gets a 2 s probe.
 - `--cmplog-log <PATH>` — replay a runtrace audit log captured with `BHF_CMPLOG=1`; recovered cmplog operands seed both the mutator dictionary and an offset-aware RedQueen-style splice that replaces `operand_a` with `operand_b` at the offset it appears in the current input (#400).
 - `--sanitizers <asan,msan,ubsan,tsan,lsan|none>` — native C/C++ sanitizer campaign matrix; other lanes own their instrumentation.
-- `--target-transport <SPEC>` — run the loop against an off-host / on-target backend instead of the host lane (additive; absent = host path unchanged). Spec forms: `agent:tcp:HOST:PORT`, `agent:serial:/dev/ttyX[,baud=N]` (a Windows port is `COM3`), `gdb:HOST:PORT[,done=ADDR][,fault=ADDR][,reset=restart|monitor:CMD]`, `qemu-system:qmp=…,gdb=…[,snapshot=TAG]`, `renode:monitor=…,gdb=…[,snapshot=PATH]`. On-device agent, debug-probe/emulator gdbstub, or a full-system `qemu-system` or Renode snapshot (Renode's telnet monitor saves and loads the baseline with `Save`/`Load`; see [Renode boards](on-target-fuzzing.md#renode-boards)). With `--workers N`, the spec names each worker's target, `{worker}` its number (0 to N-1) and `{BASE+worker}` a port per worker (`agent:tcp:127.0.0.1:{9000+worker}`); the N workers share one corpus, coverage map and finding set, and `--iterations` and `--time` are the campaign's. A spec without either is refused with `--workers`. See [On-Target & Embedded](./on-target-fuzzing.md).
+- `--target-transport <SPEC>` — run the loop against an off-host / on-target backend instead of the host lane (additive; absent = host path unchanged). Spec forms: `agent:tcp:HOST:PORT`, `agent:serial:/dev/ttyX[,baud=N]` (a Windows port is `COM3`), `gdb:HOST:PORT[,done=ADDR][,fault=ADDR][,reset=restart|monitor:CMD]`, `qemu-system:qmp=…,gdb=…[,snapshot=TAG][,reset=loadvm|persistent]` (`reset=persistent` continues the firmware's own input loop and restores the snapshot only after a crash, hang or inconclusive run; see [the persistent loop](on-target-fuzzing.md#persistent-loop)), `renode:monitor=…,gdb=…[,snapshot=PATH]`. On-device agent, debug-probe/emulator gdbstub, or a full-system `qemu-system` or Renode snapshot (Renode's telnet monitor saves and loads the baseline with `Save`/`Load`; see [Renode boards](on-target-fuzzing.md#renode-boards)). With `--workers N`, the spec names each worker's target, `{worker}` its number (0 to N-1) and `{BASE+worker}` a port per worker (`agent:tcp:127.0.0.1:{9000+worker}`); the N workers share one corpus, coverage map and finding set, and `--iterations` and `--time` are the campaign's. A spec without either is refused with `--workers`. See [On-Target & Embedded](./on-target-fuzzing.md).
 - `--transport-coverage-map <SPEC>` — for the memory-read transports (`gdb`, `qemu-system`, `renode`), locate the on-target coverage ring: `input=<addr>,input_cap=<n>,ring=<addr>,write=<addr>,wrapped=<addr>,cap=<n>` (decimal or `0x`-hex), plus `input_len=<addr>` when the firmware reads the input's length from a `u32` there, and `cmplog=<addr>,cmplog_cap=<n>` to read the comparisons the firmware records for CmpLog ([CmpLog on the target](on-target-fuzzing.md#cmplog-on-the-target)). `input_cap`, the staging buffer's size, is required: `--max-len` is cut to it and no input is written past it (see [On-target fuzzing](on-target-fuzzing.md#coverage-map-spec)). The `agent` transport carries coverage over its protocol and rejects this. With `--session-transport transport:gdb:…` or `transport:qemu-system:…` it locates the same ring for the session lane.
 - `--protocol-profile <PATH>` — load a versioned protocol profile (TOML, `bhf.protocol.v1`) and fuzz the target as a **response-dependent, multi-message session** instead of single opaque inputs (additive; absent = the paths above are unchanged). Presence routes to the session lane, which needs `--session-transport`. See [Stateful protocol sessions](#stateful-protocol-sessions-hdf-7) below; `profiles/protocols/` holds [reference profiles](#reference-profiles) for Modbus/TCP and MQTT 3.1.1 over TCP and CoAP and RTPS/DDS over UDP, and a `kind = "giop"` profile sends [GIOP requests](#giop-profiles) to an IIOP endpoint.
 - `--board-profile <PATH>` — take `--target-transport` and `--transport-coverage-map` from a board profile: a TOML file of one board's specs, `gdb` and `coverage_map` for its debug probe and `serial` for the agent on its UART (`docs/hil-boards/nucleo-f411re.toml` is the template). Every spec in it is checked when it is read, and either flag beside it is refused (exit `2`). `--board-lane <gdb|serial>` (default `gdb`) picks the lane. The bring-up is in `docs/hil-bringup.md`.
@@ -2257,7 +2270,7 @@ bhf project import-ossfuzz oss-fuzz/projects/libfoo --src path/to/libfoo \
 | `$WORK` | `<work>/ossfuzz/work`, for intermediate files |
 | `$OUT` | `<work>/ossfuzz/out`, where the fuzzers go |
 | `$CC`, `$CXX` (`$CCC`) | clang and clang++ |
-| `$CFLAGS`, `$CXXFLAGS` | OSS-Fuzz's address build, `-O1 -fno-omit-frame-pointer -gline-tables-only -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION -fsanitize=address -fsanitize-address-use-after-scope`, with `-fsanitize-coverage=trace-pc-guard,trace-cmp` (the coverage bhf's driver reads) in place of `-fsanitize=fuzzer-no-link` |
+| `$CFLAGS`, `$CXXFLAGS` | OSS-Fuzz's address build, `-O1 -fno-omit-frame-pointer -gline-tables-only -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION -fsanitize=address -fsanitize-address-use-after-scope`, with `-fsanitize-coverage=trace-pc-guard,trace-cmp` (the coverage bhf's driver reads) in place of `-fsanitize=fuzzer-no-link`, and `-fdebug-prefix-map=$SRC/<name>=<source tree>`, so a crash stack names the tree's files rather than their copy (left out for a path with whitespace or, in the copy's, a `=`) |
 | `$LIB_FUZZING_ENGINE` | `<work>/ossfuzz/engine/libFuzzingEngine.a`: bhf's driver, the `main` and coverage runtime a generated harness links, with a `bhf_run_one` that calls the target's `LLVMFuzzerTestOneInput` |
 | `$SANITIZER`, `$FUZZING_ENGINE`, `$FUZZING_LANGUAGE`, `$ARCHITECTURE` | `address`, `libfuzzer`, `c++`, and the host's architecture |
 
@@ -2338,6 +2351,17 @@ fuzzer in `$OUT` comes with it:
 `bhf project run` on the manifest applies all three; `bhf fuzz` loads the
 dictionary, takes the options as the flags the listing prints, and takes
 each seed with `--seed-file`.
+
+**`bhf auto`.** A later `bhf auto` of the same tree with the same
+`--work-dir` fuzzes every imported fuzzer linked with bhf's driver as a
+[provided harness](auto.md#provided-harnesses), ahead of the targets it
+generates, with its seeds, dictionaries and options applied, and leaves the
+registrations under `<work>/build/` in place:
+
+```sh
+bhf project import-ossfuzz path/to/libfoo --work-dir bhf_work
+bhf auto path/to/libfoo --work-dir bhf_work
+```
 
 ## Out-of-Process Extensions
 

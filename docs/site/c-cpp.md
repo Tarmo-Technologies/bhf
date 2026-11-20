@@ -66,6 +66,16 @@ without `-c`, and bhf says so. `main_afl` has no bhf driver, so
 the comparison evidence of an AFL++ finding (`finding.json` `gates`) is
 recorded by replaying its input through the `main` beside it, which is
 built from the same harness source.
+`make symcc` builds `main_symcc` with SymCC's `symcc` (C) or `sym++` (C++):
+the harness and bhf's driver without sanitizers or edge coverage, for SymCC's
+own instrumentation, which solves the branch conditions of the input it runs
+and writes an input per branch it can flip into `SYMCC_OUTPUT_DIR`. `bhf auto
+--symcc` builds it when the license profile permits SymCC (see
+[Licensing](../licensing/)), at the language standard `main` built with (a
+`C_STD` dialect rung such as `gnu89` included), with each compile-database
+unit compiled by SymCC as well. sym++ takes the system C++ library
+(`SYMCC_REGULAR_LIBCXX=1`) unless `SYMCC_LIBCXX_PATH` names the libc++ SymCC
+instrumented.
 When make's built-in compiler defaults are still `cc` / `g++`, the generated
 Makefile and `bhf build` prefer `clang` / `clang++`. `CC`/`CXX` (or `--cc`/`--cxx`,
 or `[toolchain] cc`/`cxx` in a config file) choose another compiler, and the

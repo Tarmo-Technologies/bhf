@@ -101,8 +101,10 @@ impl std::fmt::Display for WorkStateDisposition {
 /// `auto/run.json`, records it), move everything that run left, findings and
 /// corpus included, into `archived/<UTC time>-<tree name>/`, and return that
 /// directory and the other tree's path. A run then neither reports nor
-/// resumes another tree's results; nothing is deleted. Call it before the run
-/// writes anything of its own.
+/// resumes another tree's results; nothing is deleted. An OSS-Fuzz import
+/// (`ossfuzz/`, and the `build/<name>` dirs it registered) is the import's,
+/// not that run's, and stays. Call it before the run writes anything of its
+/// own.
 pub(crate) fn archive_other_tree(
     work_dir: &Path,
     source_root: &Path,
@@ -135,14 +137,33 @@ pub(crate) fn archive_other_tree(
         archive = base.join(format!("{stamp}-{tree_name}-{suffix}"));
     }
     std::fs::create_dir_all(&archive)?;
+    // An OSS-Fuzz import in the work dir is not the earlier run's: it stays,
+    // with the fuzzers it registered under build/, for this run and for
+    // `bhf fuzz --harness`.
+    let imported = crate::auto::provided::imported_registrations(work_dir);
     for entry in std::fs::read_dir(work_dir)?.flatten() {
-        if entry.file_name() == ARCHIVE_DIR {
+        let name = entry.file_name();
+        if name == ARCHIVE_DIR || name == IMPORT_DIR {
             continue;
         }
-        std::fs::rename(entry.path(), archive.join(entry.file_name()))?;
+        let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+        if name == "build" && is_dir && !imported.is_empty() {
+            for inner in std::fs::read_dir(entry.path())?.flatten() {
+                if !imported.contains(&inner.file_name()) {
+                    let to = archive.join("build");
+                    std::fs::create_dir_all(&to)?;
+                    std::fs::rename(inner.path(), to.join(inner.file_name()))?;
+                }
+            }
+            continue;
+        }
+        std::fs::rename(entry.path(), archive.join(name))?;
     }
     Ok(Some((archive, previous)))
 }
+
+/// Where `bhf project import-ossfuzz` keeps an import in the work dir.
+const IMPORT_DIR: &str = "ossfuzz";
 
 /// The source tree the run that last used `work_dir` was over, if it says.
 fn previous_source_root(work_dir: &Path) -> Option<String> {
@@ -225,6 +246,15 @@ fn refresh_regenerable_state(work_dir: &Path) -> std::io::Result<()> {
             refresh_harness_dirs_preserving_records(&path)?;
             continue;
         }
+        // The fuzzers a `bhf project import-ossfuzz` registered under build/
+        // are the import's, not a run's, and `bhf fuzz --harness` runs them.
+        if *relative == "build" {
+            let imported = crate::auto::provided::imported_registrations(work_dir);
+            if !imported.is_empty() {
+                refresh_build_dir_keeping(&path, &imported)?;
+                continue;
+            }
+        }
         match std::fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
                 std::fs::remove_dir_all(path)?;
@@ -240,6 +270,25 @@ fn refresh_regenerable_state(work_dir: &Path) -> std::io::Result<()> {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Clear `build/` but for the directories named `kept`.
+fn refresh_build_dir_keeping(build: &Path, kept: &[std::ffi::OsString]) -> std::io::Result<()> {
+    let Ok(entries) = std::fs::read_dir(build) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            if !kept.contains(&entry.file_name()) {
+                std::fs::remove_dir_all(path)?;
+            }
+        } else {
+            std::fs::remove_file(path)?;
         }
     }
     Ok(())
@@ -292,6 +341,101 @@ mod tests {
         std::fs::write(work.join("results/INDEX.md"), "source `/src/a`").unwrap();
         std::fs::create_dir_all(work.join("corpus/H-ONE")).unwrap();
         std::fs::write(work.join("corpus/H-ONE/seed"), b"seed").unwrap();
+    }
+
+    /// A fresh run refreshes `build/`, but keeps the fuzzers an OSS-Fuzz
+    /// import registered there.
+    #[test]
+    fn a_fresh_run_keeps_the_fuzzers_an_ossfuzz_import_registered() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path();
+        let registered = work.join("build/parse_record_fuzzer");
+        std::fs::create_dir_all(&registered).unwrap();
+        std::fs::write(registered.join("main"), b"fuzzer").unwrap();
+        std::fs::create_dir_all(work.join("build/H-ONE")).unwrap();
+        std::fs::write(work.join("build/H-ONE/main"), b"stale").unwrap();
+        std::fs::create_dir_all(work.join("ossfuzz")).unwrap();
+        let record = serde_json::json!({
+            "schema": crate::ossfuzz_import::IMPORT_SCHEMA,
+            "source": "/src/a",
+            "fuzzers": [{
+                "name": "parse_record_fuzzer",
+                "binary": work.join("ossfuzz/out/parse_record_fuzzer"),
+                "harness": registered.join("main"),
+                "engine": "builtin",
+            }],
+        });
+        std::fs::write(work.join("ossfuzz/import.json"), record.to_string()).unwrap();
+        assert_eq!(
+            prepare(work, false, Path::new("/src/a")).unwrap(),
+            WorkStateDisposition::IncompatibleMigration
+        );
+        assert_eq!(std::fs::read(registered.join("main")).unwrap(), b"fuzzer");
+        assert!(!work.join("build/H-ONE").exists());
+        assert!(work.join("ossfuzz/import.json").is_file());
+    }
+
+    /// An OSS-Fuzz import is not an earlier run's: a run over another tree,
+    /// a subtree of the import's here, archives that run but leaves the
+    /// import and the fuzzers it registered where they are, so the run still
+    /// fuzzes them.
+    #[test]
+    fn a_run_over_another_tree_keeps_the_ossfuzz_import() {
+        let temp = tempfile::tempdir().unwrap();
+        let tree = temp.path().join("proj");
+        std::fs::create_dir_all(tree.join("src")).unwrap();
+        std::fs::create_dir_all(tree.join("fuzz")).unwrap();
+        std::fs::write(
+            tree.join("fuzz/parse_record_fuzzer.c"),
+            "int LLVMFuzzerTestOneInput(const unsigned char *d, unsigned long n) { return 0; }\n",
+        )
+        .unwrap();
+        let tree = crate::workdir::plain_canonical(&tree);
+        let work = temp.path().join("work");
+        let registered = work.join("build/parse_record_fuzzer");
+        std::fs::create_dir_all(&registered).unwrap();
+        std::fs::write(registered.join("main"), b"fuzzer").unwrap();
+        std::fs::create_dir_all(work.join("ossfuzz/out")).unwrap();
+        std::fs::write(work.join("ossfuzz/out/parse_record_fuzzer"), b"fuzzer").unwrap();
+        let record = serde_json::json!({
+            "schema": crate::ossfuzz_import::IMPORT_SCHEMA,
+            "source": tree,
+            "fuzzers": [{
+                "name": "parse_record_fuzzer",
+                "binary": work.join("ossfuzz/out/parse_record_fuzzer"),
+                "harness": registered.join("main"),
+                "engine": "builtin",
+            }],
+        });
+        std::fs::write(work.join("ossfuzz/import.json"), record.to_string()).unwrap();
+
+        // A run over the import's tree, then one over its src/.
+        run_left_in(&work, &tree.to_string_lossy());
+        std::fs::create_dir_all(work.join("build/H-ONE")).unwrap();
+        let (archive, previous) = archive_other_tree(&work, &tree.join("src"))
+            .unwrap()
+            .expect("the run over the whole tree is archived");
+        assert_eq!(previous, tree.to_string_lossy());
+        assert!(archive.join("findings/F-0000-a").is_dir());
+        assert!(archive.join("build/H-ONE").is_dir());
+        assert!(!archive.join("ossfuzz").exists());
+        assert!(!archive.join("build/parse_record_fuzzer").exists());
+        assert!(work.join("ossfuzz/import.json").is_file());
+        assert!(work.join("ossfuzz/out/parse_record_fuzzer").is_file());
+        prepare(&work, false, &tree.join("src")).unwrap();
+        assert_eq!(std::fs::read(registered.join("main")).unwrap(), b"fuzzer");
+        let (imported, notes) = crate::auto::provided::discover_imported(
+            &work,
+            &tree.join("src"),
+            &crate::auto::discovery::DirFilter::default(),
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+        let names: Vec<&str> = imported.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["parse_record_fuzzer"]);
+        assert_eq!(
+            imported[0].source_path,
+            tree.join("fuzz/parse_record_fuzzer.c")
+        );
     }
 
     /// A work dir reused for a different tree: the earlier run, findings and

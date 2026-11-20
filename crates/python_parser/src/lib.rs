@@ -746,6 +746,196 @@ fn node_line(node: tree_sitter::Node<'_>) -> u32 {
         .saturating_add(1)
 }
 
+/// An Atheris fuzz harness's entry point: the function a file registers with
+/// `atheris.Setup(argv, test_one_input)`, `TestOneInput` by convention.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AtherisEntry {
+    /// The registered function's name.
+    pub callback: String,
+    /// 1-based line of its module-level `def`.
+    pub line: u32,
+}
+
+/// The names a module gives `atheris` (`import atheris`, `import atheris as
+/// fz`) and its `Setup` (`from atheris import Setup [as S]`).
+fn atheris_names(root: tree_sitter::Node<'_>, bytes: &[u8]) -> (Vec<String>, Vec<String>) {
+    let mut modules = Vec::new();
+    let mut setups = Vec::new();
+    let mut cursor = root.walk();
+    let mut stack: Vec<tree_sitter::Node<'_>> = root.children(&mut cursor).collect();
+    let mut depth = 0usize;
+    while let Some(node) = stack.pop() {
+        depth += 1;
+        if depth > 100_000 {
+            break;
+        }
+        match node.kind() {
+            "import_statement" => {
+                let mut inner = node.walk();
+                for name in node.children_by_field_name("name", &mut inner) {
+                    match name.kind() {
+                        "dotted_name" if node_text(name, bytes) == "atheris" => {
+                            modules.push("atheris".to_owned());
+                        }
+                        "aliased_import" => {
+                            let target = name.child_by_field_name("name");
+                            let alias = name.child_by_field_name("alias");
+                            if let (Some(target), Some(alias)) = (target, alias) {
+                                if node_text(target, bytes) == "atheris" {
+                                    modules.push(node_text(alias, bytes).to_owned());
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "import_from_statement" => {
+                let from_atheris = node
+                    .child_by_field_name("module_name")
+                    .is_some_and(|module| node_text(module, bytes) == "atheris");
+                if from_atheris {
+                    let mut inner = node.walk();
+                    for name in node.children_by_field_name("name", &mut inner) {
+                        match name.kind() {
+                            "dotted_name" if node_text(name, bytes) == "Setup" => {
+                                setups.push("Setup".to_owned());
+                            }
+                            "aliased_import" => {
+                                let target = name.child_by_field_name("name");
+                                let alias = name.child_by_field_name("alias");
+                                if let (Some(target), Some(alias)) = (target, alias) {
+                                    if node_text(target, bytes) == "Setup" {
+                                        setups.push(node_text(alias, bytes).to_owned());
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            // Imports in a `try:` or under `if __name__ == "__main__":`.
+            "function_definition" | "class_definition" => {}
+            _ => {
+                let mut inner = node.walk();
+                stack.extend(node.children(&mut inner));
+            }
+        }
+    }
+    (modules, setups)
+}
+
+/// The function names a module registers with `atheris.Setup`: the second
+/// positional argument, or the `test_one_input=` keyword, when it is a plain
+/// name.
+fn atheris_setup_callbacks(
+    root: tree_sitter::Node<'_>,
+    bytes: &[u8],
+    modules: &[String],
+    setups: &[String],
+) -> Vec<String> {
+    let mut callbacks = Vec::new();
+    let mut stack = vec![(root, 0usize)];
+    while let Some((node, depth)) = stack.pop() {
+        if depth > MAX_DEPTH {
+            continue;
+        }
+        if node.kind() == "call" {
+            let is_setup = node
+                .child_by_field_name("function")
+                .is_some_and(|function| match function.kind() {
+                    "attribute" => {
+                        let object = function.child_by_field_name("object");
+                        let attribute = function.child_by_field_name("attribute");
+                        object.is_some_and(|object| {
+                            object.kind() == "identifier"
+                                && modules.iter().any(|m| m == node_text(object, bytes))
+                        }) && attribute.is_some_and(|attr| node_text(attr, bytes) == "Setup")
+                    }
+                    "identifier" => setups.iter().any(|s| s == node_text(function, bytes)),
+                    _ => false,
+                });
+            if is_setup {
+                if let Some(arguments) = node.child_by_field_name("arguments") {
+                    let mut positional = 0usize;
+                    let mut inner = arguments.walk();
+                    for argument in arguments.named_children(&mut inner) {
+                        let callback = match argument.kind() {
+                            "keyword_argument" => argument
+                                .child_by_field_name("name")
+                                .filter(|name| node_text(*name, bytes) == "test_one_input")
+                                .and_then(|_| argument.child_by_field_name("value")),
+                            "comment" => None,
+                            _ => {
+                                positional += 1;
+                                (positional == 2).then_some(argument)
+                            }
+                        };
+                        if let Some(callback) = callback.filter(|c| c.kind() == "identifier") {
+                            let name = node_text(callback, bytes).to_owned();
+                            if !callbacks.contains(&name) {
+                                callbacks.push(name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push((child, depth + 1));
+        }
+    }
+    callbacks
+}
+
+/// The Atheris fuzz harnesses a Python module defines: each module-level
+/// function it registers with `atheris.Setup` (however it imports `atheris`
+/// or `Setup`), in source order. Empty when the module does not import
+/// atheris.
+pub fn find_atheris_entry_points(source: &str) -> Result<Vec<AtherisEntry>, PyParseError> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .map_err(|_| PyParseError::Grammar)?;
+    let tree = parser.parse(source, None).ok_or(PyParseError::Parse)?;
+    let root = tree.root_node();
+    let bytes = source.as_bytes();
+    let (modules, setups) = atheris_names(root, bytes);
+    if modules.is_empty() && setups.is_empty() {
+        return Ok(Vec::new());
+    }
+    let callbacks = atheris_setup_callbacks(root, bytes, &modules, &setups);
+    let mut entries = Vec::new();
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        let def = match child.kind() {
+            "function_definition" => Some(child),
+            "decorated_definition" => child
+                .child_by_field_name("definition")
+                .filter(|def| def.kind() == "function_definition"),
+            _ => None,
+        };
+        let Some(def) = def else {
+            continue;
+        };
+        let Some(name) = def.child_by_field_name("name") else {
+            continue;
+        };
+        let name = node_text(name, bytes);
+        if callbacks.iter().any(|callback| callback == name)
+            && !entries.iter().any(|e: &AtherisEntry| e.callback == name)
+        {
+            entries.push(AtherisEntry {
+                callback: name.to_owned(),
+                line: def.start_position().row as u32 + 1,
+            });
+        }
+    }
+    Ok(entries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -915,5 +1105,72 @@ def free_fn(a, b):
         assert_eq!(fns[0].name, "configure");
         assert_eq!(fns[0].params.len(), 3);
         assert!(fns[0].params[1].has_default);
+    }
+
+    const ATHERIS_HARNESS: &str = "import sys\n\
+        import atheris\n\
+        \n\
+        with atheris.instrument_imports():\n\
+        \x20   import recordlib\n\
+        \n\
+        \n\
+        @atheris.instrument_func\n\
+        def TestOneInput(data):\n\
+        \x20   recordlib.parse_record(data)\n\
+        \n\
+        \n\
+        def helper(data):\n\
+        \x20   return data\n\
+        \n\
+        \n\
+        def main():\n\
+        \x20   atheris.Setup(sys.argv, TestOneInput)\n\
+        \x20   atheris.Fuzz()\n\
+        \n\
+        \n\
+        if __name__ == \"__main__\":\n\
+        \x20   main()\n";
+
+    #[test]
+    fn finds_the_function_an_atheris_harness_registers() {
+        let entries = find_atheris_entry_points(ATHERIS_HARNESS).unwrap();
+        assert_eq!(
+            entries,
+            [AtherisEntry {
+                callback: "TestOneInput".to_owned(),
+                line: 9
+            }]
+        );
+    }
+
+    #[test]
+    fn atheris_setup_is_recognized_however_it_is_imported() {
+        let aliased = "import atheris as fz\n\ndef fuzz_one(data):\n    pass\n\n\
+                       fz.Setup(sys.argv, test_one_input=fuzz_one)\nfz.Fuzz()\n";
+        assert_eq!(
+            find_atheris_entry_points(aliased).unwrap(),
+            [AtherisEntry {
+                callback: "fuzz_one".to_owned(),
+                line: 3
+            }]
+        );
+        let from_import = "from atheris import Setup, Fuzz\n\ndef copy_at(data):\n    pass\n\n\
+                           Setup(sys.argv, copy_at)\nFuzz()\n";
+        assert_eq!(
+            find_atheris_entry_points(from_import).unwrap()[0].callback,
+            "copy_at"
+        );
+    }
+
+    #[test]
+    fn a_module_without_atheris_registers_nothing() {
+        // A `Setup` of something else, and a registered name the module does
+        // not define, are not harnesses.
+        let other = "import widget\n\ndef TestOneInput(data):\n    pass\n\n\
+                     widget.Setup(sys.argv, TestOneInput)\n";
+        assert!(find_atheris_entry_points(other).unwrap().is_empty());
+        let undefined = "import atheris\nfrom elsewhere import TestOneInput\n\
+                         atheris.Setup(sys.argv, TestOneInput)\n";
+        assert!(find_atheris_entry_points(undefined).unwrap().is_empty());
     }
 }

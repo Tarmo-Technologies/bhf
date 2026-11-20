@@ -64,6 +64,11 @@ pub fn build_go_harness(
         };
     };
 
+    // A native fuzz test is the project's own harness: build it, not one of ours.
+    if crate::auto::provided::is_go_fuzz_test(candidate) {
+        return build_go_fuzz_test(&go, candidate, work_dir, harness_id);
+    }
+
     let (func, siblings, data_types) = match resolve_target(candidate) {
         Ok(pair) => pair,
         Err(reason) => return GoBuildResult::Failed { reason, skip: true },
@@ -1491,122 +1496,7 @@ import (
 	tgt "{import_path}"
 )
 
-// --- bhf real edge coverage (Go -cover atomic counters -> shared edge map) ---
-// The builtin engine reads BHF_COV_SHM as a cumulative 64KB AFL edge bitmap.
-// Per input we clear Go's coverage counters, run the target, then fold the SET of
-// executed blocks (counter != 0 — the count VALUE is ignored, so a loop's trip
-// count is never false novelty) into the map. Parsing Go's internal covcounters
-// format is version-guarded: any mismatch folds nothing (black-box fallback), so a
-// future format change degrades gracefully rather than emitting a wrong signal.
-const bhfCovBits = 1 << 16
-
-var bhfCovMap []byte
-var bhfCovBuf bytes.Buffer
-
-func bhfCovInit() {{
-	path := os.Getenv("BHF_COV_SHM")
-	if path == "" {{
-		return
-	}}
-	bhfCovMap = bhfMapShared(path, bhfCovBits)
-	_ = coverage.ClearCounters()
-}}
-
-func bhfCovClear() {{
-	if bhfCovMap != nil {{
-		_ = coverage.ClearCounters()
-	}}
-}}
-
-func bhfCovRecord() {{
-	if bhfCovMap == nil {{
-		return
-	}}
-	bhfCovBuf.Reset()
-	if coverage.WriteCounters(&bhfCovBuf) != nil {{
-		_ = coverage.ClearCounters()
-		return
-	}}
-	b := bhfCovBuf.Bytes()
-	_ = coverage.ClearCounters()
-	if len(b) < 32 || b[1] != 'c' || b[2] != 'w' || b[3] != 'm' {{
-		return
-	}}
-	flavor := b[24]
-	p := 32 // magic[4] version[4] metaHash[16] flavor[1] bigEndian[1] pad[6]
-	le := func(n int) uint64 {{
-		var v uint64
-		for i := 0; i < n; i++ {{
-			v |= uint64(b[p+i]) << (8 * uint(i))
-		}}
-		p += n
-		return v
-	}}
-	uleb := func() (uint64, bool) {{
-		var v uint64
-		var s uint
-		for {{
-			if p >= len(b) {{
-				return 0, false
-			}}
-			c := b[p]
-			p++
-			v |= uint64(c&0x7f) << s
-			if c&0x80 == 0 {{
-				break
-			}}
-			s += 7
-		}}
-		return v, true
-	}}
-	rd := func() (uint64, bool) {{
-		if flavor == 1 {{ // CtrRaw: fixed uint32
-			if p+4 > len(b) {{
-				return 0, false
-			}}
-			return le(4), true
-		}}
-		return uleb() // CtrULeb128
-	}}
-	if p+16 > len(b) {{
-		return
-	}}
-	fcn := le(8)
-	strtab := le(4)
-	args := le(4)
-	p += int(strtab) + int(args)
-	if p > len(b) {{
-		return
-	}}
-	for f := uint64(0); f < fcn; f++ {{
-		nc, ok := rd()
-		if !ok {{
-			return
-		}}
-		pkg, ok2 := rd()
-		if !ok2 {{
-			return
-		}}
-		fnc, ok3 := rd()
-		if !ok3 {{
-			return
-		}}
-		for c := uint64(0); c < nc; c++ {{
-			v, ok4 := rd()
-			if !ok4 {{
-				return
-			}}
-			if v != 0 {{
-				idx := ((uint32(pkg) * 2654435761) ^ (uint32(fnc) * 40503) ^ uint32(c)) & (bhfCovBits - 1)
-				if bhfCovMap[idx] != 0xff {{
-					bhfCovMap[idx]++
-				}}
-			}}
-		}}
-	}}
-}}
-
-type cur struct {{
+{coverage}type cur struct {{
 	d []byte
 	p int
 }}
@@ -1665,22 +1555,7 @@ var _ = json.Unmarshal
 // can be qualified with); every platform has Getpid.
 var _ = syscall.Getpid
 
-var bhfTargetEntered bool
-
-func bhfMarkTargetEntry() {{
-	if bhfTargetEntered {{
-		return
-	}}
-	path := os.Getenv("BHF_TARGET_ENTRY_SHM")
-	if path == "" {{
-		return
-	}}
-	if os.WriteFile(path, []byte{{1}}, 0o600) == nil {{
-		bhfTargetEntered = true
-	}}
-}}
-
-func runOne(data []byte) {{
+{entry}func runOne(data []byte) {{
 	defer func() {{
 		if r := recover(); r != nil {{
 			os.Stderr.WriteString("== bhf go finding: " + fmt.Sprint(r) + "\n")
@@ -1740,8 +1615,1708 @@ func main() {{
 "#,
         import_path = import_path,
         body = body,
+        coverage = GO_COVERAGE_RUNTIME,
+        entry = GO_TARGET_ENTRY_RUNTIME,
     )
 }
+
+/// The harness runtime's edge coverage: per input, the set of Go `-cover`
+/// blocks the input executed, folded into the engine's `BHF_COV_SHM` map.
+/// Shared by every Go harness `main` bhf generates.
+const GO_COVERAGE_RUNTIME: &str = r#"// --- bhf real edge coverage (Go -cover atomic counters -> shared edge map) ---
+// The builtin engine reads BHF_COV_SHM as a cumulative 64KB AFL edge bitmap.
+// Per input we clear Go's coverage counters, run the target, then fold the SET of
+// executed blocks (counter != 0 — the count VALUE is ignored, so a loop's trip
+// count is never false novelty) into the map. Parsing Go's internal covcounters
+// format is version-guarded: any mismatch folds nothing (black-box fallback), so a
+// future format change degrades gracefully rather than emitting a wrong signal.
+const bhfCovBits = 1 << 16
+
+var bhfCovMap []byte
+var bhfCovBuf bytes.Buffer
+
+func bhfCovInit() {
+	path := os.Getenv("BHF_COV_SHM")
+	if path == "" {
+		return
+	}
+	bhfCovMap = bhfMapShared(path, bhfCovBits)
+	_ = coverage.ClearCounters()
+}
+
+func bhfCovClear() {
+	if bhfCovMap != nil {
+		_ = coverage.ClearCounters()
+	}
+}
+
+func bhfCovRecord() {
+	if bhfCovMap == nil {
+		return
+	}
+	bhfCovBuf.Reset()
+	if coverage.WriteCounters(&bhfCovBuf) != nil {
+		_ = coverage.ClearCounters()
+		return
+	}
+	b := bhfCovBuf.Bytes()
+	_ = coverage.ClearCounters()
+	if len(b) < 32 || b[1] != 'c' || b[2] != 'w' || b[3] != 'm' {
+		return
+	}
+	flavor := b[24]
+	p := 32 // magic[4] version[4] metaHash[16] flavor[1] bigEndian[1] pad[6]
+	le := func(n int) uint64 {
+		var v uint64
+		for i := 0; i < n; i++ {
+			v |= uint64(b[p+i]) << (8 * uint(i))
+		}
+		p += n
+		return v
+	}
+	uleb := func() (uint64, bool) {
+		var v uint64
+		var s uint
+		for {
+			if p >= len(b) {
+				return 0, false
+			}
+			c := b[p]
+			p++
+			v |= uint64(c&0x7f) << s
+			if c&0x80 == 0 {
+				break
+			}
+			s += 7
+		}
+		return v, true
+	}
+	rd := func() (uint64, bool) {
+		if flavor == 1 { // CtrRaw: fixed uint32
+			if p+4 > len(b) {
+				return 0, false
+			}
+			return le(4), true
+		}
+		return uleb() // CtrULeb128
+	}
+	if p+16 > len(b) {
+		return
+	}
+	fcn := le(8)
+	strtab := le(4)
+	args := le(4)
+	p += int(strtab) + int(args)
+	if p > len(b) {
+		return
+	}
+	for f := uint64(0); f < fcn; f++ {
+		nc, ok := rd()
+		if !ok {
+			return
+		}
+		pkg, ok2 := rd()
+		if !ok2 {
+			return
+		}
+		fnc, ok3 := rd()
+		if !ok3 {
+			return
+		}
+		for c := uint64(0); c < nc; c++ {
+			v, ok4 := rd()
+			if !ok4 {
+				return
+			}
+			if v != 0 {
+				idx := ((uint32(pkg) * 2654435761) ^ (uint32(fnc) * 40503) ^ uint32(c)) & (bhfCovBits - 1)
+				if bhfCovMap[idx] != 0xff {
+					bhfCovMap[idx]++
+				}
+			}
+		}
+	}
+}
+
+"#;
+
+/// The harness runtime's target-entry proof: one byte in `BHF_TARGET_ENTRY_SHM`
+/// once an input reached the target.
+const GO_TARGET_ENTRY_RUNTIME: &str = r#"var bhfTargetEntered bool
+
+func bhfMarkTargetEntry() {
+	if bhfTargetEntered {
+		return
+	}
+	path := os.Getenv("BHF_TARGET_ENTRY_SHM")
+	if path == "" {
+		return
+	}
+	if os.WriteFile(path, []byte{1}, 0o600) == nil {
+		bhfTargetEntered = true
+	}
+}
+
+"#;
+
+/// Where in a fuzz test's harness dir the closure of the target module is
+/// copied ([`stage_module_closure`]).
+pub(crate) const FUZZ_MODULE_DIR: &str = "bhf_module";
+
+/// The harness package the stand-in for `testing` is written to.
+const FUZZ_SHIM_DIR: &str = "bhftesting";
+
+/// The harness package an external (`package x_test`) fuzz test is copied to.
+const FUZZ_EXTERNAL_PACKAGE: &str = "bhffuzz";
+
+/// Most bytes, and files, one copy of a target module's closure may hold.
+const MAX_MODULE_COPY_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_MODULE_COPY_FILES: usize = 50_000;
+
+/// Most source-literal tokens a fuzz test's package adds to its dictionary.
+const MAX_FUZZ_PACKAGE_TOKENS: usize = 256;
+
+/// Build a Go native fuzz test (`func FuzzXxx(f *testing.F)` in a `_test.go`
+/// file) as a harness the builtin engine drives.
+///
+/// `go test -fuzz` runs a fuzz test with its own engine, which bhf's cannot
+/// drive, and a `_test.go` file is not part of any package `go build` builds.
+/// So, as OSS-Fuzz builds native Go fuzzers: the test file is copied into its
+/// package as an ordinary source file, with its `testing` import pointed at a
+/// stand-in ([`GO_TESTING_SHIM`]) whose `F.Fuzz` hands bhf's inputs to the
+/// fuzz target, and a generated `main` runs the fuzz test. The package and
+/// what it imports from its module are COPIED into the harness dir
+/// ([`stage_module_closure`]), each file with a `//line` directive naming the
+/// original, because `go build -cover` reads the files it instruments from
+/// disk and ignores a `-overlay`, and the scanned tree is never edited.
+///
+/// An input is decoded into the fuzz target's arguments in the layout bhf's
+/// generated Go harnesses use; the fuzz test's `f.Add` seeds and its
+/// `testdata/fuzz/<Name>` corpus are written in that layout to
+/// [`crate::auto::provided::SEEDS_DIR`] by running the built harness once with
+/// `BHF_GO_FUZZ_SEEDS` set. A recovered panic, or a failure the fuzz target
+/// reports with `t.Error`/`t.Fatal`, is a finding, as it is to `go test`.
+fn build_go_fuzz_test(
+    go: &Path,
+    candidate: &Candidate,
+    work_dir: &Path,
+    harness_id: &str,
+) -> GoBuildResult {
+    match build_go_fuzz_test_inner(go, candidate, work_dir, harness_id) {
+        Ok(()) => GoBuildResult::Built { forced: None },
+        Err((reason, skip)) => GoBuildResult::Failed { reason, skip },
+    }
+}
+
+/// A test file of the fuzz test's package, as read.
+struct GoTestFile {
+    path: PathBuf,
+    text: String,
+}
+
+fn build_go_fuzz_test_inner(
+    go: &Path,
+    candidate: &Candidate,
+    work_dir: &Path,
+    harness_id: &str,
+) -> Result<(), (String, bool)> {
+    let source = crate::source_text::read_source_text(&candidate.source_path).map_err(|e| {
+        (
+            format!("read {}: {e}", candidate.source_path.display()),
+            false,
+        )
+    })?;
+    let tests = go_parser::parse_go_fuzz_tests(&source)
+        .map_err(|_| ("failed to parse the Go fuzz test's file".to_owned(), true))?;
+    let test = tests
+        .iter()
+        .find(|t| t.name == candidate.name && t.line == candidate.line)
+        .or_else(|| tests.iter().find(|t| t.name == candidate.name))
+        .cloned()
+        .ok_or_else(|| {
+            (
+                format!("fuzz test `{}` no longer present in source", candidate.name),
+                true,
+            )
+        })?;
+    let target_abs = crate::workdir::plain_canonical(&candidate.source_path);
+    let pkg_dir = target_abs
+        .parent()
+        .ok_or_else(|| ("Go fuzz test has no package directory".to_owned(), false))?
+        .to_path_buf();
+    let (internal_package, external) = match test.package.strip_suffix("_test") {
+        Some(package) => (package.to_owned(), true),
+        None => (test.package.clone(), false),
+    };
+    if external && internal_package == "main" {
+        return Err((
+            "an external test of a `main` package cannot import it".to_owned(),
+            true,
+        ));
+    }
+
+    let auto_dir = crate::auto::layout::harness_dir(work_dir, harness_id);
+    std::fs::create_dir_all(&auto_dir)
+        .map_err(|e| (format!("create {}: {e}", auto_dir.display()), false))?;
+    crate::auto::provided::clear(&auto_dir)
+        .map_err(|e| (format!("clear {}: {e}", auto_dir.display()), false))?;
+
+    // The fuzz test's file, then the package's other test files, which a
+    // second build adds when the first could not resolve a helper they
+    // define. An external test's package also sees the package's internal
+    // test files, which `go test` compiles into the package under test (an
+    // `export_test.go` exporting what the external test calls): a third
+    // build adds those to the package's copy.
+    let fuzz_file = GoTestFile {
+        path: target_abs.clone(),
+        text: source,
+    };
+    let siblings = sibling_test_files(&pkg_dir, &target_abs, &test.package);
+    let internal_tests = if external {
+        sibling_test_files(&pkg_dir, &target_abs, &internal_package)
+    } else {
+        Vec::new()
+    };
+    let mut last = None;
+    for (with_siblings, with_internal) in [(false, false), (true, false), (true, true)] {
+        let adds = if with_internal {
+            !internal_tests.is_empty()
+        } else {
+            !with_siblings || !siblings.is_empty()
+        };
+        if !adds {
+            continue;
+        }
+        let mut files = vec![&fuzz_file];
+        if with_siblings {
+            files.extend(siblings.iter());
+        }
+        let internal: Vec<&GoTestFile> = if with_internal {
+            internal_tests.iter().collect()
+        } else {
+            Vec::new()
+        };
+        match stage_and_build_fuzz_test(
+            go,
+            &test,
+            &files,
+            &internal,
+            &pkg_dir,
+            &internal_package,
+            external,
+            &auto_dir,
+            work_dir,
+        ) {
+            Ok(()) => {
+                last = None;
+                break;
+            }
+            Err(error) => {
+                let retry = error.0.contains("undefined:");
+                last = Some(error);
+                if !retry {
+                    break;
+                }
+            }
+        }
+    }
+    if let Some(error) = last {
+        return Err(error);
+    }
+    probe_fuzz_test(&auto_dir, candidate, &test, &pkg_dir)
+}
+
+/// The other `_test.go` files of `pkg_dir` in `package`.
+fn sibling_test_files(pkg_dir: &Path, fuzz_file: &Path, package: &str) -> Vec<GoTestFile> {
+    let Ok(entries) = std::fs::read_dir(pkg_dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<GoTestFile> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path != fuzz_file
+                && path.is_file()
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().ends_with("_test.go"))
+        })
+        .filter_map(|path| {
+            let text = crate::source_text::read_source_text(&path).ok()?;
+            (parse_go_package(&text).ok()? == package).then_some(GoTestFile { path, text })
+        })
+        .collect();
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files
+}
+
+/// The harness file name a test file is copied to: `parse_test.go` becomes
+/// `bhf_fuzztest_parse.go`, an ordinary source file.
+fn fuzz_test_copy_name(path: &Path) -> String {
+    let stem = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix("_test.go"))
+        .unwrap_or("fuzz");
+    format!("bhf_fuzztest_{stem}.go")
+}
+
+/// Stage the fuzz test's `files` (the fuzz test's first) and, for an
+/// external test, the package's `internal` test files, and build them.
+#[allow(clippy::too_many_arguments)]
+fn stage_and_build_fuzz_test(
+    go: &Path,
+    test: &go_parser::GoFuzzTest,
+    files: &[&GoTestFile],
+    internal: &[&GoTestFile],
+    pkg_dir: &Path,
+    internal_package: &str,
+    external: bool,
+    auto_dir: &Path,
+    work_dir: &Path,
+) -> Result<(), (String, bool)> {
+    let io = |what: &str, error: std::io::Error| (format!("{what}: {error}"), false);
+    for stale in [
+        FUZZ_MODULE_DIR,
+        FUZZ_SHIM_DIR,
+        FUZZ_EXTERNAL_PACKAGE,
+        LOOSE_PACKAGE_DIR,
+    ] {
+        let _ = std::fs::remove_dir_all(auto_dir.join(stale));
+    }
+    let rename_main = internal_package == "main";
+    // The copy of the target's module, its module path, the target package's
+    // import path and its directory in the copy.
+    let (copy_root, module_path, import_path, copy_pkg_dir, gated_go_mod) =
+        match find_go_module(&files[0].path) {
+            Some((mod_root, module_path)) => {
+                let copy_root = auto_dir.join(FUZZ_MODULE_DIR);
+                let harness = harness_module_path(&module_path);
+                let shim = format!("{harness}/{FUZZ_SHIM_DIR}");
+                let imports: Vec<String> = files
+                    .iter()
+                    .chain(internal)
+                    .flat_map(|file| go_parser::parse_go_imports(&file.text).unwrap_or_default())
+                    .filter(|path| path != "testing" && *path != shim)
+                    .collect();
+                stage_module_closure(
+                    &mod_root,
+                    &module_path,
+                    pkg_dir,
+                    &imports,
+                    rename_main,
+                    &copy_root,
+                    work_dir,
+                )
+                .map_err(|reason| (reason, true))?;
+                let import_path = compute_import_path(&module_path, &mod_root, &files[0].path);
+                let relative = pkg_dir.strip_prefix(&mod_root).unwrap_or(Path::new(""));
+                let copy_pkg_dir = copy_root.join(relative);
+                let gated = copy_root.join("go.mod");
+                (
+                    copy_root,
+                    module_path,
+                    import_path,
+                    copy_pkg_dir,
+                    Some(gated),
+                )
+            }
+            None => {
+                let (copy_root, module_path) =
+                    loose_package_module(&files[0].path, auto_dir, internal_package)
+                        .map_err(|reason| (reason, false))?;
+                (
+                    copy_root.clone(),
+                    module_path.clone(),
+                    module_path,
+                    copy_root,
+                    None,
+                )
+            }
+        };
+    let harness = harness_module_path(&module_path);
+    let shim = format!("{harness}/{FUZZ_SHIM_DIR}");
+
+    // The test files, as ordinary sources: an internal test's in its package
+    // (in the copy), an external test's in a harness package of its own.
+    let external_dir = auto_dir.join(FUZZ_EXTERNAL_PACKAGE);
+    for file in files {
+        let text = go_parser::rewrite_testing_import(&file.text, &shim)
+            .unwrap_or_else(|| file.text.clone());
+        let name = fuzz_test_copy_name(&file.path);
+        if external {
+            std::fs::create_dir_all(&external_dir)
+                .map_err(|e| io("create the external test's package", e))?;
+            let copied = external_test_source(&file.path, &text, &test.package);
+            std::fs::write(external_dir.join(&name), copied)
+                .map_err(|e| io("write the fuzz test", e))?;
+        } else {
+            std::fs::create_dir_all(&copy_pkg_dir)
+                .map_err(|e| io("create the fuzz test's package", e))?;
+            std::fs::write(
+                copy_pkg_dir.join(&name),
+                loose_go_source(&file.path, &text, rename_main),
+            )
+            .map_err(|e| io("write the fuzz test", e))?;
+        }
+    }
+    for file in internal {
+        let text = go_parser::rewrite_testing_import(&file.text, &shim)
+            .unwrap_or_else(|| file.text.clone());
+        std::fs::create_dir_all(&copy_pkg_dir)
+            .map_err(|e| io("create the fuzz test's package", e))?;
+        std::fs::write(
+            copy_pkg_dir.join(fuzz_test_copy_name(&file.path)),
+            loose_go_source(&file.path, &text, false),
+        )
+        .map_err(|e| io("write the package's test file", e))?;
+    }
+    let shim_dir = auto_dir.join(FUZZ_SHIM_DIR);
+    std::fs::create_dir_all(&shim_dir).map_err(|e| io("create the testing stand-in", e))?;
+    std::fs::write(shim_dir.join("testing.go"), GO_TESTING_SHIM)
+        .map_err(|e| io("write the testing stand-in", e))?;
+
+    let entry_import = if external {
+        format!("{harness}/{FUZZ_EXTERNAL_PACKAGE}")
+    } else {
+        import_path.clone()
+    };
+    let corpus = pkg_dir.join("testdata").join("fuzz").join(&test.name);
+    let main_go = generate_fuzz_test_main_go(&entry_import, &shim, &test.name, pkg_dir, &corpus);
+    for (name, text) in std::iter::once(("bhf_harness.go", main_go.as_str())).chain(GO_OS_FILES) {
+        std::fs::write(auto_dir.join(name), text).map_err(|e| io("write the harness", e))?;
+    }
+    let tokens = fuzz_package_tokens(pkg_dir);
+    append_json_seed_dictionary(auto_dir, &tokens)
+        .map_err(|e| io("write the fuzz test's dictionary", e))?;
+    let relative_copy = format!(
+        "./{}",
+        copy_root
+            .strip_prefix(auto_dir)
+            .unwrap_or(&copy_root)
+            .to_string_lossy()
+            .replace('\\', "/")
+    );
+    let go_mod = format!(
+        "module {harness}\n\ngo 1.21\n\nrequire {module_path} {version}\n\nreplace {module_path} => {root}\n",
+        version = placeholder_module_version(&module_path),
+        root = serde_json::to_string(&relative_copy).expect("serializing a path string cannot fail"),
+    );
+    std::fs::write(auto_dir.join("go.mod"), go_mod).map_err(|e| io("write go.mod", e))?;
+
+    let bin = auto_dir.join(crate::auto::layout::harness_exe_name("main"));
+    let _ = std::fs::remove_file(&bin);
+    let mut tidy = Command::new(go);
+    tidy.args(["mod", "tidy"])
+        .current_dir(auto_dir)
+        .env("GOFLAGS", "-mod=mod")
+        .env("GOTOOLCHAIN", "local");
+    let _ =
+        crate::command_output::output_with_timeout(&mut tidy, std::time::Duration::from_secs(300));
+    let patterns = coverage_package_patterns(&module_path, &import_path);
+    let mut build = go_build_with_coverage(go, auto_dir, &bin, &patterns);
+    let version_gated = build.as_ref().is_ok_and(|out| {
+        !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("requires go >=")
+    });
+    if let (true, Some(go_mod), Some(local)) = (version_gated, gated_go_mod, local_go_minor(go)) {
+        // The copy is bhf's own, so its `go` directive is lowered in place.
+        if let Ok(text) = std::fs::read_to_string(&go_mod) {
+            if std::fs::write(&go_mod, lower_go_mod_directive(&text, &local)).is_ok() {
+                build = go_build_with_coverage(go, auto_dir, &bin, &patterns);
+            }
+        }
+    }
+    match build {
+        Ok(out) if out.status.success() && bin.is_file() => Ok(()),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let skip = stderr.contains("cannot find module")
+                || stderr.contains("missing go.sum")
+                || stderr.contains("dial tcp")
+                || stderr.contains("no required module")
+                || stderr.contains("toolchain not available")
+                || stderr.contains("requires go >=");
+            let first = stderr
+                .lines()
+                .find(|line| line.contains(".go:") || line.contains("undefined"))
+                .or_else(|| stderr.lines().last())
+                .unwrap_or("");
+            Err((format!("go build of fuzz test failed: {first}"), skip))
+        }
+        Err(e) => Err((format!("could not run go build: {e}"), false)),
+    }
+}
+
+/// `go build` the harness in `auto_dir` with coverage of the first of
+/// `patterns` that builds, else without coverage.
+fn go_build_with_coverage(
+    go: &Path,
+    auto_dir: &Path,
+    bin: &Path,
+    patterns: &[String],
+) -> std::io::Result<std::process::Output> {
+    let run = |cover: Option<&str>| {
+        let mut cmd = Command::new(go);
+        cmd.args(["build", "-o"]).arg(bin);
+        if let Some(pattern) = cover {
+            cmd.args(["-cover", "-covermode=atomic"])
+                .arg(format!("-coverpkg={pattern}"));
+        }
+        cmd.arg(".")
+            .current_dir(auto_dir)
+            .env("GOFLAGS", "-mod=mod")
+            .env("GOTOOLCHAIN", "local");
+        crate::command_output::output_with_timeout(
+            &mut cmd,
+            std::time::Duration::from_secs(30 * 60),
+        )
+    };
+    let built = |build: &std::io::Result<std::process::Output>| {
+        build
+            .as_ref()
+            .is_ok_and(|out| out.status.success() && bin.is_file())
+    };
+    for pattern in patterns {
+        let build = run(Some(pattern));
+        if built(&build) {
+            return build;
+        }
+    }
+    run(None)
+}
+
+/// Copy the package at `pkg_dir` of the module at `mod_root`, and every package
+/// of the module it imports (directly, through `imports`, or through another
+/// copied package), into `dest`, with the module's `go.mod` and `go.sum`.
+///
+/// Each `.go` file (but a test file) is copied with a `//line` directive naming
+/// the original, so panics and coverage name the project's files; every other
+/// regular file of a copied package (assembly, cgo sources, embedded files) is
+/// copied as it is, and so is each subdirectory a `//go:embed` names. Hidden
+/// and `testdata` directories, nested modules, the work dir and symlinks are
+/// not copied. The copy is refused past [`MAX_MODULE_COPY_BYTES`] or
+/// [`MAX_MODULE_COPY_FILES`].
+fn stage_module_closure(
+    mod_root: &Path,
+    module_path: &str,
+    pkg_dir: &Path,
+    imports: &[String],
+    rename_main: bool,
+    dest: &Path,
+    work_dir: &Path,
+) -> Result<(), String> {
+    let mut budget = CopyBudget::default();
+    std::fs::create_dir_all(dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
+    for name in ["go.mod", "go.sum"] {
+        let from = mod_root.join(name);
+        if from.is_file() {
+            budget.copy(&from, &dest.join(name))?;
+        }
+    }
+    let package_dir = |import: &str| -> Option<PathBuf> {
+        let rest = if import == module_path {
+            ""
+        } else {
+            import.strip_prefix(module_path)?.strip_prefix('/')?
+        };
+        let dir = mod_root.join(rest);
+        dir.is_dir().then_some(dir)
+    };
+    let work_dir = crate::workdir::plain_canonical(work_dir);
+    let mut queue: std::collections::VecDeque<PathBuf> =
+        std::iter::once(pkg_dir.to_path_buf()).collect();
+    queue.extend(imports.iter().filter_map(|import| package_dir(import)));
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(dir) = queue.pop_front() {
+        if !seen.insert(dir.clone()) || crate::workdir::plain_canonical(&dir).starts_with(&work_dir)
+        {
+            continue;
+        }
+        let relative = dir.strip_prefix(mod_root).unwrap_or(Path::new(""));
+        let copy = dest.join(relative);
+        std::fs::create_dir_all(&copy).map_err(|e| format!("create {}: {e}", copy.display()))?;
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut embedded = std::collections::BTreeSet::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if !kind.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with("_test.go") {
+                continue;
+            }
+            if !name.ends_with(".go") {
+                budget.copy(&path, &copy.join(&name))?;
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                budget.copy(&path, &copy.join(&name))?;
+                continue;
+            };
+            for import in go_parser::parse_go_imports(&text).unwrap_or_default() {
+                if let Some(imported) = package_dir(&import) {
+                    queue.push_back(imported);
+                }
+            }
+            embedded.extend(embed_dirs(&text));
+            let renamed = rename_main && dir == pkg_dir;
+            budget.charge(text.len() as u64)?;
+            std::fs::write(copy.join(&name), loose_go_source(&path, &text, renamed))
+                .map_err(|e| format!("copy {}: {e}", path.display()))?;
+        }
+        for sub in embedded {
+            let from = dir.join(&sub);
+            if from.is_dir() {
+                budget.copy_tree(&from, &copy.join(&sub))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The first path element of each pattern a `//go:embed` line names: a
+/// directory to copy with the package.
+fn embed_dirs(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| line.trim().strip_prefix("//go:embed "))
+        .flat_map(|patterns| patterns.split_whitespace())
+        .map(|pattern| {
+            pattern
+                .trim_matches(['"', '`'])
+                .trim_start_matches("all:")
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .to_owned()
+        })
+        .filter(|first| {
+            !first.is_empty()
+                && !first.starts_with('.')
+                && *first != "testdata"
+                && !first.contains(['*', '?', '['])
+        })
+        .collect()
+}
+
+/// What a module copy has taken so far.
+#[derive(Default)]
+struct CopyBudget {
+    bytes: u64,
+    files: usize,
+}
+
+impl CopyBudget {
+    fn charge(&mut self, bytes: u64) -> Result<(), String> {
+        self.bytes += bytes;
+        self.files += 1;
+        if self.bytes > MAX_MODULE_COPY_BYTES || self.files > MAX_MODULE_COPY_FILES {
+            return Err(format!(
+                "the fuzz test's packages hold more than {} MiB or {MAX_MODULE_COPY_FILES} \
+                 files; too many to stage a copy of",
+                MAX_MODULE_COPY_BYTES / (1024 * 1024)
+            ));
+        }
+        Ok(())
+    }
+
+    fn copy(&mut self, from: &Path, to: &Path) -> Result<(), String> {
+        let len = std::fs::symlink_metadata(from)
+            .map_err(|e| format!("read {}: {e}", from.display()))?
+            .len();
+        self.charge(len)?;
+        std::fs::copy(from, to)
+            .map(|_| ())
+            .map_err(|e| format!("copy {}: {e}", from.display()))
+    }
+
+    /// Copy the regular files under `from`, but hidden directories, nested
+    /// modules and symlinks.
+    fn copy_tree(&mut self, from: &Path, to: &Path) -> Result<(), String> {
+        if from.join("go.mod").exists() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(to).map_err(|e| format!("create {}: {e}", to.display()))?;
+        let entries =
+            std::fs::read_dir(from).map_err(|e| format!("read {}: {e}", from.display()))?;
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with('.') {
+                continue;
+            }
+            if kind.is_dir() {
+                self.copy_tree(&entry.path(), &to.join(&name))?;
+            } else if kind.is_file() {
+                self.copy(&entry.path(), &to.join(&name))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A copied external test file (`package x_test`): a `//line` directive
+/// naming `original`, then the source, its package clause renamed to
+/// [`FUZZ_EXTERNAL_PACKAGE`]. Every line keeps its number.
+fn external_test_source(original: &Path, text: &str, package: &str) -> String {
+    let mut out = format!("//line {}:1\n", original.display());
+    let mut renamed = false;
+    let mut in_block_comment = false;
+    for line in text.split_inclusive('\n') {
+        if !renamed && !in_block_comment {
+            let clause = line
+                .strip_prefix("package")
+                .map(|rest| rest.trim_start_matches([' ', '\t']))
+                .and_then(|name| name.strip_prefix(package))
+                .filter(|after| !after.starts_with(|c: char| c.is_alphanumeric() || c == '_'));
+            if let Some(after) = clause {
+                out.push_str(&format!("package {FUZZ_EXTERNAL_PACKAGE}{after}"));
+                renamed = true;
+                continue;
+            }
+        }
+        if let Some((_, after)) = line.rsplit_once("/*") {
+            in_block_comment = !after.contains("*/");
+        } else if in_block_comment && line.contains("*/") {
+            in_block_comment = false;
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+/// Source-literal tokens of the fuzz test's package (its ordinary files), for
+/// its dictionary: the magic values its code compares input against.
+fn fuzz_package_tokens(pkg_dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(pkg_dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension().is_some_and(|ext| ext == "go")
+                && !path.to_string_lossy().ends_with("_test.go")
+        })
+        .collect();
+    files.sort();
+    let mut tokens = Vec::new();
+    for file in files {
+        let Ok(text) = crate::source_text::read_source_text(&file) else {
+            continue;
+        };
+        for token in go_parser::extract_go_dictionary_tokens(&text).unwrap_or_default() {
+            if tokens.len() >= MAX_FUZZ_PACKAGE_TOKENS {
+                return tokens;
+            }
+            if !tokens.contains(&token) {
+                tokens.push(token);
+            }
+        }
+    }
+    tokens
+}
+
+/// Run the built fuzz test once with `BHF_GO_FUZZ_SEEDS`: it sets the test up
+/// (which must reach `f.Fuzz`) and writes its starting inputs, then record it
+/// as a provided harness.
+fn probe_fuzz_test(
+    auto_dir: &Path,
+    candidate: &Candidate,
+    test: &go_parser::GoFuzzTest,
+    pkg_dir: &Path,
+) -> Result<(), (String, bool)> {
+    let bin = auto_dir.join(crate::auto::layout::harness_exe_name("main"));
+    let seeds = auto_dir.join(crate::auto::provided::SEEDS_DIR);
+    let summary = auto_dir.join(format!("{}.txt", crate::auto::provided::SEEDS_DIR));
+    let _ = std::fs::remove_file(&summary);
+    let mut probe = Command::new(&bin);
+    probe
+        .env("BHF_GO_FUZZ_SEEDS", &seeds)
+        .env_remove("BHF_FRAMED")
+        .current_dir(auto_dir)
+        .stdin(std::process::Stdio::null());
+    let out =
+        crate::command_output::output_with_timeout(&mut probe, std::time::Duration::from_secs(60))
+            .map_err(|e| (format!("could not run the fuzz test harness: {e}"), false))?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        if let Some(why) = stderr
+            .lines()
+            .find_map(|line| line.strip_prefix("== bhf go fuzz test setup: "))
+        {
+            return Err((format!("fuzz test could not be set up: {why}"), true));
+        }
+        return Err((
+            format!(
+                "the fuzz test harness failed to start ({}): {}",
+                out.status,
+                stderr.lines().last().unwrap_or("")
+            ),
+            false,
+        ));
+    }
+    let counts = std::fs::read_to_string(&summary).unwrap_or_default();
+    let _ = std::fs::remove_file(&summary);
+    let mut numbers = counts
+        .split_whitespace()
+        .map(|n| n.parse::<usize>().unwrap_or(0));
+    let written = numbers.next().unwrap_or(0);
+    let skipped = numbers.next().unwrap_or(0);
+    let corpus = pkg_dir.join("testdata").join("fuzz").join(&test.name);
+    let mut notes = Vec::new();
+    if skipped > 0 {
+        notes.push(format!(
+            "{skipped} seed(s) could not be used: not in the `go test fuzz v1` encoding, or not \
+             of the fuzz target's argument types"
+        ));
+    }
+    let record = crate::auto::provided::ProvidedRecord {
+        seeds: written,
+        seed_sources: corpus.is_dir().then_some(corpus).into_iter().collect(),
+        notes,
+        ..crate::auto::provided::ProvidedRecord::new(
+            crate::auto::provided::Origin::GoFuzzTest,
+            &test.name,
+            &candidate.source_path,
+        )
+    };
+    crate::auto::provided::write_record(auto_dir, &record)
+        .map_err(|e| (format!("record the provided harness: {e}"), false))
+}
+
+/// The harness `main` of a native fuzz test: it runs the fuzz test `name`
+/// (from `entry_import`) through the stand-in `testing` package at
+/// `shim_import`, whose `f.Fuzz` hands it the framed input loop.
+fn generate_fuzz_test_main_go(
+    entry_import: &str,
+    shim_import: &str,
+    name: &str,
+    package_dir: &Path,
+    corpus: &Path,
+) -> String {
+    let quote = |path: &Path| {
+        serde_json::to_string(&path.to_string_lossy()).expect("serializing a string cannot fail")
+    };
+    format!(
+        r#"// SPDX-License-Identifier: Apache-2.0
+// Generated by bhf (native Go lane): runs the project's native fuzz test {name}
+// on bhf's engine. A recovered panic, or a failure the fuzz target reports
+// through its *testing.T, is a finding. Do not edit. BHF_FRAMED
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"runtime/coverage"
+	"runtime/debug"
+
+	testing "{shim_import}"
+	tgt "{entry_import}"
+)
+
+{coverage}{entry}func runOne(run func([]byte), data []byte) {{
+	defer func() {{
+		if r := recover(); r != nil {{
+			os.Stderr.WriteString("== bhf go finding: " + fmt.Sprint(r) + "\n")
+			os.Stderr.Write(debug.Stack()) // stack frames so findings cluster by site
+			_ = os.Stderr.Sync()
+			os.Exit(86)
+		}}
+	}}()
+	bhfMarkTargetEntry()
+	run(data)
+}}
+
+func readU32(f *os.File) (int, bool) {{
+	hdr := make([]byte, 4)
+	if _, err := io.ReadFull(f, hdr); err != nil {{
+		return 0, false
+	}}
+	return int(hdr[0]) | int(hdr[1])<<8 | int(hdr[2])<<16 | int(hdr[3])<<24, true
+}}
+
+func main() {{
+	// The fuzz test runs in its package's directory, as under go test, so a
+	// replayed input named relative to where bhf started the harness is
+	// resolved first.
+	if len(os.Args) > 1 {{
+		if abs, err := filepath.Abs(os.Args[1]); err == nil {{
+			os.Args[1] = abs
+		}}
+	}}
+	// Keep the control pipe (stdout) and point stdout at the null device, so
+	// the fuzz test's prints can't corrupt the sync stream.
+	control := bhfControlPipe()
+	loop := func(run func([]byte)) {{
+		in := os.Stdin
+		if os.Getenv("BHF_FRAMED") != "" {{
+			bhfCovInit()
+			_, _ = control.Write([]byte{{1}}) // ready
+			for {{
+				n, ok := readU32(in)
+				if !ok {{
+					break
+				}}
+				buf := make([]byte, n)
+				if _, err := io.ReadFull(in, buf); err != nil && n > 0 {{
+					break
+				}}
+				bhfCovClear()
+				runOne(run, buf)
+				bhfCovRecord()
+				_, _ = control.Write([]byte{{1}}) // sync
+			}}
+			return
+		}}
+		// Per-spawn replay: argv[1] file else stdin.
+		var data []byte
+		if len(os.Args) > 1 {{
+			if b, err := os.ReadFile(os.Args[1]); err == nil {{
+				data = b
+			}}
+		}} else {{
+			data, _ = io.ReadAll(in)
+		}}
+		runOne(run, data)
+	}}
+	testing.BhfMain("{name}", tgt.{name}, {dir}, {corpus}, os.Getenv("BHF_GO_FUZZ_SEEDS"), loop)
+}}
+"#,
+        coverage = GO_COVERAGE_RUNTIME,
+        entry = GO_TARGET_ENTRY_RUNTIME,
+        dir = quote(package_dir),
+        corpus = quote(corpus),
+    )
+}
+
+/// The stand-in for the standard `testing` package a native fuzz test is
+/// built against (package `testing` at `<harness>/bhftesting`). Its `F`
+/// collects the `f.Add` seeds and runs bhf's inputs through the `f.Fuzz`
+/// target; `T`, `B`, `M` and the package functions are there so the rest of a
+/// test file compiles.
+const GO_TESTING_SHIM: &str = r#"// SPDX-License-Identifier: Apache-2.0
+// Generated by bhf (native Go lane): the stand-in for the standard `testing`
+// package a project's native fuzz test is built against, so bhf's engine
+// drives the test's f.Fuzz target. Do not edit.
+
+package testing
+
+import (
+	"context"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"math"
+	"os"
+	"path/filepath"
+	"reflect"
+	"runtime/debug"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+// TB is the interface common to T, B and F.
+type TB interface {
+	Cleanup(func())
+	Error(args ...any)
+	Errorf(format string, args ...any)
+	Fail()
+	FailNow()
+	Failed() bool
+	Fatal(args ...any)
+	Fatalf(format string, args ...any)
+	Helper()
+	Log(args ...any)
+	Logf(format string, args ...any)
+	Name() string
+	Setenv(key, value string)
+	Skip(args ...any)
+	SkipNow()
+	Skipf(format string, args ...any)
+	Skipped() bool
+	TempDir() string
+}
+
+type stopNow struct{}
+
+type common struct {
+	mu       sync.Mutex
+	name     string
+	failed   bool
+	skipped  bool
+	stopping bool
+	messages []string
+	stack    []byte
+	cleanups []func()
+	parent   *common
+}
+
+// stop ends the running test function, as runtime.Goexit ends a test's
+// goroutine under go test: runGuarded recovers this panic, and only it.
+func (c *common) stop() {
+	c.mu.Lock()
+	c.stopping = true
+	c.mu.Unlock()
+	panic(stopNow{})
+}
+
+func (c *common) record(msg string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.messages) < 16 {
+		c.messages = append(c.messages, msg)
+	}
+}
+
+func (c *common) markFailed() {
+	c.mu.Lock()
+	c.failed = true
+	if c.stack == nil {
+		c.stack = callerStack()
+	}
+	c.mu.Unlock()
+	if c.parent != nil {
+		c.parent.inherit(c)
+	}
+}
+
+func (c *common) inherit(child *common) {
+	c.mu.Lock()
+	c.failed = true
+	if c.stack == nil {
+		c.stack = child.stack
+	}
+	c.messages = append(c.messages, child.messages...)
+	c.mu.Unlock()
+}
+
+func (c *common) Cleanup(f func()) {
+	c.mu.Lock()
+	c.cleanups = append(c.cleanups, f)
+	c.mu.Unlock()
+}
+
+func (c *common) runCleanups() {
+	for {
+		c.mu.Lock()
+		n := len(c.cleanups)
+		if n == 0 {
+			c.mu.Unlock()
+			return
+		}
+		f := c.cleanups[n-1]
+		c.cleanups = c.cleanups[:n-1]
+		c.mu.Unlock()
+		f()
+	}
+}
+
+func (c *common) Error(args ...any) { c.record(fmt.Sprintln(args...)); c.markFailed() }
+func (c *common) Errorf(format string, args ...any) {
+	c.record(fmt.Sprintf(format, args...))
+	c.markFailed()
+}
+func (c *common) Fail()                             { c.markFailed() }
+func (c *common) FailNow()                          { c.markFailed(); c.stop() }
+func (c *common) Failed() bool                      { c.mu.Lock(); defer c.mu.Unlock(); return c.failed }
+func (c *common) Fatal(args ...any)                 { c.Error(args...); c.stop() }
+func (c *common) Fatalf(format string, args ...any) { c.Errorf(format, args...); c.stop() }
+func (c *common) Helper()                           {}
+func (c *common) Log(args ...any)                   {}
+func (c *common) Logf(format string, args ...any)   {}
+func (c *common) Name() string                      { return c.name }
+func (c *common) Skip(args ...any)                  { c.SkipNow() }
+func (c *common) Skipf(format string, args ...any)  { c.SkipNow() }
+func (c *common) SkipNow() {
+	c.mu.Lock()
+	c.skipped = true
+	c.mu.Unlock()
+	c.stop()
+}
+func (c *common) Skipped() bool { c.mu.Lock(); defer c.mu.Unlock(); return c.skipped }
+func (c *common) Setenv(key, value string) {
+	prev, had := os.LookupEnv(key)
+	_ = os.Setenv(key, value)
+	c.Cleanup(func() {
+		if had {
+			_ = os.Setenv(key, prev)
+		} else {
+			_ = os.Unsetenv(key)
+		}
+	})
+}
+func (c *common) TempDir() string {
+	dir, err := os.MkdirTemp("", "bhf-go-fuzz-")
+	if err != nil {
+		c.Fatalf("TempDir: %v", err)
+	}
+	c.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+func (c *common) Chdir(dir string) {
+	prev, err := os.Getwd()
+	if err != nil || os.Chdir(dir) != nil {
+		c.Fatalf("Chdir %s failed", dir)
+	}
+	c.Cleanup(func() { _ = os.Chdir(prev) })
+}
+func (c *common) Context() context.Context { return context.Background() }
+func (c *common) Output() *os.File         { return os.Stderr }
+func (c *common) Attr(key, value string)   {}
+
+// T is the fuzz target's per-input test value.
+type T struct{ common }
+
+func (t *T) Parallel()                   {}
+func (t *T) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (t *T) Run(name string, f func(t *T)) bool {
+	sub := &T{common{name: t.name + "/" + name, parent: &t.common}}
+	runGuarded(&sub.common, func() { f(sub) })
+	return !sub.Failed()
+}
+
+// B is the benchmark value; a benchmark in a fuzz test's file only has to compile.
+type B struct {
+	common
+	N int
+}
+
+func (b *B) ResetTimer()                         {}
+func (b *B) StartTimer()                         {}
+func (b *B) StopTimer()                          {}
+func (b *B) ReportAllocs()                       {}
+func (b *B) SetBytes(n int64)                    {}
+func (b *B) SetParallelism(p int)                {}
+func (b *B) ReportMetric(n float64, unit string) {}
+func (b *B) Elapsed() time.Duration              { return 0 }
+func (b *B) Loop() bool                          { return false }
+func (b *B) Run(name string, f func(b *B)) bool  { return true }
+func (b *B) RunParallel(body func(*PB))          {}
+
+// PB iterates a parallel benchmark.
+type PB struct{}
+
+func (pb *PB) Next() bool { return false }
+
+// M is a TestMain's argument; bhf never runs a TestMain.
+type M struct{}
+
+func (m *M) Run() int { return 0 }
+
+// BenchmarkResult is what Benchmark returns.
+type BenchmarkResult struct {
+	N int
+	T time.Duration
+}
+
+func Benchmark(f func(b *B)) BenchmarkResult { return BenchmarkResult{} }
+func AllocsPerRun(runs int, f func()) float64 {
+	for i := 0; i < runs; i++ {
+		f()
+	}
+	return 0
+}
+func Short() bool       { return true }
+func Verbose() bool     { return false }
+func Testing() bool     { return true }
+func CoverMode() string { return "" }
+func Coverage() float64 { return 0 }
+func Init()             {}
+
+// F is the fuzz test's value: it collects the f.Add seeds, and its f.Fuzz
+// runs bhf's inputs through the fuzz target.
+type F struct {
+	common
+	seeds  [][]any
+	target reflect.Value
+	args   []reflect.Type
+	loop   func(run func([]byte))
+	ran    bool
+}
+
+func (f *F) Add(args ...any) {
+	f.mu.Lock()
+	f.seeds = append(f.seeds, args)
+	f.mu.Unlock()
+}
+
+// Fuzz takes the fuzz target, a func(*T, ...) whose other arguments are of
+// the types go test fuzzes ([]byte, string, bool, the integer types, float32
+// and float64), and runs bhf's inputs through it, as go test -fuzz runs its
+// own: the fuzz test's body resumes, and its deferred calls run, only after
+// the last input.
+func (f *F) Fuzz(ff any) {
+	v := reflect.ValueOf(ff)
+	ty := v.Type()
+	if ty.Kind() != reflect.Func || ty.NumIn() < 1 || ty.In(0) != reflect.TypeOf((*T)(nil)) {
+		f.Fatalf("f.Fuzz takes a func(*testing.T, ...), not %v", ty)
+	}
+	var args []reflect.Type
+	for i := 1; i < ty.NumIn(); i++ {
+		if !supported(ty.In(i)) {
+			f.Fatalf("f.Fuzz argument %d has a type go test does not fuzz: %v", i, ty.In(i))
+		}
+		args = append(args, ty.In(i))
+	}
+	f.target, f.args = v, args
+	if f.loop != nil && !f.ran {
+		f.ran = true
+		f.loop(f.runInput)
+	}
+}
+
+func supported(t reflect.Type) bool {
+	switch t.Kind() {
+	case reflect.Slice:
+		return t.Elem().Kind() == reflect.Uint8
+	case reflect.String, reflect.Bool, reflect.Float32, reflect.Float64,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return true
+	}
+	return false
+}
+
+// runGuarded runs body, absorbing the panic FailNow and SkipNow stop it
+// with, then the cleanups. Any other panic is left alone, never recovered
+// and raised again, so it reaches the harness with the target's frames on
+// top of its stack: it is a finding.
+func runGuarded(c *common, body func()) {
+	defer c.runCleanups()
+	defer func() {
+		c.mu.Lock()
+		stopping := c.stopping
+		c.mu.Unlock()
+		if stopping {
+			recover()
+		}
+	}()
+	body()
+}
+
+// shimPackage is this package's import path, whose frames callerStack drops.
+var shimPackage = reflect.TypeOf(common{}).PkgPath()
+
+// callerStack is the goroutine's stack without this package's frames (and
+// runtime/debug.Stack's), so a failure reported through *T is placed at the
+// target's code that reported it.
+func callerStack() []byte {
+	lines := strings.Split(string(debug.Stack()), "\n")
+	out := lines[:1]
+	for i := 1; i+1 < len(lines); i += 2 {
+		fn := lines[i]
+		if strings.HasPrefix(fn, shimPackage+".") || strings.HasPrefix(fn, "runtime/debug.") {
+			continue
+		}
+		out = append(out, fn, lines[i+1])
+	}
+	return []byte(strings.Join(out, "\n") + "\n")
+}
+
+// runInput decodes one input into the fuzz target's arguments and calls it.
+// A failure the target reports through its *T (t.Error, t.Fatal) is a
+// finding, as it is to go test.
+func (f *F) runInput(data []byte) {
+	t := &T{common{name: f.name}}
+	in := []reflect.Value{reflect.ValueOf(t)}
+	c := &cursor{d: data}
+	for i, ty := range f.args {
+		in = append(in, c.decode(ty, i == len(f.args)-1))
+	}
+	runGuarded(&t.common, func() { f.target.Call(in) })
+	if t.Failed() {
+		os.Stderr.WriteString("== bhf go finding: fuzz target " + f.name + " failed: " +
+			strings.TrimSpace(strings.Join(t.messages, " ")) + "\n")
+		os.Stderr.Write(t.stack)
+		_ = os.Stderr.Sync()
+		os.Exit(86)
+	}
+}
+
+// BhfMain runs the fuzz test fn in dir, the directory go test runs it in.
+// Its f.Fuzz hands loop the function that runs one input. With seedDir set it
+// runs no input: it writes the fuzz test's starting inputs there
+// ([F.writeSeeds]) and exits. A fuzz test that fails, skips or never reaches
+// f.Fuzz stops the harness with exit status 3.
+func BhfMain(name string, fn func(*F), dir, corpus, seedDir string, loop func(run func([]byte))) {
+	f := &F{common: common{name: name}}
+	if seedDir == "" {
+		f.loop = loop
+	}
+	if dir != "" {
+		_ = os.Chdir(dir)
+	}
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if _, ok := r.(stopNow); !ok {
+					setupFailed(name, fmt.Sprintf("panicked: %v", r))
+				}
+			}
+		}()
+		fn(f)
+	}()
+	switch {
+	case f.ran:
+		return
+	case f.failed:
+		setupFailed(name, "failed: "+strings.TrimSpace(strings.Join(f.messages, " ")))
+	case f.skipped:
+		setupFailed(name, "skipped itself")
+	case !f.target.IsValid():
+		setupFailed(name, "never called f.Fuzz")
+	}
+	if err := f.writeSeeds(seedDir, corpus); err != nil {
+		setupFailed(name, "could not write its seeds: "+err.Error())
+	}
+	os.Exit(0)
+}
+
+func setupFailed(name, why string) {
+	os.Stderr.WriteString("== bhf go fuzz test setup: " + name + " " + why + "\n")
+	os.Exit(3)
+}
+
+// The input layout, the same as bhf's generated Go harnesses decode: a
+// []byte or string takes the rest of the input when it is the last argument,
+// else one length byte and that many bytes; a bool or byte one byte; every
+// other integer 8 bytes and a float the 8 bytes of a float64, little-endian;
+// zero when the input runs out.
+type cursor struct {
+	d []byte
+	p int
+}
+
+func (c *cursor) u8() byte {
+	if c.p < len(c.d) {
+		v := c.d[c.p]
+		c.p++
+		return v
+	}
+	return 0
+}
+
+func (c *cursor) u64() uint64 {
+	var v uint64
+	for i := 0; i < 8 && c.p < len(c.d); i++ {
+		v |= uint64(c.d[c.p]) << (8 * uint(i))
+		c.p++
+	}
+	return v
+}
+
+func (c *cursor) bytes(last bool) []byte {
+	n := len(c.d) - c.p
+	if !last {
+		n = int(c.u8())
+		if rem := len(c.d) - c.p; n > rem {
+			n = rem
+		}
+	}
+	r := append([]byte(nil), c.d[c.p:c.p+n]...)
+	c.p += n
+	return r
+}
+
+func (c *cursor) decode(ty reflect.Type, last bool) reflect.Value {
+	v := reflect.New(ty).Elem()
+	switch ty.Kind() {
+	case reflect.Slice:
+		v.SetBytes(c.bytes(last))
+	case reflect.String:
+		v.SetString(string(c.bytes(last)))
+	case reflect.Bool:
+		v.SetBool(c.u8()&1 == 1)
+	case reflect.Uint8:
+		v.SetUint(uint64(c.u8()))
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		v.SetInt(int64(c.u64()))
+	case reflect.Uint, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		v.SetUint(c.u64())
+	case reflect.Float32, reflect.Float64:
+		v.SetFloat(math.Float64frombits(c.u64()))
+	}
+	return v
+}
+
+func encode(args []reflect.Type, values []any) ([]byte, bool) {
+	if len(values) != len(args) {
+		return nil, false
+	}
+	var out []byte
+	put := func(v uint64) {
+		for i := 0; i < 8; i++ {
+			out = append(out, byte(v>>(8*uint(i))))
+		}
+	}
+	for i, ty := range args {
+		rv := reflect.ValueOf(values[i])
+		if !rv.IsValid() || rv.Type() != ty && !rv.Type().ConvertibleTo(ty) {
+			return nil, false
+		}
+		rv = rv.Convert(ty)
+		last := i == len(args)-1
+		switch ty.Kind() {
+		case reflect.Slice, reflect.String:
+			var b []byte
+			if ty.Kind() == reflect.String {
+				b = []byte(rv.String())
+			} else {
+				b = rv.Bytes()
+			}
+			if !last {
+				if len(b) > 255 {
+					b = b[:255]
+				}
+				out = append(out, byte(len(b)))
+			}
+			out = append(out, b...)
+		case reflect.Bool:
+			if rv.Bool() {
+				out = append(out, 1)
+			} else {
+				out = append(out, 0)
+			}
+		case reflect.Uint8:
+			out = append(out, byte(rv.Uint()))
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			put(uint64(rv.Int()))
+		case reflect.Uint, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+			put(rv.Uint())
+		case reflect.Float32, reflect.Float64:
+			put(math.Float64bits(rv.Float()))
+		default:
+			return nil, false
+		}
+	}
+	return out, true
+}
+
+// writeSeeds writes the fuzz test's starting inputs to dir in the input
+// layout: each f.Add, then each file of its seed corpus (testdata/fuzz/<Name>,
+// in the `go test fuzz v1` encoding), and how many it wrote and could not
+// use to dir.txt.
+func (f *F) writeSeeds(dir, corpus string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	written, skipped := 0, 0
+	for i, seed := range f.seeds {
+		b, ok := encode(f.args, seed)
+		if !ok {
+			skipped++
+			continue
+		}
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("add-%04d", i)), b, 0o644); err != nil {
+			return err
+		}
+		written++
+	}
+	if corpus != "" {
+		entries, _ := os.ReadDir(corpus)
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			if e.Type().IsRegular() {
+				names = append(names, e.Name())
+			}
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			raw, err := os.ReadFile(filepath.Join(corpus, name))
+			if err != nil {
+				skipped++
+				continue
+			}
+			values, err := parseCorpusFile(raw)
+			var b []byte
+			ok := err == nil
+			if ok {
+				b, ok = encode(f.args, values)
+			}
+			if !ok {
+				skipped++
+				continue
+			}
+			if err := os.WriteFile(filepath.Join(dir, "corpus-"+name), b, 0o644); err != nil {
+				return err
+			}
+			written++
+		}
+	}
+	return os.WriteFile(dir+".txt", []byte(fmt.Sprintf("%d %d\n", written, skipped)), 0o644)
+}
+
+// parseCorpusFile reads a seed corpus file in the encoding go test writes:
+// a `go test fuzz v1` line, then one Go expression per value.
+func parseCorpusFile(raw []byte) ([]any, error) {
+	lines := strings.Split(string(raw), "\n")
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) != "go test fuzz v1" {
+		return nil, fmt.Errorf("not a go test fuzz v1 file")
+	}
+	var values []any
+	for _, line := range lines[1:] {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		v, err := parseCorpusValue(line)
+		if err != nil {
+			return nil, err
+		}
+		values = append(values, v)
+	}
+	return values, nil
+}
+
+func parseCorpusValue(line string) (any, error) {
+	expr, err := parser.ParseExpr(line)
+	if err != nil {
+		return nil, err
+	}
+	call, ok := expr.(*ast.CallExpr)
+	if !ok || len(call.Args) != 1 {
+		return nil, fmt.Errorf("expected a call: %s", line)
+	}
+	arg := call.Args[0]
+	if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
+		pkg, _ := sel.X.(*ast.Ident)
+		lit, ok := arg.(*ast.BasicLit)
+		if pkg == nil || pkg.Name != "math" || !ok || lit.Kind != token.INT {
+			return nil, fmt.Errorf("unsupported value: %s", line)
+		}
+		bits, err := strconv.ParseUint(lit.Value, 0, 64)
+		if err != nil {
+			return nil, err
+		}
+		switch sel.Sel.Name {
+		case "Float64frombits":
+			return math.Float64frombits(bits), nil
+		case "Float32frombits":
+			return math.Float32frombits(uint32(bits)), nil
+		}
+		return nil, fmt.Errorf("unsupported value: %s", line)
+	}
+	var typ string
+	switch fun := call.Fun.(type) {
+	case *ast.Ident:
+		typ = fun.Name
+	case *ast.ArrayType:
+		if id, ok := fun.Elt.(*ast.Ident); ok && fun.Len == nil && (id.Name == "byte" || id.Name == "uint8") {
+			typ = "[]byte"
+		}
+	}
+	if id, ok := arg.(*ast.Ident); ok && typ == "bool" && (id.Name == "true" || id.Name == "false") {
+		return id.Name == "true", nil
+	}
+	negative := false
+	if u, ok := arg.(*ast.UnaryExpr); ok && u.Op == token.SUB {
+		negative = true
+		arg = u.X
+	}
+	lit, ok := arg.(*ast.BasicLit)
+	if !ok {
+		return nil, fmt.Errorf("unsupported value: %s", line)
+	}
+	text := lit.Value
+	if negative {
+		text = "-" + text
+	}
+	switch typ {
+	case "[]byte", "string":
+		if lit.Kind != token.STRING {
+			return nil, fmt.Errorf("expected a string: %s", line)
+		}
+		s, err := strconv.Unquote(lit.Value)
+		if err != nil {
+			return nil, err
+		}
+		if typ == "string" {
+			return s, nil
+		}
+		return []byte(s), nil
+	case "byte", "uint8", "rune", "int32":
+		if lit.Kind == token.CHAR {
+			r, _, _, err := strconv.UnquoteChar(lit.Value[1:len(lit.Value)-1], '\'')
+			if err != nil {
+				return nil, err
+			}
+			if typ == "byte" || typ == "uint8" {
+				return byte(r), nil
+			}
+			return r, nil
+		}
+	}
+	switch typ {
+	case "int", "int8", "int16", "int32", "int64", "rune":
+		n, err := strconv.ParseInt(text, 0, 64)
+		if err != nil {
+			return nil, err
+		}
+		return convertInt(typ, n), nil
+	case "uint", "uint8", "byte", "uint16", "uint32", "uint64", "uintptr":
+		n, err := strconv.ParseUint(text, 0, 64)
+		if err != nil {
+			return nil, err
+		}
+		return convertUint(typ, n), nil
+	case "float32", "float64":
+		x, err := strconv.ParseFloat(text, 64)
+		if err != nil {
+			return nil, err
+		}
+		if typ == "float32" {
+			return float32(x), nil
+		}
+		return x, nil
+	}
+	return nil, fmt.Errorf("unsupported value: %s", line)
+}
+
+func convertInt(typ string, n int64) any {
+	switch typ {
+	case "int8":
+		return int8(n)
+	case "int16":
+		return int16(n)
+	case "int32", "rune":
+		return int32(n)
+	case "int64":
+		return n
+	}
+	return int(n)
+}
+
+func convertUint(typ string, n uint64) any {
+	switch typ {
+	case "uint8", "byte":
+		return uint8(n)
+	case "uint16":
+		return uint16(n)
+	case "uint32":
+		return uint32(n)
+	case "uint64":
+		return n
+	case "uintptr":
+		return uintptr(n)
+	}
+	return uint(n)
+}
+"#;
 
 #[cfg(test)]
 mod tests {
@@ -2440,5 +4015,134 @@ func ParseRequest(req *Request) {}
             .collect();
         copied.sort();
         assert_eq!(copied, ["build_new.go", "go.mod", "notes.md"]);
+    }
+
+    #[test]
+    fn a_fuzz_tests_package_is_copied_with_what_it_imports_from_its_module() {
+        let root = tempfile::tempdir().unwrap();
+        let module = root.path().join("widget");
+        let write = |relative: &str, text: &str| {
+            let path = module.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("go.mod", "module example.com/widget\n\ngo 1.21\n");
+        write("go.sum", "");
+        write(
+            "parser/parse.go",
+            "package parser\n\nimport (\n\t\"embed\"\n\t\"example.com/widget/codec\"\n)\n\n\
+             //go:embed tables\nvar tables embed.FS\n\nfunc parse(b []byte) int { return codec.Len(b) }\n",
+        );
+        write("parser/parse_test.go", "package parser\n");
+        write("parser/tables/kinds.txt", "kinds\n");
+        write("parser/testdata/fuzz/FuzzParse/seed", "go test fuzz v1\n");
+        write("parser/asm_amd64.s", "// assembly\n");
+        write(
+            "codec/codec.go",
+            "package codec\n\nfunc Len(b []byte) int { return len(b) }\n",
+        );
+        // Not imported by the fuzz test's package: not copied.
+        write("unrelated/unrelated.go", "package unrelated\n");
+        // Imported only by the fuzz test's file.
+        write("helpers/helpers.go", "package helpers\n");
+        let dest = root.path().join("copy");
+        let work = root.path().join("work");
+        stage_module_closure(
+            &module,
+            "example.com/widget",
+            &module.join("parser"),
+            &["example.com/widget/helpers".to_owned(), "os".to_owned()],
+            false,
+            &dest,
+            &work,
+        )
+        .unwrap();
+        let mut copied = Vec::new();
+        let mut stack = vec![dest.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    copied.push(
+                        path.strip_prefix(&dest)
+                            .unwrap()
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                    );
+                }
+            }
+        }
+        copied.sort();
+        assert_eq!(
+            copied,
+            [
+                "codec/codec.go",
+                "go.mod",
+                "go.sum",
+                "helpers/helpers.go",
+                "parser/asm_amd64.s",
+                "parser/parse.go",
+                "parser/tables/kinds.txt",
+            ]
+        );
+        // Each copied Go file names its original, line for line.
+        let parse = std::fs::read_to_string(dest.join("parser/parse.go")).unwrap();
+        assert!(parse.starts_with(&format!(
+            "//line {}:1\npackage parser\n",
+            module.join("parser").join("parse.go").display()
+        )));
+    }
+
+    #[test]
+    fn an_external_fuzz_tests_package_clause_is_renamed_line_for_line() {
+        let copied = external_test_source(
+            Path::new("/src/codec/codec_test.go"),
+            "// Package codec_test is the external test.\npackage codec_test\n\nimport \"testing\"\n",
+            "codec_test",
+        );
+        assert_eq!(
+            copied,
+            "//line /src/codec/codec_test.go:1\n// Package codec_test is the external test.\n\
+             package bhffuzz\n\nimport \"testing\"\n"
+        );
+        assert_eq!(
+            fuzz_test_copy_name(Path::new("/src/codec/codec_test.go")),
+            "bhf_fuzztest_codec.go"
+        );
+    }
+
+    #[test]
+    fn embed_patterns_name_the_directories_to_copy() {
+        let dirs = embed_dirs(
+            "//go:embed tables/*.txt static\n//go:embed \"all:assets\" *.json .hidden testdata/x\n",
+        );
+        assert_eq!(dirs, ["tables", "static", "assets"]);
+    }
+
+    #[test]
+    fn the_fuzz_test_main_runs_the_fuzz_test_through_the_testing_stand_in() {
+        let main = generate_fuzz_test_main_go(
+            "example.com/widget/parser",
+            "example.com/widget/bhfharness/bhftesting",
+            "FuzzParse",
+            Path::new("/src/parser"),
+            Path::new("/src/parser/testdata/fuzz/FuzzParse"),
+        );
+        assert!(main.contains("\ttesting \"example.com/widget/bhfharness/bhftesting\"\n"));
+        assert!(main.contains("\ttgt \"example.com/widget/parser\"\n"));
+        assert!(main.contains(
+            "testing.BhfMain(\"FuzzParse\", tgt.FuzzParse, \"/src/parser\", \
+             \"/src/parser/testdata/fuzz/FuzzParse\", os.Getenv(\"BHF_GO_FUZZ_SEEDS\"), loop)"
+        ));
+        // The same coverage and target-entry runtime as every Go harness.
+        assert!(main.contains(GO_COVERAGE_RUNTIME));
+        assert!(main.contains(GO_TARGET_ENTRY_RUNTIME));
+        assert!(main.contains("bhfMarkTargetEntry()\n\trun(data)"));
+        // The stand-in is the package `testing`, and names its own entry point
+        // apart from the real package's.
+        assert!(GO_TESTING_SHIM.contains("\npackage testing\n"));
+        assert!(GO_TESTING_SHIM.contains("func BhfMain("));
     }
 }

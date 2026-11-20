@@ -15,7 +15,9 @@
 //!   build never writes into the operator's checkout.
 //! - `$CC`/`$CXX` are clang, and `$CFLAGS`/`$CXXFLAGS` OSS-Fuzz's address
 //!   build with the SanitizerCoverage bhf's driver reads (`trace-pc-guard`,
-//!   `trace-cmp`) in place of libFuzzer's `fuzzer-no-link`.
+//!   `trace-cmp`) in place of libFuzzer's `fuzzer-no-link`, and a
+//!   `-fdebug-prefix-map` from `$SRC/<name>` to the source tree, so a crash
+//!   stack names the project's files, not their copy.
 //! - `$LIB_FUZZING_ENGINE` is an archive of bhf's own driver
 //!   (`c_runtime/bhf_driver.c`, the framed fork-server `main` and coverage
 //!   runtime every generated C harness links) and a `bhf_run_one` that calls
@@ -67,8 +69,9 @@ use serde_json::json;
 use crate::protocol_detect::{self, HarnessProtocol};
 use crate::runner::SandboxModeArg;
 
-/// The import record written to `<work>/ossfuzz/import.json`.
-const IMPORT_SCHEMA: &str = "bhf.ossfuzz-import.v1";
+/// The import record written to `<work>/ossfuzz/import.json`, which `bhf auto`
+/// reads for the fuzzers to fuzz ([`crate::auto::provided::discover_imported`]).
+pub(crate) const IMPORT_SCHEMA: &str = "bhf.ossfuzz-import.v1";
 
 /// The `bhf.project.v1` manifest the import writes in `<work>/ossfuzz/`.
 const MANIFEST_FILE: &str = "bhf.project.toml";
@@ -379,7 +382,7 @@ pub(crate) fn run(args: &ImportArgs) -> Result<()> {
     fs::copy(&build_script, &staged_script)
         .with_context(|| format!("copy '{}' to $SRC", build_script.display()))?;
 
-    let env = build_env(&layout, &tools, &engine);
+    let env = build_env(&layout, &tools, &engine, Some((&project_dir, &source)));
     let log = layout.root.join("build.log");
     bhfeprintln!(
         "bhf project import-ossfuzz: running {} in {} (SRC={}, WORK={}, OUT={}); log: {}",
@@ -462,13 +465,19 @@ pub(crate) fn run(args: &ImportArgs) -> Result<()> {
     if args.json {
         println!("{record_text}");
     } else {
-        print_listing(&name, &work_dir, &manifest, &registered);
+        print_listing(&name, &source, &work_dir, &manifest, &registered);
     }
     Ok(())
 }
 
 /// The registered fuzzers, what came with them, and how to run them.
-fn print_listing(name: &str, work_dir: &Path, manifest: &Path, registered: &[Registered]) {
+fn print_listing(
+    name: &str,
+    source: &Path,
+    work_dir: &Path,
+    manifest: &Path,
+    registered: &[Registered],
+) {
     println!(
         "project '{name}': build.sh produced {} fuzzer(s), registered as harnesses of {}:",
         registered.len(),
@@ -534,6 +543,12 @@ fn print_listing(name: &str, work_dir: &Path, manifest: &Path, registered: &[Reg
             work_dir.display(),
             entry.fuzzer.name,
             entry.extras.options.fuzz_flags()
+        );
+        println!("or every one of them, with the targets bhf generates for the tree:");
+        println!(
+            "  bhf auto {} --work-dir {}",
+            source.display(),
+            work_dir.display()
         );
     }
 }
@@ -1223,10 +1238,26 @@ fn sandboxed(
 }
 
 /// The environment `build.sh` runs with: OSS-Fuzz's build variables, and
-/// PATH, HOME and TMPDIR.
-fn build_env(layout: &Layout, tools: &Tools, engine: &Path) -> Vec<(String, String)> {
+/// PATH, HOME and TMPDIR. `copy` is `(the copy in $SRC, the tree it is of)`:
+/// the flags map the one to the other in debug info, so the fuzzers' crash
+/// stacks name the tree's files. A path the flags cannot carry (one with
+/// whitespace, or a `=` in the copy's) is left unmapped.
+fn build_env(
+    layout: &Layout,
+    tools: &Tools,
+    engine: &Path,
+    copy: Option<(&Path, &Path)>,
+) -> Vec<(String, String)> {
     let path = |p: &Path| p.display().to_string();
-    let flags = format!("{BASE_FLAGS} {SANITIZER_FLAGS} {COVERAGE_FLAGS}");
+    let mut flags = format!("{BASE_FLAGS} {SANITIZER_FLAGS} {COVERAGE_FLAGS}");
+    if let Some((Some(from), Some(to))) = copy.map(|(from, to)| (from.to_str(), to.to_str())) {
+        if !from.contains('=')
+            && !from.contains(char::is_whitespace)
+            && !to.contains(char::is_whitespace)
+        {
+            flags.push_str(&format!(" -fdebug-prefix-map={from}={to}"));
+        }
+    }
     let architecture = match std::env::consts::ARCH {
         "x86" => "i386",
         other => other,
@@ -1887,6 +1918,7 @@ mod tests {
             &layout,
             &tools,
             Path::new("/w/ossfuzz/engine/libFuzzingEngine.a"),
+            Some((Path::new("/w/ossfuzz/src/p"), Path::new("/home/me/p"))),
         )
         .into_iter()
         .collect();
@@ -1907,6 +1939,21 @@ mod tests {
             assert!(flags.contains("trace-pc-guard,trace-cmp"), "{flags}");
             assert!(flags.contains("-DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION"));
             assert!(!flags.contains("-fsanitize=fuzzer"), "{flags}");
+            // Debug info names the tree's files, not their copy in $SRC.
+            assert!(
+                flags.ends_with(" -fdebug-prefix-map=/w/ossfuzz/src/p=/home/me/p"),
+                "{flags}"
+            );
         }
+        // A tree whose path $CFLAGS cannot carry is not mapped.
+        let unmapped: std::collections::BTreeMap<String, String> = build_env(
+            &layout,
+            &tools,
+            Path::new("/w/ossfuzz/engine/libFuzzingEngine.a"),
+            Some((Path::new("/w/ossfuzz/src/p"), Path::new("/home/me/my p"))),
+        )
+        .into_iter()
+        .collect();
+        assert!(!unmapped["CFLAGS"].contains("prefix-map"), "{unmapped:?}");
     }
 }
