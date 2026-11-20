@@ -27,12 +27,19 @@
 //! integrity gate. [`frame_seed_corpus`] returns the `Vec<Vec<u8>>` shape the
 //! CLI seed loader consumes, so a descriptor set seeds a campaign directly.
 //!
+//! [`FrameCodec`] applies one descriptor to the single-input lane (`bhf fuzz
+//! --frame`): it decodes any byte string into the descriptor's fields, mutates
+//! a field or takes a byte mutation of the whole frame, and re-encodes, so
+//! every input the harness runs carries a right length and CRC.
+//!
 //! All sizes are bounded: a message declares a `max_len`, encoding refuses to
 //! exceed it, and every derived value is width-checked before it is written.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Range;
+
+use crate::rng::MutationRng;
 
 /// Default upper bound on a single encoded frame (bytes). Chosen to match the
 /// engine's typical `--max-len` ceiling while keeping encoding work bounded.
@@ -612,6 +619,508 @@ pub fn frame_seed_corpus(messages: &[Message]) -> Result<Vec<Vec<u8>>, BinFrameE
         .collect()
 }
 
+// --- single-input frame codec (`bhf fuzz --frame`) ---------------------------
+
+/// How a data field of a [`FrameCodec`] is sized when an input is decoded
+/// against the frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FieldShape {
+    /// Exactly as wide as the template's value: an integer or an enum lowered
+    /// to bytes. `codes` are encodings a field mutation favours (an enum's
+    /// variants, at the field's width); empty for a plain integer.
+    Fixed { codes: Vec<Vec<u8>> },
+    /// Variable-length bytes, at most `max` when given.
+    Variable { max: Option<usize> },
+}
+
+/// How many times [`FrameCodec`] halves the longest variable field of a frame
+/// whose derived values do not fit (a `u8` length over 255 bytes, a frame
+/// past its `max_len`) before it falls back to the template's frame.
+const MAX_TRIM_ROUNDS: usize = 32;
+
+/// The longest run a variable-field mutation inserts or repeats.
+const MAX_FIELD_GROWTH: usize = 64;
+
+/// A frame descriptor applied to single inputs: the fast in-process lane's
+/// equivalent of AFL++'s `afl_custom_post_process`.
+///
+/// [`FrameCodec::repair`] decodes any byte string against the template's
+/// layout — fixed-width fields by position, a variable field by the length
+/// field that gives it, the last variable field by what is left — and
+/// re-encodes it, so every length, checksum and offset is right again after
+/// a byte mutation. [`FrameCodec::mutate`] edits one decoded data field
+/// (grow, shrink or overwrite a payload, an interesting value or enum code in
+/// an integer) and re-encodes, which reaches parser code past a length/CRC
+/// gate that byte mutation alone never passes.
+#[derive(Clone, Debug)]
+pub struct FrameCodec {
+    template: Message,
+    slots: Vec<Slot>,
+    /// Bytes every frame has whatever its variable fields hold.
+    fixed_len: usize,
+    /// The variable field that takes the bytes the others leave.
+    last_variable: Option<usize>,
+    seed: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+enum Slot {
+    Fixed {
+        width: usize,
+        codes: Vec<Vec<u8>>,
+    },
+    /// A `Bytes` value or a TLV's value: `header` fixed bytes before it (a
+    /// TLV's tag and length), at most `cap` bytes long.
+    Variable {
+        header: usize,
+        cap: usize,
+        hint: Hint,
+        seed_len: usize,
+    },
+    Computed {
+        width: usize,
+    },
+}
+
+/// Where a variable field that is not the last one reads its length from.
+#[derive(Clone, Copy, Debug)]
+enum Hint {
+    /// Its own TLV length prefix.
+    TlvPrefix { width: IntWidth, endian: Endian },
+    /// An earlier length field (by index), less the fixed bytes of the other
+    /// fields it covers.
+    Length { field: usize, overhead: usize },
+    /// Nothing gives it: the template's length.
+    Seed,
+}
+
+impl FrameCodec {
+    /// A codec for frames laid out as `template`, whose field values are the
+    /// seed frame's. A `Bytes` field is variable-length unless `shapes` says
+    /// otherwise; a TLV's value is always variable-length. A `Fixed` code that
+    /// is not the field's width is an error.
+    pub fn new(
+        template: Message,
+        shapes: &BTreeMap<String, FieldShape>,
+    ) -> Result<Self, BinFrameError> {
+        let seed = template.encode()?.into_bytes();
+        let mut slots = Vec::with_capacity(template.fields.len());
+        for field in &template.fields {
+            slots.push(match field {
+                Field::Bytes { name, value } => match shapes.get(name) {
+                    Some(FieldShape::Fixed { codes }) => {
+                        if let Some(code) = codes.iter().find(|code| code.len() != value.len()) {
+                            return Err(BinFrameError::FieldWidthMismatch {
+                                field: name.clone(),
+                                expected: value.len(),
+                                actual: code.len(),
+                            });
+                        }
+                        Slot::Fixed {
+                            width: value.len(),
+                            codes: codes.clone(),
+                        }
+                    }
+                    Some(FieldShape::Variable { max }) => Slot::Variable {
+                        header: 0,
+                        cap: max.unwrap_or(usize::MAX),
+                        hint: Hint::Seed,
+                        seed_len: value.len(),
+                    },
+                    None => Slot::Variable {
+                        header: 0,
+                        cap: usize::MAX,
+                        hint: Hint::Seed,
+                        seed_len: value.len(),
+                    },
+                },
+                Field::Tlv {
+                    name,
+                    tag_width,
+                    len_width,
+                    endian,
+                    value,
+                    ..
+                } => {
+                    let max = match shapes.get(name) {
+                        Some(FieldShape::Variable { max: Some(max) }) => *max,
+                        _ => usize::MAX,
+                    };
+                    Slot::Variable {
+                        header: tag_width.size() + len_width.size(),
+                        cap: max.min(len_width.max_value() as usize),
+                        hint: Hint::TlvPrefix {
+                            width: *len_width,
+                            endian: *endian,
+                        },
+                        seed_len: value.len(),
+                    }
+                }
+                Field::Length { width, .. } | Field::Offset { width, .. } => Slot::Computed {
+                    width: width.size(),
+                },
+                Field::Checksum { kind, .. } => Slot::Computed {
+                    width: kind.output_width().size(),
+                },
+            });
+        }
+
+        let fixed_len: usize = slots
+            .iter()
+            .map(|slot| match slot {
+                Slot::Fixed { width, .. } | Slot::Computed { width } => *width,
+                Slot::Variable { header, .. } => *header,
+            })
+            .sum();
+        let index_of = |name: &str| template.fields.iter().position(|f| f.name() == name);
+        // A length field that covers one variable field and otherwise fixed
+        // fields bounds that field, and gives its length when it comes first.
+        for (at, field) in template.fields.iter().enumerate() {
+            let Field::Length { width, covers, .. } = field else {
+                continue;
+            };
+            let covered: Vec<usize> = covers.iter().filter_map(|name| index_of(name)).collect();
+            let variable: Vec<usize> = covered
+                .iter()
+                .copied()
+                .filter(|&i| matches!(slots[i], Slot::Variable { .. }))
+                .collect();
+            let [target] = variable[..] else {
+                continue;
+            };
+            let overhead: usize = covered
+                .iter()
+                .filter(|&&i| i != target)
+                .map(|&i| match &slots[i] {
+                    Slot::Fixed { width, .. } | Slot::Computed { width } => *width,
+                    Slot::Variable { .. } => 0,
+                })
+                .sum();
+            if let Slot::Variable {
+                header, cap, hint, ..
+            } = &mut slots[target]
+            {
+                let room = (width.max_value() as usize).saturating_sub(overhead + *header);
+                *cap = (*cap).min(room);
+                if at < target && matches!(hint, Hint::Seed) {
+                    *hint = Hint::Length {
+                        field: at,
+                        overhead: overhead + *header,
+                    };
+                }
+            }
+        }
+        let room = template.max_len.saturating_sub(fixed_len);
+        for slot in &mut slots {
+            if let Slot::Variable { cap, .. } = slot {
+                *cap = (*cap).min(room);
+            }
+        }
+        let last_variable = slots
+            .iter()
+            .rposition(|slot| matches!(slot, Slot::Variable { .. }));
+        Ok(Self {
+            template,
+            slots,
+            fixed_len,
+            last_variable,
+            seed,
+        })
+    }
+
+    /// The template's own frame: a well-formed seed for a campaign.
+    pub fn seed(&self) -> &[u8] {
+        &self.seed
+    }
+
+    /// `bytes` decoded against the frame and re-encoded with every derived
+    /// field recomputed. A valid frame comes back unchanged; any other byte
+    /// string becomes the frame its bytes decode to.
+    pub fn repair(&self, bytes: &[u8]) -> Vec<u8> {
+        self.encode_values(self.decode(bytes))
+    }
+
+    /// One data field of `base` (decoded as [`FrameCodec::repair`] does)
+    /// mutated, and the frame re-encoded: a payload grown, shrunk or
+    /// overwritten, or an integer set to an interesting value, an enum code,
+    /// or nudged. The frame stays within `max_len` bytes where `base` was.
+    pub fn mutate(&self, base: &[u8], max_len: usize, rng: &mut MutationRng) -> Vec<u8> {
+        let mut values = self.decode(base);
+        let data: Vec<usize> = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| !matches!(slot, Slot::Computed { .. }))
+            .map(|(index, _)| index)
+            .collect();
+        let Some(index) = rng.choose_index(data.len()).map(|pick| data[pick]) else {
+            return self.encode_values(values);
+        };
+        match &self.slots[index] {
+            Slot::Fixed { codes, .. } => mutate_fixed(&mut values[index], codes, rng),
+            Slot::Variable { cap, .. } => {
+                let others: usize = self
+                    .slots
+                    .iter()
+                    .zip(&values)
+                    .enumerate()
+                    .filter(|(i, (slot, _))| *i != index && matches!(slot, Slot::Variable { .. }))
+                    .map(|(_, (_, value))| value.len())
+                    .sum();
+                let room = (*cap).min(max_len.saturating_sub(self.fixed_len + others));
+                mutate_variable(&mut values[index], room, rng);
+            }
+            Slot::Computed { .. } => {}
+        }
+        self.encode_values(values)
+    }
+
+    /// Each field's bytes in `bytes`: a fixed field's by position (zero-padded
+    /// past the end), a variable field's at the length its hint gives (the
+    /// last one takes what the others leave), at most its cap. A computed
+    /// field's stored bytes are kept so a later field can read its length.
+    fn decode(&self, bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut budget = bytes.len().saturating_sub(self.fixed_len);
+        let mut cursor = 0usize;
+        let mut values: Vec<Vec<u8>> = Vec::with_capacity(self.slots.len());
+        for (index, slot) in self.slots.iter().enumerate() {
+            match slot {
+                Slot::Fixed { width, .. } | Slot::Computed { width } => {
+                    values.push(take_padded(bytes, cursor, *width));
+                    cursor += width;
+                }
+                Slot::Variable {
+                    header,
+                    cap,
+                    hint,
+                    seed_len,
+                } => {
+                    let header_bytes = take_padded(bytes, cursor, *header);
+                    cursor += header;
+                    let len = if Some(index) == self.last_variable {
+                        budget
+                    } else {
+                        self.hinted_len(*hint, *seed_len, &header_bytes, &values)
+                            .min(budget)
+                    };
+                    budget -= len;
+                    let start = cursor.min(bytes.len());
+                    let end = (cursor + len.min(*cap)).min(bytes.len());
+                    values.push(bytes[start..end].to_vec());
+                    cursor += len;
+                }
+            }
+        }
+        values
+    }
+
+    fn hinted_len(&self, hint: Hint, seed_len: usize, header: &[u8], values: &[Vec<u8>]) -> usize {
+        let stored = match hint {
+            Hint::Seed => return seed_len,
+            Hint::TlvPrefix { width, endian } => read_uint(
+                header,
+                header.len() - width.size()..header.len(),
+                width,
+                endian,
+            ),
+            Hint::Length { field, overhead } => match &self.template.fields[field] {
+                Field::Length { width, endian, .. } => {
+                    read_uint(&values[field], 0..width.size(), *width, *endian)
+                        .map(|stored| stored.saturating_sub(overhead as u64))
+                }
+                _ => None,
+            },
+        };
+        stored.map_or(0, |len| usize::try_from(len).unwrap_or(usize::MAX))
+    }
+
+    /// The template with `values` in its data fields, encoded; the longest
+    /// variable field is halved while a derived value does not fit.
+    fn encode_values(&self, mut values: Vec<Vec<u8>>) -> Vec<u8> {
+        for _ in 0..MAX_TRIM_ROUNDS {
+            match self.message_with(&values).encode() {
+                Ok(encoded) => return encoded.into_bytes(),
+                Err(BinFrameError::ValueTooWide { .. } | BinFrameError::MessageTooLong { .. }) => {
+                    let longest = self
+                        .slots
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, slot)| matches!(slot, Slot::Variable { .. }))
+                        .map(|(index, _)| index)
+                        .max_by_key(|&index| values[index].len());
+                    match longest {
+                        Some(index) if !values[index].is_empty() => {
+                            let half = values[index].len() / 2;
+                            values[index].truncate(half);
+                        }
+                        _ => break,
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        self.seed.clone()
+    }
+
+    fn message_with(&self, values: &[Vec<u8>]) -> Message {
+        let fields = self
+            .template
+            .fields
+            .iter()
+            .zip(values)
+            .map(|(field, value)| match field {
+                Field::Bytes { name, .. } => Field::Bytes {
+                    name: name.clone(),
+                    value: value.clone(),
+                },
+                Field::Tlv {
+                    name,
+                    tag,
+                    tag_width,
+                    len_width,
+                    endian,
+                    ..
+                } => Field::Tlv {
+                    name: name.clone(),
+                    tag: *tag,
+                    tag_width: *tag_width,
+                    len_width: *len_width,
+                    endian: *endian,
+                    value: value.clone(),
+                },
+                computed => computed.clone(),
+            })
+            .collect();
+        Message {
+            fields,
+            max_len: self.template.max_len,
+        }
+    }
+}
+
+/// `width` bytes of `bytes` from `at`, zero-padded past its end.
+fn take_padded(bytes: &[u8], at: usize, width: usize) -> Vec<u8> {
+    let mut out = vec![0u8; width];
+    if let Some(available) = bytes.get(at..) {
+        let n = available.len().min(width);
+        out[..n].copy_from_slice(&available[..n]);
+    }
+    out
+}
+
+/// Byte patterns of the boundary integers at any width: zero, all ones, the
+/// sign bit, one, and the largest positive value, in either byte order.
+fn interesting_fixed(width: usize, pick: u64) -> Vec<u8> {
+    let mut out = vec![0u8; width];
+    match pick % 7 {
+        0 => {}
+        1 => out.fill(0xFF),
+        2 => out[0] = 0x80,
+        3 => out[width - 1] = 0x01,
+        4 => out[0] = 0x01,
+        5 => {
+            out.fill(0xFF);
+            out[0] = 0x7F;
+        }
+        _ => {
+            out.fill(0xFF);
+            out[width - 1] = 0x7F;
+        }
+    }
+    out
+}
+
+fn mutate_fixed(value: &mut [u8], codes: &[Vec<u8>], rng: &mut MutationRng) {
+    let width = value.len();
+    if width == 0 {
+        return;
+    }
+    match rng.next_u64() % 4 {
+        0 if !codes.is_empty() => {
+            let pick = rng.choose_index(codes.len()).unwrap_or(0);
+            value.copy_from_slice(&codes[pick]);
+        }
+        0 | 1 => value.copy_from_slice(&interesting_fixed(width, rng.next_u64())),
+        // Add or subtract a small delta, as an integer of either byte order.
+        2 if width <= 8 => {
+            let little = rng.coin();
+            if little {
+                value.reverse();
+            }
+            let mut wide = [0u8; 8];
+            wide[8 - width..].copy_from_slice(value);
+            let delta = 1 + rng.next_u64() % 16;
+            let current = u64::from_be_bytes(wide);
+            let next = if rng.coin() {
+                current.wrapping_add(delta)
+            } else {
+                current.wrapping_sub(delta)
+            };
+            value.copy_from_slice(&next.to_be_bytes()[8 - width..]);
+            if little {
+                value.reverse();
+            }
+        }
+        _ => {
+            let at = rng.choose_index(width).unwrap_or(0);
+            value[at] = rng.next_u8();
+        }
+    }
+}
+
+/// One edit of a variable field's value, which stays at most `room` bytes.
+fn mutate_variable(value: &mut Vec<u8>, room: usize, rng: &mut MutationRng) {
+    let len = value.len();
+    let grow = room.saturating_sub(len).min(MAX_FIELD_GROWTH);
+    match rng.next_u64() % 7 {
+        // Insert a run of random bytes.
+        0 if grow > 0 => {
+            let n = 1 + rng.choose_index(grow).unwrap_or(0);
+            let at = rng.choose_index(len + 1).unwrap_or(0);
+            let run: Vec<u8> = (0..n).map(|_| rng.next_u8()).collect();
+            value.splice(at..at, run);
+        }
+        // Duplicate a chunk of the value.
+        1 if grow > 0 && len > 0 => {
+            let from = rng.choose_index(len).unwrap_or(0);
+            let n = (1 + rng.choose_index(len - from).unwrap_or(0)).min(grow);
+            let at = rng.choose_index(len + 1).unwrap_or(0);
+            let chunk = value[from..from + n].to_vec();
+            value.splice(at..at, chunk);
+        }
+        // Repeat one byte, the way a length-overflow input is built.
+        2 if grow > 0 && len > 0 => {
+            let byte = value[rng.choose_index(len).unwrap_or(0)];
+            let n = 1 + rng.choose_index(grow).unwrap_or(0);
+            let at = rng.choose_index(len + 1).unwrap_or(0);
+            value.splice(at..at, std::iter::repeat_n(byte, n));
+        }
+        // Delete a range.
+        3 if len > 0 => {
+            let at = rng.choose_index(len).unwrap_or(0);
+            let n = 1 + rng.choose_index(len - at).unwrap_or(0);
+            value.drain(at..at + n);
+        }
+        // Truncate.
+        4 if len > 0 => value.truncate(rng.choose_index(len).unwrap_or(0)),
+        // Overwrite a byte.
+        5 if len > 0 => {
+            let at = rng.choose_index(len).unwrap_or(0);
+            value[at] = rng.next_u8();
+        }
+        // Flip a bit.
+        6 if len > 0 => {
+            let at = rng.choose_index(len).unwrap_or(0);
+            value[at] ^= 1 << (rng.next_u64() % 8);
+        }
+        // Nothing above applies (an empty value with no room is left as is).
+        _ if grow > 0 => value.push(rng.next_u8()),
+        _ if len > 0 => value[0] ^= 0x01,
+        _ => {}
+    }
+    value.truncate(room);
+}
+
 /// Errors from descriptor validation or encoding. Every variant names the field
 /// at fault.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -717,7 +1226,8 @@ fn write_uint_vec(
     Ok(())
 }
 
-fn encode_uint(width: IntWidth, endian: Endian, value: u64) -> Vec<u8> {
+/// `value` laid out at `width` in `endian` order (truncated to the width).
+pub fn encode_uint(width: IntWidth, endian: Endian, value: u64) -> Vec<u8> {
     match (width, endian) {
         (IntWidth::U8, _) => vec![value as u8],
         (IntWidth::U16, Endian::Big) => (value as u16).to_be_bytes().to_vec(),
@@ -779,7 +1289,6 @@ pub fn crc16_ccitt(bytes: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rng::MutationRng;
 
     #[test]
     fn crc32_matches_standard_check_vector() {
@@ -1046,5 +1555,199 @@ mod tests {
         // descriptor and verifying the bytes.
         let gate_one = length_crc_message(b"seed-one").encode().unwrap();
         assert!(gate_one.verify_bytes(&corpus[0]));
+    }
+
+    /// The payload of a `length_crc_message` frame whose length and CRC are
+    /// right; `None` for any other byte string.
+    fn valid_payload(frame: &[u8]) -> Option<&[u8]> {
+        let crc_at = frame.len().checked_sub(4)?;
+        if crc_at < 2 {
+            return None;
+        }
+        let declared = usize::from(u16::from_be_bytes([frame[0], frame[1]]));
+        let stored = u32::from_be_bytes(frame[crc_at..].try_into().ok()?);
+        (declared == crc_at - 2 && stored == crc32(&frame[..crc_at])).then(|| &frame[2..crc_at])
+    }
+
+    fn length_crc_codec(payload: &[u8]) -> FrameCodec {
+        FrameCodec::new(length_crc_message(payload), &BTreeMap::new()).expect("codec")
+    }
+
+    #[test]
+    fn frame_codec_leaves_a_valid_frame_unchanged() {
+        let codec = length_crc_codec(b"OPEN track");
+        assert_eq!(valid_payload(codec.seed()), Some(&b"OPEN track"[..]));
+        assert_eq!(codec.repair(codec.seed()), codec.seed());
+        let other = length_crc_message(b"a different payload")
+            .encode()
+            .unwrap()
+            .into_bytes();
+        assert_eq!(codec.repair(&other), other, "any valid frame is kept");
+    }
+
+    #[test]
+    fn frame_codec_repairs_length_and_crc_after_a_byte_mutation() {
+        let codec = length_crc_codec(b"OPEN track");
+        // A byte inserted into the payload: the length and CRC are stale.
+        let mut grown = codec.seed().to_vec();
+        grown.insert(7, b'X');
+        assert_eq!(valid_payload(&grown), None);
+        let repaired = codec.repair(&grown);
+        assert_eq!(valid_payload(&repaired), Some(&b"OPEN Xtrack"[..]));
+
+        // A flipped payload byte keeps the length; only the CRC is redone.
+        let mut flipped = codec.seed().to_vec();
+        flipped[3] ^= 0x20;
+        let repaired = codec.repair(&flipped);
+        assert_eq!(valid_payload(&repaired), Some(&b"OpEN track"[..]));
+
+        // A stored length or CRC changed alone is put back.
+        let mut stale = codec.seed().to_vec();
+        stale[1] = 0x99;
+        *stale.last_mut().unwrap() ^= 0xFF;
+        assert_eq!(codec.repair(&stale), codec.seed());
+    }
+
+    #[test]
+    fn frame_codec_repairs_a_too_short_input_into_a_frame() {
+        let codec = length_crc_codec(b"OPEN track");
+        for input in [&b""[..], b"\x00", b"\x12\x34\x56"] {
+            let repaired = codec.repair(input);
+            assert_eq!(valid_payload(&repaired), Some(&b""[..]), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn frame_codec_reads_a_middle_field_from_its_length_field() {
+        // [u8 name_len][name][body][u8 sum8 over all three]: `name` is not the
+        // last variable field, so its length comes from `name_len`.
+        let template = Message::new(vec![
+            Field::length("name_len", IntWidth::U8, Endian::Big, &["name"]),
+            Field::bytes("name", b"abc".to_vec()),
+            Field::bytes("body", b"0123".to_vec()),
+            Field::checksum(
+                "sum",
+                ChecksumKind::Sum8,
+                Endian::Big,
+                &["name_len", "name", "body"],
+            ),
+        ]);
+        let codec = FrameCodec::new(template, &BTreeMap::new()).unwrap();
+        let mut input = vec![5u8];
+        input.extend_from_slice(b"hello");
+        input.extend_from_slice(b"world!!");
+        input.push(0);
+        let repaired = codec.repair(&input);
+        let mut expected = vec![5u8];
+        expected.extend_from_slice(b"helloworld!!");
+        let sum = expected.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+        expected.push(sum);
+        assert_eq!(repaired, expected);
+    }
+
+    #[test]
+    fn frame_codec_reads_a_tlv_value_from_its_own_prefix_and_keeps_its_tag() {
+        let template = Message::new(vec![
+            Field::tlv("record", 0x0102, Endian::Big, b"abc".to_vec()),
+            Field::bytes("tail", b"zz".to_vec()),
+        ]);
+        let codec = FrameCodec::new(template, &BTreeMap::new()).unwrap();
+        // A wrong tag and a TLV length of 4.
+        let input = [
+            0xAA, 0xBB, 0x00, 0x04, b'w', b'x', b'y', b'z', b'T', b'T', b'T',
+        ];
+        assert_eq!(
+            codec.repair(&input),
+            [0x01, 0x02, 0x00, 0x04, b'w', b'x', b'y', b'z', b'T', b'T', b'T']
+        );
+    }
+
+    #[test]
+    fn frame_codec_keeps_a_fixed_field_at_its_width() {
+        // [u16 kind][payload][crc16 over both].
+        let template = Message::new(vec![
+            Field::bytes("kind", vec![0x00, 0x01]),
+            Field::bytes("payload", b"data".to_vec()),
+            Field::checksum(
+                "crc",
+                ChecksumKind::Crc16Ccitt,
+                Endian::Big,
+                &["kind", "payload"],
+            ),
+        ]);
+        let shapes = BTreeMap::from([(
+            "kind".to_owned(),
+            FieldShape::Fixed {
+                codes: vec![vec![0x00, 0x01], vec![0x00, 0x02]],
+            },
+        )]);
+        let codec = FrameCodec::new(template, &shapes).unwrap();
+        let mut rng = MutationRng::new(7);
+        let mut codes_seen = std::collections::BTreeSet::new();
+        for _ in 0..400 {
+            let out = codec.mutate(codec.seed(), 4096, &mut rng);
+            let crc_at = out.len() - 2;
+            let stored = u16::from_be_bytes([out[crc_at], out[crc_at + 1]]);
+            assert_eq!(stored, crc16_ccitt(&out[..crc_at]), "{out:?}");
+            assert!(out.len() >= 4);
+            codes_seen.insert([out[0], out[1]]);
+        }
+        assert!(codes_seen.contains(&[0x00, 0x02]), "the other enum code");
+        assert!(codes_seen.len() > 3, "the field is mutated: {codes_seen:?}");
+    }
+
+    #[test]
+    fn frame_codec_rejects_a_code_of_the_wrong_width() {
+        let template = Message::new(vec![Field::bytes("kind", vec![0x00, 0x01])]);
+        let shapes = BTreeMap::from([(
+            "kind".to_owned(),
+            FieldShape::Fixed {
+                codes: vec![vec![0x02]],
+            },
+        )]);
+        let err = FrameCodec::new(template, &shapes).unwrap_err();
+        assert!(
+            matches!(err, BinFrameError::FieldWidthMismatch { ref field, expected: 2, actual: 1 } if field == "kind"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn frame_codec_field_mutations_are_all_valid_frames_and_change_the_length() {
+        let codec = length_crc_codec(b"OPEN track");
+        let mut rng = MutationRng::new(0x5EED);
+        let mut base = codec.seed().to_vec();
+        let mut lengths = std::collections::BTreeSet::new();
+        for _ in 0..1000 {
+            let out = codec.mutate(&base, 512, &mut rng);
+            let payload = valid_payload(&out).unwrap_or_else(|| panic!("invalid {out:?}"));
+            assert!(out.len() <= 512);
+            lengths.insert(payload.len());
+            base = out;
+        }
+        assert!(lengths.len() > 10, "payload lengths: {lengths:?}");
+    }
+
+    #[test]
+    fn frame_codec_keeps_a_payload_within_its_length_width() {
+        // A u8 length can describe at most 255 payload bytes.
+        let template = Message::new(vec![
+            Field::length("len", IntWidth::U8, Endian::Big, &["payload"]),
+            Field::bytes("payload", vec![b'A'; 250]),
+            Field::checksum("x", ChecksumKind::Xor8, Endian::Big, &["payload"]),
+        ]);
+        let codec = FrameCodec::new(template, &BTreeMap::new()).unwrap();
+        let mut rng = MutationRng::new(3);
+        let mut base = codec.seed().to_vec();
+        for _ in 0..500 {
+            base = codec.mutate(&base, 4096, &mut rng);
+            let payload = &base[1..base.len() - 1];
+            assert_eq!(usize::from(base[0]), payload.len());
+            assert!(payload.len() <= 255);
+        }
+        // A byte mutation past the bound is cut back to a frame that fits.
+        let long = vec![0x41u8; 600];
+        let repaired = codec.repair(&long);
+        assert_eq!(usize::from(repaired[0]), repaired.len() - 2);
     }
 }

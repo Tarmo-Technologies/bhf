@@ -38,7 +38,8 @@ An embedded campaign has two halves:
    body on the host under sanitizers ("stub-isolation lane").
 2. **Back half — execute & harvest.** The `--target-transport` seam delivers an
    input, triggers one execution on the real target (on-device agent, debug
-   probe/emulator over gdb-remote, or a full-system `qemu-system` guest), and
+   probe/emulator over gdb-remote, or a full-system `qemu-system` guest or
+   Renode board), and
    reads back coverage + status + faults. The built-in engine consumes all
    transports through one trait and stays backend-agnostic.
 
@@ -54,6 +55,7 @@ binary release.
 | A cross toolchain + `qemu-user` | **qemu-user replay** (see Cross-Compilation) | Real ISA/endianness, no RTOS/peripherals | ✅ RV-1 (`qemu-ppc64`) |
 | A gdbstub (OpenOCD/J-Link/QEMU) | **Debug-probe / gdb-remote** | Real target memory + coverage ring | ✅ RV-2 (`qemu-arm`); real board gated |
 | A cross toolchain + `qemu-system` | **Full-system emulator (bare-metal)** | Real core, MMIO, interrupts, snapshot reset | ✅ RV-3 (`qemu-system-arm`, bare-metal Cortex-M — **not** an RTOS) |
+| A cross toolchain + Renode (a board `qemu-system` does not model: most STM32, nRF52, i.MX RT parts) | **Full-system emulator (Renode)** | Real core, Renode's peripheral models, `Save`/`Load` reset | ✅ Renode 1.17, bare-metal Cortex-M3 on a minimal board (`live_renode`, `transport_fuzz_renode_cli`; they run when Renode is installed). Vendor board scripts and an RTOS under Renode are unvalidated. |
 | An open RTOS (FreeRTOS, Zephyr) | **Actual RTOS execution** | Scheduler / tasks / queues | ✅ FreeRTOS reference profile (`crates/target_transport/tests/freertos/`): cooperative Cortex-M3 image build, boot, snapshot reset, task/queue input drive, HardFault classification, and clean → fault → clean CLI test under `qemu-system-arm`. ✅ The reference agent as a Zephyr module (`c_runtime/zephyr/`): its `qemu_cortex_m3` sample runs clean → fault → clean and replays under `qemu-system-arm`. Kernels are bring-your-own (not vendored); physical boards and other RTOSes are unvalidated. |
 | A proprietary RTOS image | **Actual RTOS execution** | VxWorks/INTEGRITY/QNX scheduler | ⛔ unproven (bring the image + toolchain) |
 | An on-device agent (TCP/serial) | **On-target agent** | Real device; coverage over the agent protocol | ⛔ unproven: the host side ships; no target-side agent does yet ([#289](https://github.com/Tarmo-Technologies/bhf/issues/289)), so you write one to the frame format in §3c |
@@ -353,6 +355,41 @@ application references one; the reference profile's `app.c` keeps
 `bhf_kernel_version` for this. Without `firmware=`, the profile says that no
 identity was recorded.
 
+#### Renode boards
+
+`renode:monitor=HOST:PORT,gdb=HOST:PORT[,snapshot=PATH]` is the same lane for
+a board Renode models and `qemu-system` does not. Start
+Renode with its monitor on a TCP port and the board loaded but **not
+started** (no `start` in the script):
+
+```sh
+renode --disable-gui -P 1234 board.resc &   # board.resc: mach create,
+                                            # LoadPlatformDescription, sysbus LoadELF
+bhf fuzz bhf_work --harness H-C0001 \
+  --target-transport "renode:monitor=127.0.0.1:1234,gdb=127.0.0.1:3333,snapshot=/tmp/base.save,done=0x188,fault=0x20000100" \
+  --transport-coverage-map input=0x2000020c,input_cap=64,ring=0x20000004,write=0x20000204,wrapped=0x20000208,cap=512
+```
+
+BHF connects to the monitor, `pause`s, and writes the baseline with
+`Save @PATH`. Before each input it runs `Load @PATH`, then
+`machine StartGdbServer PORT` with the `gdb=` port, because `Load` replaces
+the machine and its gdb server goes with it. It then dials gdb, plants the
+`done=` breakpoint and runs the input as on `qemu-system:`. The other keys
+(`done_kind`, `fault_width`, `fault_clear`, `firmware`, `cycles`, `cpu_hz`,
+`task_id`) work as they do there.
+
+- `snapshot=` is a path on the Renode host; the default `bhf-baseline.save` is
+  relative to Renode's working directory. Its directory must exist: Renode
+  1.17 exits when `Save` cannot write the file. Each `Save` replaces the
+  file. The path may use only `[A-Za-z0-9._/\:-]`, since it is part of a
+  monitor command line.
+- Renode's gdb server listens on the port `gdb=` dials, so dial it directly,
+  not through a port mapping that changes the number.
+- A failed monitor command (`There was an error executing command ...`,
+  `No such command or device`) stops the run with Renode's text.
+- `Load` reloads the whole emulation, so a run costs more than a `loadvm`:
+  about 0.4 s per input on the minimal board in the tests.
+
 ### 3c. On-target agent (`agent:tcp:HOST:PORT` / `agent:serial:/dev/ttyX[,baud=N]`)
 
 For a device running an agent that receives inputs and streams edges and
@@ -561,11 +598,58 @@ is refused.
 
 Firmware that reads a peripheral through a fixed address
 (`#define UART_SR (*(volatile uint32_t *)(UART1_BASE + 0x00))`, a CMSIS
-`((UART_TypeDef *) UART1_BASE)`, or a cast of a literal) SEGVs on the host, where
-nothing is mapped there. `bhf auto` reads the pointer casts of constants in the
-crash path's sources and the headers they include, macros expanded, and a SEGV
-whose address lies on one of those registers (or the same 4 KiB page) is an
-environment result, not an out-of-bounds read: the finding records
+`((UART_TypeDef *) UART1_BASE)` whose members are `__IO`, or a volatile cast of
+a literal) would SEGV on the host, where nothing is mapped there. So the C
+direct harness (`bhf auto` and `bhf generate-harness --kind direct` for a C
+target) maps those registers. The C sequence harness (a handle-lifecycle C
+target) and the C++ harness do not: their register reads still fault, and the
+classification below applies.
+
+The generator reads the volatile register accesses of constants in the
+target's source file and the headers beside it that it includes, macros
+expanded: a `volatile` (or `__IO`, `__I`, `__O`) cast, or a cast to a struct
+whose members are. It keeps the ones the target's own code reaches, through
+the functions it calls in those files and the macros it uses, and maps each
+4 KiB page they lie on (adjacent pages merged, at most 16 windows). A plain
+pointer cast is no register: list.h's `LIST_POISON1` (`(void *) 0x00100100`)
+and other poison or sentinel values (`*_POISON*`, `0xdeadbeef` and the like)
+are never mapped, so a dereference of one still faults. A target that reaches
+no register gets no window, whatever else its file reads.
+
+On Linux the harness maps each window once, through the runtrace shim's
+`bhf_shim_mmio_fill` when the shim is loaded and with its own `mmap` otherwise,
+and before every input refills it from that input: byte `i` of a window is
+input byte `i % size`. A register read returns fuzz-chosen bytes, so a bug
+behind a register's value (a framing-error path, a status bit) is reachable,
+and a register the target writes does not carry into the next input.
+
+A register keeps one value for the whole run, so a loop that polls it would
+spin until the per-input timeout on every input that leaves its bit clear. A
+page whose register a loop condition reads (`while (!(UART_SR & 0x80)) {}`, a
+`do ... while`, the test of a `for`, an `if (...) break;`, directly or through
+a macro or a function the condition calls) is therefore left unmapped: its read
+faults, and the target keeps its throughput and the environment result below.
+A poll the scan cannot see (through a function pointer, or in another
+translation unit) still spins.
+
+The harness lists the windows it was generated with in `mmio-windows.txt`.
+After `bhf auto` builds it natively, it asks the harness which of them it
+could map on this host (`BHF_MMIO_PROBE=1`: the harness maps them, prints
+them and exits) and records those in `mmio-mapped.txt`. A window the build
+cannot map is left unmapped, and its read faults as before: the address is in
+use, or the sanitizer reserves it (ASan's shadow gap on x86-64 holds the
+Cortex-M system control space at 0xE000E000). Only the target's mapped
+windows set its findings' `hardware_peripherals` fidelity to `not_exercised`
+with a reason that starts `emulated:` and names them: the registers were
+memory, not a device. A cross build is not probed and claims none.
+`BHF_MMIO_VERBOSE=1` prints each window the harness could not map, and
+`BHF_NO_MMIO_EMULATION=1` leaves every register unmapped.
+
+When a register read still faults, because it was not mapped, `bhf auto` reads
+the pointer casts of constants in the crash path's sources and the headers they
+include, macros expanded, and a SEGV whose address lies on one of those
+registers (or the same 4 KiB page) is an environment result, not an
+out-of-bounds read: the finding records
 `environment_origin` (`kind: "mmio_register"`, the fault and register addresses
 and the macro), its verdict is `lab_only` (`verdict_reason: "mmio_register"`) at
 low severity, and its `hardware_peripherals` fidelity is `not_exercised` with
@@ -637,10 +721,12 @@ bhf fuzz bhf_work --harness H-C0001 \
 big-endian PPC64 fidelity (RV-1), the gdb-remote client against a real
 `qemu-arm` stub (RV-2), and the full-system Cortex-M snapshot path with a
 planted HardFault (RV-3), and the pinned FreeRTOS task/queue profile with
-CLI finding and replay (RV-4). It **hard-fails** if a required tool is missing so the
-lane cannot silently skip:
+CLI finding and replay (RV-4), and the Renode transport, library and CLI,
+against the Renode `BHF_RENODE` names (RV-7). It **hard-fails** if a required
+tool is missing so the lane cannot silently skip:
 
 ```sh
+eval "$(scripts/ci/install-renode.sh ~/.local/opt/renode-ci | sed 's/^/export /')"
 BHF_HIL_REQUIRE=1 scripts/hil-emu.sh
 ```
 
@@ -691,10 +777,12 @@ October 4, 2026; hosted HIL-emu workflow evidence remains pending.
   physical board (`hil_board.rs` + `BHF_HIL_GDB`), the TCP/serial `agent`
   transport (no target-side agent ships yet, [#289](https://github.com/Tarmo-Technologies/bhf/issues/289)), and proprietary
   RTOS images / vendor toolchains (BHF ships none — bring your own).
-- **Not available yet:** a Renode full-system transport ([#340](https://github.com/Tarmo-Technologies/bhf/issues/340));
-  `--target-transport` takes `agent`, `gdb` and `qemu-system` only. Renode's
-  gdbserver can be driven through `gdb:`, without snapshot reset. Nor is
-  typed mutation of a raw struct image in a big-endian
+- **Renode:** `renode:` was run against Renode 1.17 with a bare-metal
+  Cortex-M3 image on a minimal board (`crates/target_transport/tests/live_renode.rs`
+  and `crates/cli/tests/transport_fuzz_renode_cli.rs`, which skip without
+  Renode; `BHF_RENODE=/path/to/renode` points them at a portable build). Vendor
+  board scripts, peripherals and an RTOS under Renode are unvalidated.
+- **Not available yet:** typed mutation of a raw struct image in a big-endian
   target's byte order (decoded arguments are typed, little-endian as the
   decoder reads them; §5).
 - **Non-goals:** BHF does not bundle or crack vendor toolchains, ship RTOS

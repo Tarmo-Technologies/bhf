@@ -8,6 +8,7 @@ use corpus::{
     FindingTier, Signature, SignatureClass,
 };
 use event_log::{group_into_testcases, Event, EventReader, Testcase};
+use fuzz_engine_builtin::binframe::FrameCodec;
 use fuzz_engine_builtin::{
     generate_symbolic_seeds, Dictionary, Grammar, MutationInput, MutationRng, MutatorConfig,
     MutatorSuite, OperationSequenceLayout, OperationStepSpan, SymbolicSeedSource,
@@ -518,12 +519,27 @@ pub struct FuzzArgs {
     #[arg(long, value_name = "PATH")]
     pub cmplog_log: Option<PathBuf>,
 
-    /// Path to a JSON grammar describing the target's input format for structure-aware
-    /// generation (a Nautilus-style grammar mutator). Each rule maps a non-terminal to
-    /// a list of production strings where `{NAME}` references another rule; the start
-    /// symbol is `START` if present, else the first rule.
+    /// Path to a JSON grammar describing the target's input format, for structure-aware
+    /// generation plus tree mutation: the builtin engine generates inputs from the
+    /// grammar, keeps each one's derivation tree, and mutates a kept input on its tree
+    /// (a subtree derived afresh, a recursion repeated, or a subtree spliced in from
+    /// another input's tree of the same rule), so those mutants stay sentences of the
+    /// grammar. Each rule maps a non-terminal to a list of production strings where
+    /// `{NAME}` references another rule; the start symbol is `START` if present, else
+    /// the first rule.
     #[arg(long = "grammar", value_name = "PATH")]
     pub grammar_file: Option<PathBuf>,
+
+    /// A binary frame descriptor for the builtin engine: a protocol profile
+    /// (TOML, `bhf.protocol.v1`) of one message, whose fields describe each
+    /// input of a single-input harness such as `parse_frame(buf, len)`. Every
+    /// input is decoded into the message's fields, a mutation edits one field
+    /// or the frame's bytes, and every length, checksum, TLV length and offset
+    /// the message computes is recomputed before the harness runs it, so a
+    /// mutant passes the target's length/CRC gate. The message's own frame is
+    /// a seed.
+    #[arg(long = "frame", value_name = "PROFILE")]
+    pub frame_file: Option<PathBuf>,
 
     /// An AFL/libFuzzer dictionary (`name="token"` lines, `\xNN` escapes) whose
     /// tokens the mutator splices into inputs, on top of the harness's own
@@ -554,13 +570,16 @@ pub struct FuzzArgs {
     /// `gdb:HOST:PORT` (debug-probe/emulator gdbstub; needs
     /// `--transport-coverage-map`), and
     /// `qemu-system:qmp=HOST:PORT,gdb=HOST:PORT[,snapshot=TAG]` (full-system;
-    /// needs `--transport-coverage-map`). Live agent/gdb/qemu backends are
+    /// needs `--transport-coverage-map`), and
+    /// `renode:monitor=HOST:PORT,gdb=HOST:PORT[,snapshot=PATH]` (a Renode
+    /// board: its telnet monitor saves and loads the baseline; needs
+    /// `--transport-coverage-map`). Live agent/gdb/qemu/renode backends are
     /// hardware/emulator-gated; a malformed spec is a descriptive error.
     #[arg(long = "target-transport", value_name = "SPEC")]
     pub target_transport: Option<String>,
 
     /// Locate the input staging buffer and the on-target coverage ring for the
-    /// memory-read transports (`gdb`, `qemu-system`) as
+    /// memory-read transports (`gdb`, `qemu-system`, `renode`) as
     /// `input=<addr>,input_cap=<n>,ring=<addr>,write=<addr>,wrapped=<addr>,cap=<n>`,
     /// plus `input_len=<addr>` when the firmware reads the input's length from
     /// a `u32` there, and `cmplog=<addr>,cmplog_cap=<n>` for the comparison
@@ -1406,6 +1425,7 @@ struct PreparedFuzzRun {
     _local_count_map: Option<shared_map::SharedMapFile>,
     cmplog_log: Option<PathBuf>,
     grammar_file: Option<PathBuf>,
+    frame_file: Option<PathBuf>,
     dict_file: Option<PathBuf>,
     structured_inputs: StructuredInputMode,
     sanitizers: Vec<multicore_fuzz::Sanitizer>,
@@ -1592,6 +1612,16 @@ pub fn run(mut args: FuzzArgs) -> i32 {
     // drop them (a single blind mutator instead of the asked-for workers,
     // grammar or CmpLog log) is refused instead.
     if let Some(error) = lane_flag_conflict(&args) {
+        bhfeprintln!("{error}");
+        return 2;
+    }
+    if let Some(error) = frame_conflict(&args) {
+        bhfeprintln!("{error}");
+        return 2;
+    }
+    // A `--frame` profile the loop cannot apply fails here, once, before a
+    // harness or worker starts.
+    if let Err(error) = load_frame_for_run(args.frame_file.as_deref()) {
         bhfeprintln!("{error}");
         return 2;
     }
@@ -2231,6 +2261,7 @@ pub(crate) fn run_one_target_programmatic_with_runner(
         runtime_oracles: crate::runtime_oracles::RuntimeOracleMode::Off,
         cmplog_log,
         grammar_file: None,
+        frame_file: None,
         dict_file: None,
         structured_inputs: StructuredInputMode::Auto,
         bhf_bin: None,
@@ -2481,6 +2512,7 @@ fn afl_programmatic_args(
         runtime_oracles: crate::runtime_oracles::RuntimeOracleMode::Off,
         cmplog_log: None,
         grammar_file: None,
+        frame_file: None,
         dict_file: None,
         structured_inputs: StructuredInputMode::Auto,
         bhf_bin: None,
@@ -2512,6 +2544,7 @@ pub(crate) fn given_flags(args: &FuzzArgs) -> Vec<&'static str> {
     let given = [
         ("--workers", args.workers.is_some()),
         ("--grammar", args.grammar_file.is_some()),
+        ("--frame", args.frame_file.is_some()),
         ("--dict", args.dict_file.is_some()),
         ("--cmplog-log", args.cmplog_log.is_some()),
         ("--len-control", args.len_control != DEFAULT_LEN_CONTROL),
@@ -2600,6 +2633,26 @@ fn lane_flag_conflict(args: &FuzzArgs) -> Option<String> {
     })
 }
 
+/// Why `--frame` cannot apply to this run: only the builtin engine's
+/// single-input loop decodes and repairs its inputs against a frame.
+fn frame_conflict(args: &FuzzArgs) -> Option<String> {
+    args.frame_file.as_ref()?;
+    let other = if args.engine != FuzzEngine::Builtin {
+        format!("--engine {}", engine_arg_name(args.engine))
+    } else if crate::transport_fuzz::should_use_transport(args) {
+        "--target-transport".to_owned()
+    } else if crate::session_fuzz::should_use_session(args) {
+        "--protocol-profile".to_owned()
+    } else {
+        return None;
+    };
+    Some(format!(
+        "bhf fuzz --frame: only the builtin engine's single-input loop repairs its inputs \
+         against a frame, and {other} runs another one, which would ignore it; remove --frame \
+         or {other}"
+    ))
+}
+
 /// Why `--engine` cannot run with `--target-transport` or
 /// `--protocol-profile`, which drive the builtin engine's transport and
 /// session lanes.
@@ -2629,6 +2682,7 @@ const MULTICORE_FLAGS: &[&str] = &[
     "--workers",
     "--sanitizers",
     "--grammar",
+    "--frame",
     "--dict",
     "--cmplog-log",
     "--len-control",
@@ -3266,6 +3320,10 @@ fn worker_passthrough_args(args: &FuzzArgs) -> Vec<String> {
         out.push("--grammar".to_owned());
         out.push(grammar.display().to_string());
     }
+    if let Some(frame) = &args.frame_file {
+        out.push("--frame".to_owned());
+        out.push(frame.display().to_string());
+    }
     if let Some(dict) = &args.dict_file {
         out.push("--dict".to_owned());
         out.push(dict.display().to_string());
@@ -3613,6 +3671,7 @@ fn prepare_with_runner(
         _local_count_map: local_count_map,
         cmplog_log: args.cmplog_log,
         grammar_file: args.grammar_file,
+        frame_file: args.frame_file,
         dict_file: args.dict_file,
         structured_inputs: args.structured_inputs,
         sanitizers,
@@ -4161,6 +4220,10 @@ struct PoolEntry {
     /// finding, so it is neither mutated from nor saved in the queue. Kept in
     /// place so every other entry keeps its pool index.
     retired: bool,
+    /// The `--grammar` derivation tree whose sentence `bytes` is (#329), for
+    /// an input a grammar derivation or tree mutation made: its children are
+    /// mostly tree mutations, which keep them sentences of the grammar.
+    tree: Option<fuzz_engine_builtin::grammar::Derivation>,
 }
 
 /// Quantitative marginal feedback from one execution. Keeping the channel
@@ -4343,6 +4406,7 @@ impl PoolEntry {
             colored: None,
             typed_spans: None,
             retired: false,
+            tree: None,
         }
     }
 
@@ -4565,6 +4629,12 @@ fn run_builtin_with_progress(
         prepared.per_input_timeout = prepared.per_input_timeout.min(pass_budget);
     }
     reset_target_entry(&prepared.extra_env);
+    // `--frame`: every input the loop runs is a frame of the profile's message,
+    // its seeds included.
+    let frame = load_frame_for_run(prepared.frame_file.as_deref())?;
+    if let Some(codec) = &frame {
+        frame_seeds(codec, &mut prepared.seeds);
+    }
     bound_seed_corpus(&mut prepared.seeds, prepared.max_len);
     let corpus_limits = corpus_limits(prepared.max_len);
     let finding_dedup_limit = max_finding_dedup_keys();
@@ -4615,6 +4685,7 @@ fn run_builtin_with_progress(
                 .map_err(|error| format!("serialize sandbox metadata: {error}"))?,
         )
         .with_mode(prepared.mode)
+        .with_shim_env(crate::runtime_oracles::shim_mode_gates(&prepared.extra_env))
         .with_line_maps_dir(&prepared.work_dir.join("src_instrumented")),
         &prepared.harness_path,
         &prepared.work_dir,
@@ -5274,6 +5345,8 @@ fn run_builtin_with_progress(
         }
 
         let mut parents = crate::fuzz_lineage::InputParents::Queued(iteration);
+        // The derivation tree of a grammar-made child (#329).
+        let mut input_tree = None;
         // A peer's entry runs as it is, once the seeds have run.
         let imported = match peer_sync.as_mut() {
             Some(sync) if iteration >= initial_seed_count => {
@@ -5344,8 +5417,40 @@ fn run_builtin_with_progress(
                     donor: None,
                 };
                 bytes
+            } else if let Some(codec) = frame.as_ref() {
+                let base = pool
+                    .get(base_index)
+                    .map(|entry| entry.bytes.clone())
+                    .unwrap_or_default();
+                let mut made_from = None;
+                let (bytes, field_edit) =
+                    frame_child(codec, &base, effective_max_len, &mut rng, |rng| {
+                        let (bytes, parents, tree) = mutate_from_pool(
+                            &pool,
+                            base_index,
+                            &dictionary,
+                            cmplog_log.as_ref(),
+                            grammar.as_ref(),
+                            mutator_config(prepared.structured_inputs, effective_max_len),
+                            sequence_geometry,
+                            rng,
+                        );
+                        made_from = Some((parents, tree));
+                        bytes
+                    });
+                parents = match made_from {
+                    Some((made_from, tree)) if !field_edit => {
+                        input_tree = tree;
+                        made_from
+                    }
+                    _ => crate::fuzz_lineage::InputParents::Mutated {
+                        base: base_index,
+                        donor: None,
+                    },
+                };
+                bytes
             } else {
-                let (bytes, made_from) = mutate_from_pool(
+                let (bytes, made_from, tree) = mutate_from_pool(
                     &pool,
                     base_index,
                     &dictionary,
@@ -5356,8 +5461,15 @@ fn run_builtin_with_progress(
                     &mut rng,
                 );
                 parents = made_from;
+                input_tree = tree;
                 bytes
             }
+        };
+        // `--frame`: an input from another worker or an extension stage is
+        // repaired too (a frame comes back unchanged).
+        let input = match frame.as_ref() {
+            Some(codec) => codec.repair(&input),
+            None => input,
         };
         // RedQueen colorization can execute up to 65 probes before the main
         // input. Slow interpreted targets used to multiply a one-second pass
@@ -5846,6 +5958,13 @@ fn run_builtin_with_progress(
                 write_live_corpus_entry(dir, &input);
             }
             pool_bytes = pool_bytes.saturating_add(input.len());
+            // The tree is kept while it still derives the input (a `--frame`
+            // repair may have changed it) and fits the pool's byte budget.
+            let tree = input_tree.take().filter(|tree| {
+                grammar.as_ref().is_some_and(|g| g.sentence(tree) == input)
+                    && pool_bytes.saturating_add(tree.footprint()) <= corpus_limits.bytes
+            });
+            pool_bytes = pool_bytes.saturating_add(tree.as_ref().map_or(0, |t| t.footprint()));
             pool.push(PoolEntry {
                 bytes: input,
                 energy: input_energy,
@@ -5854,6 +5973,7 @@ fn run_builtin_with_progress(
                 colored: None,
                 typed_spans: None,
                 retired: false,
+                tree,
             });
         }
 
@@ -6949,6 +7069,7 @@ impl<'a> ExternalIngest<'a> {
                     .map_err(|error| format!("serialize sandbox metadata: {error}"))?,
             )
             .with_mode(prepared.mode)
+            .with_shim_env(crate::runtime_oracles::shim_mode_gates(&prepared.extra_env))
             .with_line_maps_dir(&prepared.work_dir.join("src_instrumented")),
             &fixture,
             &prepared.work_dir,
@@ -9132,6 +9253,206 @@ pub(crate) fn load_grammar_for_run(path: Option<&Path>) -> Result<Option<Grammar
     Grammar::from_rules(&rules, None).map(Some)
 }
 
+/// The largest `--frame` profile read: a profile is a few fields of TOML.
+const MAX_FRAME_PROFILE_BYTES: usize = 1024 * 1024;
+
+/// Load a `--frame` profile into the [`FrameCodec`] the builtin loop decodes,
+/// mutates and repairs each input with. The profile is a `bhf.protocol.v1`
+/// protocol profile of one binary message, the session lane's message schema
+/// for a single frame. `None` → `Ok(None)`. A profile the codec cannot apply
+/// to a single input (several messages, a GIOP message, an optional field or
+/// a reference to a response) is an error that says why.
+pub(crate) fn load_frame_for_run(path: Option<&Path>) -> Result<Option<FrameCodec>, String> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let fail = |reason: String| format!("--frame {}: {reason}", path.display());
+    let (bytes, original_len) = read_seed_file_prefix(path, MAX_FRAME_PROFILE_BYTES)
+        .map_err(|e| fail(format!("read: {e}")))?;
+    if original_len > bytes.len() as u64 {
+        return Err(fail(format!(
+            "{original_len} bytes, above the {} MiB limit for a profile",
+            MAX_FRAME_PROFILE_BYTES / (1024 * 1024)
+        )));
+    }
+    let text = String::from_utf8(bytes).map_err(|e| fail(format!("not UTF-8: {e}")))?;
+    let profile = protocol_session::Profile::from_toml(&text).map_err(|e| fail(e.to_string()))?;
+    if profile.kind() != protocol_session::ProfileKind::Binary {
+        return Err(fail(
+            "a frame is a binary message; a giop profile's messages are GIOP requests the \
+             session lane sends"
+                .to_owned(),
+        ));
+    }
+    let model =
+        protocol_session::ProtocolModel::from_profile(&profile).map_err(|e| fail(e.to_string()))?;
+    let message = match model.messages() {
+        [message] => message,
+        messages => {
+            let names: Vec<&str> = messages.iter().map(|m| m.name.as_str()).collect();
+            return Err(fail(format!(
+                "a frame profile declares one [[message]]; this one declares {} ({})",
+                names.len(),
+                names.join(", ")
+            )));
+        }
+    };
+    frame_codec_for(message).map(Some).map_err(fail)
+}
+
+/// The [`FrameCodec`] of one compiled profile message: its seed frame's field
+/// values as the template, an integer or enum field at its width (an enum's
+/// variants as the codes a field edit favours), and a `bytes` field at most
+/// its `max`.
+fn frame_codec_for(message: &protocol_session::CompiledMessage) -> Result<FrameCodec, String> {
+    use fuzz_engine_builtin::binframe::{encode_uint, FieldShape};
+    use fuzz_engine_builtin::{Field, Message};
+    use protocol_session::{ComputedSpec, DataSpec, FieldRole};
+
+    // What a single input cannot carry is refused before the seed frame is
+    // built, which would fail on it with a less telling error.
+    for field in &message.fields {
+        let name = &field.name;
+        if field.optional {
+            return Err(format!(
+                "field {name:?} is optional, and a single input carries no sign of whether it \
+                 is there; make it required"
+            ));
+        }
+        if let FieldRole::Ref { source, .. } = &field.role {
+            return Err(format!(
+                "field {name:?} is the response value {source}, and a single input has no \
+                 reply to take it from"
+            ));
+        }
+    }
+    let seed = message
+        .build_frame(
+            &message.seed_values(),
+            &protocol_session::Bindings::default(),
+        )
+        .map_err(|e| format!("message {}: {e}", message.name))?;
+    let mut fields = Vec::with_capacity(message.fields.len());
+    let mut shapes = std::collections::BTreeMap::new();
+    for field in &message.fields {
+        let name = field.name.clone();
+        let value = |header: usize| {
+            seed.span(&name)
+                .map(|span| seed.bytes()[span][header..].to_vec())
+                .ok_or_else(|| format!("field {name:?} is not in the message's frame"))
+        };
+        match &field.role {
+            FieldRole::Ref { .. } => unreachable!("refused above"),
+            FieldRole::Computed(ComputedSpec::Length {
+                width,
+                endian,
+                covers,
+            }) => fields.push(Field::Length {
+                name,
+                width: *width,
+                endian: *endian,
+                covers: covers.clone(),
+            }),
+            FieldRole::Computed(ComputedSpec::Checksum {
+                kind,
+                endian,
+                covers,
+            }) => fields.push(Field::Checksum {
+                name,
+                kind: *kind,
+                endian: *endian,
+                covers: covers.clone(),
+            }),
+            FieldRole::Computed(ComputedSpec::Offset {
+                width,
+                endian,
+                target,
+            }) => fields.push(Field::Offset {
+                name,
+                width: *width,
+                endian: *endian,
+                target: target.clone(),
+            }),
+            FieldRole::Data(DataSpec::Bytes { max }) => {
+                shapes.insert(name.clone(), FieldShape::Variable { max: *max });
+                fields.push(Field::bytes(&name, value(0)?));
+            }
+            FieldRole::Data(DataSpec::Int { .. }) => {
+                shapes.insert(name.clone(), FieldShape::Fixed { codes: Vec::new() });
+                fields.push(Field::bytes(&name, value(0)?));
+            }
+            FieldRole::Data(DataSpec::Enum {
+                width,
+                endian,
+                variants,
+            }) => {
+                let bits = 8 * width.size() as u32;
+                let codes = variants
+                    .values()
+                    .filter(|&&code| code >> bits == 0)
+                    .map(|&code| encode_uint(*width, *endian, code))
+                    .collect();
+                shapes.insert(name.clone(), FieldShape::Fixed { codes });
+                fields.push(Field::bytes(&name, value(0)?));
+            }
+            FieldRole::Data(DataSpec::Tlv {
+                tag,
+                tag_width,
+                len_width,
+                endian,
+            }) => fields.push(Field::Tlv {
+                tag: u32::try_from(*tag)
+                    .map_err(|_| format!("field {name:?}: tag {tag} is wider than 32 bits"))?,
+                tag_width: *tag_width,
+                len_width: *len_width,
+                endian: *endian,
+                value: value(tag_width.size() + len_width.size())?,
+                name,
+            }),
+        }
+    }
+    FrameCodec::new(Message::new(fields).with_max_len(message.max_len), &shapes)
+        .map_err(|e| format!("message {}: {e}", message.name))
+}
+
+/// `--frame`: each seed decoded and re-encoded as a frame, once, and the
+/// profile's own frame among them.
+fn frame_seeds(codec: &FrameCodec, seeds: &mut Vec<Vec<u8>>) {
+    let mut framed: Vec<Vec<u8>> = Vec::with_capacity(seeds.len() + 1);
+    for seed in seeds.drain(..) {
+        let frame = codec.repair(&seed);
+        if !framed.contains(&frame) {
+            framed.push(frame);
+        }
+    }
+    if !framed.iter().any(|frame| frame == codec.seed()) {
+        framed.push(codec.seed().to_vec());
+    }
+    *seeds = framed;
+}
+
+/// A `--frame` child of `base`: half the time a field edit
+/// ([`FrameCodec::mutate`]), otherwise `byte_child` (a byte mutation of the
+/// whole frame, made only when it is used) repaired. A byte mutation the repair
+/// undoes, one that changed only a stored length or checksum, becomes a field
+/// edit, so the loop does not run its base again. The second value is whether
+/// the child is a field edit.
+fn frame_child(
+    codec: &FrameCodec,
+    base: &[u8],
+    max_len: usize,
+    rng: &mut MutationRng,
+    byte_child: impl FnOnce(&mut MutationRng) -> Vec<u8>,
+) -> (Vec<u8>, bool) {
+    if rng.coin() {
+        let repaired = codec.repair(&byte_child(rng));
+        if repaired != base {
+            return (repaired, false);
+        }
+    }
+    (codec.mutate(base, max_len, rng), true)
+}
+
 /// The op program's geometry, read from the sidecar a sequence harness writes.
 ///
 /// The harness reserves a fixed-stride control block at the END of every input:
@@ -9258,6 +9579,8 @@ pub(crate) fn expand_sequence_portfolio_seeds(harness_dir: &Path, seeds: &mut Ve
 /// per-input RedQueen cmplog (#400) so `CmpLogSplice` injects the operands it
 /// observed at the offsets they were compared; falls back to the global
 /// pre-mined log (`global_cmplog`) so non-driver paths keep their behavior.
+/// Returns the child, what it descends from and, for a `--grammar`
+/// derivation or tree mutation (#329), the child's derivation tree.
 #[allow(clippy::too_many_arguments)]
 fn mutate_from_pool(
     pool: &[PoolEntry],
@@ -9268,7 +9591,11 @@ fn mutate_from_pool(
     config: MutatorConfig,
     sequence: Option<SequenceGeometry>,
     rng: &mut MutationRng,
-) -> (Vec<u8>, crate::fuzz_lineage::InputParents) {
+) -> (
+    Vec<u8>,
+    crate::fuzz_lineage::InputParents,
+    Option<fuzz_engine_builtin::grammar::Derivation>,
+) {
     let suite = MutatorSuite::new(config);
     let full_base = pool
         .get(base_index)
@@ -9296,7 +9623,12 @@ fn mutate_from_pool(
         mutation_input = mutation_input.with_cmplog(log);
     }
     if let Some(g) = grammar {
-        mutation_input = mutation_input.with_grammar(g);
+        // #329: the base's and the peer's derivation trees, for the tree
+        // mutations.
+        mutation_input = mutation_input.with_grammar(g).with_grammar_trees(
+            pool.get(base_index).and_then(|entry| entry.tree.as_ref()),
+            pool.get(peer_index).and_then(|entry| entry.tree.as_ref()),
+        );
     }
     // A sequence harness's op program lives in a fixed-stride control block, so
     // it can be described to the mutator as ordered spans instead of being
@@ -9307,9 +9639,9 @@ fn mutate_from_pool(
         mutation_input = mutation_input.with_operation_sequence(layout);
     }
 
-    let (bytes, kind) = match suite.mutate(&mutation_input, rng) {
-        Some(result) => (result.bytes, Some(result.kind)),
-        None => (vec![rng.next_u8()], None),
+    let (bytes, kind, tree) = match suite.mutate(&mutation_input, rng) {
+        Some(result) => (result.bytes, Some(result.kind), result.tree),
+        None => (vec![rng.next_u8()], None, None),
     };
     // AdaFuzz.Input.Load_From_Stdin exits the harness loop on empty input,
     // which leaves no event log behind and breaks first-run dogfooding when
@@ -9318,11 +9650,12 @@ fn mutate_from_pool(
         (
             vec![rng.next_u8()],
             crate::fuzz_lineage::InputParents::Generated,
+            None,
         )
     } else {
         let parents =
             crate::fuzz_lineage::InputParents::from_mutation(base_index, peer_index, kind);
-        (bytes, parents)
+        (bytes, parents, tree)
     }
 }
 
@@ -13559,6 +13892,73 @@ mod entropic_tests {
 }
 
 #[cfg(test)]
+mod grammar_tree_tests {
+    use super::{mutate_from_pool, PoolEntry};
+    use fuzz_engine_builtin::{Dictionary, Grammar, MutationRng, MutatorConfig};
+
+    fn grammar() -> Grammar {
+        Grammar::from_rules(
+            &[(
+                "S".to_owned(),
+                ["({S})", "[{S}]", "{S}{S}", "x", "y"]
+                    .map(str::to_owned)
+                    .to_vec(),
+            )],
+            None,
+        )
+        .unwrap()
+    }
+
+    /// #329: a pool entry that keeps its derivation tree is mutated mostly on
+    /// the tree, and each such child comes back with the tree that derives it;
+    /// an entry without one gets a tree only from a fresh derivation.
+    #[test]
+    fn a_grammar_entry_is_mutated_on_its_tree() {
+        let grammar = grammar();
+        let mut rng = MutationRng::new(3);
+        let tree = loop {
+            let tree = grammar.generate_tree(64, &mut rng).unwrap();
+            if tree.len() > 6 {
+                break tree;
+            }
+        };
+        let mut entry = PoolEntry::seed(grammar.sentence(&tree));
+        entry.tree = Some(tree);
+        let pool = vec![entry];
+        let plain = vec![PoolEntry::seed(pool[0].bytes.clone())];
+        let config = MutatorConfig {
+            max_len: 64,
+            ..MutatorConfig::default()
+        };
+        let dictionary = Dictionary::default();
+        let children_with_trees = |pool: &[PoolEntry], rng: &mut MutationRng| {
+            let mut count = 0;
+            for _ in 0..300 {
+                let (bytes, _, tree) = mutate_from_pool(
+                    pool,
+                    0,
+                    &dictionary,
+                    None,
+                    Some(&grammar),
+                    config,
+                    None,
+                    rng,
+                );
+                if let Some(tree) = tree {
+                    assert_eq!(grammar.sentence(&tree), bytes);
+                    count += 1;
+                }
+            }
+            count
+        };
+        let on_tree = children_with_trees(&pool, &mut rng);
+        let fresh = children_with_trees(&plain, &mut rng);
+        assert!(on_tree > 150, "{on_tree} of 300 children carry a tree");
+        assert!(fresh < on_tree / 2, "{fresh} fresh derivations");
+    }
+}
+
+#[cfg(test)]
 mod typed_span_tests {
     use super::{mutate_from_pool, typed_spans, PoolEntry};
     use fuzz_engine_builtin::{Dictionary, MutationRng, MutatorConfig};
@@ -16283,6 +16683,7 @@ exit 0
         let args_dir = tmpdir();
         let mut args = fuzz_args_for_worker_passthrough(&args_dir, StructuredInputMode::Json);
         args.grammar_file = Some(args_dir.join("grammar.json"));
+        args.frame_file = Some(args_dir.join("frame.toml"));
         args.dict_file = Some(args_dir.join("tokens.dict"));
         args.cmplog_log = Some(args_dir.join("cmplog.txt"));
         args.len_control = DEFAULT_LEN_CONTROL + 1;
@@ -18192,6 +18593,179 @@ exit 0
         assert!(load_grammar_for_run(Some(&path)).is_err());
     }
 
+    /// A `--frame` profile of one message, lowered field by field: an enum
+    /// at its width with its variants as codes, a TLV with its tag, a length
+    /// over a fixed and a variable field, and a CRC-16 over the frame.
+    #[test]
+    fn load_frame_for_run_lowers_each_field_kind_of_a_profile_message() {
+        let dir = tmpdir();
+        let path = dir.join("frame.toml");
+        std::fs::write(
+            &path,
+            r#"
+schema = "bhf.protocol.v1"
+
+[[message]]
+name = "cmd"
+
+[[message.field]]
+name = "op"
+type = "enum"
+variants = { READ = 1, WRITE = 2, ERASE = 0x30 }
+value = "WRITE"
+
+[[message.field]]
+name = "len"
+type = "u16"
+endian = "little"
+computed = "length(seq, body)"
+
+[[message.field]]
+name = "seq"
+type = "u16"
+endian = "little"
+value = 7
+
+[[message.field]]
+name = "body"
+type = "bytes"
+value = "abc"
+
+[[message.field]]
+name = "opt"
+type = "tlv"
+tag = 9
+value = "xy"
+
+[[message.field]]
+name = "crc"
+type = "u16"
+computed = "crc16(op, len, seq, body, opt)"
+"#,
+        )
+        .unwrap();
+        let codec = load_frame_for_run(Some(&path)).unwrap().expect("a codec");
+        let mut expected = vec![0x02, 0x05, 0x00, 0x07, 0x00, b'a', b'b', b'c'];
+        expected.extend_from_slice(&[0x00, 0x09, 0x00, 0x02, b'x', b'y']);
+        let crc = fuzz_engine_builtin::crc16_ccitt(&expected);
+        expected.extend_from_slice(&crc.to_be_bytes());
+        assert_eq!(codec.seed(), expected.as_slice());
+        assert_eq!(codec.repair(&expected), expected, "a valid frame is kept");
+
+        // `body` is the only variable field `len` covers, so its length comes
+        // from `len` (less `seq`'s two bytes); the TLV's from its own prefix.
+        let mut input = vec![0x30, 0x06, 0x00, 0x01, 0x00, b'w', b'x', b'y', b'z'];
+        input.extend_from_slice(&[0xFF, 0xFF, 0x00, 0x01, b'q', 0, 0]);
+        let repaired = codec.repair(&input);
+        let mut want = vec![0x30, 0x06, 0x00, 0x01, 0x00, b'w', b'x', b'y', b'z'];
+        want.extend_from_slice(&[0x00, 0x09, 0x00, 0x01, b'q']);
+        let crc = fuzz_engine_builtin::crc16_ccitt(&want);
+        want.extend_from_slice(&crc.to_be_bytes());
+        assert_eq!(repaired, want);
+
+        // A field edit of `op` favours the declared codes.
+        let mut rng = MutationRng::new(11);
+        let ops: HashSet<u8> = (0..300)
+            .map(|_| codec.mutate(codec.seed(), 4096, &mut rng)[0])
+            .collect();
+        for code in [0x01, 0x02, 0x30] {
+            assert!(ops.contains(&code), "{code:#x} in {ops:?}");
+        }
+    }
+
+    #[test]
+    fn load_frame_for_run_refuses_what_a_single_input_cannot_carry() {
+        let dir = tmpdir();
+        let path = dir.join("frame.toml");
+        let cases = [
+            (
+                "[[message]]\nname = \"a\"\n[[message.field]]\nname = \"tok\"\ntype = \"u32\"\n\
+                 ref = \"b.response.token\"\n\n[[message]]\nname = \"b\"\n\
+                 [[message.response.capture]]\nname = \"token\"\ntype = \"u32\"\nat = 0\n",
+                "declares 2 (a, b)",
+            ),
+            ("kind = \"giop\"\n[[message]]\nname = \"op\"\n", "giop"),
+            ("[[message]]\nname = \"m\"\n", "no fields"),
+            (
+                "[[message]]\nname = \"a\"\n[[message.field]]\nname = \"tok\"\ntype = \"u32\"\n\
+                 ref = \"a.response.token\"\n[[message.response.capture]]\nname = \"token\"\n\
+                 type = \"u32\"\nat = 0\n",
+                "no reply",
+            ),
+        ];
+        for (body, expected) in cases {
+            std::fs::write(&path, format!("schema = \"bhf.protocol.v1\"\n{body}")).unwrap();
+            let error = load_frame_for_run(Some(&path)).expect_err(expected);
+            assert!(error.starts_with("--frame "), "{error}");
+            assert!(error.contains(expected), "{expected}: {error}");
+        }
+        std::fs::write(&path, b"schema = [").unwrap();
+        assert!(load_frame_for_run(Some(&path)).is_err());
+        assert!(load_frame_for_run(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn frame_seeds_repairs_each_seed_once_and_adds_the_profiles_frame() {
+        use fuzz_engine_builtin::binframe::FrameCodec;
+        use fuzz_engine_builtin::{ChecksumKind, Endian, Field, IntWidth, Message};
+        let codec = FrameCodec::new(
+            Message::new(vec![
+                Field::length("len", IntWidth::U8, Endian::Big, &["body"]),
+                Field::bytes("body", b"seed".to_vec()),
+                Field::checksum("sum", ChecksumKind::Sum8, Endian::Big, &["body"]),
+            ]),
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+        let mut seeds = vec![b"\x00ab\x00".to_vec(), b"\x09ab\x07".to_vec()];
+        frame_seeds(&codec, &mut seeds);
+        let ab = vec![2, b'a', b'b', b'a'.wrapping_add(b'b')];
+        assert_eq!(seeds, vec![ab, codec.seed().to_vec()]);
+    }
+
+    /// A byte mutation the repair undoes is no child: the field edit runs
+    /// instead, and the loop never runs the base again.
+    #[test]
+    fn frame_child_never_hands_back_its_base() {
+        use fuzz_engine_builtin::binframe::FrameCodec;
+        use fuzz_engine_builtin::{ChecksumKind, Endian, Field, IntWidth, Message};
+        let codec = FrameCodec::new(
+            Message::new(vec![
+                Field::length("len", IntWidth::U16, Endian::Big, &["body"]),
+                Field::bytes("body", b"payload".to_vec()),
+                Field::checksum("crc", ChecksumKind::Crc32, Endian::Big, &["body"]),
+            ]),
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+        let base = codec.seed().to_vec();
+        let mut rng = MutationRng::new(5);
+        let (mut byte_children, mut field_edits) = (0, 0);
+        for _ in 0..200 {
+            // A byte mutation of the stored CRC alone.
+            let (child, field_edit) = frame_child(&codec, &base, 4096, &mut rng, |_| {
+                let mut stale = base.clone();
+                *stale.last_mut().unwrap() ^= 0x55;
+                stale
+            });
+            assert!(field_edit, "the repair undid the byte mutation");
+            assert_eq!(codec.repair(&child), child, "a frame");
+            field_edits += 1;
+            // A byte mutation of the body: repaired, and kept.
+            let (child, field_edit) = frame_child(&codec, &base, 4096, &mut rng, |_| {
+                let mut grown = base.clone();
+                grown.insert(3, b'!');
+                grown
+            });
+            if !field_edit {
+                byte_children += 1;
+                assert_eq!(&child[2..10], b"p!ayload");
+                assert_eq!(codec.repair(&child), child);
+            }
+        }
+        assert!(byte_children > 50 && field_edits == 200, "{byte_children}");
+    }
+
     #[test]
     fn collector_flag_parses_auto_none_path_and_window() {
         use clap::Parser;
@@ -18324,6 +18898,7 @@ exit 0
             runtime_oracles: crate::runtime_oracles::RuntimeOracleMode::Off,
             cmplog_log: None,
             grammar_file: None,
+            frame_file: None,
             dict_file: None,
             structured_inputs,
             bhf_bin: None,

@@ -94,6 +94,7 @@ fn peripheral_harness_reaches_branch_gated_on_third_register_read() {
                 }],
             }],
             fuzz_driven_callbacks: false,
+            mmio_windows: Vec::new(),
         }),
     };
 

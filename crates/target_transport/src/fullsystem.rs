@@ -58,20 +58,12 @@
 //! [`crate::testsupport::MockGdbStub`]); the live emulator run is unproven until
 //! executed against the real resource (roadmap HDF-4 gated acceptance).
 //!
-//! # Renode (documented follow-up)
+//! # Renode
 //!
-//! A Renode board is a `.resc` script that instantiates the platform and can
-//! expose a GDB server (`machine StartGdbServer`), so the *same* [`GdbClient`] +
-//! [`MemoryBufferReader`](crate::coverage::MemoryBufferReader) read the coverage
-//! ring, and Renode's `Save`/`Load` state serialization plays the snapshot role
-//! that `savevm`/`loadvm` play here. What differs is the control channel:
-//! Renode's monitor is a line-oriented telnet CLI, **not** QMP, so a
-//! `RenodeTransport` needs a small monitor adapter in place of [`QmpClient`]
-//! (`Save @snap`, `Load @snap` instead of `savevm`/`loadvm`). That adapter is a
-//! deliberate follow-up rather than part of this change: shipping it without a
-//! Renode instance to test against would be untested integration, which the
-//! roadmap forbids. The transport seam and the coverage reader it would reuse
-//! are already in place, so the follow-up is additive.
+//! [`crate::renode::RenodeTransport`] is the same lane for a Renode board:
+//! Renode's telnet monitor ([`crate::renode::RenodeMonitor`]) plays QMP's
+//! part, with `Save @path` / `Load @path` for `savevm` / `loadvm`, and the
+//! run itself is [`run_from_baseline`], shared with this module.
 
 use crate::error::{Result, TransportError};
 use crate::gdb::{ContStop, GdbClient, GdbMemoryMap};
@@ -432,16 +424,43 @@ pub(crate) fn classify_fault_status<C: Read + Write>(
 pub struct FullSystemTransport<FQ, FG> {
     connect_qmp: FQ,
     connect_gdb: FG,
-    map: GdbMemoryMap,
     snapshot_tag: String,
     harness_breakpoint: Option<(u64, u32)>,
-    fault_status: Option<GuestFaultStatus>,
-    exec_deadline: Option<Duration>,
-    input_contract: Option<crate::gdb::InputContract>,
-    cycle_counter: Option<crate::cycles::CycleCounter>,
-    task_id_address: Option<u64>,
-    cmplog: Option<crate::cmplog::CmpLogRegion>,
-    semihosting_coverage: bool,
+    run: RunSettings,
+}
+
+/// What one run from a restored baseline needs: where the input and the
+/// coverage live, and what is read around the run. Shared by
+/// [`FullSystemTransport`] and [`crate::renode::RenodeTransport`], which
+/// differ only in how they save and restore the baseline.
+#[derive(Debug, Clone)]
+pub(crate) struct RunSettings {
+    pub(crate) map: GdbMemoryMap,
+    pub(crate) fault_status: Option<GuestFaultStatus>,
+    pub(crate) exec_deadline: Option<Duration>,
+    pub(crate) input_contract: Option<crate::gdb::InputContract>,
+    pub(crate) cycle_counter: Option<crate::cycles::CycleCounter>,
+    pub(crate) task_id_address: Option<u64>,
+    pub(crate) cmplog: Option<crate::cmplog::CmpLogRegion>,
+    pub(crate) semihosting_coverage: bool,
+    /// Names the emulator in a fault's detail (`qemu-system`, `renode`).
+    pub(crate) backend: &'static str,
+}
+
+impl RunSettings {
+    pub(crate) fn new(map: GdbMemoryMap, backend: &'static str) -> Self {
+        Self {
+            map,
+            fault_status: None,
+            exec_deadline: None,
+            input_contract: None,
+            cycle_counter: None,
+            task_id_address: None,
+            cmplog: None,
+            semihosting_coverage: false,
+            backend,
+        }
+    }
 }
 
 impl<FQ, FG> FullSystemTransport<FQ, FG> {
@@ -458,30 +477,23 @@ impl<FQ, FG> FullSystemTransport<FQ, FG> {
         Ok(Self {
             connect_qmp,
             connect_gdb,
-            map,
             snapshot_tag,
             harness_breakpoint: None,
-            fault_status: None,
-            exec_deadline: None,
-            input_contract: None,
-            cycle_counter: None,
-            task_id_address: None,
-            cmplog: None,
-            semihosting_coverage: false,
+            run: RunSettings::new(map, "qemu-system"),
         })
     }
 
     /// Read the 32-bit task identity word at `address` after each run and
     /// report it in [`RunOutcome::target`] (#252).
     pub fn with_task_id(mut self, address: Option<u64>) -> Self {
-        self.task_id_address = address;
+        self.run.task_id_address = address;
         self
     }
 
     /// Read `counter` around each run and report the cycles it took in
     /// [`RunOutcome::target`] (#251).
     pub fn with_cycle_counter(mut self, counter: Option<crate::cycles::CycleCounter>) -> Self {
-        self.cycle_counter = counter;
+        self.run.cycle_counter = counter;
         self
     }
 
@@ -489,7 +501,7 @@ impl<FQ, FG> FullSystemTransport<FQ, FG> {
     /// report the comparisons it holds after it in [`RunOutcome::target`]
     /// (#386).
     pub fn with_cmplog(mut self, region: Option<crate::cmplog::CmpLogRegion>) -> Self {
-        self.cmplog = region;
+        self.run.cmplog = region;
         self
     }
 
@@ -497,14 +509,14 @@ impl<FQ, FG> FullSystemTransport<FQ, FG> {
     /// its semihosting channel ([`crate::gdb::SEMIHOSTING_COVERAGE_FD`]) in
     /// place of the coverage ring (#292).
     pub fn with_semihosting_coverage(mut self, semihosting: bool) -> Self {
-        self.semihosting_coverage = semihosting;
+        self.run.semihosting_coverage = semihosting;
         self
     }
 
     /// Stage each input under `contract`: cut to the guest staging region's
     /// capacity, with its length word written first when the firmware reads one.
     pub fn with_input_contract(mut self, contract: Option<crate::gdb::InputContract>) -> Self {
-        self.input_contract = contract;
+        self.run.input_contract = contract;
         self
     }
 
@@ -514,7 +526,7 @@ impl<FQ, FG> FullSystemTransport<FQ, FG> {
     /// outcome rather than blocking on the gdbstub read timeout alone. `None` (the
     /// default) relies on the connection read timeout and the packet/byte caps.
     pub fn with_exec_deadline(mut self, deadline: Option<Duration>) -> Self {
-        self.exec_deadline = deadline;
+        self.run.exec_deadline = deadline;
         self
     }
 
@@ -543,7 +555,7 @@ impl<FQ, FG> FullSystemTransport<FQ, FG> {
     /// crash is not reported as a silent clean pass (#72). Leave it unset (the
     /// default) for targets that surface faults directly in the stop reply.
     pub fn with_fault_status(mut self, status: GuestFaultStatus) -> Self {
-        self.fault_status = Some(status);
+        self.run.fault_status = Some(status);
         self
     }
 }
@@ -579,15 +591,8 @@ where
         Ok(Box::new(FullSystemSession {
             qmp,
             gdb,
-            map: self.map,
             snapshot_tag: self.snapshot_tag.clone(),
-            fault_status: self.fault_status.clone(),
-            exec_deadline: self.exec_deadline,
-            input_contract: self.input_contract,
-            cycle_counter: self.cycle_counter,
-            task_id_address: self.task_id_address,
-            cmplog: self.cmplog,
-            semihosting_coverage: self.semihosting_coverage,
+            run: self.run.clone(),
         }))
     }
 }
@@ -597,15 +602,8 @@ where
 pub struct FullSystemSession<CQ, CG> {
     qmp: QmpClient<CQ>,
     gdb: GdbClient<CG>,
-    map: GdbMemoryMap,
     snapshot_tag: String,
-    fault_status: Option<GuestFaultStatus>,
-    exec_deadline: Option<Duration>,
-    input_contract: Option<crate::gdb::InputContract>,
-    cycle_counter: Option<crate::cycles::CycleCounter>,
-    task_id_address: Option<u64>,
-    cmplog: Option<crate::cmplog::CmpLogRegion>,
-    semihosting_coverage: bool,
+    run: RunSettings,
 }
 
 impl<CQ: Read + Write, CG: Read + Write + crate::gdb::ReadDeadline> TargetSession
@@ -618,123 +616,133 @@ impl<CQ: Read + Write, CG: Read + Write + crate::gdb::ReadDeadline> TargetSessio
         self.qmp.stop()?;
         self.qmp.loadvm(&self.snapshot_tag)?;
 
-        // Deliver the input into the guest staging region, then run to the
-        // harness end breakpoint and collect the stop reply. The run control is
-        // bounded by the absolute per-input deadline (#70): a guest that never
-        // reaches the completion stop is a first-class Timeout outcome (a hang)
-        // with a structured fault, distinct from a lost link — not an unbounded
-        // wait and not a silent clean pass. Coverage is not read from a hung guest.
-        crate::gdb::stage_input(
-            &mut self.gdb,
-            self.map.input_address,
-            self.input_contract.as_ref(),
-            input,
-        )?;
-        // The snapshot holds the record as it was at arm: start it empty.
-        if let Some(region) = &self.cmplog {
-            crate::cmplog::clear(&mut self.gdb, region)?;
-        }
-        self.gdb.take_semihosting_output();
-        // The cycle counter starts last, so it measures the run, not the setup.
-        let cycles_start = match &self.cycle_counter {
-            Some(counter) => Some(counter.start(&mut self.gdb)?),
-            None => None,
-        };
-        let deadline = self.exec_deadline.map(|budget| Instant::now() + budget);
-        let (stop, stdout) = match self.gdb.cont_until(deadline)? {
-            (ContStop::Stopped(stop), stdout) => (stop, stdout),
-            (ContStop::DeadlineExceeded, mut stdout) => {
-                let written = self.gdb.take_semihosting_output();
-                if !self.semihosting_coverage {
-                    stdout.extend_from_slice(&written);
-                }
-                let detail = match self.exec_deadline {
-                    Some(budget) => format!(
-                        "no completion stop within the per-input execution deadline {}ms",
-                        budget.as_millis()
-                    ),
-                    None => "no completion stop within the per-input execution deadline".to_owned(),
-                };
-                return Ok(RunOutcome {
-                    target: Default::default(),
-                    exit: ExitKind::Timeout,
-                    coverage_edges: Vec::new(),
-                    fault: Some(Fault {
-                        kind: FaultKind::Timeout,
-                        address: None,
-                        detail,
-                    }),
-                    stdout,
-                    coverage_incomplete: Some(
-                        "guest hung: coverage ring not read after an execution timeout".to_owned(),
-                    ),
-                    inconclusive: None,
-                });
-            }
-        };
+        run_from_baseline(&mut self.gdb, &self.run, input)
+    }
+}
 
-        // Classify the stop reply FIRST (#74: a later readback failure must not
-        // erase an already-observed crash).
-        let mut exit = stop.to_exit_kind();
-        let mut fault = fault_from_stop(&stop);
-        let mut coverage_incomplete: Option<String> = None;
-        let mut inconclusive: Option<String> = None;
-
-        // Explicit firmware fault-status channel (#72). A target whose fault
-        // handler returns through the completion breakpoint reports a benign
-        // SIGTRAP, hiding the crash in the stop reply. Read the declared status
-        // word (before the next loadvm reset) and, when the stop itself was not
-        // already a crash, let a recorded fault upgrade the outcome. This is a
-        // separate evidence channel from coverage: a coverage edge id is never
-        // reinterpreted as a fault.
-        if let Some(status) = &self.fault_status {
-            classify_fault_status(
-                &mut self.gdb,
-                status,
-                &mut exit,
-                &mut fault,
-                &mut coverage_incomplete,
-                &mut inconclusive,
-            );
-        }
-
-        // The cycles the run took (#251), best-effort like coverage: a failed
-        // read leaves the classification alone.
-        let mut target = crate::outcome::TargetObservation::default();
-        if let (Some(counter), Some(start)) = (&self.cycle_counter, cycles_start) {
-            match counter.elapsed(&mut self.gdb, start) {
-                Ok(cycles) => target.cycles = Some(cycles),
-                Err(err) => {
-                    coverage_incomplete.get_or_insert_with(|| format!("cycle counter: {err}"));
-                }
+/// Run one input on a target already reset to its baseline: stage the input,
+/// run to the completion stop within the deadline, classify the stop, and read
+/// the fault-status word, the cycle counter, the task id, the CmpLog record
+/// and the coverage. Shared by [`FullSystemSession`] and
+/// [`crate::renode::RenodeSession`].
+pub(crate) fn run_from_baseline<CG: Read + Write + crate::gdb::ReadDeadline>(
+    gdb: &mut GdbClient<CG>,
+    run: &RunSettings,
+    input: &[u8],
+) -> Result<RunOutcome> {
+    // Deliver the input into the guest staging region, then run to the
+    // harness end breakpoint and collect the stop reply. The run control is
+    // bounded by the absolute per-input deadline (#70): a guest that never
+    // reaches the completion stop is a first-class Timeout outcome (a hang)
+    // with a structured fault, distinct from a lost link — not an unbounded
+    // wait and not a silent clean pass. Coverage is not read from a hung guest.
+    crate::gdb::stage_input(
+        gdb,
+        run.map.input_address,
+        run.input_contract.as_ref(),
+        input,
+    )?;
+    // The snapshot holds the record as it was at arm: start it empty.
+    if let Some(region) = &run.cmplog {
+        crate::cmplog::clear(gdb, region)?;
+    }
+    gdb.take_semihosting_output();
+    // The cycle counter starts last, so it measures the run, not the setup.
+    let cycles_start = match &run.cycle_counter {
+        Some(counter) => Some(counter.start(gdb)?),
+        None => None,
+    };
+    let deadline = run.exec_deadline.map(|budget| Instant::now() + budget);
+    let (stop, stdout) = match gdb.cont_until(deadline)? {
+        (ContStop::Stopped(stop), stdout) => (stop, stdout),
+        (ContStop::DeadlineExceeded, mut stdout) => {
+            let written = gdb.take_semihosting_output();
+            if !run.semihosting_coverage {
+                stdout.extend_from_slice(&written);
             }
+            let detail = match run.exec_deadline {
+                Some(budget) => format!(
+                    "no completion stop within the per-input execution deadline {}ms",
+                    budget.as_millis()
+                ),
+                None => "no completion stop within the per-input execution deadline".to_owned(),
+            };
+            return Ok(RunOutcome {
+                target: Default::default(),
+                exit: ExitKind::Timeout,
+                coverage_edges: Vec::new(),
+                fault: Some(Fault {
+                    kind: FaultKind::Timeout,
+                    address: None,
+                    detail,
+                }),
+                stdout,
+                coverage_incomplete: Some(
+                    "guest hung: coverage ring not read after an execution timeout".to_owned(),
+                ),
+                inconclusive: None,
+            });
         }
-        if let Some(address) = self.task_id_address {
-            match crate::gdb::read_u32(&mut self.gdb, address) {
-                Ok(id) => target.task_id = Some(u64::from(id)),
-                Err(err) => {
-                    coverage_incomplete.get_or_insert_with(|| format!("task id: {err}"));
-                }
-            }
-        }
-        if let Some(region) = &self.cmplog {
-            match crate::cmplog::read(&mut self.gdb, region) {
-                Ok(comparisons) => target.comparisons = comparisons,
-                Err(err) => {
-                    coverage_incomplete.get_or_insert_with(|| format!("cmplog: {err}"));
-                }
+    };
+
+    // Classify the stop reply FIRST (#74: a later readback failure must not
+    // erase an already-observed crash).
+    let mut exit = stop.to_exit_kind();
+    let mut fault = fault_from_stop(&stop, run.backend);
+    let mut coverage_incomplete: Option<String> = None;
+    let mut inconclusive: Option<String> = None;
+
+    // Explicit firmware fault-status channel (#72). A target whose fault
+    // handler returns through the completion breakpoint reports a benign
+    // SIGTRAP, hiding the crash in the stop reply. Read the declared status
+    // word (before the next loadvm reset) and, when the stop itself was not
+    // already a crash, let a recorded fault upgrade the outcome. This is a
+    // separate evidence channel from coverage: a coverage edge id is never
+    // reinterpreted as a fault.
+    if let Some(status) = &run.fault_status {
+        classify_fault_status(
+            gdb,
+            status,
+            &mut exit,
+            &mut fault,
+            &mut coverage_incomplete,
+            &mut inconclusive,
+        );
+    }
+
+    // The cycles the run took (#251), best-effort like coverage: a failed
+    // read leaves the classification alone.
+    let mut target = crate::outcome::TargetObservation::default();
+    if let (Some(counter), Some(start)) = (&run.cycle_counter, cycles_start) {
+        match counter.elapsed(gdb, start) {
+            Ok(cycles) => target.cycles = Some(cycles),
+            Err(err) => {
+                coverage_incomplete.get_or_insert_with(|| format!("cycle counter: {err}"));
             }
         }
+    }
+    if let Some(address) = run.task_id_address {
+        match crate::gdb::read_u32(gdb, address) {
+            Ok(id) => target.task_id = Some(u64::from(id)),
+            Err(err) => {
+                coverage_incomplete.get_or_insert_with(|| format!("task id: {err}"));
+            }
+        }
+    }
+    if let Some(region) = &run.cmplog {
+        match crate::cmplog::read(gdb, region) {
+            Ok(comparisons) => target.comparisons = comparisons,
+            Err(err) => {
+                coverage_incomplete.get_or_insert_with(|| format!("cmplog: {err}"));
+            }
+        }
+    }
 
-        // Harvest coverage from the in-guest ring or the semihosting
-        // channel, best-effort (#74).
-        let mut stdout = stdout;
-        let coverage_edges = match crate::gdb::collect_coverage(
-            &mut self.gdb,
-            &self.map,
-            self.semihosting_coverage,
-            &mut stdout,
-        ) {
+    // Harvest coverage from the in-guest ring or the semihosting
+    // channel, best-effort (#74).
+    let mut stdout = stdout;
+    let coverage_edges =
+        match crate::gdb::collect_coverage(gdb, &run.map, run.semihosting_coverage, &mut stdout) {
             Ok(edges) => edges,
             Err(err) => {
                 coverage_incomplete.get_or_insert_with(|| err.to_string());
@@ -742,16 +750,15 @@ impl<CQ: Read + Write, CG: Read + Write + crate::gdb::ReadDeadline> TargetSessio
             }
         };
 
-        Ok(RunOutcome {
-            target,
-            exit,
-            coverage_edges,
-            fault,
-            stdout,
-            coverage_incomplete,
-            inconclusive,
-        })
-    }
+    Ok(RunOutcome {
+        target,
+        exit,
+        coverage_edges,
+        fault,
+        stdout,
+        coverage_incomplete,
+        inconclusive,
+    })
 }
 
 /// Coarse fault classification from a GDB stop reply.
@@ -760,7 +767,7 @@ impl<CQ: Read + Write, CG: Read + Write + crate::gdb::ReadDeadline> TargetSessio
 /// taxonomy is HDF-2's job. Here a crash-classified stop reply is given a
 /// best-effort [`FaultKind`] from its signal so the finding is not empty; a
 /// clean exit or a benign breakpoint stop carries no fault.
-fn fault_from_stop(stop: &crate::gdb::StopReply) -> Option<Fault> {
+fn fault_from_stop(stop: &crate::gdb::StopReply, backend: &str) -> Option<Fault> {
     use crate::gdb::{gdb_signal, is_fatal_signal, StopReply};
     // Produce a fault exactly when `to_exit_kind` classifies a crash, so the
     // coarse exit and the detailed fault never disagree: a fatal `Sxx`/`Txx`
@@ -782,7 +789,7 @@ fn fault_from_stop(stop: &crate::gdb::StopReply) -> Option<Fault> {
     Some(Fault {
         kind,
         address: None,
-        detail: format!("qemu-system stop reply reported GDB signal {signal}"),
+        detail: format!("{backend} stop reply reported GDB signal {signal}"),
     })
 }
 
@@ -1442,11 +1449,11 @@ mod tests {
     #[test]
     fn fault_from_stop_uses_gdb_signal_numbers_and_ignores_clean_exit() {
         use crate::gdb::gdb_signal;
-        assert!(fault_from_stop(&StopReply::Exited(0)).is_none());
-        assert!(fault_from_stop(&StopReply::Signal(gdb_signal::TRAP)).is_none()); // benign trap
-        assert!(fault_from_stop(&StopReply::Signal(0)).is_none());
+        assert!(fault_from_stop(&StopReply::Exited(0), "qemu-system").is_none());
+        assert!(fault_from_stop(&StopReply::Signal(gdb_signal::TRAP), "qemu-system").is_none()); // benign trap
+        assert!(fault_from_stop(&StopReply::Signal(0), "qemu-system").is_none());
         assert_eq!(
-            fault_from_stop(&StopReply::Signal(gdb_signal::SEGV))
+            fault_from_stop(&StopReply::Signal(gdb_signal::SEGV), "qemu-system")
                 .unwrap()
                 .kind,
             FaultKind::MemoryProtection
@@ -1454,26 +1461,26 @@ mod tests {
         // SIGBUS is GDB signal 10 (not the host POSIX 7): a memory-protection
         // fault that was previously misclassified as Other(10) and reported Ok.
         assert_eq!(
-            fault_from_stop(&StopReply::Signal(gdb_signal::BUS))
+            fault_from_stop(&StopReply::Signal(gdb_signal::BUS), "qemu-system")
                 .unwrap()
                 .kind,
             FaultKind::MemoryProtection
         );
         // GDB signal 7 is SIGEMT (an emulator/CPU trap), not SIGBUS.
         assert_eq!(
-            fault_from_stop(&StopReply::Signal(gdb_signal::EMT))
+            fault_from_stop(&StopReply::Signal(gdb_signal::EMT), "qemu-system")
                 .unwrap()
                 .kind,
             FaultKind::CpuException
         );
         assert_eq!(
-            fault_from_stop(&StopReply::Signal(gdb_signal::ILL))
+            fault_from_stop(&StopReply::Signal(gdb_signal::ILL), "qemu-system")
                 .unwrap()
                 .kind,
             FaultKind::CpuException
         );
         assert_eq!(
-            fault_from_stop(&StopReply::Terminated(gdb_signal::ABRT))
+            fault_from_stop(&StopReply::Terminated(gdb_signal::ABRT), "qemu-system")
                 .unwrap()
                 .kind,
             FaultKind::AssertionPanic

@@ -410,6 +410,16 @@ fn build_capsule(f: &FindingRef, out_root: &Path, tar: bool) -> anyhow::Result<C
     let build_path = cap.join("build.sh");
     std::fs::write(&build_path, &plan.build_script)?;
     set_executable(&build_path);
+    // The runtrace shim's modes the finding ran under (#312): its replays
+    // here and in `bhf verify-poc` run under the shim with them set.
+    let shim_env = corpus::finding::recorded_shim_env(&f.raw);
+    if !shim_env.is_empty() {
+        let record: serde_json::Map<String, Value> = shim_env
+            .iter()
+            .map(|(key, value)| (key.clone(), json!(value)))
+            .collect();
+        std::fs::write(cap.join(SHIM_ENV_FILE), serde_json::to_vec_pretty(&record)?)?;
+    }
     if let Some(windows) = &plan.windows {
         std::fs::write(cap.join(WINDOWS_BUILD_SCRIPT), &windows.script)?;
     }
@@ -808,6 +818,34 @@ fn validate_capsule_id(value: &str, label: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The runtrace shim's mode gates the capsule's finding ran under, as a JSON
+/// object of `BHF_*` variables, when it ran under any.
+const SHIM_ENV_FILE: &str = "shim_env.json";
+
+/// The environment a crash replay of `cap` runs with: none, or, for a
+/// finding that ran under the runtrace shim's modes ([`SHIM_ENV_FILE`]),
+/// those gates and the shim preloaded (Linux; elsewhere, or without the
+/// shim, the gates alone, which do nothing).
+fn capsule_replay_env(cap: &Path) -> Vec<(String, String)> {
+    let Some(record) = std::fs::read(cap.join(SHIM_ENV_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    else {
+        return Vec::new();
+    };
+    let mut env = corpus::finding::recorded_shim_env(&json!({ "shim_env": record }));
+    if env.is_empty() {
+        return env;
+    }
+    if let Some(shim) = crate::auto::shim_path::locate().filter(|_| cfg!(target_os = "linux")) {
+        env.push((
+            "LD_PRELOAD".to_owned(),
+            crate::auto::shim_path::ld_preload_value(&shim),
+        ));
+    }
+    env
+}
+
 /// Build the capsule in place, then replay each input in turn; the first that
 /// crashes with the finding's crash is the one the capsule reproduces with.
 /// With the finding's `identity` (its rule, kind and sink or site, in capsule
@@ -861,9 +899,16 @@ fn verify_capsule(
         Some(recorded) if !recorded.is_crash() => &[][..],
         _ => inputs,
     };
+    let replay_env = capsule_replay_env(cap);
     for input in crash_inputs {
         // A replay that ran out its wall clock did not show the crash.
-        let replay = match repro_lane::replay_poc(cap, input, protocol, REPLAY_TIMEOUT) {
+        let replay = match repro_lane::replay_poc_with_env(
+            cap,
+            input,
+            protocol,
+            REPLAY_TIMEOUT,
+            &replay_env,
+        ) {
             Ok(replay) if !replay.timed_out => replay,
             Ok(_) => continue,
             Err(error) => {
@@ -1266,6 +1311,13 @@ fn manifest_value(
         "expected_signature": verification.signature,
         "reproduced": verification.reproduced_with.is_some(),
     });
+    // The runtrace shim's modes the finding ran under (#312).
+    let shim_env = corpus::finding::recorded_shim_env(&f.raw);
+    if !shim_env.is_empty() {
+        manifest["shim_env"] = json!(shim_env
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>());
+    }
     // The Windows build: no POSIX shell, its own compilers.
     if let Some(windows) = &plan.windows {
         manifest["build_windows"] = json!(WINDOWS_BUILD_COMMAND);
@@ -1440,6 +1492,23 @@ fn readme(
         ),
         None => String::new(),
     };
+    let shim_env = corpus::finding::recorded_shim_env(&f.raw);
+    let shim_note = if shim_env.is_empty() {
+        String::new()
+    } else {
+        let gates: Vec<String> = shim_env
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
+        format!(
+            "\nThe crash was found under bhf's runtrace shim with {} (`{SHIM_ENV_FILE}`):\n\
+             replay with those set and the shim preloaded,\n\
+             `{} LD_PRELOAD=/path/to/libbhf_runtrace_shim.so {run}`.\n\
+             `bhf verify-poc` does that itself.\n",
+            gates.join(", "),
+            gates.join(" ")
+        )
+    };
     let stdin_note = if protocol == HarnessProtocol::StdinEventLog {
         "\nThe harness reads its input from stdin and records what it raised in the\n\
          event log `$BHF_EVENTS_PATH`; pipe the input in (`cat ... |`), as a file\n\
@@ -1457,7 +1526,7 @@ fn readme(
          sh build.sh                 # {summary}\n\
          {run}    # replay {which_input}\n\
          ```\n\
-         {stdin_note}{oracle_note}{windows}\n\
+         {stdin_note}{shim_note}{oracle_note}{windows}\n\
          Or verify with bhf:\n\n\
          ```sh\n\
          bhf verify-poc .\n\
@@ -1913,6 +1982,36 @@ fn read_json(path: &Path) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #312: a capsule of a finding that ran under the runtrace shim's modes
+    /// replays with them set (and the shim preloaded where it is found); a
+    /// capsule without any replays as before.
+    #[test]
+    fn a_capsule_replays_under_the_shim_modes_its_finding_ran_with() {
+        let cap = crate::test_support::TestDir::new("capsule-shim-env");
+        assert!(capsule_replay_env(cap.path()).is_empty());
+        std::fs::write(
+            cap.join(SHIM_ENV_FILE),
+            r#"{"BHF_DESOCKET": "1", "LD_PRELOAD": "/elsewhere.so"}"#,
+        )
+        .unwrap();
+        let env = capsule_replay_env(cap.path());
+        assert_eq!(env[0], ("BHF_DESOCKET".to_owned(), "1".to_owned()));
+        // Only the shim bhf finds is preloaded, never one the file names.
+        assert!(
+            env.iter().all(|(_, value)| value != "/elsewhere.so"),
+            "{env:?}"
+        );
+        if let Some(shim) = crate::auto::shim_path::locate().filter(|_| cfg!(target_os = "linux")) {
+            assert_eq!(
+                env.get(1),
+                Some(&(
+                    "LD_PRELOAD".to_owned(),
+                    crate::auto::shim_path::ld_preload_value(&shim)
+                ))
+            );
+        }
+    }
 
     /// A leak capsule an earlier release packaged recorded the leak's byte
     /// count as its signature; it still verifies against today's class, and

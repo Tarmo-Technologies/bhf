@@ -39,10 +39,12 @@
 //! * `gdb:HOST:PORT`         — [`GdbRemoteTransport`]; needs `--transport-coverage-map`.
 //! * `qemu-system:qmp=HOST:PORT,gdb=HOST:PORT[,snapshot=TAG]` — [`FullSystemTransport`];
 //!   needs `--transport-coverage-map`.
+//! * `renode:monitor=HOST:PORT,gdb=HOST:PORT[,snapshot=PATH]` — [`RenodeTransport`]
+//!   over Renode's telnet monitor; needs `--transport-coverage-map`.
 //!
 //! `--transport-coverage-map input=<addr>,ring=<addr>,write=<addr>,wrapped=<addr>,cap=<n>`
 //! (each `<addr>` is decimal or `0x`-hex) locates the coverage ring in target
-//! memory for the memory-read backends (gdb / qemu-system). The agent backend
+//! memory for the memory-read backends (gdb / qemu-system / renode). The agent backend
 //! carries coverage over its protocol and rejects a coverage map.
 
 use std::path::{Path, PathBuf};
@@ -58,8 +60,8 @@ use serde::Serialize;
 use target_transport::cycles::{CycleCounter, CycleSource};
 use target_transport::{
     AgentTransport, CmpLogRegion, ExitKind, FullSystemTransport, GdbMemoryMap, GdbRemoteTransport,
-    GuestFaultStatus, InputContract, ResetMode, RunOutcome, TargetSession, TargetTransport,
-    TransportError,
+    GuestFaultStatus, InputContract, RenodeTransport, ResetMode, RunOutcome, TargetSession,
+    TargetTransport, TransportError,
 };
 
 use crate::fuzz::FuzzArgs;
@@ -238,6 +240,36 @@ pub(crate) enum TransportPlan {
         /// What the parser corrected in the spec, for the run to print.
         notes: Vec<String>,
     },
+    /// Full-system Renode board (#340) driven by its telnet monitor
+    /// (`Save`/`Load` snapshot lifecycle) + the gdb server Renode starts on
+    /// `gdb_port` after each `Load`.
+    Renode {
+        monitor_host: String,
+        monitor_port: u16,
+        gdb_host: String,
+        gdb_port: u16,
+        map: GdbMemoryMap,
+        /// The staging region's capacity and length word.
+        input: InputContract,
+        /// The baseline state file on the Renode host (`snapshot=`).
+        snapshot: String,
+        /// The completion breakpoint `(address, RSP kind)` (`done=`).
+        harness_done: Option<(u64, u32)>,
+        /// The firmware fault-status word (`fault=`).
+        fault_status: Option<GuestFaultStatus>,
+        /// The firmware ELF the board runs (`firmware=`, #248).
+        firmware: Option<PathBuf>,
+        /// The target cycle counter read around each run (`cycles=`, #251).
+        cycles: Option<CycleCounter>,
+        /// The address of the firmware's task identity word (`task_id=`, #252).
+        task_id: Option<u64>,
+        /// The firmware's comparison record (`cmplog=`, #386).
+        cmplog: Option<CmpLogRegion>,
+        /// Coverage from the semihosting channel (`coverage=semihosting`).
+        semihosting: bool,
+        /// What the parser corrected in the spec, for the run to print.
+        notes: Vec<String>,
+    },
 }
 
 /// A descriptive failure parsing a `--target-transport` / `--transport-coverage-map`
@@ -247,13 +279,13 @@ pub(crate) enum TransportSpecError {
     #[error(
         "empty --target-transport spec; expected one of \
          agent:tcp:HOST:PORT, agent:serial:PATH[,baud=N], gdb:HOST:PORT, \
-         qemu-system:qmp=HOST:PORT,gdb=HOST:PORT"
+         qemu-system:qmp=HOST:PORT,gdb=HOST:PORT, renode:monitor=HOST:PORT,gdb=HOST:PORT"
     )]
     Empty,
 
     #[error(
         "unknown --target-transport backend {backend:?}; supported: \
-         agent:tcp, agent:serial, gdb, qemu-system"
+         agent:tcp, agent:serial, gdb, qemu-system, renode"
     )]
     UnknownBackend { backend: String },
 
@@ -426,6 +458,34 @@ impl TransportPlan {
             return parse_qemu_system(spec, rest, map, input, cmplog, semihosting);
         }
 
+        if let Some(rest) = spec.strip_prefix("renode:") {
+            let (map, input, cmplog, semihosting) = require_coverage_map("renode", coverage_map)?;
+            let parsed = SnapshotSpec::parse(
+                "renode",
+                "monitor",
+                target_transport::renode::DEFAULT_SNAPSHOT_PATH,
+                spec,
+                rest,
+            )?;
+            return Ok(Self::Renode {
+                monitor_host: parsed.control.0,
+                monitor_port: parsed.control.1,
+                gdb_host: parsed.gdb.0,
+                gdb_port: parsed.gdb.1,
+                map,
+                input,
+                snapshot: parsed.snapshot,
+                harness_done: parsed.harness_done,
+                fault_status: parsed.fault_status,
+                firmware: parsed.firmware,
+                cycles: parsed.cycles,
+                task_id: parsed.task_id,
+                cmplog,
+                semihosting,
+                notes: parsed.notes,
+            });
+        }
+
         Err(TransportSpecError::UnknownBackend {
             backend: spec.split(':').next().unwrap_or(spec).to_owned(),
         })
@@ -532,6 +592,45 @@ impl TransportPlan {
                 transport = transport.with_exec_deadline(io_timeout);
                 Ok(Box::new(transport))
             }
+            Self::Renode {
+                monitor_host,
+                monitor_port,
+                gdb_host,
+                gdb_port,
+                map,
+                input,
+                snapshot,
+                harness_done,
+                fault_status,
+                firmware: _,
+                cycles,
+                task_id,
+                cmplog,
+                semihosting,
+                notes: _,
+            } => {
+                // Renode starts its gdb server on the port the spec dials.
+                let mut transport = RenodeTransport::new(
+                    move || connect_tcp_bounded(&monitor_host, monitor_port, io_timeout),
+                    move || connect_tcp_bounded(&gdb_host, gdb_port, io_timeout),
+                    gdb_port,
+                    map,
+                    snapshot,
+                )?
+                .with_input_contract(Some(input))
+                .with_cycle_counter(cycles)
+                .with_task_id(task_id)
+                .with_cmplog(cmplog)
+                .with_semihosting_coverage(semihosting)
+                .with_exec_deadline(io_timeout);
+                if let Some((address, kind)) = harness_done {
+                    transport = transport.with_harness_breakpoint(address, kind);
+                }
+                if let Some(status) = fault_status {
+                    transport = transport.with_fault_status(status);
+                }
+                Ok(Box::new(transport))
+            }
         }
     }
 
@@ -539,7 +638,9 @@ impl TransportPlan {
     /// agent, whose own protocol carries the length.
     pub(crate) fn input_contract(&self) -> Option<InputContract> {
         match self {
-            Self::Gdb { input, .. } | Self::QemuSystem { input, .. } => Some(*input),
+            Self::Gdb { input, .. }
+            | Self::QemuSystem { input, .. }
+            | Self::Renode { input, .. } => Some(*input),
             _ => None,
         }
     }
@@ -547,7 +648,9 @@ impl TransportPlan {
     /// The firmware ELF the spec names (`firmware=`), if any.
     pub(crate) fn firmware(&self) -> Option<&Path> {
         match self {
-            Self::Gdb { firmware, .. } | Self::QemuSystem { firmware, .. } => firmware.as_deref(),
+            Self::Gdb { firmware, .. }
+            | Self::QemuSystem { firmware, .. }
+            | Self::Renode { firmware, .. } => firmware.as_deref(),
             _ => None,
         }
     }
@@ -555,7 +658,9 @@ impl TransportPlan {
     /// The target cycle counter the spec names (`cycles=`), if any.
     pub(crate) fn cycle_counter(&self) -> Option<CycleCounter> {
         match self {
-            Self::Gdb { cycles, .. } | Self::QemuSystem { cycles, .. } => *cycles,
+            Self::Gdb { cycles, .. }
+            | Self::QemuSystem { cycles, .. }
+            | Self::Renode { cycles, .. } => *cycles,
             _ => None,
         }
     }
@@ -563,7 +668,9 @@ impl TransportPlan {
     /// The firmware's comparison record the coverage map names (`cmplog=`).
     pub(crate) fn cmplog(&self) -> Option<CmpLogRegion> {
         match self {
-            Self::Gdb { cmplog, .. } | Self::QemuSystem { cmplog, .. } => *cmplog,
+            Self::Gdb { cmplog, .. }
+            | Self::QemuSystem { cmplog, .. }
+            | Self::Renode { cmplog, .. } => *cmplog,
             _ => None,
         }
     }
@@ -571,7 +678,9 @@ impl TransportPlan {
     /// What the parser corrected in the spec (a Thumb `done=` address).
     pub(crate) fn notes(&self) -> &[String] {
         match self {
-            Self::Gdb { notes, .. } | Self::QemuSystem { notes, .. } => notes,
+            Self::Gdb { notes, .. }
+            | Self::QemuSystem { notes, .. }
+            | Self::Renode { notes, .. } => notes,
             _ => &[],
         }
     }
@@ -589,6 +698,13 @@ impl TransportPlan {
                 gdb_port,
                 ..
             } => format!("qemu-system:qmp={qmp_host}:{qmp_port},gdb={gdb_host}:{gdb_port}"),
+            Self::Renode {
+                monitor_host,
+                monitor_port,
+                gdb_host,
+                gdb_port,
+                ..
+            } => format!("renode:monitor={monitor_host}:{monitor_port},gdb={gdb_host}:{gdb_port}"),
         }
     }
 }
@@ -618,76 +734,113 @@ fn parse_qemu_system(
     cmplog: Option<CmpLogRegion>,
     semihosting: bool,
 ) -> Result<TransportPlan, TransportSpecError> {
-    let mut qmp: Option<(String, u16)> = None;
-    let mut gdb: Option<(String, u16)> = None;
-    let mut snapshot_tag = DEFAULT_SNAPSHOT_TAG.to_owned();
-    // Completion contract (#71) and firmware fault-status (#72), all optional.
-    let mut contract = ContractKeys::default();
-    let mut firmware: Option<PathBuf> = None;
-    let mut cycles = CycleKeys::default();
-    let mut task_id: Option<u64> = None;
-
-    let malformed = |reason: String| TransportSpecError::Malformed {
-        backend: "qemu-system",
-        spec: spec.to_owned(),
-        reason,
-    };
-
-    for part in rest.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        let (key, value) = part
-            .split_once('=')
-            .ok_or_else(|| malformed(format!("expected key=value in {part:?}")))?;
-        let value = value.trim();
-        match key.trim() {
-            "qmp" => qmp = Some(parse_host_port("qemu-system", spec, value)?),
-            "gdb" => gdb = Some(parse_host_port("qemu-system", spec, value)?),
-            "snapshot" => snapshot_tag = value.to_owned(),
-            "firmware" => firmware = Some(PathBuf::from(value)),
-            "task_id" => task_id = Some(parse_int("task_id", value)?),
-            key if cycles.take(key, value)? => {}
-            key if contract.take(key, value)? => {}
-            other => {
-                return Err(malformed(format!(
-                    "unknown key {other:?}; allowed: qmp, gdb, snapshot, done, done_kind, \
-                     fault, fault_width, fault_clear, firmware, cycles, cpu_hz, task_id"
-                )))
-            }
-        }
-    }
-
-    let (qmp_host, qmp_port) =
-        qmp.ok_or_else(|| malformed("missing required key qmp=HOST:PORT".to_owned()))?;
-    let (gdb_host, gdb_port) =
-        gdb.ok_or_else(|| malformed("missing required key gdb=HOST:PORT".to_owned()))?;
-
-    let (harness_done, fault_status, notes) = contract.finish("qemu-system", spec)?;
-
+    let parsed = SnapshotSpec::parse("qemu-system", "qmp", DEFAULT_SNAPSHOT_TAG, spec, rest)?;
     Ok(TransportPlan::QemuSystem {
-        qmp_host,
-        qmp_port,
-        gdb_host,
-        gdb_port,
+        qmp_host: parsed.control.0,
+        qmp_port: parsed.control.1,
+        gdb_host: parsed.gdb.0,
+        gdb_port: parsed.gdb.1,
         map,
         input,
-        snapshot_tag,
-        harness_done,
-        fault_status,
-        firmware,
-        cycles: cycles.counter("qemu-system", spec)?,
-        task_id,
+        snapshot_tag: parsed.snapshot,
+        harness_done: parsed.harness_done,
+        fault_status: parsed.fault_status,
+        firmware: parsed.firmware,
+        cycles: parsed.cycles,
+        task_id: parsed.task_id,
         cmplog,
         semihosting,
-        notes,
+        notes: parsed.notes,
     })
+}
+
+/// The keys the snapshot backends share: `qemu-system:` names its control
+/// channel `qmp=`, `renode:` names it `monitor=`.
+struct SnapshotSpec {
+    control: (String, u16),
+    gdb: (String, u16),
+    snapshot: String,
+    harness_done: Option<(u64, u32)>,
+    fault_status: Option<GuestFaultStatus>,
+    firmware: Option<PathBuf>,
+    cycles: Option<CycleCounter>,
+    task_id: Option<u64>,
+    notes: Vec<String>,
+}
+
+impl SnapshotSpec {
+    fn parse(
+        backend: &'static str,
+        control_key: &'static str,
+        default_snapshot: &str,
+        spec: &str,
+        rest: &str,
+    ) -> Result<Self, TransportSpecError> {
+        let mut control: Option<(String, u16)> = None;
+        let mut gdb: Option<(String, u16)> = None;
+        let mut snapshot = default_snapshot.to_owned();
+        // Completion contract (#71) and firmware fault-status (#72), all optional.
+        let mut contract = ContractKeys::default();
+        let mut firmware: Option<PathBuf> = None;
+        let mut cycles = CycleKeys::default();
+        let mut task_id: Option<u64> = None;
+
+        let malformed = |reason: String| TransportSpecError::Malformed {
+            backend,
+            spec: spec.to_owned(),
+            reason,
+        };
+
+        for part in rest.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let (key, value) = part
+                .split_once('=')
+                .ok_or_else(|| malformed(format!("expected key=value in {part:?}")))?;
+            let value = value.trim();
+            match key.trim() {
+                key if key == control_key => {
+                    control = Some(parse_host_port(backend, spec, value)?);
+                }
+                "gdb" => gdb = Some(parse_host_port(backend, spec, value)?),
+                "snapshot" => snapshot = value.to_owned(),
+                "firmware" => firmware = Some(PathBuf::from(value)),
+                "task_id" => task_id = Some(parse_int("task_id", value)?),
+                key if cycles.take(key, value)? => {}
+                key if contract.take(key, value)? => {}
+                other => {
+                    return Err(malformed(format!(
+                        "unknown key {other:?}; allowed: {control_key}, gdb, snapshot, done, \
+                         done_kind, fault, fault_width, fault_clear, firmware, cycles, cpu_hz, \
+                         task_id"
+                    )))
+                }
+            }
+        }
+
+        let control = control
+            .ok_or_else(|| malformed(format!("missing required key {control_key}=HOST:PORT")))?;
+        let gdb = gdb.ok_or_else(|| malformed("missing required key gdb=HOST:PORT".to_owned()))?;
+        let (harness_done, fault_status, notes) = contract.finish(backend, spec)?;
+        Ok(Self {
+            control,
+            gdb,
+            snapshot,
+            harness_done,
+            fault_status,
+            firmware,
+            cycles: cycles.counter(backend, spec)?,
+            task_id,
+            notes,
+        })
+    }
 }
 
 /// The completion contract keys of a memory-read spec: `done=` and
 /// `done_kind=` (#71), `fault=`, `fault_width=` and `fault_clear=` (#72).
-/// The `qemu-system` and, since #293, `gdb` backends take them.
+/// The `qemu-system`, `renode` and, since #293, `gdb` backends take them.
 struct ContractKeys {
     done: Option<u64>,
     /// The RSP breakpoint kind: 2, ARM Thumb's instruction size, by default.
@@ -1665,6 +1818,8 @@ fn backend_and_reset(spec: &str) -> (&'static str, &'static str) {
         ("gdb-remote", "gdb R restart")
     } else if spec.starts_with("qemu-system:") {
         ("qemu-system", "qmp savevm/loadvm snapshot")
+    } else if spec.starts_with("renode:") {
+        ("renode", "renode Save/Load snapshot")
     } else {
         ("unknown", "unknown")
     }
@@ -2914,6 +3069,188 @@ mod tests {
             TransportSpecError::UnknownMapKey { key } => assert_eq!(key, "bogus"),
             other => panic!("expected UnknownMapKey, got {other}"),
         }
+    }
+
+    // --- renode: (#340) -------------------------------------------------------
+
+    const RENODE_MAP: &str =
+        "input=0x1000,input_cap=64,ring=0x4000,write=0x5000,wrapped=0x5100,cap=64";
+
+    #[test]
+    fn parses_a_renode_spec_with_its_defaults() {
+        let plan = TransportPlan::parse(
+            "renode:monitor=127.0.0.1:1234,gdb=127.0.0.1:3333",
+            Some(RENODE_MAP),
+        )
+        .unwrap();
+        let TransportPlan::Renode {
+            monitor_host,
+            monitor_port,
+            gdb_host,
+            gdb_port,
+            snapshot,
+            map,
+            harness_done,
+            ..
+        } = &plan
+        else {
+            panic!("expected Renode, got {plan:?}");
+        };
+        assert_eq!((monitor_host.as_str(), *monitor_port), ("127.0.0.1", 1234));
+        assert_eq!((gdb_host.as_str(), *gdb_port), ("127.0.0.1", 3333));
+        assert_eq!(snapshot, target_transport::renode::DEFAULT_SNAPSHOT_PATH);
+        assert_eq!(map.ring_address, 0x4000);
+        assert_eq!(*harness_done, None);
+        assert_eq!(
+            plan.label(),
+            "renode:monitor=127.0.0.1:1234,gdb=127.0.0.1:3333"
+        );
+        assert_eq!(plan.input_contract().map(|c| c.capacity), Some(64));
+        assert_eq!(
+            backend_and_reset("renode:monitor=h:1,gdb=h:2"),
+            ("renode", "renode Save/Load snapshot")
+        );
+    }
+
+    #[test]
+    fn a_renode_spec_takes_the_snapshot_path_and_the_completion_contract() {
+        let plan = TransportPlan::parse(
+            "renode:monitor=h:1,gdb=h:2,snapshot=/tmp/base.save,done=0x189,fault=0x20000100,\
+             task_id=0x20000200,firmware=fw.elf,cycles=dwt,cpu_hz=64000000",
+            Some(RENODE_MAP),
+        )
+        .unwrap();
+        let TransportPlan::Renode {
+            snapshot,
+            harness_done,
+            fault_status,
+            task_id,
+            ..
+        } = &plan
+        else {
+            panic!("expected Renode, got {plan:?}");
+        };
+        assert_eq!(snapshot, "/tmp/base.save");
+        assert_eq!(*harness_done, Some((0x188, 2)), "the Thumb bit is cleared");
+        assert_eq!(fault_status.as_ref().map(|f| f.address), Some(0x2000_0100));
+        assert_eq!(*task_id, Some(0x2000_0200));
+        assert_eq!(plan.firmware(), Some(Path::new("fw.elf")));
+        assert!(plan.cycle_counter().is_some());
+        assert_eq!(plan.notes().len(), 1, "{:?}", plan.notes());
+    }
+
+    #[test]
+    fn a_renode_spec_without_its_endpoints_or_map_is_refused() {
+        let no_monitor = TransportPlan::parse("renode:gdb=h:2", Some(RENODE_MAP)).unwrap_err();
+        assert!(
+            no_monitor.to_string().contains("monitor=HOST:PORT"),
+            "{no_monitor}"
+        );
+        let no_gdb = TransportPlan::parse("renode:monitor=h:1", Some(RENODE_MAP)).unwrap_err();
+        assert!(no_gdb.to_string().contains("gdb=HOST:PORT"), "{no_gdb}");
+        let no_map = TransportPlan::parse("renode:monitor=h:1,gdb=h:2", None).unwrap_err();
+        assert!(
+            matches!(
+                no_map,
+                TransportSpecError::MissingCoverageMap { backend: "renode" }
+            ),
+            "{no_map}"
+        );
+        let unknown = TransportPlan::parse("renode:monitor=h:1,gdb=h:2,qmp=h:3", Some(RENODE_MAP))
+            .unwrap_err();
+        assert!(
+            unknown.to_string().contains("allowed: monitor, gdb"),
+            "{unknown}"
+        );
+    }
+
+    #[test]
+    fn a_renode_snapshot_path_that_could_split_the_monitor_command_is_refused_at_build() {
+        let plan = TransportPlan::parse(
+            "renode:monitor=h:1,gdb=h:2,snapshot=a;quit",
+            Some(RENODE_MAP),
+        )
+        .unwrap();
+        let Err(error) = plan.into_transport(None) else {
+            panic!("an unsafe snapshot path must be refused");
+        };
+        assert!(
+            error.to_string().contains("disallowed character"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_unknown_backend_error_lists_renode() {
+        let error = TransportPlan::parse("bogus:1", None).unwrap_err();
+        assert!(error.to_string().contains("renode"), "{error}");
+    }
+
+    /// The parsed spec drives a whole Renode session over real sockets: the
+    /// mock monitor and a mock gdb server listen on loopback ports, and the
+    /// transport the CLI builds saves, loads, restarts the gdb server and
+    /// reads the run's coverage.
+    #[test]
+    fn a_renode_spec_builds_a_transport_that_runs_over_tcp() {
+        use std::net::TcpListener;
+        use target_transport::testsupport::{
+            encode_event_stream, simulate_ring, MockGdbStub, MockRenodeMonitor,
+        };
+
+        let monitor_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let gdb_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let monitor_port = monitor_listener.local_addr().unwrap().port();
+        let gdb_port = gdb_listener.local_addr().unwrap().port();
+        let monitor_log = Arc::new(Mutex::new(Vec::new()));
+        let gdb_server = Arc::new(Mutex::new(None));
+        {
+            let log = Arc::clone(&monitor_log);
+            let server = Arc::clone(&gdb_server);
+            thread::spawn(move || {
+                let (stream, _) = monitor_listener.accept().unwrap();
+                let _ = MockRenodeMonitor::new(stream, log, server).serve();
+            });
+        }
+        thread::spawn(move || {
+            for stream in gdb_listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let events: Vec<event_log::Event> = [0x10, 0x11]
+                    .into_iter()
+                    .map(|id| event_log::Event::Crumb { id })
+                    .collect();
+                let (image, write, wrapped) = simulate_ring(&encode_event_stream(&events), 64);
+                let stub = MockGdbStub::new(stream, Arc::new(Mutex::new(Vec::new())))
+                    .with_unsolicited_stops()
+                    .with_stop_reply(b"T05swbreak:;".to_vec())
+                    .with_region(0x1000, vec![0; 64])
+                    .with_region(0x4000, image)
+                    .with_region(0x5000, write.to_le_bytes().to_vec())
+                    .with_region(0x5100, vec![u8::from(wrapped)]);
+                thread::spawn(move || {
+                    let _ = stub.serve();
+                });
+            }
+        });
+
+        let plan = TransportPlan::parse(
+            &format!("renode:monitor=127.0.0.1:{monitor_port},gdb=127.0.0.1:{gdb_port},done=0x1a8"),
+            Some(RENODE_MAP),
+        )
+        .unwrap();
+        let transport = plan.into_transport(Some(Duration::from_secs(10))).unwrap();
+        let mut session = transport.arm().unwrap();
+        let outcome = session.run_input(b"abc").unwrap();
+        assert_eq!(outcome.exit, ExitKind::Ok, "{outcome:?}");
+        assert_eq!(outcome.coverage_edges, [0x10, 0x11]);
+        let log = monitor_log.lock().unwrap();
+        assert!(
+            log.iter().any(|line| line == "Save @bhf-baseline.save")
+                && log.iter().any(|line| line == "Load @bhf-baseline.save")
+                && log
+                    .iter()
+                    .any(|line| *line == format!("machine StartGdbServer {gdb_port}")),
+            "{log:?}"
+        );
     }
 
     #[test]

@@ -605,6 +605,7 @@ pub(crate) unsafe extern "C" fn fclose_hook(file: *mut libc::FILE) -> libc::c_in
     if fd >= 0 && (result == 0 || saved_errno != libc::EBADF) {
         // The descriptor number is free for reuse now, as after `close`.
         crate::fakes::memfd::clear_fake_fd(fd);
+        crate::hooks::net::desocket_closed(fd);
         if let Some(_g) = HookGuard::acquire() {
             log_fd_close(fd, 0);
         }
@@ -859,6 +860,7 @@ pub unsafe extern "C" fn close(fd: libc::c_int) -> libc::c_int {
         // Clear virtual-device provenance before this numeric descriptor can be
         // reused for an unrelated file or pipe.
         crate::fakes::memfd::clear_fake_fd(fd);
+        crate::hooks::net::desocket_closed(fd);
         if let Some(_g) = HookGuard::acquire() {
             log_fd_close(fd, result);
         }

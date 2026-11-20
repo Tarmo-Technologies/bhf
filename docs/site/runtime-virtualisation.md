@@ -47,6 +47,9 @@ oracles described below are unavailable.
 | `__assert_fail`, `__assert_perror_fail` | Audit then forward. Logs native assertion/contract failures before preserving libc's aborting assertion behavior. |
 | `sqlite3_exec`, `sqlite3_prepare[_v2/_v3]`, `PQexec`, `PQexecParams`, `mysql_query`, `mysql_real_query` | Audit only. Logs SQL query strings passed to SQLite / libpq / MySQL so the BHF-441 SQL-injection oracle (CWE-89) can flag a fuzz-controlled query. |
 | `getpid`, `getuid`, `getgid`, `getppid` | Env-gated on `BHF_FAKE_IDENTITY`. Returns deterministic identity constants so environment-driven crashes reproduce identically across runs. |
+| `bind`, `listen`, `accept`, `accept4`, `getsockname`, `getpeername`, `setsockopt` | Env-gated on `BHF_DESOCKET` (#312): see [Desocketing a server](#desocketing-a-server). Without the gate every call goes to libc. |
+| `clock_gettime`, `gettimeofday`, `time`, `clock`, `timespec_get` | Env-gated on `BHF_FAKE_CLOCK` (#342). A virtual clock: the wall clocks start at 2026-01-01T00:00:00Z, the monotonic ones at 1000 s and the CPU clocks at 0, every read is 1 ms after the one before, and every input the harness publishes starts the clock over, so the same input sees the same times on every run and a loop waiting for a deadline still reaches it. A clock it does not model (another process's CPU clock) reads the real one. Without the gate every call goes to the real clock. The real functions are resolved as the shim loads, never inside a call, and the gate is read from `environ` without calling `getenv`. A runtime that reads the clock itself in the same process (AddressSanitizer's allocator does when it maps memory) also advances it, so an input's times can shift when it runs after other inputs in one persistent process. `bhf fuzz --engine libfuzzer` ignores the gate, with a warning, and gives its children `BHF_FAKE_CLOCK=0`: libFuzzer runs in the harness process and times `-timeout` with the clock the shim would fake, so a hang would never time out. The builtin and AFL++ engines time inputs from their own process and keep the virtual clock. |
+| `clock_nanosleep` (`TIMER_ABSTIME`), `pthread_cond_timedwait`, `pthread_cond_clockwait`, `sem_timedwait`, `sem_clockwait` | With `BHF_FAKE_CLOCK=1` (#342), an absolute deadline the target computed from the virtual clock is waited for on the kernel's real clock as far ahead as it was of the virtual time; one already past ends at once. Without this a monotonic deadline (the virtual clock starts at 1000 s) ended at once on a host up longer than that and slept until the uptime reached it on one just booted, and a wall-clock one ended at once. `pthread_cond_timedwait` cannot see the condition variable's clock, so it takes a deadline near the virtual wall clock as `CLOCK_REALTIME` and any other as `CLOCK_MONOTONIC`. Other absolute deadlines (`pthread_mutex_timedlock`, `pthread_rwlock_timed*`, `mq_timedreceive`, `timer_settime` and `timerfd_settime` with `TIMER_ABSTIME`) still compare the virtual deadline with the real clock. Relative sleeps and timeouts (`nanosleep`, `poll`, `select`) take real time. |
 | `strcmp`, `strncmp`, `memcmp` | Env-gated on `BHF_CMPLOG`. Records comparison operands (cmplog / RedQueen) so the engine can splice them into inputs to defeat magic-byte and string gates. Off unless the fuzz loop enables it. |
 | `mq_open`, `mq_receive`, `mq_timedreceive`, `mq_send`, `mq_getattr`, `mq_close`, `mq_unlink` | Message-queue virtualization (#440). Partitioned / message-driven systems on POSIX (cFS Software Bus, DDS, RTOS-on-Linux IPC) move data over POSIX message queues; a message loop normally blocks in `mq_receive` waiting for a peer that doesn't exist under fuzzing. During a faking pass `mq_open` returns a private fake descriptor and `mq_receive`/`mq_timedreceive` DELIVER the current fuzz input as a message (mode-driven: Empty → none, Rng → pseudo-random, FuzzDriven → the live input), feeding a partition's handler its input through the real IPC API. Delivery is bounded so a `while (1) mq_receive(...)` loop terminates instead of spinning. `mq_send` is swallowed; `mq_getattr` reports a sane message size. (Vendor message-bus structs — cFE `CFE_SB_*`, ARINC 653 APEX — sit above this and are generated against the target's own headers by stub-gen.) |
 | `open`/`openat` of `/dev/mem`, `/dev/kmem`, `/dev/gpiomem`, `/dev/uio*`, `/dev/mtd*`, `/dev/i2c-*`, `/dev/spidev*`, `/dev/watchdog*` | MMIO / device-register virtualization (#441). A Linux MMIO driver `open`s one of these and `mmap`s it to reach device registers. During a faking pass the open is redirected to a private, mode-filled memfd (logged as an `mmio` event), so the unprivileged open that would fail with EACCES succeeds, the driver's `mmap` + register reads hit fuzz-controlled memory, and no real device memory is touched. Intercepting at `open` (not `mmap`) keeps this off the allocator/loader hot path. |
@@ -136,6 +139,59 @@ was **not armed** (e.g. the default `--runtime-oracles off`, so the loop wrote n
 `observed: false`, never `clean_assurance: true` — rather than fabricating a clean
 observation over coverage it never had.
 
+## Desocketing a server
+
+A network server's input arrives through `accept` and `recv`, so a harness
+that calls its main loop (`serve(port)`) would wait in `accept` for a client
+that never comes. With `BHF_DESOCKET=1` the runtrace shim stands in for the
+network, as libdesock and preeny's desock do:
+
+- `bind` of an IPv4 or IPv6 stream socket succeeds without binding, so no
+  port is taken and a privileged port needs no privilege. `getsockname`
+  reports the loopback address and the port the server asked for.
+- `listen` succeeds, and the listener reads as ready to `poll`, `select` and
+  `epoll`.
+- The first `accept` (or `accept4`) returns a connection whose reads deliver
+  the current fuzz input (the one the harness published, else stdin) and then
+  end of file. Its peer is `127.0.0.1` (`::1`) port 40000; TCP and IP
+  `setsockopt` calls on it succeed without effect, and what the server sends
+  is absorbed.
+- A later `accept` flushes stdio and ends the process with status 0 once the
+  server is done with that connection: it closed it, in every thread and
+  process that held it, or shut it down for writing. Until then a later
+  `accept` on a non-blocking listener fails with `EAGAIN`, so an event loop
+  that accepts until `EAGAIN` (libevent's listener, an edge-triggered
+  `epoll`) goes on to read the connection; on a blocking listener it waits
+  while another thread (a thread-per-connection server's handler) or the
+  child the connection was forked to works on it, reading and dropping what
+  the server sends meanwhile. When the server closes the connection, each
+  faked listener becomes readable again, so an edge-triggered loop calls
+  `accept` once more and the run ends. A single-threaded server that accepts
+  again with the connection still open could never close it, and ends at
+  once. Publishing a new input starts over.
+
+The C driver runs each framed input in a forked child while the mode is on,
+so the builtin engine's persistent fork-server keeps one process for the
+campaign and the exit ends only the child; a child that crashes is passed on,
+and the engine re-runs that input in a fresh process as it does any crash.
+
+```sh
+bhf generate-harness server.c --target serve --id H-SERVE --output work/generated_harnesses
+bhf build work --harness H-SERVE
+BHF_DESOCKET=1 bhf fuzz work --harness H-SERVE --runtime-oracles on --time 5m
+```
+
+`--runtime-oracles on` loads the shim. A finding records the shim modes its
+campaign ran under (`"shim_env": {"BHF_DESOCKET": "1"}`, and `BHF_FAKE_CLOCK`
+the same way), and `bhf replay`, `bhf minimize`, `bhf env-capsule`, the
+capture replay of `bhf explain` and `bhf verify-poc` set them again, so the
+finding replays in a clean environment. `replay.py` sets them too, and
+preloads the shim `BHF_RUNTRACE_SHIM` names. Limits: TCP only (a UDP server's
+`recvfrom` is not faked); a connection carries at most what fits in a socket
+buffer (about 200 KiB) and a server that sends more than that in reply
+blocks; the C++ driver does not fork, so a C++ server's runs each end the
+persistent process and are re-run in a fresh one, slower but complete.
+
 ## Allocation Discipline
 
 Every hook formats its event into a stack buffer and writes through `libc::write`.
@@ -182,6 +238,8 @@ in the parent shell.
 | `BHF_FUZZ_INPUT_LEN` | harness | shim | Length of the fuzz input in the shared memfd |
 | `BHF_DISABLE_DLOPEN_FAKE` | user | shim | Opt out of synthetic `dlopen` / `dlsym` handles when a target uses struct-return-by-value through `dlsym` |
 | `BHF_FAKE_IDENTITY` | auto (replay) | shim | Enable deterministic `getpid`/`getuid`/`getgid`/`getppid` constants |
+| `BHF_DESOCKET` | user | shim, C driver | `1` serves a TCP server's first accepted connection from the fuzz input and ends the run at a later `accept` once the server has closed it; the C driver then runs each framed input in a forked child (#312) |
+| `BHF_FAKE_CLOCK` | user | shim | `1` serves `clock_gettime`, `gettimeofday`, `time`, `clock` and `timespec_get` from the virtual clock each input starts over, and waits for an absolute deadline taken from it on the real clock (#342); ignored by `--engine libfuzzer` |
 | `BHF_CMPLOG` | auto | shim, C/C++ driver | Enable `strcmp`/`strncmp`/`memcmp` comparison-operand recording (cmplog / RedQueen) into `BHF_RUNTRACE_LOG`. The shim records each distinct comparison once per process, and none once the log holds 8 MiB |
 | `BHF_TARGET_EXE` | bhf (native harnesses) | shim | The harness executable. With it set, only a process running that file (the same device and inode as `/proc/self/exe`) records comparisons: the harness and the children it forks, such as the fork server's, but not a shell or tool it runs through `system`, `popen` or `exec` |
 | `BHF_CMP_EVIDENCE` | bhf (capture replays) | C/C++ driver | File the driver records every comparison of one run into, for the comparison evidence of a finding's input; unset during fuzzing |

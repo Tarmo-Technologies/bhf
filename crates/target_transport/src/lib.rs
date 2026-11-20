@@ -27,6 +27,9 @@
 //!   backend over `qemu-system-*`: a [`fullsystem::QmpClient`] drives the
 //!   snapshot lifecycle (`qmp_capabilities`, `stop`, `savevm`/`loadvm`) while
 //!   the [`gdb::GdbClient`] delivers input, runs, and reads the coverage ring.
+//! * [`renode::RenodeTransport`] — the same full-system lane over a Renode
+//!   board: a [`renode::RenodeMonitor`] (Renode's telnet monitor) saves and
+//!   loads the baseline with `Save`/`Load`, and gdb runs each input.
 //! * [`host::HostChildTransport`] (Unix) — a self-contained reference host
 //!   backend (spawn child, feed stdin, map exit/signal). It collects no
 //!   coverage; adopting the production `mmap`/fork-server coverage path is a
@@ -42,7 +45,8 @@
 //! # Test support
 //!
 //! [`testsupport`] provides in-process mocks ([`testsupport::MockAgent`],
-//! [`testsupport::MockGdbStub`], an in-memory [`testsupport::duplex`]) so every
+//! [`testsupport::MockGdbStub`], [`testsupport::MockQmpServer`],
+//! [`testsupport::MockRenodeMonitor`], an in-memory [`testsupport::duplex`]) so every
 //! backend is exercised end-to-end with no hardware.
 
 pub mod agent;
@@ -53,6 +57,7 @@ pub mod error;
 pub mod fullsystem;
 pub mod gdb;
 pub mod outcome;
+pub mod renode;
 pub mod testsupport;
 pub mod transport;
 mod wire;
@@ -72,6 +77,7 @@ pub use gdb::{
     GdbSession, InputContract, ResetMode, StopReply,
 };
 pub use outcome::{ExitKind, Fault, FaultKind, RunOutcome, TargetObservation};
+pub use renode::{RenodeLimits, RenodeMonitor, RenodeSession, RenodeTransport};
 pub use transport::{TargetSession, TargetTransport};
 
 #[cfg(unix)]

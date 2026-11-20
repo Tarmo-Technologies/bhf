@@ -4,6 +4,47 @@
 
 ## Unreleased
 
+### Added
+- `bhf fuzz --target-transport renode:monitor=HOST:PORT,gdb=HOST:PORT[,snapshot=PATH]`
+  fuzzes firmware on a Renode board (#340): Renode's telnet monitor saves the
+  baseline with `Save` and restores it with `Load` before each input, and gdb
+  runs the input as on `qemu-system:`. It takes the same `done=`, `fault=`,
+  `firmware=`, `cycles=` and `task_id=` keys. The gdb client now drops a stop
+  reply a stub sends unprompted, as Renode's does.
+- The C direct harness maps the device registers its target reads at fixed
+  addresses (#341): the pages of the volatile register accesses the target's
+  code reaches in its source and the headers it includes are mapped once,
+  through `bhf_shim_mmio_fill` when the runtrace shim is loaded, and refilled
+  from each input, so a bug gated on a register's value is found where the
+  read used to fault. Poison and sentinel pointers (`LIST_POISON1`) and a page
+  a loop condition polls are left unmapped. `bhf auto` asks the built harness
+  which windows it mapped (`mmio-mapped.txt`), and only those make the
+  finding's `hardware_peripherals` fidelity say `emulated:`.
+  `BHF_NO_MMIO_EMULATION=1` turns it off.
+- `BHF_FAKE_CLOCK=1` gives a target under the runtrace shim a virtual clock
+  (#342): `clock_gettime`, `gettimeofday`, `time`, `clock` and
+  `timespec_get` start at a fixed instant, advance 1 ms per read and start
+  over with each input, so the same input sees the same times on every run.
+  The real functions are resolved as the shim loads, never inside a call.
+  An absolute-deadline wait (`clock_nanosleep` with `TIMER_ABSTIME`,
+  `pthread_cond_timedwait`/`clockwait`, `sem_timedwait`/`clockwait`) on a
+  virtual deadline waits that long on the real clock. `bhf fuzz --engine
+  libfuzzer` ignores the gate with a warning, since libFuzzer times its
+  `-timeout` with the clock it would fake. `bhf auto --list-fakes` lists it
+  as `clock`.
+- `BHF_DESOCKET=1` runs a TCP server's main loop on the fuzz input (#312):
+  under the runtrace shim, `bind` and `listen` succeed without the network,
+  the first `accept` returns a connection that delivers the input and then
+  end of file, and a later one ends the run once the server has closed that
+  connection (a non-blocking listener gets `EAGAIN` until then, so
+  thread-per-connection and event-loop servers handle it first). The C driver
+  then runs each framed input in a forked child, so a harness that calls
+  `serve(port)` fuzzes in the builtin engine's persistent fork-server.
+- A finding records the runtrace shim modes its campaign ran under
+  (`BHF_DESOCKET`, `BHF_FAKE_CLOCK`) in a new `shim_env` block, and replay,
+  minimize, env-capsule, the capsule's `verify-poc` and `replay.py` set them
+  again.
+
 ### Changed
 - The in-crate lane for private Rust targets (#83) is `bhf auto
   --rust-private` (#244), or `rust-private = true` in the config; it was
@@ -70,6 +111,11 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- A SEGV on a fixed address is taken for a missing device register only when
+  the target reads that address as a register: a volatile access that is no
+  poison or sentinel value (#437). A fault on a plain pointer constant, such
+  as list.h's `LIST_POISON1`, keeps the crash's own classification and
+  severity.
 - An Ada harness given its input as a file on stdin reads it once (#304).
   Each loop reopened `/dev/stdin`, which starts a regular file over, so the
   harness read the same input until it was killed.
@@ -2853,6 +2899,78 @@
   when bhf panics.
 
 ### Added
+- `bhf differential --metamorphic-transform` has a transform registry (#330):
+  `append-newline`, `trailing-whitespace` (a space and a tab at the end of
+  every line), `reorder-json-keys` (every JSON object's members in reverse
+  order, every other byte kept) and `utf8-bom` (a byte order mark before the
+  input). Each declares the relation its variant must keep: the same stdout
+  and exit status, or for `utf8-bom` the same exit status only, so a parser
+  that echoes the mark is not flagged and one that rejects it is. The flag
+  takes several transforms, comma-separated or repeated, each applied to
+  every input; a finding's `metamorphic` block names the `relation` it
+  broke. Only `append-newline` existed before.
+- `bhf minimize --strategy grammar --grammar <PATH>` minimizes a grammar
+  finding on its derivation tree (#369), so the minimized input is a smaller
+  sentence of the grammar that still reproduces; byte-wise minimization broke
+  its structure. The testcase is parsed with the grammar (an Earley parse),
+  and each subtree, outermost first, is replaced by its rule's smallest
+  derivation, a same-rule subtree inside it, or a smaller production of its
+  rule that keeps its children, while the finding reproduces, as Nautilus
+  and Perses do. `bhf auto --grammar` minimizes a finding whose testcase the
+  grammar derives the same way.
+- `--grammar` mutates derivation trees (#329), as Nautilus does: the builtin
+  engine keeps the derivation tree of each input it derives from the grammar,
+  and most children of such an input are tree mutations, a subtree derived
+  afresh from its rule, a recursion repeated, or a subtree spliced in from
+  another input's tree of the same rule, so they stay sentences of the
+  grammar. A derivation ends within `--max-len` by taking each rule's
+  smallest production as it nears it, where it was cut off mid-sentence. The
+  `--grammar` help said "a Nautilus-style grammar mutator" when the engine
+  only generated fresh derivations; it now says what the engine does. A
+  grammar whose smallest derivation nests more than 512 rules deep is refused.
+- `bhf fuzz --frame <profile.toml>` fuzzes a single-input harness through a
+  binary frame descriptor (#328): a `bhf.protocol.v1` profile of one message,
+  whose typed fields, lengths, checksums, TLVs and offsets the session lane
+  already reads. The builtin engine decodes each input into the message's
+  fields, edits a field or mutates the frame's bytes, and recomputes every
+  derived field before the harness runs it, as AFL++'s
+  `afl_custom_post_process` does, so a mutant passes a length/CRC gate that
+  byte mutation alone breaks. Seeds are repaired the same way and the
+  message's own frame is a seed. Before, only the session lane used the frame
+  fix-ups.
+- `bhf project import-ossfuzz` imports what OSS-Fuzz keeps beside each
+  fuzzer (#335): `<name>_seed_corpus.zip` is unpacked with the system
+  `unzip` (no zip library) into the manifest target's seeds, with any
+  symlink it restores removed; `<name>.dict` and the dictionary `.options`
+  names are merged into the harness's `dictionary.txt` and are the target's
+  dictionaries; and the `[libfuzzer]` `max_len`, `timeout` and
+  `rss_limit_mb` options set the target's `max-len`, `timeout` and
+  `rss-limit-mb`, with every other option reported as not applied. A seed
+  corpus without `unzip` on PATH stops the import with what to install.
+- The fuzzers `bhf project import-ossfuzz` builds are registered as
+  harnesses of the work dir (#377): each is staged at
+  `<work>/build/<name>/main`, where `bhf fuzz --harness <name>`, replay and
+  minimize find it, with the framed input mode declared beside one linked
+  with bhf's driver, and is a target of the `bhf.project.v1` manifest the
+  import writes to `<work>/ossfuzz/bhf.project.toml` for `bhf project run`
+  (`engine = "builtin"`, or `engine = "binary"` with `input-mode = "file"`
+  for a libFuzzer binary linked without bhf's driver). The import lists them
+  with the commands that fuzz them.
+- `bhf project import-ossfuzz` builds a project's existing OSS-Fuzz or
+  ClusterFuzzLite integration (#334). It runs the project's `build.sh` as
+  OSS-Fuzz does, `bash -eux $SRC/build.sh` from `$SRC/<name>`, with the
+  OSS-Fuzz build variables: `$SRC`, `$WORK` and `$OUT` under
+  `<work>/ossfuzz/`, clang as `$CC`/`$CXX`, OSS-Fuzz's address-sanitizer
+  `$CFLAGS`/`$CXXFLAGS` with the coverage bhf's driver reads, and
+  `$LIB_FUZZING_ENGINE` an archive of bhf's own driver, so every fuzz target
+  the build links is a bhf harness. The build runs in bubblewrap or
+  firejail, with no network and no writes outside `$SRC`, `$WORK` and `$OUT`,
+  and with nothing of bhf's environment beyond the build contract; the
+  import is refused, naming the missing tool or why it failed, when no
+  sandbox works, and `--sandbox none` runs it directly. The fuzzers are
+  collected from `$OUT` by OSS-Fuzz's own rule. The nightly runs the
+  sandbox tests in a job of their own that lets bubblewrap create its
+  namespaces, which the hosted Ubuntu 24.04 image denies.
 - The Fortran lane runs on native Windows (#327). MinGW-w64's gfortran ships
   no AddressSanitizer, so there the Fortran objects are compiled with
   gfortran's bounds and pointer checks, a failed check is a crash instead of
@@ -2885,6 +3003,15 @@
 - The extension's `lifecycle.setup`, `reset` and `teardown` run around the
   campaign and between its cases (#374). A setup or reset the extension
   answers as failed stops the campaign with its message.
+- `bhf extension session --session-transport SPEC` drives a real target
+  over the session lane's transport (#313), where it could drive only a
+  built-in toy target: each scenario message goes to the target as the
+  extension framed it, and the target's reply is what the extension observes
+  and binds. `--session-server-cmd` starts the service, waits for its port
+  and stops it after the session, and `--session-reply-timeout` bounds a
+  reply. A target that ends the session or a service that exits is exit `3`
+  with the reason in `extension.json` (a service's sanitizer report included),
+  never an extension fault or a finding.
 - `bhf binary fuzz --engine afl-frida` runs AFL++'s Frida mode (`afl-fuzz
   -O`) on a binary without source (#322). Both binary-only modes record their
   engine, the trace program or library, `executions` and a `fidelity` object

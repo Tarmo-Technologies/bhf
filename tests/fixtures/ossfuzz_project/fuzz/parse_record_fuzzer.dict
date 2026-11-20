@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+# The record format's magic and its largest payload length.
+magic="REC1"
+max_length="\x10"

@@ -85,6 +85,7 @@ mod minimize;
 mod model;
 mod msvc_cc;
 mod offline_symbolize;
+mod ossfuzz_import;
 mod pack;
 mod policy;
 mod probe_backend;
@@ -156,7 +157,8 @@ COMMANDS BY AREA (run `bhf <command> --help` for details):
   Crash triage  corpus, minimize, replay, capsule, verify-poc, env-capsule,
                 differential, relational, cmplog, explain, cartography, decode-args
   Binaries      binary (scan, adapter, fuzz — no source)
-  Projects      project (validate, list, run), extension (validate, evaluate)
+  Projects      project (validate, list, run, import-ossfuzz),
+                extension (validate, evaluate)
   Supply chain  sbom, license-audit, static-scan, sloc, extract-state-machines
   Reference     rules, list oracles
   Governance    policy, audit, pack, export

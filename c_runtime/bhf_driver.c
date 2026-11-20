@@ -1198,6 +1198,64 @@ BHF_NOCOV static void bhf_run_one_bytes(const uint8_t *data, size_t size) {
     bhf_run_one(data, size);
     bhf_c8_flush();
 }
+#ifndef _WIN32
+#include <errno.h>
+#include <signal.h>
+#include <sys/wait.h>
+/* #312: under the runtrace shim's desocket mode (BHF_DESOCKET=1) a server's
+ * loop ends its process at the accept after its one connection. Each framed
+ * input then runs in a forked child, so that exit ends the child and the
+ * persistent process takes the next input. The child's coverage and events
+ * reach the shared maps and the log as before; its stdin is /dev/null so it
+ * cannot read the frames. A child that dies of a signal or exits non-zero is
+ * passed on as this process's own end, so the engine isolates the input in a
+ * fresh process as it does any crash. Kept in step with the copy in
+ * direct_harness.c.tera. */
+extern int bhf_shim_desocket_active(void) __attribute__((weak));
+BHF_NOCOV static void bhf_run_framed(const uint8_t *input, size_t len) {
+    pid_t pid;
+    int status = 0;
+    if (!(bhf_shim_desocket_active && bhf_shim_desocket_active())) {
+        BHF_STACK_BEGIN();
+        bhf_run_one_bytes(input, len);
+        BHF_STACK_END();
+        return;
+    }
+    fflush(NULL);
+    pid = fork();
+    if (pid == 0) {
+        int null_fd = bhf_open(BHF_DEVNULL, O_RDONLY);
+        if (null_fd >= 0 && null_fd != 0) {
+            bhf_dup2(null_fd, 0);
+            bhf_close(null_fd);
+        }
+        BHF_STACK_BEGIN();
+        bhf_run_one_bytes(input, len);
+        BHF_STACK_END();
+        fflush(NULL);
+        _exit(0);
+    }
+    if (pid < 0) {
+        bhf_run_one_bytes(input, len);
+        return;
+    }
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) return;
+    }
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) return;
+    if (WIFSIGNALED(status)) {
+        signal(WTERMSIG(status), SIG_DFL);
+        raise(WTERMSIG(status));
+    }
+    _exit(WIFEXITED(status) ? WEXITSTATUS(status) : 1);
+}
+#else
+#define bhf_run_framed(input, len) do { \
+    BHF_STACK_BEGIN(); \
+    bhf_run_one_bytes((input), (len)); \
+    BHF_STACK_END(); \
+} while (0)
+#endif
 /* Returns -1, having run nothing, when `path` cannot be opened. */
 static int bhf_run_file(const char *path) {
     FILE *f = fopen(path, "rb");
@@ -1326,9 +1384,7 @@ int main(int argc, char **argv) {
             uint8_t *input = (uint8_t *)malloc(len ? (size_t)len : 1);
             if (!input) return 1;
             if (len && !bhf_read_n(0, input, len)) { free(input); break; }
-            BHF_STACK_BEGIN();
-            bhf_run_one_bytes(input, len);
-            BHF_STACK_END();
+            bhf_run_framed(input, len);
             free(input);
             unsigned char sync = 1;
             if (bhf_write(bhf_ctrl_fd, &sync, 1) != 1) break;

@@ -387,6 +387,8 @@ fn wait_for_baton<'a>(
     mut guard: std::sync::MutexGuard<'a, SchedState>,
     me: usize,
 ) -> (std::sync::MutexGuard<'a, SchedState>, bool) {
+    // The shim's own wait: its clock reads stay real under BHF_FAKE_CLOCK.
+    let _own = crate::reentrancy::OwnWork::enter();
     let deadline = Instant::now() + GATE_TIMEOUT;
     loop {
         if guard.running == me as isize {

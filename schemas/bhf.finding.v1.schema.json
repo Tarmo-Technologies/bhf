@@ -200,6 +200,12 @@
         "buffer_len_dimension": { "type": "boolean" }
       }
     },
+    "shim_env": {
+      "description": "The runtrace shim's mode gates the campaign ran with (BHF_DESOCKET, BHF_FAKE_CLOCK), each \"1\". bhf replay, minimize, env-capsule, verify-poc and replay.py set them again. Absent when none was on.",
+      "type": "object",
+      "propertyNames": { "pattern": "^BHF_[A-Z0-9_]+$" },
+      "additionalProperties": { "type": "string" }
+    },
     "history": {
       "type": "array",
       "items": {

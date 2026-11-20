@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+# Shared by the record fuzzers; parse_record_fuzzer.options names it.
+magic="REC1"
+fnv_offset="\xc5\x9d\x1c\x81"

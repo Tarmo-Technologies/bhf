@@ -1594,17 +1594,8 @@ pub(crate) fn configure_offline_replay(command: &mut Command) {
 /// file. Stdin is a pipe, never the file: the Ada runtime re-opens
 /// `/dev/stdin` for each input, which a redirected file would serve forever.
 /// The PoC runs in the capsule dir, so its path is made absolute first: a
-/// relative one would be resolved again from inside that dir.
-pub(crate) fn replay_poc(
-    capsule: &Path,
-    input: &str,
-    protocol: crate::protocol_detect::HarnessProtocol,
-    timeout: Duration,
-) -> std::io::Result<ReplayOutput> {
-    replay_poc_with_env(capsule, input, protocol, timeout, &[])
-}
-
-/// [`replay_poc`] with `env` set on top of the offline replay's environment.
+/// relative one would be resolved again from inside that dir. `env` is set on
+/// top of the offline replay's environment.
 pub(crate) fn replay_poc_with_env(
     capsule: &Path,
     input: &str,

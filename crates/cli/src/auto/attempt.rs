@@ -3653,6 +3653,15 @@ fn run_attempt(
                             recorded_by: "auto",
                         },
                     );
+                    // #341: the device windows this build maps on this
+                    // host, which the report's emulated-peripheral note
+                    // names. A foreign build's probe would not run here.
+                    if !is_cpp && cross_compiler.is_none() && cross_runner.is_none() {
+                        crate::generate_harness::record_mapped_mmio_windows(
+                            &harness_dir,
+                            &crate::auto::layout::harness_exe(&harness_dir, "main"),
+                        );
+                    }
                     // The work dir's C++ compatibility fragment reached this
                     // build: say so where the target's repairs are recorded.
                     let compat =
@@ -5614,11 +5623,13 @@ fn hdf6_environment_model(c: &Candidate) -> Option<harness_gen::c_generate::CEnv
         RegisteredEntryPoint => Some(harness_gen::c_generate::CEnvironmentModel {
             peripheral_readers,
             fuzz_driven_callbacks: true,
+            mmio_windows: Vec::new(),
         }),
         ChannelConsumer if !peripheral_readers.is_empty() => {
             Some(harness_gen::c_generate::CEnvironmentModel {
                 peripheral_readers,
                 fuzz_driven_callbacks: true,
+                mmio_windows: Vec::new(),
             })
         }
         _ => None,

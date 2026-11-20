@@ -13,7 +13,10 @@
 //! A `--mode` selects a global misbehaviour so the CLI tests can drive `bhf
 //! extension validate/evaluate/session` and `bhf fuzz --extension` through the
 //! happy path and every bounded fault (timeout, crash, malformed response,
-//! unsupported capability, mismatched case identity).
+//! unsupported capability, mismatched case identity). `target-oracle` judges
+//! what a session's target answered instead of the input: a target that
+//! acknowledges a WRITE with the path it wrote (`WRITEOK <path>`) outside its
+//! root is a finding.
 
 use std::env;
 use std::fs;
@@ -28,6 +31,20 @@ struct State {
     root: Option<String>,
     path: Vec<u8>,
     handle: Option<String>,
+    /// The path the target said it wrote to (`WRITEOK <path>`), this case.
+    target_write: Option<String>,
+}
+
+/// What `oracle.evaluate` judges.
+#[derive(Clone, Copy, PartialEq)]
+enum Oracle {
+    /// The input, as a path: any sandbox escape, the full path in the
+    /// signature.
+    Path,
+    /// The input's `..`, with a defect-level signature (just the rule).
+    Defect,
+    /// The path the session's target reported writing to.
+    Target,
 }
 
 fn main() {
@@ -43,7 +60,11 @@ fn main() {
         exit(7);
     }
 
-    let defect_oracle = mode == "defect-oracle";
+    let oracle = match mode.as_str() {
+        "defect-oracle" => Oracle::Defect,
+        "target-oracle" => Oracle::Target,
+        _ => Oracle::Path,
+    };
 
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
@@ -126,7 +147,7 @@ fn main() {
                     &capability,
                     &request,
                     &mut state,
-                    defect_oracle,
+                    oracle,
                 );
                 write_frame(&mut stdout, &serde_json::to_vec(&response).unwrap()).unwrap();
             }
@@ -172,14 +193,7 @@ fn main() {
             }
             "count-resets" if capability == "lifecycle.reset" => {
                 // One line per reset in the case root's `resets.log`.
-                let response = handle(
-                    &protocol,
-                    &case,
-                    &capability,
-                    &request,
-                    &mut state,
-                    defect_oracle,
-                );
+                let response = handle(&protocol, &case, &capability, &request, &mut state, oracle);
                 if let Some(root) = &state.root {
                     let log = std::path::Path::new(root).join("resets.log");
                     let mut file = fs::OpenOptions::new()
@@ -198,14 +212,7 @@ fn main() {
                 exit(101);
             }
             _ => {
-                let response = handle(
-                    &protocol,
-                    &case,
-                    &capability,
-                    &request,
-                    &mut state,
-                    defect_oracle,
-                );
+                let response = handle(&protocol, &case, &capability, &request, &mut state, oracle);
                 write_frame(&mut stdout, &serde_json::to_vec(&response).unwrap()).unwrap();
             }
         }
@@ -222,14 +229,17 @@ fn handle(
     capability: &str,
     request: &Value,
     state: &mut State,
-    defect_oracle: bool,
+    oracle: Oracle,
 ) -> Value {
     match capability {
+        "oracle.evaluate" if oracle == Oracle::Target => {
+            target_oracle_evaluate(protocol, case, state)
+        }
         "oracle.evaluate" => oracle_evaluate(
             protocol,
             case,
             &decode_input(request, "input_b64"),
-            defect_oracle,
+            oracle == Oracle::Defect,
         ),
         "codec.decode" => codec_decode(protocol, case, &decode_input(request, "input_b64")),
         "codec.encode" => codec_encode(protocol, case, request),
@@ -283,6 +293,29 @@ fn oracle_evaluate(protocol: &str, case: &Value, input: &[u8], defect_oracle: bo
         })
     } else {
         ok(protocol, case, None)
+    }
+}
+
+/// `target-oracle`: a finding when the target acknowledged a WRITE to a path
+/// outside its root. The evidence is the target's own report of the path.
+fn target_oracle_evaluate(protocol: &str, case: &Value, state: &State) -> Value {
+    match &state.target_write {
+        Some(path) if escapes(path) => json!({
+            "protocol": protocol,
+            "case": case,
+            "result": "finding",
+            "finding": {
+                "rule": "oracle.write-escape",
+                "classification": "extension_oracle",
+                "signature_inputs": ["oracle.write-escape", path],
+                "evidence": [
+                    { "key": "target_path", "value": path },
+                    { "key": "reason", "value": "the target wrote outside its root" }
+                ],
+                "min_predicate": "target-wrote-outside-root"
+            }
+        }),
+        _ => ok(protocol, case, None),
     }
 }
 
@@ -400,6 +433,9 @@ fn scenario_observe(protocol: &str, case: &Value, request: &Value, state: &mut S
         if let Some(handle) = text.strip_prefix("OPENOK ") {
             state.handle = Some(handle.trim().to_string());
         }
+        if let Some(path) = text.strip_prefix("WRITEOK ") {
+            state.target_write = Some(path.to_string());
+        }
     }
     ok(protocol, case, None)
 }
@@ -419,6 +455,7 @@ fn lifecycle(
     if reset {
         state.handle = None;
         state.path.clear();
+        state.target_write = None;
     }
     if let Some(root) = root {
         state.root = Some(root);

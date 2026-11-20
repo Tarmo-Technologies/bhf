@@ -19,6 +19,8 @@
 #   RV-6  the board lane from a board profile (#293): hil_board against a
 #         qemu-system-arm stand-in, and the reference agent on a pty over the
 #         profile's serial lane
+#   RV-7  the Renode transport (#340): live_renode and the shipped CLI against
+#         the pinned Renode BHF_RENODE names (scripts/ci/install-renode.sh)
 #
 # Unlike the default `cargo test` (which self-skips when the emulator/cross
 # toolchains are absent), this lane first HARD-FAILS if any required tool is
@@ -139,4 +141,14 @@ BHF_HIL_REQUIRE=1 cargo test --locked -p target_transport --test hil_board -- --
 BHF_REQUIRE_TOOLS=1 cargo test --locked -p bhf --test transport_agent_serial_cli -- --nocapture
 echo
 
-echo "== hil-emu: RV-1 through RV-6 executed the REAL live paths and passed =="
+echo "== RV-7: the Renode transport, library and CLI (Save/Load snapshot reset) =="
+[ -n "${BHF_RENODE:-}" ] && [ -x "$BHF_RENODE" ] || command -v renode >/dev/null || {
+  echo "ERROR: RV-7 needs Renode: set BHF_RENODE (scripts/ci/install-renode.sh)" >&2
+  exit 1
+}
+BHF_REQUIRE_TOOLS=1 cargo test --locked -p target_transport --test live_renode -- --nocapture
+BHF_REQUIRE_TOOLS=1 BHF_RENODE_CLI=1 cargo test --locked \
+  -p bhf --test transport_fuzz_renode_cli -- --nocapture
+echo
+
+echo "== hil-emu: RV-1 through RV-7 executed the REAL live paths and passed =="

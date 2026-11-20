@@ -85,6 +85,19 @@ harness and to a generated C/C++ harness, by the `arg-layout.json` beside it.
 Another lane, a binary finding and an on-target transport finding have no
 argument layout and are refused by name; minimize them with `--strategy
 bytes`, the default.
+`--strategy grammar --grammar <PATH>` minimizes a finding of a `--grammar`
+campaign on its derivation tree, so the minimized input is still a sentence of
+the grammar, where `--strategy bytes` cuts it down to bytes the target's
+parser may reject before the bug. The testcase is parsed with the grammar (an
+Earley parse), and each subtree, outermost first, is replaced while the
+finding reproduces: by its rule's smallest derivation, by a subtree of the
+same rule inside it, or by a smaller production of its rule that keeps its
+children. It runs at most 4096 candidates, and the finding's `minimization`
+block records `grammar.nodes_before`, `nodes_after`, `candidates_tried` and
+`candidates_kept`. A testcase the grammar does not derive is refused with the
+byte where its parse stops; a binary or on-target transport finding is
+refused by name. `bhf auto --grammar` minimizes a finding whose testcase the
+grammar derives the same way, and any other byte-wise.
 An on-target transport finding minimizes through the transport it was found
 on, rebuilt from its profile (`--transport-endpoint HOST:PORT` relocates it),
 on the same fault rule and site (see
@@ -594,11 +607,18 @@ bhf_work`; the old `--out DIR` spelling is a deprecated alias for it) and
 `results/` is rebuilt. Differential
 findings carry `oracle.name = "differential-output-runtime"` evidence from the
 same executable-oracle registry used by runtime runtrace findings.
-`bhf differential --harness <H> --metamorphic-transform append-newline
---inputs <DIR>` replays each input through one harness before and after
-appending a trailing newline; mismatched stdout, exit status, or timeout
-behavior emits BHF-307 `metamorphic-relation-runtime` findings with both the
-original and transformed testcase bytes.
+`bhf differential --harness <H> --metamorphic-transform <NAME>[,<NAME>...]
+--inputs <DIR>` replays each input through one harness and again as the
+variant each transform makes of it, and a variant that breaks its transform's
+relation emits a BHF-307 `metamorphic-relation-runtime` finding with both the
+original and transformed testcase bytes and the `transform` and `relation` it
+broke. `append-newline` (a `\n` after the input), `trailing-whitespace` (a
+space and a tab at the end of every line) and `reorder-json-keys` (every JSON
+object's members in reverse order, every other byte kept) must keep stdout and
+the exit status; `utf8-bom` (a byte order mark before the input) must keep the
+exit status. Several transforms, comma-separated or the flag repeated, are each
+applied to every input; a transform that does not apply to an input (no JSON
+object to reorder, a BOM already there) leaves it out.
 
 Runtrace `runtime_check` events from Ada instrumentation can promote handled
 `Constraint_Error` range/index checks into BHF-102
@@ -1480,12 +1500,14 @@ so a run whose crashes were all known does not read as clean.
 - `--fork-server` / `--no-fork-server` — persistent framed execution is the default for the builtin engine. Native drivers and the Java, Python, Perl, Go, C#, JavaScript/TypeScript, Ruby, Lua, and PHP launchers each keep one target runtime alive and feed it inputs over the same protocol. Every finding is replay-validated in a fresh process so a global-state artifact never escapes (#416), and every new corpus input is re-run once in a fresh process on a background thread before it is saved in the corpus queue (see [Sanitizers](./sanitizers.md)). `--no-fork-server` runs a fresh process per input — use it for a target that intentionally carries fuzz-relevant global state across calls. The persistent engine calibrates each input it would add to the corpus, as AFL++ does: it re-runs the input four times, each from a zeroed edge bitmap, and an edge one run hit and another did not is variable. An input whose runs differ is added only if every run hit an edge no calibrated input hit every time before; one whose only new coverage was variable edges is left out, and the re-runs' edges count as seen, so a state-dependent edge is not new coverage later. `stability` in `fuzz_runs/<harness>-latest.json` gives `stability_pct` (the share of the edges calibration saw that no run varied on), `variable_edges`, `calibrated_entries` and `unstable_entries_dropped`. Below 90% bhf prints a note that the harness keeps state between executions, with this flag as one remedy. A harness that speaks the framed protocol gets `--timeout`, but at least 10 s (never more than `--time`), to start its fork-server, so a slow start on a loaded machine does not drop the run to a fresh process per input; bhf prints a note if it still misses that. Any other harness gets a 2 s probe.
 - `--cmplog-log <PATH>` — replay a runtrace audit log captured with `BHF_CMPLOG=1`; recovered cmplog operands seed both the mutator dictionary and an offset-aware RedQueen-style splice that replaces `operand_a` with `operand_b` at the offset it appears in the current input (#400).
 - `--sanitizers <asan,msan,ubsan,tsan,lsan|none>` — native C/C++ sanitizer campaign matrix; other lanes own their instrumentation.
-- `--target-transport <SPEC>` — run the loop against an off-host / on-target backend instead of the host lane (additive; absent = host path unchanged). Spec forms: `agent:tcp:HOST:PORT`, `agent:serial:/dev/ttyX[,baud=N]` (a Windows port is `COM3`), `gdb:HOST:PORT[,done=ADDR][,fault=ADDR][,reset=restart|monitor:CMD]`, `qemu-system:qmp=…,gdb=…[,snapshot=TAG]`. On-device agent, debug-probe/emulator gdbstub, or full-system `qemu-system` snapshot. With `--workers N`, the spec names each worker's target, `{worker}` its number (0 to N-1) and `{BASE+worker}` a port per worker (`agent:tcp:127.0.0.1:{9000+worker}`); the N workers share one corpus, coverage map and finding set, and `--iterations` and `--time` are the campaign's. A spec without either is refused with `--workers`. See [On-Target & Embedded](./on-target-fuzzing.md).
-- `--transport-coverage-map <SPEC>` — for the memory-read transports (`gdb`, `qemu-system`), locate the on-target coverage ring: `input=<addr>,input_cap=<n>,ring=<addr>,write=<addr>,wrapped=<addr>,cap=<n>` (decimal or `0x`-hex), plus `input_len=<addr>` when the firmware reads the input's length from a `u32` there, and `cmplog=<addr>,cmplog_cap=<n>` to read the comparisons the firmware records for CmpLog ([CmpLog on the target](on-target-fuzzing.md#cmplog-on-the-target)). `input_cap`, the staging buffer's size, is required: `--max-len` is cut to it and no input is written past it (see [On-target fuzzing](on-target-fuzzing.md#coverage-map-spec)). The `agent` transport carries coverage over its protocol and rejects this. With `--session-transport transport:gdb:…` or `transport:qemu-system:…` it locates the same ring for the session lane.
+- `--target-transport <SPEC>` — run the loop against an off-host / on-target backend instead of the host lane (additive; absent = host path unchanged). Spec forms: `agent:tcp:HOST:PORT`, `agent:serial:/dev/ttyX[,baud=N]` (a Windows port is `COM3`), `gdb:HOST:PORT[,done=ADDR][,fault=ADDR][,reset=restart|monitor:CMD]`, `qemu-system:qmp=…,gdb=…[,snapshot=TAG]`, `renode:monitor=…,gdb=…[,snapshot=PATH]`. On-device agent, debug-probe/emulator gdbstub, or a full-system `qemu-system` or Renode snapshot (Renode's telnet monitor saves and loads the baseline with `Save`/`Load`; see [Renode boards](on-target-fuzzing.md#renode-boards)). With `--workers N`, the spec names each worker's target, `{worker}` its number (0 to N-1) and `{BASE+worker}` a port per worker (`agent:tcp:127.0.0.1:{9000+worker}`); the N workers share one corpus, coverage map and finding set, and `--iterations` and `--time` are the campaign's. A spec without either is refused with `--workers`. See [On-Target & Embedded](./on-target-fuzzing.md).
+- `--transport-coverage-map <SPEC>` — for the memory-read transports (`gdb`, `qemu-system`, `renode`), locate the on-target coverage ring: `input=<addr>,input_cap=<n>,ring=<addr>,write=<addr>,wrapped=<addr>,cap=<n>` (decimal or `0x`-hex), plus `input_len=<addr>` when the firmware reads the input's length from a `u32` there, and `cmplog=<addr>,cmplog_cap=<n>` to read the comparisons the firmware records for CmpLog ([CmpLog on the target](on-target-fuzzing.md#cmplog-on-the-target)). `input_cap`, the staging buffer's size, is required: `--max-len` is cut to it and no input is written past it (see [On-target fuzzing](on-target-fuzzing.md#coverage-map-spec)). The `agent` transport carries coverage over its protocol and rejects this. With `--session-transport transport:gdb:…` or `transport:qemu-system:…` it locates the same ring for the session lane.
 - `--protocol-profile <PATH>` — load a versioned protocol profile (TOML, `bhf.protocol.v1`) and fuzz the target as a **response-dependent, multi-message session** instead of single opaque inputs (additive; absent = the paths above are unchanged). Presence routes to the session lane, which needs `--session-transport`. See [Stateful protocol sessions](#stateful-protocol-sessions-hdf-7) below; `profiles/protocols/` holds [reference profiles](#reference-profiles) for Modbus/TCP and MQTT 3.1.1 over TCP and CoAP and RTPS/DDS over UDP, and a `kind = "giop"` profile sends [GIOP requests](#giop-profiles) to an IIOP endpoint.
 - `--board-profile <PATH>` — take `--target-transport` and `--transport-coverage-map` from a board profile: a TOML file of one board's specs, `gdb` and `coverage_map` for its debug probe and `serial` for the agent on its UART (`docs/hil-boards/nucleo-f411re.toml` is the template). Every spec in it is checked when it is read, and either flag beside it is refused (exit `2`). `--board-lane <gdb|serial>` (default `gdb`) picks the lane. The bring-up is in `docs/hil-bringup.md`.
 - `--session-transport <SPEC>` — request/response backend for the session lane. `tcp:HOST:PORT` connects a socket per session. `udp:HOST:PORT` sends each message as one datagram, from a socket of its own per session (so the target sees a new source port), and waits for one reply datagram. `serial:PATH[,baud=N]` drives a UART or a pty, opened raw as the agent's `serial:` transport is (no echo, line editing or newline translation; 8N1, no flow control), at baud `N` when given; requests and replies are framed as the profile says, and `--session-reset reconnect` reopens the device while `none` keeps it open. `transport:TARGET-TRANSPORT-SPEC` drives a session through a `--target-transport` backend (`transport:agent:tcp:HOST:PORT`, `transport:gdb:HOST:PORT` with `--transport-coverage-map`, …): each message is one execution on the target, a fault, a crash or a hang ends the session at that message, and the executions' edges feed the code channel. A reply is the backend's stdout, which the agent backends do not have, so a profile over them captures nothing from replies. `--session-reset reconnect` arms a fresh target session for each protocol session; `none` keeps one armed. See [On-target fuzzing](on-target-fuzzing.md#3d-protocol-sessions-on-the-target). Required with `--protocol-profile`.
 - `--session-reply-timeout <DURATION>` — how long the session lane waits for a reply before the target is taken to have ended the session: 5s over TCP and 1s over UDP by default. A UDP datagram that gets no reply in time, or that the target's host refuses (port unreachable), ends the session as a closed TCP connection does. A finding records the timeout, and `bhf replay` waits as long.
+- `--grammar <PATH>` — a JSON grammar describing the target's input format, for structure-aware generation plus tree mutation: the builtin engine generates inputs from the grammar, keeps each one's derivation tree, and mutates a kept input on its tree (a subtree derived afresh, a recursion repeated, or a subtree spliced in from another input's tree of the same rule), so those mutants stay sentences of the grammar. Each rule maps a non-terminal to a list of production strings where `{NAME}` references another rule; the start symbol is `START` if present, else the first rule. A derivation ends within `--max-len`: as it nears the length, or 40 levels of nesting, it takes each rule's smallest production, so a sentence is never cut off. Most children of an input with a tree are tree mutations (the others are byte mutations, for the malformed input a parser must reject); an input the grammar did not make, such as a seed, gets fresh derivations and byte mutations. A grammar whose smallest derivation nests more than 512 rules deep is refused.
+- `--frame <PROFILE>` — a binary frame descriptor for a single-input harness such as `parse_frame(buf, len)`: a protocol profile (TOML, `bhf.protocol.v1`) of one `[[message]]`, the session lane's message schema for one frame. The builtin engine decodes every input into the message's fields: a fixed-width field (an integer, an enum) by position, a variable-length `bytes` or `tlv` value by the length field that gives it (a `length(...)` field before it that covers it and otherwise only fixed fields, or a TLV's own length), and the last variable-length field takes the bytes the others leave. Half the mutants are a field edit (a payload grown, shrunk or overwritten within its `max`, an integer set to a boundary value or nudged, an enum set to one of its `variants`), the other half a byte mutation of the whole frame; either way every `length`, `crc32`, `crc16`, `sum8`, `xor8`, `offset` and TLV length is recomputed before the harness runs the input, so a mutant passes the target's length/CRC gate and reaches the code behind it. Seeds are decoded and re-encoded the same way, and the message's own frame (its fields' `value`s) is a seed. A TLV keeps the profile's `tag`. A profile with more than one message, a `giop` profile, an `optional` field or a `ref` field (a single input has no reply) is refused with exit `2`, as is `--frame` with an engine other than `builtin` or with `--target-transport` or `--protocol-profile`.
 - `--dict <PATH>` — an AFL/libFuzzer dictionary (`name="token"` lines, `\xNN` escapes) whose tokens the mutator splices into inputs, on top of the harness's own `dictionary.txt`. The host loop and the transport lane read it; a file that cannot be read stops the run. The transport lane also reads the harness's `dictionary.txt` and `--grammar`: with a grammar, a seed is a derivation of it when no `--seed-input` or `--seed-file` is given, and every other input is a fresh derivation, so a target that parses the grammar receives only its sentences.
 - The transport (`--target-transport`) and session (`--protocol-profile`) lanes run their own loops and refuse, with exit `2` and the flags named, a host-lane flag they do not wire rather than ignore it: `--workers`, `--cmplog-log`, `--len-control`, `--rss-limit-mb`, the fork-server, qemu-user, extension, sanitizer, symbolic-seed, sandbox, runtime-oracle, structured-input, final-stats and collector flags. The transport lane also refuses the session flags; the session lane, whose seeds come from the profile, also refuses `--grammar`, `--dict`, `--seed-input`, `--seed-file`, `--max-len`, `--timeout`, `--deadline` and `--transport-coverage-map`.
 - `--session-reset <reconnect|none>` — how a session is reset between testcases: `reconnect` (default; a fresh connection gives fresh per-session target state, so a new handle/id/nonce is captured each run) or `none` (keep one connection). Recorded as the run's reset fidelity.
@@ -1517,7 +1539,7 @@ campaign (`per_worker[].duplicates_of_existing` names that copy).
 Every worker gets the run's `--runtime-oracles` mode (the summary's
 `runtime_oracles`), so its oracle findings merge with its crashes; `on` without
 a usable runtrace shim exits `3` before any worker starts. Every worker also
-gets `--grammar`, `--dict`, `--deadline` and the fork-server switch. A flag
+gets `--grammar`, `--frame`, `--dict`, `--deadline` and the fork-server switch. A flag
 whose output stays in a worker's own dir or log is refused, with exit `2` and
 the flag named: `--collector`, `--collector-window-ms`, `--extension` and
 `--print-final-stats`. Run those with one worker and one sanitizer.
@@ -2211,6 +2233,112 @@ reset-command = "./reset-case"
 Any unknown field (a typo) is still rejected at parse time by
 `deny-unknown-fields`, keeping the on-disk format strict.
 
+### Importing an OSS-Fuzz build
+
+`bhf project import-ossfuzz` builds a project's existing OSS-Fuzz or
+ClusterFuzzLite integration and collects the fuzzers its `build.sh` leaves in
+`$OUT`:
+
+```sh
+# A source tree with its own build.sh (or .clusterfuzzlite/build.sh):
+bhf project import-ossfuzz path/to/libfoo --work-dir bhf_work
+
+# An OSS-Fuzz projects/<name>/ directory, and the checkout it builds:
+bhf project import-ossfuzz oss-fuzz/projects/libfoo --src path/to/libfoo \
+  --work-dir bhf_work
+```
+
+`build.sh` runs as OSS-Fuzz runs it, `bash -eux $SRC/build.sh` from
+`$SRC/<name>`, with the OSS-Fuzz build variables:
+
+| Variable | Value |
+|---|---|
+| `$SRC` | `<work>/ossfuzz/src`. The source tree is copied to `$SRC/<name>` (`--name`; by default the tree's directory name), and the script to `$SRC/build.sh` (`--build-script` names another) |
+| `$WORK` | `<work>/ossfuzz/work`, for intermediate files |
+| `$OUT` | `<work>/ossfuzz/out`, where the fuzzers go |
+| `$CC`, `$CXX` (`$CCC`) | clang and clang++ |
+| `$CFLAGS`, `$CXXFLAGS` | OSS-Fuzz's address build, `-O1 -fno-omit-frame-pointer -gline-tables-only -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION -fsanitize=address -fsanitize-address-use-after-scope`, with `-fsanitize-coverage=trace-pc-guard,trace-cmp` (the coverage bhf's driver reads) in place of `-fsanitize=fuzzer-no-link` |
+| `$LIB_FUZZING_ENGINE` | `<work>/ossfuzz/engine/libFuzzingEngine.a`: bhf's driver, the `main` and coverage runtime a generated harness links, with a `bhf_run_one` that calls the target's `LLVMFuzzerTestOneInput` |
+| `$SANITIZER`, `$FUZZING_ENGINE`, `$FUZZING_LANGUAGE`, `$ARCHITECTURE` | `address`, `libfuzzer`, `c++`, and the host's architecture |
+
+Nothing else of bhf's environment reaches the build: `PATH` is kept, `HOME`
+is `$WORK`, `TMPDIR` is `$WORK/tmp`, and `ASAN_OPTIONS` turns leak detection
+off for the build, as OSS-Fuzz does. `$SRC`, `$WORK` and `$OUT` are emptied
+before each import, and the source tree itself is never written.
+
+**Sandbox.** `build.sh` runs project code, so it runs in bubblewrap (`bwrap`)
+or, without that, firejail, with no network and no writes outside `$SRC`,
+`$WORK` and `$OUT`. Under bubblewrap the build sees the system directories
+(`/usr`, `/etc`, `/opt`, ...) and bhf's engine read-only and the three
+directories read-write, with an empty, read-only `/tmp` and no home
+directory. Under firejail the whole filesystem is read-only except the three
+directories. Before anything is staged, bhf runs the sandbox once with the
+build's mounts; when no sandbox works it refuses the import and says which
+tool is missing or why it failed. An unprivileged `bwrap` on Ubuntu 24.04
+gets no user namespace while `kernel.apparmor_restrict_unprivileged_userns`
+is 1 and no AppArmor profile allows it. `--sandbox bubblewrap` or
+`--sandbox firejail` picks one, `--sandbox-tool` names its executable, and
+`--sandbox none` runs `build.sh` directly, with your network and file
+access.
+
+**Fuzzers.** The fuzzers are the files in `$OUT`, and in its
+subdirectories, that OSS-Fuzz takes for fuzz targets: executable regular
+files named `[A-Za-z0-9_-]+`, with no extension or `.exe`, not
+`jazzer_driver*`, whose name ends in `_fuzzer` or whose bytes contain
+`LLVMFuzzerTestOneInput`. A tool the build leaves beside them is not one.
+The import lists them, writes the import record to
+`<work>/ossfuzz/import.json` (`--json` prints it), and keeps the build's
+output in `<work>/ossfuzz/build.log`. A failing `build.sh` fails the import
+with the end of that log. A target linked with `-fsanitize=fuzzer` instead
+of `$LIB_FUZZING_ENGINE` is listed as a `libFuzzer single input` binary.
+
+**Harnesses.** Each fuzzer is registered as a harness of the work dir under
+its own name: copied to `<work>/build/<name>/main`, where `bhf fuzz`,
+`bhf replay` and `bhf minimize` find it, with a `harness-protocol.json`
+declaring the framed input mode beside one linked with bhf's driver. The
+listing names each one and the commands that fuzz it:
+
+```sh
+bhf fuzz bhf_work --harness parse_record_fuzzer --time 60s
+bhf project run --manifest bhf_work/ossfuzz/bhf.project.toml \
+  --target parse_record_fuzzer --work-dir bhf_work
+```
+
+The import also writes a `bhf.project.v1` manifest,
+`<work>/ossfuzz/bhf.project.toml`, with one target per fuzzer: `engine =
+"builtin"` for a fuzzer linked with bhf's driver, which the builtin engine
+drives through the framed protocol with coverage, and `engine = "binary"`
+with `input-mode = "file"` for a libFuzzer binary linked without it, which
+runs one input file per process. Importing again rewrites the manifest and
+the registered binaries. A target has no `time`, so `bhf project run` runs
+`bhf fuzz`'s default budget; add `time = "10m"` to a target for a timed
+campaign.
+
+**Seeds, dictionaries and options.** What OSS-Fuzz takes from beside a
+fuzzer in `$OUT` comes with it:
+
+- `<name>_seed_corpus.zip` is unpacked with the system `unzip` (bhf links no
+  zip library) into `<work>/ossfuzz/seeds/<name>/`, the target's `seeds`.
+  `unzip` keeps every entry inside that directory, and a symlink it restores
+  is removed, since it could name a host file. When the build leaves a seed
+  corpus and `unzip` is not on PATH, the import stops and names the corpus
+  and the package to install.
+- `<name>.dict` and the dictionary the `.options` file's `dict` names
+  (relative to the fuzzer, inside `$OUT`) are merged, in that order and
+  without duplicate tokens, into `<work>/build/<name>/dictionary.txt`, which
+  `bhf fuzz` loads, and are the target's `dictionaries`. A dictionary that is
+  not UTF-8 or is over the size limit is left out with a note.
+- The `[libfuzzer]` options with a bhf equivalent set the target's
+  `max-len` (`max_len`), `timeout` (`timeout`, in seconds) and
+  `rss-limit-mb` (`rss_limit_mb`); the listing prints them as `bhf fuzz`
+  flags. Every other option (`close_fd_mask`, `only_ascii`, the `[asan]`
+  and `[afl]` sections, ...) is reported as not applied. A binary-lane
+  target takes the seeds and `timeout` (as `timeout-ms`) only.
+
+`bhf project run` on the manifest applies all three; `bhf fuzz` loads the
+dictionary, takes the options as the flags the listing prints, and takes
+each seed with `--seed-file`.
+
 ## Out-of-Process Extensions
 
 `bhf extension` drives an explicitly-trusted, **out-of-process** extension that
@@ -2238,6 +2366,11 @@ bhf extension evaluate --manifest path/to/extension.toml --input case.bin --work
 # message (scenario.observe-response), then oracle.evaluate the clean-exit outcome.
 bhf extension session --manifest path/to/extension.toml --input seed.bin --work bhf_work \
   --mutate 42 --repair true
+
+# The same session against a real service: bhf starts it, waits for its port,
+# and sends each scenario message to it over TCP.
+bhf extension session --manifest path/to/extension.toml --input seed.bin --work bhf_work \
+  --session-transport tcp:127.0.0.1:7000 --session-server-cmd './toy-server 7000'
 
 # Fuzz with the extension's stages in the builtin loop (below), then drive the
 # just-retained corpus through its oracle; when the extension provides
@@ -2274,10 +2407,41 @@ The run summary's `extension.stages` records what each stage did: `calls`,
 `mutated`, `encoded`, `codec_errors`, `lifecycle.resets` and `cut_off` (why a
 stage stopped, or `null`).
 
+**The session's target.** Without `--session-transport`, `bhf extension
+session` drives a built-in toy target that speaks the reference extension's
+OPEN/WRITE protocol. With `--session-transport SPEC` it drives a real one over
+the session lane's transport, the spec `bhf fuzz --session-transport` takes
+(`tcp:HOST:PORT`, `udp:HOST:PORT`, `serial:PATH[,baud=N]` or
+`transport:SPEC`). The extension frames every message, so bhf sends each one
+as `scenario.next` (and any mutate and repair) left it, and takes as its reply
+every byte the target sends until it goes quiet for 50 ms, which
+`scenario.observe-response` gets. bhf connects before `lifecycle.setup` runs,
+and a TCP target it cannot connect to is exit `2`. `--session-reply-timeout`
+bounds how long a reply may take to start (5 s over TCP, 1 s over UDP).
+
+`--session-server-cmd COMMAND` runs the service as the session lane's flag
+does: through the shell, in its own process group, with its stderr in
+`<work>/session_server/`. bhf waits until it serves the port (a service that
+does not start is exit `2`, with its stderr), drives the session, checks
+whether the service exited (waiting up to 2 s when the session lost the
+target), and stops it.
+
+A target that ends the session (closes or resets the connection, or does not
+answer in time) or a service that exits is the target's result, exit `3`:
+`extension.json` says `target_error: <why>` or `target_exited: <status>`, and
+the oracle does not judge a session that did not finish. A service that exits
+after answering the whole session is still exit `1` when the oracle fired on
+it, with the exit recorded. `session.target` records the transport, the
+exchanges, the error, and the service's command, starts and exit (its status,
+the sanitizer report's kind, rule and message when its stderr has one, and the
+log dir). Hunting crashes in a service over many sessions is `bhf fuzz
+--protocol-profile --session-server-cmd`'s job.
+
 `bhf extension evaluate` / `session` exit `0` for a benign input, `1` when a
-semantic finding is emitted, `2` for a manifest/usage error, and `4` for a bounded
-extension-side infrastructure failure (so a fault is never confused with a clean
-run or a finding). `--json` emits a machine-readable report.
+semantic finding is emitted, `2` for a manifest/usage error, `3` (`session`
+over `--session-transport`) when the target ended the session, and `4` for a
+bounded extension-side infrastructure failure (so a fault is never confused
+with a clean run or a finding). `--json` emits a machine-readable report.
 
 **Capabilities.** The host drives the full `bhf.extension.v1` surface —
 `oracle.evaluate`, `codec.decode`/`encode`/`repair`, `mutator.mutate`,

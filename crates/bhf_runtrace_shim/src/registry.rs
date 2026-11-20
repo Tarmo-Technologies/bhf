@@ -4,6 +4,8 @@
 //! `manifest::MANIFEST` (cli-safe POD). The unit test
 //! `registry_and_manifest_match` keeps the two in sync.
 
+use crate::hooks::determinism::Clock;
+use crate::hooks::net::Desocket;
 use crate::hooks::{
     assertion::Assertion, cmplog::CmpLog, determinism::Determinism, dl::Dl, dlsym::Dlsym, env::Env,
     format::Format, fs::Fs, identity::Identity, ioctl::Ioctl, mem::Mem, mqueue::Mqueue, net::Net,
@@ -14,6 +16,7 @@ use crate::sdk::FakeResource;
 pub static REGISTRY: &[&'static dyn FakeResource] = &[
     &Env,
     &Net,
+    &Desocket,
     &Fs,
     &Dl,
     &Dlsym,
@@ -26,6 +29,7 @@ pub static REGISTRY: &[&'static dyn FakeResource] = &[
     &Mqueue,
     &Sql,
     &Determinism,
+    &Clock,
     &Ioctl,
     &Rtos,
     &Sched,

@@ -12,6 +12,9 @@
 //! * [`MockGdbStub`] — a minimal gdbstub speaking the target side of RSP.
 //! * [`MockQmpServer`] — a minimal QMP monitor: greeting, capability
 //!   negotiation, `stop`/`cont`, and `savevm`/`loadvm` via `human-monitor-command`.
+//! * [`MockRenodeMonitor`] — a minimal Renode telnet monitor: `pause`,
+//!   `Save`/`Load` and `machine StartGdbServer`, with Renode's telnet
+//!   negotiation, echo, colours and error text.
 //! * [`encode_event_stream`] / [`simulate_ring`] — build `BHF_EVENTS` byte
 //!   streams and simulate the Ada ring buffer for the coverage-reader tests.
 
@@ -304,6 +307,9 @@ pub struct MockGdbStub<C: Read + Write> {
     file_io: Vec<FileIoRequest>,
     /// Whether it takes monitor commands (`qRcmd`).
     monitor: bool,
+    /// Whether it sends Renode's unprompted `S05`s (see
+    /// [`MockGdbStub::with_unsolicited_stops`]).
+    unsolicited_stops: bool,
 }
 
 impl<C: Read + Write> MockGdbStub<C> {
@@ -319,7 +325,15 @@ impl<C: Read + Write> MockGdbStub<C> {
             run_writes: Vec::new(),
             file_io: Vec::new(),
             monitor: true,
+            unsolicited_stops: false,
         }
+    }
+
+    /// Send an unprompted `S05` as the debugger connects and another after
+    /// each `c`'s stop reply, as Renode's gdb server does.
+    pub fn with_unsolicited_stops(mut self) -> Self {
+        self.unsolicited_stops = true;
+        self
     }
 
     /// Refuse monitor commands with an empty reply, as QEMU's system gdbstub
@@ -411,6 +425,9 @@ impl<C: Read + Write> MockGdbStub<C> {
 
     /// Run the serve loop until the client closes the link.
     pub fn serve(mut self) -> Result<()> {
+        if self.unsolicited_stops {
+            self.connection.send_unacked(b"S05")?;
+        }
         while let Some(packet) = self.connection.recv_packet_opt()? {
             self.log
                 .lock()
@@ -487,6 +504,9 @@ impl<C: Read + Write> MockGdbStub<C> {
                     }
                     let reply = self.stop_reply.clone();
                     self.connection.send_packet(&reply)?;
+                    if self.unsolicited_stops {
+                        self.connection.send_unacked(b"S05")?;
+                    }
                 }
                 b'g' => {
                     let reply = hex(&self.registers).into_bytes();
@@ -633,6 +653,207 @@ impl<C: Read + Write> MockQmpServer<C> {
                     self.send_line(
                         br#"{"error":{"class":"GenericError","desc":"request has no execute field"}}"#,
                     )?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mock Renode monitor
+// ---------------------------------------------------------------------------
+
+/// A minimal Renode telnet monitor for driving [`crate::renode`] tests
+/// without a real `renode`, modelled on Renode 1.17's wire bytes.
+///
+/// It opens with Renode's telnet option negotiation, banner and coloured
+/// `(monitor) ` prompt, echoes each command line, and answers:
+///
+/// * `$name=value` — nothing (a variable assignment).
+/// * `pause` / `start` — `Pausing emulation...` / `Starting emulation...`.
+/// * `Save @PATH` — remembers `PATH`; no output.
+/// * `Load @PATH` — when `PATH` was saved, no output, the gdb server stops,
+///   as Renode's goes with the machine `Load` replaces, and no machine is
+///   selected (the prompt reads `(monitor)`), as in Renode 1.17.0; otherwise
+///   Renode's error text.
+/// * `mach set "machine-0"` / `mach set 0` — selects the machine; another
+///   name prints `Machine NAME not found.`
+/// * `machine StartGdbServer PORT` — with a machine selected, sets the gdb
+///   server to `PORT`, or Renode's "already attached" error while one runs;
+///   with none, `No such command or device: machine`.
+/// * anything else — `No such command or device: ...`.
+///
+/// Every command line is pushed to `log`. `gdb_server` holds the port of the
+/// running gdb server, for the test's gdb dialer to check.
+pub struct MockRenodeMonitor<C: Read + Write> {
+    channel: C,
+    log: Arc<Mutex<Vec<String>>>,
+    gdb_server: Arc<Mutex<Option<u16>>>,
+    saved: Vec<String>,
+    failures: Vec<(String, String)>,
+    startup_script: Option<String>,
+    selected: bool,
+}
+
+impl<C: Read + Write> MockRenodeMonitor<C> {
+    /// Build a monitor over `channel`.
+    pub fn new(
+        channel: C,
+        log: Arc<Mutex<Vec<String>>>,
+        gdb_server: Arc<Mutex<Option<u16>>>,
+    ) -> Self {
+        Self {
+            channel,
+            log,
+            gdb_server,
+            saved: Vec::new(),
+            failures: Vec::new(),
+            startup_script: None,
+            selected: true,
+        }
+    }
+
+    /// Print the `i @path` line and prompt of a board script Renode was
+    /// started with, after the greeting, as `renode -P N path` does.
+    pub fn with_startup_script(mut self, path: &str) -> Self {
+        self.startup_script = Some(path.to_owned());
+        self
+    }
+
+    /// Answer a command line starting with `prefix` with Renode's error text
+    /// carrying `message`.
+    pub fn with_failure(mut self, prefix: &str, message: &str) -> Self {
+        self.failures.push((prefix.to_owned(), message.to_owned()));
+        self
+    }
+
+    fn send(&mut self, bytes: &[u8]) -> Result<()> {
+        self.channel.write_all(bytes)?;
+        self.channel.flush()?;
+        Ok(())
+    }
+
+    fn prompt(&mut self) -> Result<()> {
+        if self.selected {
+            self.send(b"\x1b[33m(machine-0) \x1b[0m")
+        } else {
+            self.send(b"\x1b[91m(monitor) \x1b[0m")
+        }
+    }
+
+    fn error(&mut self, command: &str, message: &str) -> Result<()> {
+        self.send(
+            format!(
+                "\x1b[91mThere was an error executing command '{command}': \r\n\x1b[0m\
+                 \x1b[91m{message}\r\n\x1b[0m"
+            )
+            .as_bytes(),
+        )?;
+        self.prompt()
+    }
+
+    /// Read one command line; `Ok(None)` on a clean EOF.
+    fn read_line(&mut self) -> Result<Option<String>> {
+        let mut line = Vec::new();
+        let mut buf = [0_u8; 1];
+        loop {
+            if self.channel.read(&mut buf)? == 0 {
+                return Ok(None);
+            }
+            match buf[0] {
+                b'\n' => return Ok(Some(String::from_utf8_lossy(&line).trim().to_owned())),
+                b'\r' => {}
+                byte => line.push(byte),
+            }
+        }
+    }
+
+    /// Serve until the client closes the link.
+    pub fn serve(mut self) -> Result<()> {
+        self.send(
+            b"\xff\xfd\x00\xff\xfd\x1f\xff\xfb\x01\xff\xfb\x03\xff\xfc\"\x1b[0m\
+              Renode, version 1.17.0 (mock)\n\r\n\r",
+        )?;
+        self.send(b"\x1b[91m(monitor) \x1b[0m")?;
+        if let Some(script) = self.startup_script.clone() {
+            self.send(format!("i @{script}\n\r").as_bytes())?;
+            self.prompt()?;
+        }
+        while let Some(line) = self.read_line()? {
+            self.log.lock().unwrap().push(line.clone());
+            self.send(format!("{line}\n\r").as_bytes())?;
+            if let Some((_, message)) = self
+                .failures
+                .iter()
+                .find(|(prefix, _)| line.starts_with(prefix.as_str()))
+                .cloned()
+            {
+                self.error(&line, &message)?;
+                continue;
+            }
+            let (verb, argument) = line.split_once(' ').unwrap_or((line.as_str(), ""));
+            match verb {
+                // A monitor variable assignment prints nothing.
+                _ if line.starts_with('$') => self.prompt()?,
+                "pause" => {
+                    self.send(b"Pausing emulation...\r\n\r")?;
+                    self.prompt()?;
+                }
+                "start" => {
+                    self.send(b"Starting emulation...\r\n\r")?;
+                    self.prompt()?;
+                }
+                "Save" => {
+                    self.saved.push(argument.trim_start_matches('@').to_owned());
+                    self.prompt()?;
+                }
+                "Load"
+                    if self
+                        .saved
+                        .iter()
+                        .any(|path| *path == argument.trim_start_matches('@')) =>
+                {
+                    *self.gdb_server.lock().unwrap() = None;
+                    self.selected = false;
+                    self.prompt()?;
+                }
+                "mach" if argument.starts_with("set ") => {
+                    let name = argument["set ".len()..].trim().trim_matches('"');
+                    if name == "machine-0" || name == "0" {
+                        self.selected = true;
+                    } else {
+                        self.send(format!("Machine {name} not found.\r\n").as_bytes())?;
+                    }
+                    self.prompt()?;
+                }
+                "Load" => self.error(&line, "Parameters did not match the signature")?,
+                "machine" if self.selected && argument.starts_with("StartGdbServer ") => {
+                    let port = argument["StartGdbServer ".len()..]
+                        .trim()
+                        .parse::<u16>()
+                        .ok();
+                    let running = *self.gdb_server.lock().unwrap();
+                    match (running, port) {
+                        (Some(running), _) => self.error(
+                            &line,
+                            &format!(
+                                "CPU: machine-0.cpu is already attached to an existing GDB \
+                                 server, running on port :{running}"
+                            ),
+                        )?,
+                        (None, Some(port)) => {
+                            *self.gdb_server.lock().unwrap() = Some(port);
+                            self.prompt()?;
+                        }
+                        (None, None) => self.error(&line, "bad port")?,
+                    }
+                }
+                _ => {
+                    self.send(
+                        format!("\x1b[91mNo such command or device: {verb}\r\n\x1b[0m").as_bytes(),
+                    )?;
+                    self.prompt()?;
                 }
             }
         }

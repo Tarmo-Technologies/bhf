@@ -94,6 +94,39 @@ pub struct CEnvironmentModel {
     /// same fuzz-fed source (its trampoline returns fuzz-controlled values that
     /// steer the driver) rather than a no-op `return 0;`.
     pub fuzz_driven_callbacks: bool,
+    /// Device pages the target reads at fixed addresses (`*(volatile
+    /// uint32_t *)0x40011000`), found in its sources (#341). The harness maps
+    /// each one, through the runtrace shim's `bhf_shim_mmio_fill` when the
+    /// shim is loaded, and refills it from every input before the target
+    /// runs, so a register read returns fuzz-chosen bytes instead of faulting.
+    pub mmio_windows: Vec<CMmioWindow>,
+}
+
+/// One device window the harness maps and fills from the input: `len` bytes
+/// at `base` (page aligned), filled as `input[i % input_len]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CMmioWindow {
+    /// The base address as a C hex literal without suffix (`0x40011000`).
+    pub base: String,
+    /// The length in bytes as a C hex literal without suffix (`0x1000`).
+    pub len: String,
+    /// The register macro the window was found through, or empty.
+    pub name: String,
+}
+
+impl CMmioWindow {
+    /// A window of `len` bytes at `base`. A `name` that is not a C identifier
+    /// is dropped, since it is spliced into a C string literal.
+    pub fn new(base: u64, len: u64, name: Option<&str>) -> Self {
+        let name = name
+            .filter(|name| name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or_default();
+        Self {
+            base: format!("{base:#x}"),
+            len: format!("{len:#x}"),
+            name: name.to_owned(),
+        }
+    }
 }
 
 /// One fuzz-fed peripheral read accessor to synthesize. Its signature must match
@@ -8887,6 +8920,7 @@ mod tests {
                 }],
             }],
             fuzz_driven_callbacks: false,
+            mmio_windows: Vec::new(),
         });
         let result = generate_c_direct_harness(args).unwrap();
         let main = fs::read_to_string(&result.main_c).unwrap();
@@ -8941,6 +8975,7 @@ mod tests {
                     params: Vec::new(),
                 }],
                 fuzz_driven_callbacks,
+                mmio_windows: Vec::new(),
             });
             let result = generate_c_direct_harness(args).unwrap();
             fs::read_to_string(&result.main_c).unwrap()
@@ -8961,6 +8996,117 @@ mod tests {
             !constant.contains("return (int)_bhf_env_next_u32();"),
             "the flag is off by default: {constant}"
         );
+    }
+
+    /// #341: a target that reads a device register at a fixed address gets
+    /// that page mapped by the harness and refilled from each input, so a
+    /// branch gated on the register's value is reachable: the planted abort
+    /// behind `STATUS == 0xA5` fires for an input that starts with 0xA5 and
+    /// not for one that does not. Without the window the read would SEGV.
+    #[test]
+    fn a_mapped_mmio_window_makes_a_register_gated_branch_reachable() {
+        let tools_ok = ["make", "clang"].iter().all(|tool| {
+            Command::new(tool)
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        });
+        if !tools_ok || !cfg!(target_os = "linux") {
+            eprintln!("skipping mmio window e2e: needs Linux, clang and make");
+            return;
+        }
+        let (_out_guard, out) = temp_dir("mmio_window_e2e");
+        let c_runtime = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../c_runtime")
+            .canonicalize()
+            .expect("c_runtime dir");
+        let target_c = out.join("target.c");
+        fs::write(
+            &target_c,
+            "#include <stdint.h>\n#include <stdlib.h>\n\
+             #define STATUS (*(volatile uint32_t *)0x40011000u)\n\
+             int read_status(int unused) {\n\
+             \x20   (void)unused;\n\
+             \x20   if ((STATUS & 0xffu) == 0xa5u) abort();\n\
+             \x20   return 0;\n\
+             }\n",
+        )
+        .unwrap();
+        let mut args = direct_args("read_status", out.clone());
+        args.params = vec![CParameter {
+            name: "unused".to_owned(),
+            c_type: "int".to_owned(),
+        }];
+        args.target_sources = vec![target_c];
+        args.c_runtime_include = c_runtime;
+        // The second window lies in ASan's shadow gap on x86-64 (the
+        // Cortex-M system control space): this ASan build cannot map it.
+        args.environment = Some(CEnvironmentModel {
+            mmio_windows: vec![
+                CMmioWindow::new(0x4001_1000, 0x1000, Some("STATUS")),
+                CMmioWindow::new(0xe000_e000, 0x1000, Some("SCB_CPUID")),
+            ],
+            ..CEnvironmentModel::default()
+        });
+        let result = generate_c_direct_harness(args).unwrap();
+        let main = fs::read_to_string(&result.main_c).unwrap();
+        assert!(
+            main.contains("{ (uintptr_t)0x40011000u, 0x1000u, \"STATUS\" }"),
+            "the window table names the device page: {main}"
+        );
+        let build = Command::new("make")
+            .arg("main")
+            .current_dir(&out)
+            .output()
+            .expect("run make");
+        assert!(
+            build.status.success(),
+            "make main failed:\n{}\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+        let run = |name: &str, bytes: &[u8]| {
+            let input = out.join(name);
+            fs::write(&input, bytes).unwrap();
+            crate::harness_command(out.join("main"))
+                .arg(&input)
+                .output()
+                .unwrap()
+        };
+        let quiet = run("quiet.bin", &[0x11, 0, 0, 0]);
+        assert!(
+            quiet.status.success(),
+            "a status other than 0xA5 runs clean: {}",
+            String::from_utf8_lossy(&quiet.stderr)
+        );
+        let gated = run("gated.bin", &[0xa5, 0, 0, 0]);
+        assert!(
+            !gated.status.success(),
+            "the register-gated abort is reachable from the input"
+        );
+        assert!(
+            !String::from_utf8_lossy(&gated.stderr).contains("SEGV"),
+            "the register read itself does not fault: {}",
+            String::from_utf8_lossy(&gated.stderr)
+        );
+        // Asked, the harness names the windows it could map and runs no
+        // target: the shadow-gap window is not among them.
+        let probe = crate::harness_command(out.join("main"))
+            .env("BHF_MMIO_PROBE", "1")
+            .arg(out.join("gated.bin"))
+            .output()
+            .unwrap();
+        assert!(probe.status.success(), "{probe:?}");
+        let mapped = String::from_utf8_lossy(&probe.stdout);
+        assert!(
+            mapped.starts_with("0x40011000 0x1000 STATUS\n"),
+            "{mapped}{}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        if cfg!(target_arch = "x86_64") {
+            assert_eq!(mapped, "0x40011000 0x1000 STATUS\n");
+        }
+        fs::remove_dir_all(&out).ok();
     }
 
     /// The environment model is strictly opt-in: with `environment: None` the

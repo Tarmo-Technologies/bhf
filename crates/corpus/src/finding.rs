@@ -275,6 +275,7 @@ impl FindingEmitter {
                 harness_format_version: None,
                 buffer_len_dimension: false,
                 crash_scope: None,
+                shim_env: Vec::new(),
             },
             line_maps: crate::line_remap::SourceLineMaps::default(),
         }
@@ -299,6 +300,7 @@ impl FindingEmitter {
                 harness_format_version: None,
                 buffer_len_dimension: false,
                 crash_scope: None,
+                shim_env: Vec::new(),
             },
             line_maps: crate::line_remap::SourceLineMaps::default(),
         }
@@ -330,6 +332,15 @@ impl FindingEmitter {
     /// this emitter writes): it is part of the harness input format.
     pub fn with_buffer_len_dimension(mut self, enabled: bool) -> Self {
         self.metadata.buffer_len_dimension = enabled;
+        self
+    }
+
+    /// Record `env`, the runtrace shim's mode gates the campaign ran with
+    /// (`BHF_DESOCKET`, `BHF_FAKE_CLOCK`), as `shim_env` in every finding
+    /// this emitter writes, so replay, minimization, the reproducer and the
+    /// capsule set them again ([`recorded_shim_env`]).
+    pub fn with_shim_env(mut self, env: Vec<(String, String)>) -> Self {
+        self.metadata.shim_env = env;
         self
     }
 
@@ -935,6 +946,9 @@ struct FindingMetadata {
     /// What frame-less crashes are grouped by ([`crate::cluster::crash_scope`]);
     /// `None` groups them by the harness id.
     crash_scope: Option<String>,
+    /// The runtrace shim's mode gates the harness ran with, which a replay
+    /// sets again: recorded as `record["shim_env"]`.
+    shim_env: Vec<(String, String)>,
 }
 
 impl FindingMetadata {
@@ -957,8 +971,27 @@ impl Default for FindingMetadata {
             harness_format_version: None,
             buffer_len_dimension: false,
             crash_scope: None,
+            shim_env: Vec::new(),
         }
     }
+}
+
+/// The runtrace shim's mode gates a finding recorded (`shim_env`), to set on
+/// its replay: only `BHF_*` names, each with its string value.
+pub fn recorded_shim_env(record: &serde_json::Value) -> Vec<(String, String)> {
+    record
+        .get("shim_env")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(key, _)| {
+            key.starts_with("BHF_")
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        })
+        .filter_map(|(key, value)| Some((key.clone(), value.as_str()?.to_owned())))
+        .collect()
 }
 
 /// The directories under a work dir that hold harness `<id>/` directories.
@@ -1109,7 +1142,8 @@ pub fn touch_last_seen(finding_dir: &std::path::Path, command: &str) -> std::io:
 
 /// Merge the harness/target binary's identity into `record["build"]["binary"]`,
 /// creating `build` as an object first if no sandbox metadata already put one
-/// there. No-op when `metadata` carries no build identity.
+/// there, and the shim mode gates into `record["shim_env"]`. No-op when
+/// `metadata` carries neither.
 fn merge_build_binary(record: &mut serde_json::Value, metadata: &FindingMetadata) {
     if let Some(version) = metadata.harness_format_version {
         // `harness` is where readers look first; the top-level keys stay for
@@ -1132,6 +1166,14 @@ fn merge_build_binary(record: &mut serde_json::Value, metadata: &FindingMetadata
         if let Some(build) = build.as_object_mut() {
             build.insert("binary".to_owned(), binary.clone());
         }
+    }
+    if !metadata.shim_env.is_empty() {
+        record["shim_env"] = metadata
+            .shim_env
+            .iter()
+            .map(|(key, value)| (key.clone(), json!(value)))
+            .collect::<serde_json::Map<_, _>>()
+            .into();
     }
 }
 
@@ -1263,6 +1305,55 @@ mod tests {
             )
             .unwrap(),
             b"\x00\x01bad"
+        );
+    }
+
+    /// #312: the runtrace shim's mode gates a campaign ran with are recorded
+    /// for replay; none means no block.
+    #[test]
+    fn findings_record_the_environment_a_replay_needs() {
+        let (_root_guard, root) = temp_dir("injected-env");
+        let read = |id: &str| -> serde_json::Value {
+            serde_json::from_slice(
+                &fs::read(
+                    crate::layout::findings_dir(&root)
+                        .join(id)
+                        .join("finding.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let plain = FindingEmitter::new(root.clone())
+            .emit(b"abc", &testcase(), 0)
+            .unwrap();
+        assert!(read(&plain.0).get("shim_env").is_none());
+        assert!(super::recorded_shim_env(&read(&plain.0)).is_empty());
+        let report = crate::parse_sanitizer_report(
+            "==1==ERROR: AddressSanitizer: stack-buffer-overflow on address 0x7ffd at pc 0x1 \
+             bp 0x2 sp 0x3\nWRITE of size 4 at 0x7ffd thread T0\n    #0 0x1 in parse_record \
+             /src/server.c:7:5\n",
+        )
+        .unwrap();
+        let gated = FindingEmitter::new(root.clone())
+            .with_shim_env(vec![("BHF_DESOCKET".to_owned(), "1".to_owned())])
+            .emit_sanitizer_crash(b"R:\xff", &report)
+            .unwrap();
+        let record = read(&gated.0);
+        assert_eq!(record["shim_env"], serde_json::json!({"BHF_DESOCKET": "1"}));
+        assert_eq!(
+            super::recorded_shim_env(&record),
+            [("BHF_DESOCKET".to_owned(), "1".to_owned())]
+        );
+        // The faked network is no missing-environment prosthetic: the input
+        // is what a peer would send.
+        assert_eq!(record["actionability"]["prosthetics"]["used"], false);
+        // Only BHF_ names are read back.
+        let foreign =
+            serde_json::json!({"shim_env": {"LD_PRELOAD": "/x.so", "BHF_FAKE_CLOCK": "1"}});
+        assert_eq!(
+            super::recorded_shim_env(&foreign),
+            [("BHF_FAKE_CLOCK".to_owned(), "1".to_owned())]
         );
     }
 

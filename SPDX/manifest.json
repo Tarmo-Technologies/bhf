@@ -1243,7 +1243,15 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/bhf_runtrace_shim/tests/clock_fake.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/bhf_runtrace_shim/tests/cmplog_target.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/bhf_runtrace_shim/tests/desocket.rs",
       "license": "Apache-2.0"
     },
     {
@@ -1956,6 +1964,10 @@
     },
     {
       "path": "crates/cli/src/offline_symbolize.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/ossfuzz_import.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2691,6 +2703,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_mmio_register_emulation.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_mmio_register_fault.rs",
       "license": "Apache-2.0"
     },
@@ -3055,6 +3071,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/extension_session_target_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/fixtures/ext_mock.rs",
       "license": "Apache-2.0"
     },
@@ -3099,7 +3119,19 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/fuzz_desocket_server.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/fuzz_extension_stages.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/fuzz_frame_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/fuzz_grammar_help.rs",
       "license": "Apache-2.0"
     },
     {
@@ -3259,6 +3291,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/minimize_grammar_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/minimize_typed_cli.rs",
       "license": "Apache-2.0"
     },
@@ -3272,6 +3308,10 @@
     },
     {
       "path": "crates/cli/tests/oracle_findings_minimize_capsule.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/ossfuzz_import.rs",
       "license": "Apache-2.0"
     },
     {
@@ -3452,6 +3492,10 @@
     },
     {
       "path": "crates/cli/tests/transport_fuzz_qemu_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/transport_fuzz_renode_cli.rs",
       "license": "Apache-2.0"
     },
     {
@@ -5047,6 +5091,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/target_transport/src/renode.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/target_transport/src/testsupport.rs",
       "license": "Apache-2.0"
     },
@@ -5103,7 +5151,15 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/target_transport/tests/live_renode.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/target_transport/tests/live_rtos.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/target_transport/tests/renode_mock.rs",
       "license": "Apache-2.0"
     },
     {
@@ -6176,6 +6232,18 @@
     },
     {
       "path": "tests/fixtures/legacy_breakage_validation/manifest.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/ossfuzz_project/fuzz/checksum_fuzzer.c",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/ossfuzz_project/src/record.c",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/ossfuzz_project/tools/record_tool.c",
       "license": "Apache-2.0"
     },
     {

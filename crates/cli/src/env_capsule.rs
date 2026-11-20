@@ -524,6 +524,7 @@ fn recorded_world(raw: &serde_json::Value) -> (String, Vec<(String, String)>) {
             !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         })
         .filter_map(|(key, value)| Some((key.clone(), value.as_str()?.to_owned())))
+        .chain(corpus::finding::recorded_shim_env(raw))
         .collect();
     (mode, env)
 }

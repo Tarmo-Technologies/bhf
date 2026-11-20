@@ -62,6 +62,9 @@ const MAX_PACKET_BYTES: usize = 2 * 1024 * 1024;
 const MAX_MEMORY_READ: usize = 1024 * 1024;
 /// Retransmit attempts on a `-` (NAK) before giving up.
 const MAX_RETRANSMITS: usize = 3;
+/// Unprompted stop replies dropped while awaiting one packet's ack before
+/// giving up (see [`GdbConnection::send_packet`]).
+const MAX_UNSOLICITED_STOPS: usize = 16;
 /// Max intermediate `O` console-output packets accepted between a `c` and the
 /// terminal stop reply before giving up, so a chatty or wedged target cannot
 /// stream forever (an absolute execution deadline is enforced by the campaign).
@@ -339,25 +342,58 @@ impl<C: Read + Write> GdbConnection<C> {
 
     /// Send a command packet and consume the peer's `+` acknowledgement,
     /// retransmitting on `-`.
+    ///
+    /// A stop reply the stub sent unprompted may stand where the ack belongs:
+    /// Renode's gdb server announces `S05` as a debugger connects and repeats
+    /// `S05` after each breakpoint stop. Such a packet is acked and dropped (up
+    /// to [`MAX_UNSOLICITED_STOPS`]), so it is never read as the reply to this
+    /// packet; any other packet there is still an error.
     pub fn send_packet(&mut self, data: &[u8]) -> Result<()> {
         let frame = encode_packet(data);
+        let mut unsolicited = 0_usize;
         for _ in 0..MAX_RETRANSMITS {
             self.channel.write_all(&frame)?;
             self.channel.flush()?;
-            match self.read_byte_required("packet acknowledgement")? {
-                b'+' => return Ok(()),
-                b'-' => continue,
-                other => {
-                    return Err(TransportError::gdb(format!(
-                        "expected '+'/'-' ack, got {:?}",
-                        other as char
-                    )))
+            loop {
+                match self.read_byte_required("packet acknowledgement")? {
+                    b'+' => return Ok(()),
+                    b'-' => break,
+                    b'$' => {
+                        let packet = self.read_packet_rest()?;
+                        if !matches!(packet.first(), Some(b'S' | b'T')) {
+                            return Err(TransportError::gdb(format!(
+                                "expected '+'/'-' ack, got the packet {:?}",
+                                String::from_utf8_lossy(&packet)
+                            )));
+                        }
+                        unsolicited += 1;
+                        if unsolicited > MAX_UNSOLICITED_STOPS {
+                            return Err(TransportError::gdb(format!(
+                                "more than {MAX_UNSOLICITED_STOPS} unsolicited stop replies \
+                                 before a packet acknowledgement"
+                            )));
+                        }
+                    }
+                    other => {
+                        return Err(TransportError::gdb(format!(
+                            "expected '+'/'-' ack, got {:?}",
+                            other as char
+                        )))
+                    }
                 }
             }
         }
         Err(TransportError::gdb(
             "peer NAKed the packet past the retransmit limit",
         ))
+    }
+
+    /// Write a packet without waiting for its ack, as a stub sends a stop
+    /// reply nobody asked for. Used by [`crate::testsupport::MockGdbStub`].
+    pub(crate) fn send_unacked(&mut self, data: &[u8]) -> Result<()> {
+        self.channel.write_all(&encode_packet(data))?;
+        self.channel.flush()?;
+        Ok(())
     }
 
     /// Receive a response packet, verify its checksum, and send `+`.
@@ -384,6 +420,11 @@ impl<C: Read + Write> GdbConnection<C> {
                 }
             }
         }
+        self.read_packet_rest().map(Some)
+    }
+
+    /// Read a packet's body and checksum after its `$`, verify it, and ack it.
+    fn read_packet_rest(&mut self) -> Result<Vec<u8>> {
         let mut data = Vec::new();
         loop {
             let byte = self.read_byte_required("packet body")?;
@@ -412,7 +453,7 @@ impl<C: Read + Write> GdbConnection<C> {
         }
         self.channel.write_all(b"+")?;
         self.channel.flush()?;
-        Ok(Some(unescape(&data)?))
+        unescape(&data)
     }
 }
 
@@ -2042,6 +2083,55 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(3600);
         let (stop, _out) = client.cont_until(Some(deadline)).unwrap();
         assert_eq!(stop, ContStop::DeadlineExceeded);
+    }
+
+    /// A stub that announces a stop the moment a debugger connects, as
+    /// Renode's gdb server does, puts that `S05` where the client awaits the
+    /// ack of its first packet. The client acks and drops it, and the attach
+    /// goes on.
+    #[test]
+    fn attach_skips_a_stop_reply_the_stub_sends_on_connect() {
+        let mut script = Vec::new();
+        script.extend_from_slice(&encode_packet(b"S05"));
+        script.push(b'+');
+        script.extend_from_slice(&encode_packet(b"OK"));
+        script.push(b'+');
+        script.extend_from_slice(&encode_packet(b"T05thread:01;"));
+        let mut client = GdbClient::new(AckThenSilent {
+            to_read: script.into(),
+        });
+        assert_eq!(client.attach().unwrap(), StopReply::Signal(5));
+    }
+
+    /// Renode follows each breakpoint stop (`T05swbreak:;`) with a second
+    /// `S05`. The next command finds it ahead of its ack and must still read
+    /// its own reply, not the stale stop.
+    #[test]
+    fn a_repeated_stop_reply_after_a_run_does_not_shift_the_next_reply() {
+        let mut script = vec![b'+'];
+        script.extend_from_slice(&encode_packet(b"T05swbreak:;"));
+        script.extend_from_slice(&encode_packet(b"S05"));
+        script.push(b'+');
+        script.extend_from_slice(&encode_packet(b"11000000"));
+        let mut client = GdbClient::new(AckThenSilent {
+            to_read: script.into(),
+        });
+        let (stop, _) = client.cont().unwrap();
+        assert_eq!(stop, StopReply::Signal(5));
+        assert_eq!(client.read_memory(0x2000_0000, 4).unwrap(), [0x11, 0, 0, 0]);
+    }
+
+    /// Only stop replies are dropped: any other packet where an ack belongs
+    /// is still a protocol error.
+    #[test]
+    fn a_non_stop_packet_in_place_of_an_ack_is_still_an_error() {
+        let mut script = encode_packet(b"OK");
+        script.push(b'+');
+        let mut client = GdbClient::new(AckThenSilent {
+            to_read: script.into(),
+        });
+        let err = client.read_memory(0x1000, 4).unwrap_err();
+        assert!(err.to_string().contains("ack"), "unexpected error: {err}");
     }
 
     #[test]

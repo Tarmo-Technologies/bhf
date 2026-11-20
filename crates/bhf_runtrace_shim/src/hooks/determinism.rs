@@ -16,13 +16,28 @@
 //! observe the initial state and fail to reproduce. `srand` still honours the
 //! target's own seed after the per-input reset.
 //!
-//! The CLOCK is deliberately not interposed. It was, and it broke targets:
-//! `clock_gettime`/`gettimeofday` are resolved through the vDSO and versioned
-//! symbols, and the lazy `dlsym` a pass-through needs can run under the loader
-//! lock. Measured effect was targets that built and were then NEVER ENTERED —
-//! a silent loss far worse than a non-reproducible timestamp. A clock fake needs
-//! eager resolution at load time (or a `LD_PRELOAD`-free mechanism) before it
-//! can be reintroduced.
+//! The clock has its own gate, `BHF_FAKE_CLOCK=1` (#342). With it,
+//! `clock_gettime`, `gettimeofday`, `time`, `clock` and `timespec_get` read a
+//! virtual clock: it starts at a fixed instant (2026-01-01T00:00:00Z for the
+//! wall clocks, 1000 s for the monotonic ones, 0 for the CPU clocks), every
+//! read advances it [`CLOCK_TICK_NS`], and every input the harness publishes
+//! starts it over. So an input sees the same times on every run, and a loop
+//! waiting for a deadline still reaches it. The shim's own reads (the
+//! scheduler's safety valve) keep the real clock. An absolute-deadline wait
+//! (`clock_nanosleep` with `TIMER_ABSTIME`, `pthread_cond_timedwait`,
+//! `pthread_cond_clockwait`, `sem_timedwait`, `sem_clockwait`) on a deadline
+//! taken from the virtual clock waits on the real clock for as long as the
+//! deadline was ahead of the virtual time.
+//!
+//! An earlier clock fake broke targets: its pass-through resolved the real
+//! symbols with a lazy `dlsym` inside the hook, which could run under the
+//! loader lock, and targets built and were then never entered. These hooks
+//! never resolve anything when called. A constructor resolves the real
+//! functions eagerly, as the shim loads; a hook called before that (from an
+//! earlier library constructor) makes the system call itself. The clock gate
+//! is read from `environ`, not through the shim's `getenv` hook, for the same
+//! reason. A runtime in the process that reads the clock itself (a
+//! sanitizer's allocator) advances it too.
 //!
 //! Allocation discipline matches the other hook modules: no malloc / Box / Vec
 //! / String inside the hooks, and the env gate is read once.
@@ -30,7 +45,7 @@
 #![allow(clippy::missing_safety_doc)]
 #![allow(clippy::missing_transmute_annotations)]
 
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicU8, Ordering};
 
 use crate::jsonl::Builder;
 use crate::reentrancy::HookGuard;
@@ -119,6 +134,9 @@ fn seed_from_env() -> u64 {
 /// observes the same pseudo-random decisions regardless of corpus order or how
 /// many earlier iterations ran in the persistent process.
 pub(crate) fn reset_for_input(input: &[u8]) {
+    if clock_enabled() {
+        CLOCK_READS.store(0, Ordering::Relaxed);
+    }
     if !env_enabled() {
         return;
     }
@@ -244,6 +262,581 @@ pub unsafe extern "C" fn getrandom(
     written as libc::ssize_t
 }
 
+// ---------------------------------------------------------------------------
+// Virtual clock (#342)
+// ---------------------------------------------------------------------------
+
+/// The gate's entry in the environment, up to its value.
+const CLOCK_ENV_PREFIX: &[u8] = b"BHF_FAKE_CLOCK=";
+/// How far the virtual clock advances per read.
+pub const CLOCK_TICK_NS: u64 = 1_000_000;
+/// Where the wall clocks start: 2026-01-01T00:00:00Z.
+const CLOCK_EPOCH_SECS: u64 = 1_767_225_600;
+/// Where the monotonic clocks start.
+const CLOCK_BOOT_SECS: u64 = 1_000;
+const NANOS_PER_SEC: u64 = 1_000_000_000;
+
+/// Reads of the virtual clock since the current input was published.
+static CLOCK_READS: AtomicU64 = AtomicU64::new(0);
+
+extern "C" {
+    static environ: *const *const libc::c_char;
+}
+
+/// Whether `BHF_FAKE_CLOCK` is exactly "1", read once.
+///
+/// It reads `environ` itself rather than calling `getenv`: a sanitizer's
+/// allocator reads the clock from inside `free`, even inside glibc's
+/// `dlerror` bookkeeping, and `getenv` is the shim's own hook, whose first
+/// call resolves the real one with `dlvsym` and so re-entered that
+/// bookkeeping (a double free). No call here reaches a hook.
+pub fn clock_enabled() -> bool {
+    static CACHED: AtomicU8 = AtomicU8::new(2); // 0=false, 1=true, 2=uninit
+    let cached = CACHED.load(Ordering::Relaxed);
+    if cached != 2 {
+        return cached == 1;
+    }
+    // Before libc sets `environ` nothing is known yet: not cached.
+    let Some(enabled) = (unsafe { environ_value_is(CLOCK_ENV_PREFIX, b"1") }) else {
+        return false;
+    };
+    CACHED.store(u8::from(enabled), Ordering::Relaxed);
+    enabled
+}
+
+/// Whether the first `environ` entry starting with `prefix` (`NAME=`) has
+/// the value `value`; `None` while `environ` is unset. Calls nothing, so a
+/// hook may use it where `getenv` (the shim's own hook) is unsafe.
+pub(crate) unsafe fn environ_value_is(prefix: &[u8], value: &[u8]) -> Option<bool> {
+    let mut entry = core::ptr::addr_of!(environ).read();
+    if entry.is_null() {
+        return None;
+    }
+    while !(*entry).is_null() {
+        let text = *entry as *const u8;
+        if (0..prefix.len()).all(|i| *text.add(i) == prefix[i]) {
+            let rest = text.add(prefix.len());
+            return Some(
+                (0..value.len()).all(|i| *rest.add(i) == value[i]) && *rest.add(value.len()) == 0,
+            );
+        }
+        entry = entry.add(1);
+    }
+    Some(false)
+}
+
+/// Set once [`resolve_clock_at_load`] has run: from then on the shim's
+/// thread-local state is safe to read from a clock hook.
+static CLOCK_LOADED: AtomicBool = AtomicBool::new(false);
+
+/// Whether this read is the target's and the fake serves it: the gate is on
+/// and the shim's own code (its scheduler's waits) is not the caller. The
+/// gate is read first, so a run without it touches no thread-local state.
+fn clock_faked() -> bool {
+    clock_enabled() && !(CLOCK_LOADED.load(Ordering::Relaxed) && crate::reentrancy::in_shim())
+}
+
+/// Where the virtual `clock` starts, or `None` for a clock the fake does not
+/// serve (another process's CPU clock, a POSIX clock from a descriptor).
+fn clock_base(clock: libc::clockid_t) -> Option<u64> {
+    Some(match clock {
+        libc::CLOCK_REALTIME
+        | libc::CLOCK_REALTIME_COARSE
+        | libc::CLOCK_REALTIME_ALARM
+        | libc::CLOCK_TAI => CLOCK_EPOCH_SECS * NANOS_PER_SEC,
+        libc::CLOCK_MONOTONIC
+        | libc::CLOCK_MONOTONIC_RAW
+        | libc::CLOCK_MONOTONIC_COARSE
+        | libc::CLOCK_BOOTTIME
+        | libc::CLOCK_BOOTTIME_ALARM => CLOCK_BOOT_SECS * NANOS_PER_SEC,
+        libc::CLOCK_PROCESS_CPUTIME_ID | libc::CLOCK_THREAD_CPUTIME_ID => 0,
+        _ => return None,
+    })
+}
+
+/// The next virtual reading for `clock`, or `None` for a clock the fake does
+/// not serve.
+fn virtual_time(clock: libc::clockid_t) -> Option<u64> {
+    let base = clock_base(clock)?;
+    let read = CLOCK_READS.fetch_add(1, Ordering::Relaxed);
+    Some(base + read.wrapping_mul(CLOCK_TICK_NS))
+}
+
+/// The virtual reading for `clock` now, without advancing it.
+fn virtual_now(clock: libc::clockid_t) -> Option<u64> {
+    let base = clock_base(clock)?;
+    Some(
+        base + CLOCK_READS
+            .load(Ordering::Relaxed)
+            .wrapping_mul(CLOCK_TICK_NS),
+    )
+}
+
+fn timespec_of(nanos: u64) -> libc::timespec {
+    libc::timespec {
+        tv_sec: (nanos / NANOS_PER_SEC) as libc::time_t,
+        tv_nsec: (nanos % NANOS_PER_SEC) as libc::c_long,
+    }
+}
+
+// The real functions, resolved by `resolve_clock_at_load` and never inside a
+// hook. Null until then, or when the lookup found only this shim.
+static REAL_CLOCK_GETTIME: AtomicPtr<libc::c_void> = AtomicPtr::new(core::ptr::null_mut());
+static REAL_GETTIMEOFDAY: AtomicPtr<libc::c_void> = AtomicPtr::new(core::ptr::null_mut());
+static REAL_TIME: AtomicPtr<libc::c_void> = AtomicPtr::new(core::ptr::null_mut());
+static REAL_CLOCK: AtomicPtr<libc::c_void> = AtomicPtr::new(core::ptr::null_mut());
+static REAL_TIMESPEC_GET: AtomicPtr<libc::c_void> = AtomicPtr::new(core::ptr::null_mut());
+static REAL_CLOCK_NANOSLEEP: AtomicPtr<libc::c_void> = AtomicPtr::new(core::ptr::null_mut());
+static REAL_COND_TIMEDWAIT: AtomicPtr<libc::c_void> = AtomicPtr::new(core::ptr::null_mut());
+static REAL_COND_CLOCKWAIT: AtomicPtr<libc::c_void> = AtomicPtr::new(core::ptr::null_mut());
+static REAL_SEM_TIMEDWAIT: AtomicPtr<libc::c_void> = AtomicPtr::new(core::ptr::null_mut());
+static REAL_SEM_CLOCKWAIT: AtomicPtr<libc::c_void> = AtomicPtr::new(core::ptr::null_mut());
+
+#[used]
+#[link_section = ".init_array"]
+static RESOLVE_CLOCK_AT_LOAD: extern "C" fn() = resolve_clock_at_load;
+
+extern "C" fn resolve_clock_at_load() {
+    clock_enabled();
+    let slots: [(&AtomicPtr<libc::c_void>, &core::ffi::CStr, *const ()); 5] = [
+        (
+            &REAL_CLOCK_GETTIME,
+            c"clock_gettime",
+            clock_gettime as *const (),
+        ),
+        (
+            &REAL_GETTIMEOFDAY,
+            c"gettimeofday",
+            gettimeofday as *const (),
+        ),
+        (&REAL_TIME, c"time", time as *const ()),
+        (&REAL_CLOCK, c"clock", clock as *const ()),
+        (
+            &REAL_TIMESPEC_GET,
+            c"timespec_get",
+            timespec_get as *const (),
+        ),
+    ];
+    for (slot, name, hook) in slots {
+        let real = unsafe { crate::dlsym::bhf_shim_resolve_next(name.as_ptr()) };
+        if !real.is_null() && real as *const () != hook {
+            slot.store(real, Ordering::Relaxed);
+        }
+    }
+    for wait in WAITS {
+        unsafe { wait.real() };
+    }
+    CLOCK_LOADED.store(true, Ordering::Relaxed);
+}
+
+/// A real absolute-deadline wait, resolved as the shim loads (or, for a call
+/// from a library constructor that runs first, on that call: unlike a clock
+/// read, a wait is never made from inside the loader's or an allocator's
+/// bookkeeping).
+struct RealWait {
+    slot: &'static AtomicPtr<libc::c_void>,
+    name: &'static core::ffi::CStr,
+    /// The symbol version to bind when the base version is an older,
+    /// different implementation (glibc's pre-2.3.2 condition variables).
+    version: Option<&'static core::ffi::CStr>,
+    hook: fn() -> *const (),
+}
+
+impl RealWait {
+    unsafe fn real(&self) -> *mut libc::c_void {
+        let cached = self.slot.load(Ordering::Relaxed);
+        if !cached.is_null() {
+            return cached;
+        }
+        let real = match self.version {
+            Some(version) => libc::dlvsym(libc::RTLD_NEXT, self.name.as_ptr(), version.as_ptr()),
+            None => crate::dlsym::bhf_shim_resolve_next(self.name.as_ptr()),
+        };
+        if real.is_null() || real as *const () == (self.hook)() {
+            return core::ptr::null_mut();
+        }
+        self.slot.store(real, Ordering::Relaxed);
+        real
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+const COND_TIMEDWAIT_VERSION: Option<&core::ffi::CStr> = Some(c"GLIBC_2.3.2");
+#[cfg(not(target_arch = "x86_64"))]
+const COND_TIMEDWAIT_VERSION: Option<&core::ffi::CStr> = None;
+
+static CLOCK_NANOSLEEP_WAIT: RealWait = RealWait {
+    slot: &REAL_CLOCK_NANOSLEEP,
+    name: c"clock_nanosleep",
+    version: None,
+    hook: || clock_nanosleep as *const (),
+};
+static COND_TIMEDWAIT: RealWait = RealWait {
+    slot: &REAL_COND_TIMEDWAIT,
+    name: c"pthread_cond_timedwait",
+    version: COND_TIMEDWAIT_VERSION,
+    hook: || pthread_cond_timedwait as *const (),
+};
+static COND_CLOCKWAIT: RealWait = RealWait {
+    slot: &REAL_COND_CLOCKWAIT,
+    name: c"pthread_cond_clockwait",
+    version: None,
+    hook: || pthread_cond_clockwait as *const (),
+};
+static SEM_TIMEDWAIT: RealWait = RealWait {
+    slot: &REAL_SEM_TIMEDWAIT,
+    name: c"sem_timedwait",
+    version: None,
+    hook: || sem_timedwait as *const (),
+};
+static SEM_CLOCKWAIT: RealWait = RealWait {
+    slot: &REAL_SEM_CLOCKWAIT,
+    name: c"sem_clockwait",
+    version: None,
+    hook: || sem_clockwait as *const (),
+};
+static WAITS: [&RealWait; 5] = [
+    &CLOCK_NANOSLEEP_WAIT,
+    &COND_TIMEDWAIT,
+    &COND_CLOCKWAIT,
+    &SEM_TIMEDWAIT,
+    &SEM_CLOCKWAIT,
+];
+
+/// `clock_gettime` through the kernel, for a read before the real function
+/// is resolved.
+unsafe fn sys_clock_gettime(clock: libc::clockid_t, tp: *mut libc::timespec) -> libc::c_int {
+    libc::syscall(libc::SYS_clock_gettime, clock, tp) as libc::c_int
+}
+
+unsafe fn real_clock_gettime(clock: libc::clockid_t, tp: *mut libc::timespec) -> libc::c_int {
+    let real = REAL_CLOCK_GETTIME.load(Ordering::Relaxed);
+    if real.is_null() {
+        return sys_clock_gettime(clock, tp);
+    }
+    let real: unsafe extern "C" fn(libc::clockid_t, *mut libc::timespec) -> libc::c_int =
+        std::mem::transmute(real);
+    real(clock, tp)
+}
+
+pub struct Clock;
+
+impl FakeResource for Clock {
+    fn name(&self) -> &'static str {
+        "clock"
+    }
+    fn intercepts(&self) -> &'static [&'static [u8]] {
+        &[
+            b"clock_gettime\0",
+            b"gettimeofday\0",
+            b"time\0",
+            b"clock\0",
+            b"timespec_get\0",
+            b"clock_nanosleep\0",
+            b"pthread_cond_timedwait\0",
+            b"pthread_cond_clockwait\0",
+            b"sem_timedwait\0",
+            b"sem_clockwait\0",
+        ]
+    }
+    fn is_enabled(&self) -> bool {
+        clock_enabled()
+    }
+    fn describe(&self) -> &'static str {
+        "a virtual clock that each input starts over, so the same input sees the same times"
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn clock_gettime(
+    clock: libc::clockid_t,
+    tp: *mut libc::timespec,
+) -> libc::c_int {
+    if clock_faked() {
+        if let Some(nanos) = virtual_time(clock) {
+            if tp.is_null() {
+                set_errno(libc::EFAULT);
+                return -1;
+            }
+            *tp = timespec_of(nanos);
+            return 0;
+        }
+    }
+    real_clock_gettime(clock, tp)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gettimeofday(
+    tv: *mut libc::timeval,
+    tz: *mut libc::c_void,
+) -> libc::c_int {
+    if clock_faked() {
+        let nanos = virtual_time(libc::CLOCK_REALTIME).unwrap_or_default();
+        if !tv.is_null() {
+            *tv = libc::timeval {
+                tv_sec: (nanos / NANOS_PER_SEC) as libc::time_t,
+                tv_usec: ((nanos % NANOS_PER_SEC) / 1_000) as libc::suseconds_t,
+            };
+        }
+        if !tz.is_null() {
+            core::ptr::write_bytes(tz as *mut u8, 0, 2 * core::mem::size_of::<libc::c_int>());
+        }
+        return 0;
+    }
+    let real = REAL_GETTIMEOFDAY.load(Ordering::Relaxed);
+    if real.is_null() {
+        return libc::syscall(libc::SYS_gettimeofday, tv, tz) as libc::c_int;
+    }
+    let real: unsafe extern "C" fn(*mut libc::timeval, *mut libc::c_void) -> libc::c_int =
+        std::mem::transmute(real);
+    real(tv, tz)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn time(out: *mut libc::time_t) -> libc::time_t {
+    let now = if clock_faked() {
+        (virtual_time(libc::CLOCK_REALTIME).unwrap_or_default() / NANOS_PER_SEC) as libc::time_t
+    } else {
+        let real = REAL_TIME.load(Ordering::Relaxed);
+        if !real.is_null() {
+            let real: unsafe extern "C" fn(*mut libc::time_t) -> libc::time_t =
+                std::mem::transmute(real);
+            return real(out);
+        }
+        let mut ts = timespec_of(0);
+        if sys_clock_gettime(libc::CLOCK_REALTIME, &mut ts) != 0 {
+            return -1;
+        }
+        ts.tv_sec
+    };
+    if !out.is_null() {
+        *out = now;
+    }
+    now
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn clock() -> libc::clock_t {
+    // POSIX fixes CLOCKS_PER_SEC at one million.
+    let nanos = if clock_faked() {
+        virtual_time(libc::CLOCK_PROCESS_CPUTIME_ID).unwrap_or_default()
+    } else {
+        let real = REAL_CLOCK.load(Ordering::Relaxed);
+        if !real.is_null() {
+            let real: unsafe extern "C" fn() -> libc::clock_t = std::mem::transmute(real);
+            return real();
+        }
+        let mut ts = timespec_of(0);
+        if sys_clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) != 0 {
+            return -1;
+        }
+        ts.tv_sec as u64 * NANOS_PER_SEC + ts.tv_nsec as u64
+    };
+    (nanos / 1_000) as libc::clock_t
+}
+
+/// C11 `TIME_UTC`.
+const TIME_UTC: libc::c_int = 1;
+
+#[no_mangle]
+pub unsafe extern "C" fn timespec_get(ts: *mut libc::timespec, base: libc::c_int) -> libc::c_int {
+    if base == TIME_UTC && clock_faked() {
+        if ts.is_null() {
+            return 0;
+        }
+        *ts = timespec_of(virtual_time(libc::CLOCK_REALTIME).unwrap_or_default());
+        return base;
+    }
+    let real = REAL_TIMESPEC_GET.load(Ordering::Relaxed);
+    if !real.is_null() {
+        let real: unsafe extern "C" fn(*mut libc::timespec, libc::c_int) -> libc::c_int =
+            std::mem::transmute(real);
+        return real(ts, base);
+    }
+    if base == TIME_UTC && !ts.is_null() && sys_clock_gettime(libc::CLOCK_REALTIME, ts) == 0 {
+        return base;
+    }
+    0
+}
+
+// Absolute-deadline waits. A target computes the deadline from the virtual
+// clock (a monotonic one starts at 1000 s, the wall clock on 2026-01-01), but
+// the kernel compares it with its real clock: on a host up for days the wait
+// would end at once, and on one booted less than 1000 s ago it would sleep
+// until the real uptime caught up. So a wait on a virtual deadline waits on
+// the real clock as long as the deadline is ahead of the virtual time, and
+// one already past ends at once, as it would have.
+
+/// `TIMER_ABSTIME` for `clock_nanosleep`.
+const TIMER_ABSTIME: libc::c_int = 1;
+
+/// The real deadline on `clock` for `deadline`, which the target computed
+/// from the virtual clock; `None` when the wait is not on a virtual deadline
+/// (the fake is off, the caller is the shim, the clock is not served, or the
+/// deadline is malformed, which the real call reports).
+unsafe fn real_deadline(
+    clock: libc::clockid_t,
+    deadline: *const libc::timespec,
+) -> Option<libc::timespec> {
+    if deadline.is_null() || !clock_faked() {
+        return None;
+    }
+    let virtual_now = virtual_now(clock)?;
+    let deadline = &*deadline;
+    if deadline.tv_sec < 0 || !(0..NANOS_PER_SEC as libc::c_long).contains(&deadline.tv_nsec) {
+        return None;
+    }
+    let wanted = (deadline.tv_sec as u64)
+        .saturating_mul(NANOS_PER_SEC)
+        .saturating_add(deadline.tv_nsec as u64);
+    let ahead = wanted.saturating_sub(virtual_now);
+    let mut now = timespec_of(0);
+    if real_clock_gettime(clock, &mut now) != 0 {
+        return None;
+    }
+    let real_now = now.tv_sec as u64 * NANOS_PER_SEC + now.tv_nsec as u64;
+    Some(timespec_of(real_now.saturating_add(ahead)))
+}
+
+/// The clock a `pthread_cond_timedwait` deadline was read from. The condition
+/// variable's clock (`pthread_condattr_setclock`) is not visible here, but
+/// the virtual wall clock and the virtual monotonic one lie decades apart.
+fn deadline_clock(deadline: *const libc::timespec) -> libc::clockid_t {
+    let wall = !deadline.is_null() && unsafe { (*deadline).tv_sec } as u64 >= CLOCK_EPOCH_SECS / 2;
+    if wall {
+        libc::CLOCK_REALTIME
+    } else {
+        libc::CLOCK_MONOTONIC
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn clock_nanosleep(
+    clock: libc::clockid_t,
+    flags: libc::c_int,
+    request: *const libc::timespec,
+    remain: *mut libc::timespec,
+) -> libc::c_int {
+    let translated = if flags & TIMER_ABSTIME != 0 {
+        real_deadline(clock, request)
+    } else {
+        None
+    };
+    let request = translated
+        .as_ref()
+        .map_or(request, |deadline| deadline as *const libc::timespec);
+    let real = CLOCK_NANOSLEEP_WAIT.real();
+    if real.is_null() {
+        let rc = libc::syscall(libc::SYS_clock_nanosleep, clock, flags, request, remain);
+        return if rc == 0 {
+            0
+        } else {
+            *libc::__errno_location()
+        };
+    }
+    let real: unsafe extern "C" fn(
+        libc::clockid_t,
+        libc::c_int,
+        *const libc::timespec,
+        *mut libc::timespec,
+    ) -> libc::c_int = std::mem::transmute(real);
+    real(clock, flags, request, remain)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_cond_timedwait(
+    cond: *mut libc::pthread_cond_t,
+    mutex: *mut libc::pthread_mutex_t,
+    deadline: *const libc::timespec,
+) -> libc::c_int {
+    let translated = real_deadline(deadline_clock(deadline), deadline);
+    let deadline = translated
+        .as_ref()
+        .map_or(deadline, |deadline| deadline as *const libc::timespec);
+    let real = COND_TIMEDWAIT.real();
+    if real.is_null() {
+        return libc::ENOSYS;
+    }
+    let real: unsafe extern "C" fn(
+        *mut libc::pthread_cond_t,
+        *mut libc::pthread_mutex_t,
+        *const libc::timespec,
+    ) -> libc::c_int = std::mem::transmute(real);
+    real(cond, mutex, deadline)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_cond_clockwait(
+    cond: *mut libc::pthread_cond_t,
+    mutex: *mut libc::pthread_mutex_t,
+    clock: libc::clockid_t,
+    deadline: *const libc::timespec,
+) -> libc::c_int {
+    let translated = real_deadline(clock, deadline);
+    let deadline = translated
+        .as_ref()
+        .map_or(deadline, |deadline| deadline as *const libc::timespec);
+    let real = COND_CLOCKWAIT.real();
+    if real.is_null() {
+        return libc::ENOSYS;
+    }
+    let real: unsafe extern "C" fn(
+        *mut libc::pthread_cond_t,
+        *mut libc::pthread_mutex_t,
+        libc::clockid_t,
+        *const libc::timespec,
+    ) -> libc::c_int = std::mem::transmute(real);
+    real(cond, mutex, clock, deadline)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sem_timedwait(
+    sem: *mut libc::sem_t,
+    deadline: *const libc::timespec,
+) -> libc::c_int {
+    let translated = real_deadline(libc::CLOCK_REALTIME, deadline);
+    let deadline = translated
+        .as_ref()
+        .map_or(deadline, |deadline| deadline as *const libc::timespec);
+    let real = SEM_TIMEDWAIT.real();
+    if real.is_null() {
+        set_errno(libc::ENOSYS);
+        return -1;
+    }
+    let real: unsafe extern "C" fn(*mut libc::sem_t, *const libc::timespec) -> libc::c_int =
+        std::mem::transmute(real);
+    real(sem, deadline)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sem_clockwait(
+    sem: *mut libc::sem_t,
+    clock: libc::clockid_t,
+    deadline: *const libc::timespec,
+) -> libc::c_int {
+    let translated = real_deadline(clock, deadline);
+    let deadline = translated
+        .as_ref()
+        .map_or(deadline, |deadline| deadline as *const libc::timespec);
+    let real = SEM_CLOCKWAIT.real();
+    if real.is_null() {
+        set_errno(libc::ENOSYS);
+        return -1;
+    }
+    let real: unsafe extern "C" fn(
+        *mut libc::sem_t,
+        libc::clockid_t,
+        *const libc::timespec,
+    ) -> libc::c_int = std::mem::transmute(real);
+    real(sem, clock, deadline)
+}
+
+fn set_errno(value: i32) {
+    unsafe {
+        *libc::__errno_location() = value;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,6 +862,30 @@ mod tests {
             first.windows(2).any(|w| w[0] != w[1]),
             "stream must vary: {first:?}"
         );
+    }
+
+    #[test]
+    fn the_virtual_clock_serves_the_system_clocks_and_leaves_the_others() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        CLOCK_READS.store(0, Ordering::Relaxed);
+        assert_eq!(
+            virtual_time(libc::CLOCK_REALTIME),
+            Some(CLOCK_EPOCH_SECS * NANOS_PER_SEC)
+        );
+        assert_eq!(
+            virtual_time(libc::CLOCK_BOOTTIME),
+            Some(CLOCK_BOOT_SECS * NANOS_PER_SEC + CLOCK_TICK_NS)
+        );
+        assert_eq!(
+            virtual_time(libc::CLOCK_THREAD_CPUTIME_ID),
+            Some(2 * CLOCK_TICK_NS)
+        );
+        // Another process's CPU clock (clock_getcpuclockid) and a descriptor
+        // clock are negative ids: the fake leaves them, and they do not tick.
+        assert_eq!(virtual_time(-6), None);
+        assert_eq!(CLOCK_READS.load(Ordering::Relaxed), 3);
+        let at = timespec_of(CLOCK_EPOCH_SECS * NANOS_PER_SEC + 1_500_000_000);
+        assert_eq!((at.tv_sec, at.tv_nsec), (1_767_225_601, 500_000_000));
     }
 
     #[test]

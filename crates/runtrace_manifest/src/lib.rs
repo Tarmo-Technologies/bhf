@@ -62,6 +62,21 @@ pub const MANIFEST: &[ManifestEntry] = &[
         &[b"connect\0", b"getaddrinfo\0"],
         "log connect/getaddrinfo failures and substitute fake socket peers",
     ),
+    ManifestEntry::gated(
+        "desocket",
+        &[
+            b"bind\0",
+            b"listen\0",
+            b"accept\0",
+            b"accept4\0",
+            b"getsockname\0",
+            b"getpeername\0",
+            b"setsockopt\0",
+            b"bhf_shim_desocket_active\0",
+        ],
+        "BHF_DESOCKET",
+        "serve a TCP server's first accepted connection from the fuzz input, then end the run",
+    ),
     ManifestEntry::always_on(
         "fs",
         &[
@@ -218,6 +233,23 @@ pub const MANIFEST: &[ManifestEntry] = &[
         ],
         "BHF_FAKE_DETERMINISM",
         "deterministic randomness so a saved input replays identically",
+    ),
+    ManifestEntry::gated(
+        "clock",
+        &[
+            b"clock_gettime\0",
+            b"gettimeofday\0",
+            b"time\0",
+            b"clock\0",
+            b"timespec_get\0",
+            b"clock_nanosleep\0",
+            b"pthread_cond_timedwait\0",
+            b"pthread_cond_clockwait\0",
+            b"sem_timedwait\0",
+            b"sem_clockwait\0",
+        ],
+        "BHF_FAKE_CLOCK",
+        "a virtual clock that each input starts over, so the same input sees the same times",
     ),
     ManifestEntry::always_on(
         "ioctl",

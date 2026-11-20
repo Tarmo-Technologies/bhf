@@ -34,7 +34,8 @@
 //! This module also hosts the bare-metal MMIO fill helper
 //! [`bhf_shim_mmio_fill`] (HDF-6 deliverable 3): a fixed-address `mmap` filled
 //! from the fuzz input, for `*(volatile T*)ADDR` register reads the `LD_PRELOAD`
-//! path cannot see (they are loads, not syscalls).
+//! path cannot see (they are loads, not syscalls). The generated C direct
+//! harness calls it for the device windows its target's code reads (#341).
 
 #![allow(clippy::missing_safety_doc)]
 #![allow(clippy::missing_transmute_annotations)]
@@ -548,16 +549,18 @@ pub unsafe extern "C" fn CFE_SB_CreatePipe(
 // syscall, so the LD_PRELOAD path cannot intercept it. The general, robust way
 // to make such a fixed-address read fuzz-controlled on the host is to MAP the
 // page(s) it lives on and fill them from the fuzz input. `bhf_shim_mmio_fill`
-// does exactly that on demand: a generated harness (or a fixture) calls it with
-// the device base + span before driving the target, and the subsequent volatile
-// loads read fuzz-controlled bytes.
+// does exactly that on demand. The generated C direct harness (#341) calls it
+// once for each device window its target's code reads (the volatile register
+// accesses of constants, macros expanded) when the shim is loaded, and maps the window
+// itself otherwise; it then refills each window from every input, so the
+// bytes a register read returns do not depend on whether the shim was loaded.
 //
-// Honest limits (documented for the general-case follow-up): the address must be
-// page-mappable in the host process (a low or kernel address will not map);
-// MAP_FIXED_NOREPLACE means the call FAILS (returns -1, never silently clobbers)
-// if the range is already mapped; and the address must be supplied — automatic
-// discovery of literal MMIO addresses in already-compiled target code, and a
-// compiler-assisted volatile-load rewrite, remain follow-ups. Where the target
+// Honest limits: the address must be page-mappable in the host process (a low
+// or kernel address will not map); MAP_FIXED_NOREPLACE means the call FAILS
+// (returns -1, never silently clobbers) if the range is already mapped; and the
+// address must be supplied. Discovering MMIO addresses in already-compiled
+// target code, and a compiler-assisted volatile-load rewrite, remain
+// follow-ups. Where the target
 // reads registers through a BSP accessor function instead of a raw literal, the
 // harness-side `CEnvironmentModel`/`CPeripheralReader` accessor synthesis (HDF-5,
 // wired by HDF-6 deliverable 4) is the cleaner path and needs no fixed mapping.
