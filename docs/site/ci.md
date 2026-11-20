@@ -123,12 +123,7 @@ fails the check, and the action prints the work dir's diagnostics in the log.
 
 ## Regression replay
 
-Before a run is judged, `bhf ci` replays the findings an earlier run stored
-against this run's build of their harness. A finding that still reproduces
-fails the gate, unless `pr-gate` is `never` or a `--policy` file sets the
-exit status; one that no longer reproduces is reported fixed and passes. The stored findings come from the work dir's
-`regressions/` directory and from each `--regressions <DIR>` (a directory of
-finding directories, laid out as `results/findings/` holds them).
+Before a run is judged, `bhf ci` replays the findings an earlier run stored against this run's build of their harness. A finding that still reproduces fails the gate, unless `pr-gate` is `never`; one that no longer reproduces is reported fixed and passes. The stored findings come from the work dir's `regressions/` directory and from each `--regressions <DIR>` (a directory of finding directories, laid out as `results/findings/` holds them).
 
 A work dir restored from a CI cache still holds its last run's findings in
 `results/findings/`. Before the run they move to `regressions/`, one per root
@@ -179,16 +174,14 @@ bhf ci . \
 | `--changed-since <ref>` | Scope the run to the diff `<merge-base>..HEAD`. |
 | `--changed-paths-from <file>` | Read a newline-separated changed-file list from a file instead of asking git. Overrides `--changed-since`. |
 | `--sarif <path>` | Write the run's SARIF 2.1.0 report to `<path>`. Every result carries a location, because code scanning drops one without: a finding with no crash frame (a format-string, memory-limit or deadline oracle) points at the fuzzed function's line, or at the source root when that is unknown. |
-| `--ci-json <path>` | Write a compact JSON result: counts by severity and verdict, the confirmed count, the scoped file count, the exit code and the [regression replay](#regression-replay) ids. |
+| `--ci-json <path>` | Write a compact JSON result: counts by severity and verdict, the confirmed count, the scoped file count, the exit code, the [regression replay](#regression-replay) ids and each gate's result (`gates`). |
 | `--regressions <DIR>` | Replay the stored findings in `<DIR>` as well as the work dir's own. Repeatable. |
 | `--gitlab-sast <path>` | Write a [GitLab SAST report](#gitlab-ci) of the run's findings. |
 | `--pr-gate <policy>` | `confirmed`, `all` or `never`, as for the action. The CLI default is `off`, which gates on `--fail-on` (severity threshold, default `any`) or `--fail-on-actionability`. |
 | `--summary-file <path>` | Append the Markdown summary here. Default: the file `GITHUB_STEP_SUMMARY` names. |
-| `--policy <file>` | Gate on a policy-as-code file (`bhf policy validate` checks one). Its `ci` section (`fail_on_severity`, `require_artifacts`, `require_runner_plan`, `require_full_runner_assignment`) sets the exit status in place of `--pr-gate`, `--fail-on`, `--fail-on-actionability` and the regression replay. |
+| `--policy <file>` | Gate on a policy-as-code file (`bhf policy validate` checks one) as well. Its `ci` section (`fail_on_severity`, `require_artifacts`, `require_runner_plan`, `require_full_runner_assignment`) is one more gate beside `--pr-gate`, `--fail-on-actionability`, the regression replay and a `--fail-on` the command line gives; its `fail_on_severity` takes the place of the default `--fail-on any`. |
 
-The CLI's `--per-target-time` default is 60 seconds; the action passes 30.
-`bhf ci` exits `0` when the gate passes and `1` when it fails or when the run
-errors. Run `bhf ci --help` for the full option list.
+The CLI's `--per-target-time` default is 60 seconds; the action passes 30. `bhf ci` exits `0` when every gate it applied passes and `1` when one fails or when the run errors; the summary names each gate's result. Run `bhf ci --help` for the full option list.
 
 ## GitLab CI
 

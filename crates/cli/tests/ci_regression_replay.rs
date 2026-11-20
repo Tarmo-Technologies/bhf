@@ -25,6 +25,15 @@ const FIXED: &str = "#include <stddef.h>\n#include <stdint.h>\n#include <string.
                      memcpy(tag, data, len);\n    return tag[1];\n  }\n  return 0;\n}\n";
 
 fn ci(src: &Path, work: &Path, json: &Path) -> (i32, serde_json::Value, String) {
+    ci_with(src, work, json, &[])
+}
+
+fn ci_with(
+    src: &Path,
+    work: &Path,
+    json: &Path,
+    extra: &[&std::ffi::OsStr],
+) -> (i32, serde_json::Value, String) {
     let output = Command::new(env!("CARGO_BIN_EXE_bhf"))
         .arg("ci")
         .arg(src)
@@ -33,6 +42,7 @@ fn ci(src: &Path, work: &Path, json: &Path) -> (i32, serde_json::Value, String) 
         .args(["--languages", "c", "--per-target-time", "10"])
         .arg("--ci-json")
         .arg(json)
+        .args(extra)
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -85,4 +95,84 @@ fn a_stored_finding_fails_the_gate_until_it_is_fixed() {
         Some(0),
         "{third:#}"
     );
+}
+
+/// A `--policy` gate is one gate among those the run applies (#448): a
+/// passing policy does not hide a failing `--fail-on` or a stored finding that
+/// still reproduces, and the run passes only when every gate passes. The
+/// summary names each gate's result.
+#[test]
+fn a_passing_policy_does_not_hide_a_failing_gate() {
+    if Command::new("clang").arg("--version").output().is_err() {
+        eprintln!("skipping: no clang");
+        return;
+    }
+    let root = TestDir::new("ci-policy-gates");
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("tag.c"), BUGGY).unwrap();
+    let work = root.join("work");
+    // A policy that fails on no finding.
+    let policy = root.join("policy.json");
+    std::fs::write(
+        &policy,
+        r#"{"schema_version":"bhf.policy.v1","policy_id":"report-only","ci":{"fail_on_severity":"none"}}"#,
+    )
+    .unwrap();
+    let summary = |name: &str| root.join(format!("{name}.md"));
+    let args = |name: &str, more: &[&str]| -> Vec<std::ffi::OsString> {
+        let mut args: Vec<std::ffi::OsString> = vec![
+            "--policy".into(),
+            policy.clone().into(),
+            "--summary-file".into(),
+            summary(name).into(),
+        ];
+        args.extend(more.iter().map(Into::into));
+        args
+    };
+    let run = |name: &str, more: &[&str]| {
+        let extra = args(name, more);
+        let extra: Vec<&std::ffi::OsStr> = extra.iter().map(|arg| arg.as_os_str()).collect();
+        let (exit, doc, stderr) = ci_with(&src, &work, &root.join(format!("{name}.json")), &extra);
+        let markdown = std::fs::read_to_string(summary(name)).unwrap_or_default();
+        (exit, doc, format!("{stderr}\n{markdown}"), markdown)
+    };
+
+    // The policy passes the planted overflow; `--fail-on any` fails on it.
+    let (exit, first, log, markdown) = run("fail-on", &["--fail-on", "any"]);
+    assert!(first["total_findings"].as_u64().unwrap() >= 1, "{first:#}");
+    assert_eq!(exit, 1, "{first:#}\n{log}");
+    assert_eq!(first["exit_code"], 1, "{first:#}");
+    assert!(markdown.contains("`--fail-on any`: **failed**"), "{log}");
+    assert!(markdown.contains("`--policy`: passed"), "{log}");
+
+    // The same tree again with only the policy: the stored finding still
+    // reproduces, which fails the run. The default `--fail-on any` is not
+    // applied beside the policy.
+    let (exit, second, log, markdown) = run("regression", &[]);
+    assert!(
+        !second["regressions"]["reproduced"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{second:#}\n{log}"
+    );
+    assert_eq!(exit, 1, "{second:#}\n{log}");
+    assert!(markdown.contains("regression replay: **failed**"), "{log}");
+    assert!(!markdown.contains("`--fail-on"), "{log}");
+
+    // Fixed: no finding, the stored one is fixed and the policy passes, so
+    // every gate passes.
+    std::fs::write(src.join("tag.c"), FIXED).unwrap();
+    let (exit, third, log, markdown) = run("fixed", &["--fail-on", "any"]);
+    assert_eq!(third["total_findings"], 0, "{third:#}\n{log}");
+    assert_eq!(exit, 0, "{third:#}\n{log}");
+    assert_eq!(third["exit_code"], 0, "{third:#}");
+    for gate in [
+        "`--fail-on any`: passed",
+        "regression replay: passed",
+        "`--policy`: passed",
+    ] {
+        assert!(markdown.contains(gate), "{gate}: {log}");
+    }
 }
