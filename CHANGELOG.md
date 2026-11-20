@@ -1871,6 +1871,7 @@
   when bhf panics.
 
 ### Fixed
+- An extension manifest named by a bare relative path (`--manifest extension.toml`) starts the executable beside it (#450). Its parent directory is empty, so the executable joined to a bare name that was looked up on `PATH`; it now resolves against the current directory, as `./extension.toml` does.
 - `bhf auto --resume --no-discovery-cache` re-attempts the targets whose source file changed and reloads the others (#449). It reused every earlier result, because `--no-discovery-cache` also skipped the per-file source record that `--resume` compares; that record is now kept without the cache.
 - `bhf ci --policy` no longer discards the other gates (#448): the run fails when the policy, `--pr-gate`, `--fail-on-actionability`, a `--fail-on` the command line gives or the regression replay fails. The summary, a new `gates` array in the `--ci-json` result and the `--dashboard-out` gate name each gate's result. Beside `--policy` the default `--fail-on any` still does not apply.
 - The all-language container image ships OpenJDK 21.0.13.1+2 (#445). Its
