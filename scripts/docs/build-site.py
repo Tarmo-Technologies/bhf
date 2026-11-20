@@ -3,6 +3,7 @@
 
 import argparse
 import html
+import importlib.util
 import re
 import shutil
 from dataclasses import dataclass
@@ -16,6 +17,15 @@ DEFAULT_BASE_URL = ""
 REPO_BLOB_URL = "https://github.com/Tarmo-Technologies/bhf/blob/main"
 REPO_README_URL = f"{REPO_BLOB_URL}/README.md"
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Heading anchors follow GitHub's rules, as scripts/check-doc-links.py
+# computes them for the Markdown, so a link that works on GitHub works here.
+_spec = importlib.util.spec_from_file_location("check_doc_links", REPO_ROOT / "scripts/check-doc-links.py")
+check_doc_links = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(check_doc_links)
+# An ATX heading: up to three spaces, one to six `#`, the text, and an
+# optional closing run of `#` after a space.
+HEADING = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)(?:[ \t]+#+)?[ \t]*$")
 
 
 @dataclass(frozen=True)
@@ -108,7 +118,9 @@ def main() -> None:
     copy_cname(source, out)
     write_sitemap(out, base_url)
     write_robots(out, base_url)
-    validate_generated_links(out)
+    failures = generated_link_failures(out)
+    if failures:
+        raise SystemExit("broken generated docs links:\n  " + "\n  ".join(failures))
 
 
 def validate_manifest(source: Path) -> None:
@@ -168,25 +180,31 @@ def rewrite_source_links(markdown: str, page: Page, source: Path = REPO_ROOT / "
     return re.sub(r"\[([^\]]+)\]\(([^)]+\.md(?:#[^)]+)?)\)", replace, markdown)
 
 
-def validate_generated_links(out: Path) -> None:
-    """Fail the build when a generated relative hyperlink has no local target."""
+def generated_link_failures(out: Path) -> list[str]:
+    """Every generated relative hyperlink with no local target, and every
+    `#fragment` (on another page or the same one) that names no `id` there."""
+    documents = sorted(out.glob("**/*.html"))
+    ids = {
+        document.resolve(): set(re.findall(r'\bid="([^"]+)"', document.read_text(encoding="utf-8")))
+        for document in documents
+    }
     failures = []
-    for document in out.glob("**/*.html"):
+    for document in documents:
         body = document.read_text(encoding="utf-8")
         for target in re.findall(r'href="([^"]+)"', body):
-            if target.startswith(("http://", "https://", "mailto:", "#")):
+            if target.startswith(("http://", "https://", "mailto:")):
                 continue
-            path = target.split("#", 1)[0].split("?", 1)[0]
-            if not path:
-                continue
-            resolved = document.parent / path
-            exists = resolved.is_file() or (
-                resolved.is_dir() and (resolved / "index.html").is_file()
-            )
-            if not exists:
-                failures.append(f"{document.relative_to(out)} -> {target}")
-    if failures:
-        raise ValueError("broken generated docs links:\n  " + "\n  ".join(failures))
+            path, _, fragment = html.unescape(target).partition("#")
+            path = path.split("?", 1)[0]
+            resolved = document.parent / path if path else document
+            if resolved.is_dir():
+                resolved = resolved / "index.html"
+            where = f"{document.relative_to(out).as_posix()} -> {target}"
+            if not resolved.is_file():
+                failures.append(where)
+            elif fragment and resolved.suffix == ".html" and fragment not in ids.get(resolved.resolve(), set()):
+                failures.append(f"{where} (no such heading)")
+    return failures
 
 
 def write_page(out: Path, page: Page, content: str, base_url: str) -> None:
@@ -379,6 +397,7 @@ def render_shell(page: Page, content: str, base_url: str) -> str:
 def render_markdown(markdown: str) -> str:
     lines = strip_spdx(markdown).splitlines()
     blocks = []
+    anchors = HeadingAnchors()
     paragraph = []
     list_kind = None
     code_lines = []
@@ -471,15 +490,15 @@ def render_markdown(markdown: str) -> str:
             continue
         flush_table()
 
-        heading = re.match(r"^(#{1,3})\s+(.+)$", line)
+        heading = HEADING.match(line)
         if heading:
             flush_paragraph()
             close_list()
             level = len(heading.group(1))
             text = heading.group(2).strip()
-            blocks.append(
-                f'<h{level} id="{slugify(text)}">{render_inline(text)}</h{level}>'
-            )
+            anchor = anchors.next(text)
+            id_attribute = f' id="{html.escape(anchor, quote=True)}"' if anchor else ""
+            blocks.append(f"<h{level}{id_attribute}>{render_inline(text)}</h{level}>")
             continue
 
         bullet = re.match(r"^\s*-\s+(.+)$", line)
@@ -559,9 +578,21 @@ def canonical_url(base_url: str, slug: str) -> str:
     return f"{base_url}/" if slug == "index" else f"{base_url}/{slug}/"
 
 
-def slugify(text: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
-    return slug or "section"
+class HeadingAnchors:
+    """GitHub's anchors for one page's headings, in order: the slug of the
+    heading's text, and a repeat of a slug gets `-1`, `-2` and so on."""
+
+    def __init__(self) -> None:
+        self.seen: dict[str, int] = {}
+
+    def next(self, text: str) -> str:
+        base = check_doc_links.slug(text)
+        anchor = base
+        while anchor in self.seen:
+            self.seen[base] += 1
+            anchor = f"{base}-{self.seen[base]}"
+        self.seen[anchor] = 0
+        return anchor
 
 
 def copy_assets(source: Path, out: Path) -> None:

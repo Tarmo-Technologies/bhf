@@ -174,11 +174,7 @@ renders them to static HTML, which you can build and read offline:
 python3 scripts/docs/build-site.py --out target/docs-site
 ```
 
-The build fails on a relative link to a Markdown file that does not exist.
-A link to a repository file the site does not publish points to that file on
-GitHub. The build writes canonical links, `sitemap.xml` and a `Sitemap:`
-line in `robots.txt` only for the host you pass with `--base-url`; the
-default is no host.
+Every heading, `#` to `######`, gets the anchor GitHub gives it, so a link to `auto.md#needed_for_build` works on the site as it does on GitHub. The build fails on a relative link to a Markdown file that does not exist, and on a link to a heading that the target page, or the same page, does not have. A link to a repository file the site does not publish points to that file on GitHub. The build writes canonical links, `sitemap.xml` and a `Sitemap:` line in `robots.txt` only for the host you pass with `--base-url`; the default is no host.
 
 The `Docs Site` workflow builds the site and uploads it as a GitHub Pages
 artifact on every push to `main` and every pull request. Its deploy job runs
