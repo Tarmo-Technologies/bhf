@@ -1,10 +1,9 @@
-All numbers below were measured on the pinned repositories.
+# Python static scan: bhf, bandit and semgrep (2026-07-08 campaign)
 
-## Python SAST comparison: bhf vs bandit vs semgrep
+Measured 2026-07-09 on the pinned repositories. All three tools ran on both
+repositories without errors or timeouts.
 
-All three tools ran cleanly on both repos (no errors, no timeouts). Numbers are real, measured 2026-07-09.
-
-### Raw finding counts
+## Raw finding counts
 
 | Repo (SLOC) | Tool | Total | Severity mix | Categories (rule → count) |
 |---|---|---|---|---|
@@ -15,26 +14,44 @@ All three tools ran cleanly on both repos (no errors, no timeouts). Numbers are 
 | | semgrep (--config=auto) | **3** | 3 WARN | insecure-hash-sha1 2, non-literal-import 1 |
 | | **bhf** | **14** | 14 HIGH | BHF-421 unsafe-deserialization 7, BHF-426 TLS-verify-disabled 4, BHF-427 SSRF (taint) 3 |
 
-### Signal quality (the raw counts are misleading)
+## Substantive findings after filtering
 
-Bandit's totals are dominated by test-file noise. After excluding test files and `assert_used` (B101), the substantive bandit signal is **23 findings in py_click, 0 in py_requests**:
-- **py_click**: 1290 of 1325 findings (97%) are in test files; 1292 are bare `assert`.
-- **py_requests**: 692 of 708 (98%) are in test files; **every non-test finding is an assert or timeout** — 0 substantive non-test findings after filtering.
+Most of bandit's results are in test files. After excluding test files and
+`assert_used` (B101), bandit has **23 substantive findings in py_click and 0
+in py_requests**:
+
+- **py_click**: 1290 of 1325 findings (97%) are in test files; 1292 are bare
+  `assert`.
+- **py_requests**: 692 of 708 (98%) are in test files, and **every non-test
+  finding is an assert or a missing timeout**, so 0 substantive non-test
+  findings remain after filtering.
 
 Bandit's much larger raw count consists mostly of `assert` in tests plus
 `requests(...)` without a `timeout=`. Semgrep's auto ruleset reported three
 findings per repository.
 
-### bhf-specific results
+## bhf results
 
-- **Taint-traced, HIGH-severity vuln classes** none of the others surfaced on py_requests: BHF-421 unsafe deserialization (pickle/marshal/yaml, CWE-502), BHF-426 TLS cert/hostname verification disabled (CWE-295), BHF-427 SSRF via tainted URL reaching an outbound HTTP request (CWE-918) — with a full `taint_trace` (assignment → project-local calls → sink), engine `bhf.static.taint.v1`. Bandit reports B301 (pickle *import/usage*, no dataflow) but never reaches SSRF or TLS-verify-disabled as taint findings. Semgrep's auto config missed all three classes on py_requests.
-- **Deduped, non-noisy output**: 14 findings all HIGH, no test-assert flood — vs bandit's 708/1325 that a human must triage down to ~0–23.
-- Emits SARIF/JSON/Markdown with baseline-diff (`new`/`unchanged`/`resolved`) and records 24/36 unresolved project-local calls in `analysis_gaps`.
+- **Taint-traced, HIGH-severity classes** that the other tools did not report
+  on py_requests: BHF-421 unsafe deserialization (pickle/marshal/yaml,
+  CWE-502), BHF-426 TLS certificate/hostname verification disabled (CWE-295),
+  and BHF-427 SSRF through a tainted URL reaching an outbound HTTP request
+  (CWE-918). Each has a full `taint_trace` (assignment, project-local calls,
+  sink) from the `bhf.static.taint.v1` engine. Bandit reports B301 (pickle
+  import and use, no dataflow) and reports neither SSRF nor disabled TLS
+  verification as taint findings. Semgrep's auto config reported none of the
+  three classes on py_requests.
+- **Deduplicated output**: 14 findings, all HIGH, with no test-file asserts.
+  Bandit's 708 (py_requests) and 1325 (py_click) need manual filtering down to
+  0 and 23.
+- bhf writes SARIF, JSON and Markdown with a baseline diff
+  (`new`/`unchanged`/`resolved`), and records 24 (py_click) and 36
+  (py_requests) unresolved project-local calls in `analysis_gaps`.
 
-### Verdict
+## Result
 
-The result was mixed: bhf did not lead by raw count, but it produced the
-high-severity taint findings measured on py_requests.
+The result was mixed. bhf produced the high-severity taint findings measured
+on py_requests; bandit had the larger raw count on both repositories.
 
 - **py_requests:** bhf reported 14 high-severity taint findings (SSRF,
   deserialization, and TLS); bandit had no substantive non-test findings, and
@@ -44,10 +61,22 @@ high-severity taint findings measured on py_requests.
   weak random-number generation. bhf also emitted 24
   `unresolved_project_local_call` gaps.
 
-### Concrete gaps
+## Gaps found
 
-1. **py_click zero-finding miss** is the priority: add non-taint syntactic rules for the classes bandit caught and bhf has no equivalent for — `subprocess` without `shell=` review / partial-path exec (B603/B607, CWE-78/426), `try/except/pass` swallowing (B110, CWE-703), and non-crypto `random.*` used in a security context (B311, CWE-330). bhf already ships a weak-PRNG rule (BHF-428) per memory — verify why it didn't fire on py_click's 3 `random` sites (likely context-gate too strict, or Python lane not wired to BHF-428).
-2. **Resolve `unresolved_project_local_call` gaps** (24 in click, 36 in requests): bhf's taint engine is dropping intra-project call edges it can't resolve, which both suppresses findings and inflates the gap count. Improving the Python decl-index / call resolution would let the taint lane reach sinks it currently can't, directly converting gaps into findings.
+1. **py_click returned zero findings**, which makes it the priority.
+   Proposed: non-taint syntactic rules for the classes bandit caught and bhf
+   had no equivalent for: `subprocess` partial-path execution and `shell=`
+   review (B603/B607, CWE-78/426), `try/except/pass` swallowing (B110,
+   CWE-703), and non-crypto `random.*` in a security context (B311, CWE-330).
+   bhf has a weak-PRNG rule (BHF-428); why it did not fire on py_click's 3
+   `random` sites is open. Untested possible causes: a context gate that is
+   too strict, or a Python lane not wired to BHF-428.
+2. **`unresolved_project_local_call` gaps** (24 in click, 36 in requests):
+   each is an intra-project call the taint engine could not resolve, so the
+   taint lane stopped there. Better Python declaration indexing and call
+   resolution would let the taint lane follow those calls toward their
+   sinks.
 
-The py_requests result demonstrates bhf's taint analysis. The py_click result
-shows that the measured Python rule coverage was incomplete.
+On py_requests, bhf's taint analysis found 14 high-severity findings. On
+py_click, bhf's Python rules at the time found none of the classes bandit
+reported.

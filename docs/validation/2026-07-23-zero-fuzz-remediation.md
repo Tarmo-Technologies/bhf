@@ -15,11 +15,10 @@ dominant outcomes were `unsupported_params` and `failed_build`, including:
 - legacy header syntax failures and receiver constructor failures;
 - cascades of Ada `missing_ada_symbol` diagnostics.
 
-This ledger is the authoritative remediation checklist. An item is complete only
-when the implementation is changed, a focused regression test demonstrates the
-old failure, and an appropriate integration or campaign test demonstrates the
-fixed path. A passing unit test that does not exercise the reported boundary is
-not sufficient.
+This ledger is the remediation checklist. An item is complete when the
+implementation is changed, a focused regression test demonstrates the old
+failure, and an integration or campaign test demonstrates the fixed path. The
+tests must exercise the reported boundary.
 
 Status values:
 
@@ -28,8 +27,8 @@ Status values:
 - `FIXED, PROOF PENDING`: code changed but the required campaign evidence is
   incomplete;
 - `CLOSED`: implementation and listed proof are complete;
-- `EXPECTED`: intentional limitation, with an honest non-success outcome and
-  regression coverage required.
+- `EXPECTED`: a known limitation; bhf reports a non-success outcome for it,
+  with regression coverage required.
 
 ## Primary high-impact defects
 
@@ -43,8 +42,9 @@ Status values:
   declaration. A viable later overload may never be attempted.
 - Correction: select by exact declaration line first; retain an
   explicitly diagnosed name-only fallback only for stale/manual requests.
-- Proof requirement (met; see closure matrix): parser/generator regression with two same-named profiles plus
-  an Ada auto campaign in which both stable harness IDs call their own profile.
+- Proof requirement (met; see closure matrix): parser/generator regression
+  with two same-named profiles plus an Ada auto campaign in which both stable
+  harness IDs call their own profile.
 
 ### ZF-02 — Default-constructible C++ target parameters are not registered
 
@@ -52,15 +52,15 @@ Status values:
 - Evidence: `default_constructible_classes` is populated from receiver
   constructor parameters and then reused for the target call. The target's own
   class-typed parameters are not analyzed.
-- Impact: `const ns::Options&` and similar infrastructure objects are rejected as
-  opaque even when `ns::Options value; target(value);` is valid. This matches the
-  largest repeated C++ unsupported cluster.
+- Impact: `const ns::Options&` and similar infrastructure objects are rejected
+  as opaque even when `ns::Options value; target(value);` is valid. This
+  matches the largest repeated C++ unsupported cluster.
 - Correction: analyze target, lifecycle, constructor, and factory
   parameter classes against the complete include closure; register only
   accessible, non-deleted, non-abstract default constructors.
-- Proof requirement (met; see closure matrix): direct and sequence harness generation/build tests for value,
-  const-reference, output-pointer, namespaced, private, deleted, and abstract
-  classes.
+- Proof requirement (met; see closure matrix): direct and sequence harness
+  generation/build tests for value, const-reference, output-pointer,
+  namespaced, private, deleted, and abstract classes.
 
 ### ZF-03 — The target cap is applied after viability-blind ranking
 
@@ -71,11 +71,13 @@ Status values:
   top-`N` cap is applied to this ordering.
 - Impact: hundreds of opaque or blocked endpoints can displace simple fuzzable
   endpoints from a 500-target campaign.
-- Correction: add a conservative harness-viability verdict/penalty
-  derived from the same decoder/type context used by generation; blocked targets
-  remain discoverable but cannot outrank proven byte channels by parameter count.
-- Proof requirement (met; see closure matrix): ranking tests containing buildable and opaque signatures, and
-  a capped mixed-language campaign that reaches at least one viable endpoint.
+- Correction: add a conservative harness-viability verdict/penalty derived
+  from the same decoder/type context used by generation; blocked targets
+  remain discoverable but cannot outrank proven byte channels by parameter
+  count.
+- Proof requirement (met; see closure matrix): ranking tests containing
+  buildable and opaque signatures, and a capped mixed-language campaign that
+  reaches at least one viable endpoint.
 
 ### ZF-04 — Separate IDL files overwrite reopened Ada modules
 
@@ -86,12 +88,13 @@ Status values:
 - Impact: later IDLs erase earlier structs, typedefs, constants, operations, and
   helpers. A few truncated module specs can produce hundreds of missing-symbol
   diagnostics.
-- Correction: parse all IDLs into one aggregate AST (with include
-  duplicate handling) or merge generated units semantically before one atomic write.
+- Correction: parse all IDLs into one aggregate AST (with include duplicate
+  handling) or merge generated units semantically before one atomic write.
   Dictionary tokens must also be unioned rather than overwritten.
-- Proof requirement (met; see closure matrix): two and three-file reopened-module fixtures, cross-includes,
-  repeated include guards, deterministic output, and a GNAT build of generated
-  packages when GNAT is available.
+- Proof requirement (met; see closure matrix): two and three-file
+  reopened-module fixtures, cross-includes, repeated include guards,
+  deterministic output, and a GNAT build of generated packages when GNAT is
+  available.
 
 ### ZF-05 — Header targets cannot inherit translation-unit compile commands
 
@@ -99,12 +102,14 @@ Status values:
 - Evidence: compile database lookup requires exact normalized path equality;
   compile databases conventionally list translation units rather than headers.
 - Impact: header endpoints lose feature/export macros, generated-header paths,
-  forced includes, dialect, and ABI options even when a complete database exists.
+  forced includes, dialect, and ABI options even when a complete database
+  exists.
 - Correction: associate a header with including translation-unit
   entries, prefer direct include evidence and nearest target context, and record
   ambiguity/confidence without exposing paths.
-- Proof requirement (met; see closure matrix): multi-TU compile database fixtures proving deterministic header
-  association and a header harness that requires a TU-only macro/include path.
+- Proof requirement (met; see closure matrix): multi-TU compile database
+  fixtures proving deterministic header association and a header harness that
+  requires a TU-only macro/include path.
 
 ### ZF-06 — C++ harness include order differs from the real translation unit
 
@@ -116,22 +121,23 @@ Status values:
 - Correction: preserve source include order; never promote a same-stem
   header ahead of preceding source includes; resolve non-self-contained header
   targets through an including TU/umbrella context.
-- Proof requirement (met; see closure matrix): config-before-API and umbrella-only header build fixtures for C
-  and C++.
+- Proof requirement (met; see closure matrix): config-before-API and
+  umbrella-only header build fixtures for C and C++.
 
 ### ZF-07 — Compile-command/compiler fidelity is insufficient
 
 - Status: `CLOSED`.
 - Evidence: compile-command extraction allowlists only a small flag subset and
   discards compiler identity. Native builds default to clang/clang++.
-- Impact: legacy GCC/vendor/MS-extension, target/sysroot, packing, ABI, language,
-  permissive, and per-TU builds fail despite a valid project build.
+- Impact: legacy GCC/vendor/MS-extension, target/sysroot, packing, ABI,
+  language, permissive, and per-TU builds fail despite a valid project build.
 - Correction: classify and forward safe compile-relevant flags, preserve
   paired operands, select a compatible compiler from the command entry when
   available, and explicitly report every dropped flag family.
-- Proof requirement (met; see closure matrix): compile DB unit tests for paired/joined flags and campaigns for
-  GCC extensions, forced headers, packing/ABI, sysroot/target, and safe rejection
-  of output/dependency/module/PCH flags.
+- Proof requirement (met; see closure matrix): compile DB unit tests for
+  paired/joined flags and campaigns for GCC extensions, forced headers,
+  packing/ABI, sysroot/target, and safe rejection of
+  output/dependency/module/PCH flags.
 
 ### ZF-08 — Recovered `-std` defeats the dialect ladder; C++03/98 rungs are false
 
@@ -143,10 +149,11 @@ Status values:
   cannot compile the generated driver.
 - Correction: normalize the recovered standard into the explicit
   `CXX_STD` decision instead of forwarding it twice; either provide a true
-  C++03-compatible driver or honestly make C++11 the minimum and route older
+  C++03-compatible driver or make C++11 the stated minimum and route older
   dialects to `report_only`.
-- Proof requirement (met; see closure matrix): command-line inspection plus build fixtures for C++98-only,
-  C++11, C++14, and C++17 APIs, including a compile DB with its own `-std`.
+- Proof requirement (met; see closure matrix): command-line inspection plus
+  build fixtures for C++98-only, C++11, C++14, and C++17 APIs, including a
+  compile DB with its own `-std`.
 
 ### ZF-09 — C++ default-constructor scanning accepts deleted/private expressions
 
@@ -155,26 +162,28 @@ Status values:
   `= delete` or class access; ordinary temporary expressions also match.
 - Impact: generated receivers fail with deleted/private/no-matching-constructor
   diagnostics.
-- Correction: use parsed constructor declarations keyed by qualified
-  class and access/signature; textual fallback must reject deletion and require a
+- Correction: use parsed constructor declarations keyed by qualified class and
+  access/signature; textual fallback must reject deletion and require a
   declaration in the correct class body.
-- Proof requirement (met; see closure matrix): public/defaulted/default-argument, private, protected, deleted,
+- Proof requirement (met; see closure matrix):
+  public/defaulted/default-argument, private, protected, deleted,
   temporary-expression, namespace-collision, and implicit-default tests.
 
 ### ZF-10 — C++ type and member-access registries lose namespace/signature identity
 
 - Status: `CLOSED`.
 - Evidence: class/struct definitions are primarily stored by leaf name and
-  qualified type resolution falls back to the leaf. Header method access is keyed
-  by `Class::method`, without namespace or parameter profile.
+  qualified type resolution falls back to the leaf. Header method access is
+  keyed by `Class::method`, without namespace or parameter profile.
 - Impact: common generated names (`Object`, `Header`, `Options`) can resolve to
   the wrong aggregate or access declaration, producing incorrect members,
   constructor decisions, and “not known public” warnings.
 - Correction: retain full namespace/class identity in parser type
   definitions and access declarations; permit leaf fallback only when unique and
   report ambiguity.
-- Proof requirement (met; see closure matrix): duplicate leaf types/classes in two namespaces, overloaded
-  access declarations, nested classes/enums, and complete harness builds.
+- Proof requirement (met; see closure matrix): duplicate leaf types/classes in
+  two namespaces, overloaded access declarations, nested classes/enums, and
+  complete harness builds.
 
 ### ZF-11 — Lifecycle gating uses a weaker type model than lifecycle emission
 
@@ -186,8 +195,9 @@ Status values:
   without initialization or routed through unnecessary fallback.
 - Correction: use one registry-aware support decision for candidate
   selection and emission, and retain structured reasons for rejected steps.
-- Proof requirement (met; see closure matrix): lifecycle steps taking typedefs, aggregates, containers,
-  infrastructure objects, private methods, and unresolved/ambiguous access.
+- Proof requirement (met; see closure matrix): lifecycle steps taking
+  typedefs, aggregates, containers, infrastructure objects, private methods,
+  and unresolved/ambiguous access.
 
 ### ZF-12 — Ada synthetic builds discard governing GPR semantics
 
@@ -201,152 +211,157 @@ Status values:
 - Correction: carry the canonical source root/governing GPR into build;
   extend/import the real project where safe, or synthesize an overlay that
   preserves its evaluated attributes and target-specific switches.
-- Proof requirement (met; see closure matrix): external work directory, custom naming, ordered duplicate
-  source dirs, scenario-selected body, config pragma, binder/linker switch, and
-  imported-project fixtures.
+- Proof requirement (met; see closure matrix): external work directory, custom
+  naming, ordered duplicate source dirs, scenario-selected body, config
+  pragma, binder/linker switch, and imported-project fixtures.
 
 ## Additional systemic defects and capability gaps
 
 ### ZF-13 — Fake and real Ada units have no collision policy
 
 - Status: `CLOSED`.
-- Correction/proof (met): inventory canonical unit names before generation; prefer a
-  complete real spec/body, emit fake units only for missing units, and test mixed
-  checked-in bindings plus IDL without duplicate-unit builds.
+- Correction/proof (met): inventory canonical unit names before generation;
+  prefer a complete real spec/body, emit fake units only for missing units,
+  and test mixed checked-in bindings plus IDL without duplicate-unit builds.
 
 ### ZF-14 — Ada type resolution uses unsafe leaf-only fallback
 
 - Status: `CLOSED`.
-- Correction/proof (met): resolve exact qualified names and Ada-visible unqualified
-  names; reject ambiguity. Test identical leaf types across withed packages and
-  local/nested scopes.
+- Correction/proof (met): resolve exact qualified names and Ada-visible
+  unqualified names; reject ambiguity. Test identical leaf types across withed
+  packages and local/nested scopes.
 
 ### ZF-15 — Flattened Ada duplicate selection is traversal-order dependent
 
 - Status: `CLOSED`.
-- Correction/proof (met): derive source precedence from the governing project and sort
-  all remaining walks. Test repeated runs and conflicting platform/scenario
-  variants.
+- Correction/proof (met): derive source precedence from the governing project
+  and sort all remaining walks. Test repeated runs and conflicting
+  platform/scenario variants.
 
 ### ZF-16 — Discovery preprocessing and generation parsing use different worlds
 
 - Status: `CLOSED`.
-- Correction/proof (met): persist the effective conditional context and reuse it for
-  selection/type parsing, or always reconcile against the exact raw declaration.
-  Give C++ the same zero-result safety fallback as C. Test project-defined feature
-  branches and overlapping declarations.
+- Correction/proof (met): persist the effective conditional context and reuse
+  it for selection/type parsing, or always reconcile against the exact raw
+  declaration. Give C++ the same zero-result safety fallback as C. Test
+  project-defined feature branches and overlapping declarations.
 
 ### ZF-17 — Discovery cache is not invalidated by a bhf upgrade
 
 - Status: `CLOSED`.
-- Correction/proof (met): key cache data by producer version/commit plus a discovery
-  semantic version. Test same-source reuse across equal and changed producers.
+- Correction/proof (met): key cache data by producer version/commit plus a
+  discovery semantic version. Test same-source reuse across equal and changed
+  producers.
 
 ### ZF-18 — Ada generated harness mirroring preserves stale files
 
 - Status: `CLOSED`.
-- Correction/proof (met): atomically refresh owned harness files on every non-resumed
-  attempt while preserving corpus/results separately. Test same stable ID with
-  changed generated call/profile.
+- Correction/proof (met): atomically refresh owned harness files on every
+  non-resumed attempt while preserving corpus/results separately. Test same
+  stable ID with changed generated call/profile.
 
 ### ZF-19 — Work-directory generated state is incompletely refreshed/cleaned
 
 - Status: `CLOSED`.
-- Correction/proof (met): version or clear `src_instrumented`, `fake_corba`, dialect and
-  compatibility caches when their producers/inputs change; make `clean --all`
-  remove every owned artifact including root-level cache files. Test upgrade,
-  source deletion, and clean/re-run paths.
+- Correction/proof (met): version or clear `src_instrumented`, `fake_corba`,
+  dialect and compatibility caches when their producers/inputs change; make
+  `clean --all` remove every owned artifact including root-level cache files.
+  Test upgrade, source deletion, and clean/re-run paths.
 
 ### ZF-20 — Project-global C++ dialect cache can be poisoned by one target
 
 - Status: `CLOSED`.
-- Correction/proof (met): cache by compatible build-context fingerprint rather than one
-  project-wide value; never cache a merely “fewest errors” failed dialect. Test
-  mixed C++11/C++17 translation units and repair-induced header changes.
+- Correction/proof (met): cache by compatible build-context fingerprint rather
+  than one project-wide value; never cache a failed dialect for producing the
+  fewest errors. Test mixed C++11/C++17 translation units and repair-induced
+  header changes.
 
 ### ZF-21 — Sequence-to-direct retry can hide the direct failure
 
 - Status: `CLOSED`.
-- Correction/proof (met): retain both attempt chains and return the most actionable
-  terminal diagnostic. Test sequence build failure followed by direct generation,
-  unsupported, and build failures.
+- Correction/proof (met): retain both attempt chains and return the most
+  actionable terminal diagnostic. Test sequence build failure followed by
+  direct generation, unsupported, and build failures.
 
 ### ZF-22 — Ada missing-symbol classification inflates counts and repairs the unit, not the symbol
 
 - Status: `CLOSED`.
-- Correction/proof (met): handle duplicates identical GNAT diagnostics per invocation; before
-  proposing `AddAdaSource`, verify that the selected spec declares the missing
-  symbol, otherwise report wrong-version/incomplete-unit evidence or synthesize a
-  safe declaration only where valid. Test repeated diagnostics and a wrong spec
-  shadowing the correct one.
+- Correction/proof (met): deduplicate identical GNAT diagnostics per
+  invocation; before proposing `AddAdaSource`, verify that the selected spec
+  declares the missing symbol, otherwise report wrong-version/incomplete-unit
+  evidence or synthesize a safe declaration only where valid. Test repeated
+  diagnostics and a wrong spec shadowing the correct one.
 
 ### ZF-23 — Non-self-contained header roots are attempted without an owner TU
 
 - Status: `CLOSED`.
-- Correction/proof (met): preflight direct header inclusion under associated compile
-  context; use an owning/umbrella TU when available, otherwise emit an explicit
-  `report_only` reason. Test fragment, umbrella-only, generated, and standalone
-  headers.
+- Correction/proof (met): preflight direct header inclusion under associated
+  compile context; use an owning/umbrella TU when available, otherwise emit an
+  explicit `report_only` reason. Test fragment, umbrella-only, generated, and
+  standalone headers.
 
 ### ZF-24 — Receiver constructor/factory discovery is definition-local
 
 - Status: `CLOSED`.
-- Correction/proof (met): include declarations and definitions from the resolved include
-  and build-context closure, keyed by qualified signatures. Test header-declared,
-  sibling-TU-defined constructors/factories and static factory overloads.
+- Correction/proof (met): include declarations and definitions from the
+  resolved include and build-context closure, keyed by qualified signatures.
+  Test header-declared, sibling-TU-defined constructors/factories and static
+  factory overloads.
 
 ### ZF-25 — One standalone C/C++ link command cannot reproduce complex TU graphs
 
 - Status: `CLOSED`.
-- Correction/proof (met): prefer a build-system-derived target/archive or compile TUs
-  with their own command contexts before linking the harness; retain the current
-  single-command path only as a confidence-labelled fallback. Test per-TU defines,
-  generated sources, static archive, and conflicting flags.
+- Correction/proof (met): prefer a build-system-derived target/archive or
+  compile TUs with their own command contexts before linking the harness;
+  retain the current single-command path only as a confidence-labelled
+  fallback. Test per-TU defines, generated sources, static archive, and
+  conflicting flags.
 
 ### ZF-26 — Custom Ada naming is assumed during dependency analysis
 
 - Status: `CLOSED`.
-- Correction/proof (met): obtain unit-to-source mappings from evaluated GPR metadata or
-  parsed unit declarations rather than GNAT filenames. Test arbitrary filenames
-  and child units.
+- Correction/proof (met): obtain unit-to-source mappings from evaluated GPR
+  metadata or parsed unit declarations rather than GNAT filenames. Test
+  arbitrary filenames and child units.
 
 ### ZF-27 — IDL recovery can silently omit active declarations
 
 - Status: `CLOSED`.
-- Correction/proof (met): feed project IDL defines, distinguish inactive/unsupported
-  branches, checkpoint warning categories, and refuse to call a mapping complete
-  when active declarations were skipped. Test function-like macros, unsupported
-  expressions, and vendor pragmas.
+- Correction/proof (met): feed project IDL defines, distinguish
+  inactive/unsupported branches, checkpoint warning categories, and refuse to
+  call a mapping complete when active declarations were skipped. Test
+  function-like macros, unsupported expressions, and vendor pragmas.
 
 ### ZF-28 — IDL dictionary output is last-file-wins
 
 - Status: `CLOSED`.
-- Correction/proof (met): union, normalize, and deterministically write tokens from the
-  aggregate IDL AST. Test disjoint tokens across multiple files.
+- Correction/proof (met): union, normalize, and deterministically write tokens
+  from the aggregate IDL AST. Test disjoint tokens across multiple files.
 
 ### ZF-29 — Old K&R C has discovery/static analysis but no fuzzing lane
 
 - Status: `EXPECTED` capability gap.
-- Correction/proof (met): either implement ANSI-wrapper generation from the existing
-  synthesized profiles or retain a precise `report_only` outcome that cannot be
-  counted as attempted fuzzing. Test a real K&R definition through the chosen
-  path.
+- Correction/proof (met): either implement ANSI-wrapper generation from the
+  existing synthesized profiles or retain a precise `report_only` outcome that
+  cannot be counted as attempted fuzzing. Test a real K&R definition through
+  the chosen path.
 
 ### ZF-30 — Ada task/protected targets require scheduling wrappers
 
 - Status: `EXPECTED` capability gap.
-- Correction/proof (met): keep the explicit concurrency block, exclude it from generic
-  unsupported counts, demote it below viable targets, and document the wrapper
-  contract. Test protected objects, task types, and ordinary packages.
+- Correction/proof (met): keep the explicit concurrency block, exclude it from
+  generic unsupported counts, demote it below viable targets, and document the
+  wrapper contract. Test protected objects, task types, and ordinary packages.
 
 ### ZF-31 — Unsupported outcomes do not carry a uniform diagnostic ledger
 
 - Status: `CLOSED`.
-- Evidence: `UnsupportedParams` has only `reason`; `repairs` and `last_errors` are
-  absent by schema, producing confusing `null` queries.
-- Correction/proof (met): expose a uniform structured attempt trace containing stage,
-  fallback chain, decoder/type reason, and `repairs_attempted=false`, while keeping
-  backward-compatible outcome fields. Test serialization and report rendering.
+- Evidence: `UnsupportedParams` has only `reason`; `repairs` and `last_errors`
+  are absent by schema, producing confusing `null` queries.
+- Correction/proof (met): expose a uniform structured attempt trace containing
+  stage, fallback chain, decoder/type reason, and `repairs_attempted=false`,
+  while keeping backward-compatible outcome fields. Test serialization and
+  report rendering.
 
 ### ZF-36 — C++ synthesized forward declarations erase cv/ref parameter types
 
@@ -379,29 +394,30 @@ Status values:
 ### ZF-38 — User-constructed C++ classes are misclassified as C aggregates
 
 - Status: `CLOSED`.
-- Evidence: the C++ type parser feeds every class body to the C-shaped aggregate
-  registry. A class with `T() = delete` and no public fields therefore appears as
-  an empty visible struct, and codegen emits `T value{}` despite the constructor
-  verdict rejecting it.
+- Evidence: the C++ type parser feeds every class body to the C-shaped
+  aggregate registry. A class with `T() = delete` and no public fields
+  therefore appears as an empty visible struct, and codegen emits `T value{}`
+  despite the constructor verdict rejecting it.
 - Impact: deterministic unsupported parameters become `failed_build` with
   deleted/private/no-matching-constructor errors; ranking also falsely treats
   those signatures as viable.
 - Correction: remove abstract classes and classes with user-declared
   constructors from field-wise aggregate synthesis. They can re-enter only
   through the independently verified public default-constructor registry.
-- Proof: deleted/private/parameter-only constructors are demoted before
-  caps and rejected before compilation; public default construction still builds.
+- Proof: deleted/private/parameter-only constructors are demoted before caps
+  and rejected before compilation; public default construction still builds.
 
 ### ZF-39 — Native GCC coverage builds lack the `trace-pc` runtime hook
 
 - Status: `CLOSED`.
 - Evidence: GCC uses `-fsanitize-coverage=trace-pc`; the driver implemented
-  `__sanitizer_cov_trace_pc` only under `_WIN32`, so a native GCC build failed to
-  link with repeated undefined references as soon as compiler fidelity was fixed.
+  `__sanitizer_cov_trace_pc` only under `_WIN32`, so a native GCC build failed
+  to link with repeated undefined references as soon as compiler fidelity was
+  fixed.
 - Impact: every Linux GCC-family compile-command target failed at the final
   harness link even when its project flags and source were otherwise correct.
 - Correction: provide the guard-less hook on every platform; Clang guard-mode
-  builds simply leave it unused.
+  builds leave it unused.
 - Proof: native GCC C and C++ harness builds and target-entry runs.
 
 ### ZF-40 — Included per-TU make fragments replace the harness default goal
@@ -414,10 +430,11 @@ Status values:
 - Correction: native C/C++ builds explicitly request the `main` goal, the CLI
   build path treats a missing expected artifact as failure, and auto accepts a
   successful make status only when the executable exists.
-- Proof: `native_make_build_explicitly_requests_main_after_included_object_graph`
-  reproduces the misleading exit-zero condition; `auto_full_tu_link` compiles a
-  GCC per-TU object graph, links the executable, enters the endpoint, and fuzzes
-  it after exact source-closure recovery.
+- Proof:
+  `native_make_build_explicitly_requests_main_after_included_object_graph`
+  reproduces the misleading exit-zero condition; `auto_full_tu_link` compiles
+  a GCC per-TU object graph, links the executable, enters the endpoint, and
+  fuzzes it after exact source-closure recovery.
 
 ### ZF-41 — C++ class inventory was coupled to aggregate synthesis
 
@@ -462,12 +479,12 @@ Status values:
 ### ZF-44 — Repair-added C/C++ sources lose their own compile context
 
 - Status: `CLOSED`.
-- Evidence: generation-time target sources with exact compile-database rows were
-  compiled through `build_context_objects.mk`, but a source discovered later by
-  undefined-symbol repair was passed through `AUTO_EXTRA_SOURCES`. It was then
-  compiled and linked in the harness command under the target/header owner's
-  flags. A support TU whose own row required `-DSUPPORT_TU=1` consequently failed
-  with that define absent.
+- Evidence: generation-time target sources with exact compile-database rows
+  were compiled through `build_context_objects.mk`, but a source discovered
+  later by undefined-symbol repair was passed through `AUTO_EXTRA_SOURCES`. It
+  was then compiled and linked in the harness command under the target/header
+  owner's flags. A support TU whose own row required `-DSUPPORT_TU=1`
+  consequently failed with that define absent.
 - Correction: every make invocation partitions the complete repair-source set
   by exact compile-database row, regenerates a separate
   `repair_context_objects.mk` graph, and removes those files from the shared
@@ -492,12 +509,13 @@ Status values:
   qualifier.
 - Correction: compare Ada (and the other case-insensitive compiled languages)
   without ASCII case, remove the parameter profile before finding the leaf, and
-  support both `::` and dotted qualification while preserving exact/qualified-
-  family selection. Case-sensitive language filters remain case-sensitive.
-- Proof: unit coverage includes dotted Ada/nested qualification and a C++ profile
-  containing `std::string`; the multi-IDL checked-in servant acceptance campaign
-  selects `Compute` by its documented leaf spelling and fuzzes the qualified
-  endpoint.
+  support both `::` and dotted qualification while preserving
+  exact/qualified-family selection. Case-sensitive language filters remain
+  case-sensitive.
+- Proof: unit coverage includes dotted Ada/nested qualification and a C++
+  profile containing `std::string`; the multi-IDL checked-in servant
+  acceptance campaign selects `Compute` by its documented leaf spelling and
+  fuzzes the qualified endpoint.
 
 ### ZF-46 — Auto never selects servant-direct and erases concrete servant types
 
@@ -570,8 +588,8 @@ Status values:
 
 The detailed requirements above are backed by the following focused regression
 and campaign evidence. Test names are stable identifiers accepted by `cargo
-test`; campaign tests create new work directories and require endpoint-entry and
-nonzero fuzz-execution evidence rather than merely accepting a compiler exit.
+test`; campaign tests create new work directories and require endpoint-entry
+and nonzero fuzz-execution evidence on top of a successful compiler exit.
 
 | Issue | Focused regression evidence | Campaign/build evidence |
 |---|---|---|
@@ -582,7 +600,7 @@ nonzero fuzz-execution evidence rather than merely accepting a compiler exit.
 | ZF-05 | `cpp_header_inherits_directly_including_translation_unit_command` | header compile-database campaign |
 | ZF-06 | `auto_detect_c_headers_preserves_config_before_same_stem_api`; `cpp_header_preflight_selects_a_compiling_umbrella` | legacy C++ and header campaigns |
 | ZF-07 | `compile_database_preserves_compiler_abi_and_extension_context` | GCC header/per-TU campaign |
-| ZF-08 | `cpp_build_context_extracts_last_standard_into_single_control`; dialect-floor tests | C++14/C++17 campaign plus honest pre-C++98 report-only tests |
+| ZF-08 | `cpp_build_context_extracts_last_standard_into_single_control`; dialect-floor tests | C++14/C++17 campaign plus pre-C++98 report-only tests |
 | ZF-09 | `generate_cpp_harness_does_not_treat_deleted_ctor_or_temporary_as_constructible` | legacy C++ constructor-decoy campaign |
 | ZF-10 | `header_member_access_resolution_is_namespace_and_overload_exact`; namespace type-registry tests | namespace-collision campaign |
 | ZF-11 | registry-aware lifecycle generation/decoder tests | legacy C++ lifecycle setup campaign |
@@ -618,26 +636,25 @@ nonzero fuzz-execution evidence rather than merely accepting a compiler exit.
 
 ## Diagnostic-count interpretation and intentional outcomes
 
-- Repeated GNAT diagnostics are processed for duplicates per invocation, and a symbol repair
-  is proposed only when the selected unit actually declares that symbol. Counts
-  now represent distinct structured diagnostics rather than raw repeated lines.
-- `blocked_by_concurrency` is intentional under ZF-30 and must not be repaired by
-  fabricating scheduling assumptions.
-- K&R `report_only` is the intentional, tested ZF-29 outcome; it is never counted
-  as attempted fuzzing.
-- Backward-compatible `unsupported_params` variants still do not invent
-  `repairs` or `last_errors` arrays. Their uniform `attempt_trace` explicitly
-  records stage, fallback chain, stable reason category, and
-  `repairs_attempted=false`, removing the earlier ambiguity.
+- Repeated GNAT diagnostics are deduplicated per invocation, and a symbol
+  repair is proposed only when the selected unit declares that symbol. Counts
+  now represent distinct structured diagnostics, not raw repeated lines.
+- `blocked_by_concurrency` is the intended ZF-30 outcome; repair does not
+  fabricate scheduling assumptions to get past it.
+- K&R `report_only` is the intentional, tested ZF-29 outcome; it is never
+  counted as attempted fuzzing.
+- Backward-compatible `unsupported_params` variants carry no `repairs` or
+  `last_errors` arrays. Their uniform `attempt_trace` records stage, fallback
+  chain, stable reason category, and `repairs_attempted=false`.
 
 ## Bug-report collector deficiencies
 
 ### BR-01 — Campaign producer identity is not checkpointed
 
 - Status: `CLOSED`.
-- The auto-run version/commit and discovery semantic version are checkpointed in support
-  context. The collector binary's current version is not a substitute when it is
-  run later or after an upgrade.
+- The auto-run version/commit and discovery semantic version are checkpointed
+  in support context. The collector binary's current version is not a
+  substitute when it is run later or after an upgrade.
 
 ### BR-02 — Cache decisions and stale-artifact state are not reported
 
@@ -656,15 +673,16 @@ nonzero fuzz-execution evidence rather than merely accepting a compiler exit.
 ### BR-04 — Target selection and fallback chains are absent
 
 - Status: `CLOSED`.
-- The report records whether requested/selected lines matched, name fallback occurred,
-  sequence/direct/receiver/factory paths attempted, and the terminal stage.
+- The report records whether requested/selected lines matched, name fallback
+  occurred, sequence/direct/receiver/factory paths attempted, and the terminal
+  stage.
 
 ### BR-05 — Ada/IDL collision and overwrite evidence is absent
 
 - Status: `CLOSED`.
-- Count-only facts cover IDLs parsed/partially parsed, reopened modules, generated
-  unit collisions, real-vs-fake collisions, duplicate staged units, and selected
-  source variants.
+- Count-only facts cover IDLs parsed/partially parsed, reopened modules,
+  generated unit collisions, real-vs-fake collisions, duplicate staged units,
+  and selected source variants.
 
 ### BR-06 — Unsupported parameter details are only scrubbed free text
 
@@ -676,9 +694,9 @@ nonzero fuzz-execution evidence rather than merely accepting a compiler exit.
 ### BR-07 — The collector cannot prove whether any real target executed
 
 - Status: `CLOSED`.
-- Counts cover generated, compiled, launched, target-entry observed, fuzz-input
-  executions, coverage edges, and stub-only executions. This distinguishes “built
-  a driver” from “fuzzed the endpoint.”
+- Counts cover generated, compiled, launched, target-entry observed,
+  fuzz-input executions, coverage edges, and stub-only executions. This
+  distinguishes “built a driver” from “fuzzed the endpoint.”
 
 ### BR-08 — Clean/upgrade provenance is absent
 
@@ -690,21 +708,22 @@ nonzero fuzz-execution evidence rather than merely accepting a compiler exit.
 ### Collector closure proof
 
 `collector_reports_offline_decision_and_execution_facts_without_identifiers`
-constructs one scrubbed v3 report containing BR-01 through BR-08 fields, verifies
-that mirrored harnesses are not double-counted, rejects private identifiers and
-paths, and enforces the 4,000-byte cap. The fresh header campaign additionally
-proves associated-header GCC context, selection, attempt, repair-time per-TU
-graphs, endpoint entry, and executions. The multi-IDL campaign proves reopened-
-module/collision facts, and the migration campaign proves incompatible-upgrade
-and cache-decision provenance. `offline_dist_scripts` verifies that
-`bhf-bug-report.sh` is installed and packaged in the offline release; its
-output is capped and can be copied as one compact text report.
+constructs one scrubbed v3 report containing BR-01 through BR-08 fields,
+verifies that mirrored harnesses are not double-counted, rejects private
+identifiers and paths, and enforces the 4,000-byte cap. The fresh header
+campaign additionally proves associated-header GCC context, selection,
+attempt, repair-time per-TU graphs, endpoint entry, and executions. The
+multi-IDL campaign proves reopened-module/collision facts, and the migration
+campaign proves incompatible-upgrade and cache-decision provenance.
+`offline_dist_scripts` verifies that `bhf-bug-report.sh` is installed and
+packaged in the offline release; its output is capped and can be copied as one
+compact text report.
 
 ## Final campaign acceptance gate
 
 Status: `CLOSED`. All applicable defects and collector gaps are closed; ZF-29
-and ZF-30 are explicitly tested intentional outcomes. The following fresh-work-
-directory campaigns pass:
+and ZF-30 are tested intended outcomes. The following fresh-work-directory
+campaigns pass:
 
 1. Ada overloads plus two target-specific dependency closures: both harnesses
    build, enter their intended target, and execute fuzz inputs.
@@ -717,12 +736,12 @@ directory campaigns pass:
 4. Compile-database campaign with a header target, GCC extension flag, forced
    include, per-TU defines, and recovered standard: effective commands match the
    safe project context and at least one endpoint is fuzzed.
-5. C/K&R campaign follows the ZF-29 decision and reports its status honestly.
+5. C/K&R campaign follows the ZF-29 decision and reports `report_only`.
 6. Upgrade/reuse and `clean --all` campaigns demonstrate that old discovery,
    harness, fake-Ada, staging, and dialect state cannot affect the new run.
 7. `bhf bug-report` over the campaigns remains within its byte cap, contains
-   every BR-01..BR-08 fact, and contains no source paths, filenames, target names,
-   unit/type/member/variable names, harness text, or corpus bytes.
+   every BR-01..BR-08 fact, and contains no source paths, filenames, target
+   names, unit/type/member/variable names, harness text, or corpus bytes.
 
 Campaigns 1–4 and 6–7 are implemented in `zero_fuzz_acceptance`; campaign 5 is
 implemented in `legacy_knr_c`. All successful fuzz campaigns assert both

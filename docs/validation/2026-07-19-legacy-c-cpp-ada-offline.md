@@ -18,9 +18,9 @@ used for discovery, repair, compilation, or fuzz execution.
 | C++ | `cmdline@e4cd007fb8f0`, `libzmq@ba63f0372701`, `loki-lib@7c29d87ecdec`, `luabind@cc743c37a7ff`, `minisat@37dc6c67e2af`, `Signals@17881fb92ec3`, `thrift@40d5a7ed9558`, `uncrustify@76b54da8c2b4`, `jsoncpp@edc01ab10f52`, `leveldb@7ee830d02b62`, `smhasher@07bb4de10a63`, `tinyxml2@8224e427b655` |
 | Ada / C | `Ada_Drivers_Library@81c04806d267`, `gnatcoll-bindings@f6c420094905` |
 
-Every repository produced at least one discovered target. This specifically
-guards against the earlier failure mode where preprocessing, non-UTF-8 source,
-old syntax, or directory pruning silently produced zero candidates.
+Every repository produced at least one discovered target. This checks for an
+earlier failure mode, in which preprocessing, non-UTF-8 source, old syntax, or
+directory pruning produced zero candidates without a warning.
 
 ## Executed Fuzz Proofs
 
@@ -65,9 +65,8 @@ The campaign added regression coverage and implementation fixes for:
 
 ## External Boundaries
 
-An offline fuzzing tool cannot reconstruct source semantics or a compiler that
-is absent from the offline content pack. The campaign verified these boundaries
-instead of hiding them behind fabricated success:
+The campaign confirmed that each of these projects needs source or a
+toolchain that the offline checkout does not contain:
 
 - `yaml-ada` requires a separately generated `C.yaml` Ada binding. Its
   README requires the external `headmaster` translator or pre-translated
@@ -81,33 +80,33 @@ instead of hiding them behind fabricated success:
 - TAMP is an ARM cross-toolchain and replacement Ada RTS project. Its own
   instructions require `arm-none-eabi` GNAT plus a board RTS; host GNAT
   correctly rejects recompiling language-defined units.
-- Drake is a replacement GNAT runtime with platform-specific runtime units, not
-  a host library. It likewise requires the matching runtime/toolchain context.
+- Drake is a replacement GNAT runtime with platform-specific runtime units.
+  It also requires the matching runtime/toolchain context.
 
 Each exclusion is checked against pinned file/absence evidence and an exact
-clean-control failure signature. Ocarina is not excluded: its `mknodes`
+clean-control failure signature. Ocarina is in scope: its `mknodes`
 generator is present, and the expanded gate fuzzes `Charset.To_Lower` before
 and after exact recovery of its deleted body.
 
-These are content-pack/toolchain prerequisites, not harness-generation
-failures. For a self-contained C, C++, Ada, or mixed source tree with its
-matching compiler/runtime and generated dependency sources staged offline, this
-matrix exercises discovery through real fuzz execution. Exact recovery of
-deleted implementation semantics additionally requires local Git history; a
-source archive cannot reconstruct arbitrary missing code from no information.
+Each exclusion is a content-pack or toolchain prerequisite. For a
+self-contained C, C++, Ada, or mixed source tree with its matching
+compiler/runtime and generated dependency sources staged offline, this matrix
+exercises discovery through real fuzz execution. Exact recovery of deleted
+implementation code also requires local Git history.
 
 ## Destructive Dependency Gate
 
-The follow-up [legacy dependency breakage matrix](2026-07-19-legacy-breakage-matrix.md)
-deleted required sources, headers, and Ada child-unit bodies from 13 pinned
-projects. It passed 12/13 scenarios (92.3%) against a 90% hard gate while
-requiring real-target fuzz execution, repair provenance, and no stub-only
-downgrade.
+The follow-up [legacy dependency breakage
+matrix](2026-07-19-legacy-breakage-matrix.md) deleted required sources,
+headers, and Ada child-unit bodies from 13 pinned projects. It passed 12/13
+scenarios (92.3%) against a 90% hard gate while requiring real-target fuzz
+execution, repair provenance, and no stub-only downgrade.
 
-The later [expanded 53-repository stress matrix](2026-07-19-expanded-legacy-breakage-matrix.md)
-passes 47/47 in-scope clean controls and 47/47 corresponding damaged projects.
-It also verifies six external/toolchain constraints and supplies the 95-sample
-convergence distribution supporting the 16-round default.
+The later [expanded 53-repository stress
+matrix](2026-07-19-expanded-legacy-breakage-matrix.md) passes 47/47 in-scope
+clean controls and 47/47 corresponding damaged projects. It also verifies six
+external/toolchain constraints and supplies the 95-sample convergence
+distribution supporting the 16-round default.
 
 ## Regression Gates
 

@@ -1,9 +1,9 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Ada-4 vendored-runtime re-run, 2026-11-18
 
-This re-runs, by name, every Ada target that the 2026-07-28 campaign sweep
-(`results-0728`) failed to build because a GNAT predefined unit "depends on
-itself". That is the Ada-4 class of [expected-gaps.md](../expected-gaps.md).
+This record re-runs, by name, every Ada target that the 2026-07-28 campaign
+sweep (`results-0728`) failed to build because a GNAT predefined unit "depends
+on itself". That is the Ada-4 class of [expected-gaps.md](../expected-gaps.md).
 The project is re-run at the commit that sweep measured. The bhf under test is
 a release build of the wave-12 branch, which leaves the GNAT predefined units
 to the compiler's runtime (#356).
@@ -46,13 +46,12 @@ subprograms.
 `Vga_Console.Put` builds and runs, but no input reached it: its harness
 rejected every input it decoded.
 
-The run reported 7 findings, and none of them is a defect of bare_bones. Each
-is the kernel's own hardware access run as a host process: `Crash`
-dereferences the `System.Address` it is given, the multiboot accessors read
-the structures at the addresses the boot loader hands over, and the console
-writes the VGA text buffer at its fixed address. On the board these are
-valid; on the host they are an `access check failed` (1) and a
-`STORAGE_ERROR` for an erroneous memory access (6).
+The run reported 7 findings, all from the kernel's own hardware access run
+as a host process: `Crash` dereferences the `System.Address` it is given, the
+multiboot accessors read the structures at the addresses the boot loader
+hands over, and the console writes the VGA text buffer at its fixed address.
+On the board these are valid; on the host they are an `access check failed`
+(1) and a `STORAGE_ERROR` for an erroneous memory access (6).
 
 ## What it took
 

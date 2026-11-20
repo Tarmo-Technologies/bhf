@@ -5,18 +5,19 @@
 This campaign exercises BHF discovery, build repair, and fuzz execution
 against 53 pinned legacy C, C++, Ada, and mixed repositories. It is a hard
 compatibility gate: unmodified controls and damaged copies must both reach the
-selected real target with positive coverage. A clean failure is excluded from
-the in-scope denominator only when pinned repository evidence and an exact
-runtime failure signature both prove an unavailable external source,
-generator, runtime, or cross-toolchain requirement.
+selected real target with positive coverage. A clean failure leaves the
+in-scope denominator only when pinned repository evidence and an exact runtime
+failure signature both prove an unavailable external source, generator,
+runtime, or cross-toolchain requirement. The first, 13-scenario matrix is in
+the [legacy dependency breakage matrix](2026-07-19-legacy-breakage-matrix.md).
 
 ## Scope and Reproduction
 
 The catalog contains 57 exact Git revisions. The audited manifest selects 53
 distinct repositories with a non-test, input-driven target and a
-machine-checkable mutation. Four repositories (`cmdline`, `loki-lib`,
-`luabind`, and `Signals`) have no suitable target/dependency pair and are not
-part of the 53-case gate.
+machine-checkable mutation. The other four repositories (`cmdline`,
+`loki-lib`, `luabind`, and `Signals`) have no suitable target/dependency pair
+and stay out of the 53-case gate.
 
 ```sh
 cargo build --release -p bhf
@@ -48,10 +49,10 @@ offline. A pass requires all of:
 - at least one damaged-tree repair;
 - no `fuzzed_stub_only` downgrade and no stub of the selected target.
 
-The local Git clone matters: it lets BHF restore exact deleted content from
-the pinned object database without network access. A source archive without
-that history can still use safe declaration/stub synthesis, but cannot in
-general reconstruct arbitrary deleted implementation semantics.
+The local Git clone lets BHF restore the exact deleted content from the
+pinned object database without network access. Without that history, a
+source archive gets safe declaration/stub synthesis only, which cannot in
+general rebuild arbitrary deleted implementation code.
 
 ## Results
 
@@ -65,8 +66,8 @@ The fresh run passed the 90% gate:
 
 The raw damaged numerator is 48 because the mutated TAMP case can substitute a
 host `Interfaces` unit, while its unmodified embedded runtime still fails with
-the verified cross-toolchain signature. This does not count as proof that the
-original TAMP runtime is host-fuzzable.
+the verified cross-toolchain signature. TAMP therefore stays in the excluded
+set.
 
 All 47 in-scope controls and all 47 corresponding damaged copies executed the
 selected target with nonzero coverage. Damaged copies performed 192 fuzz
@@ -155,9 +156,10 @@ declared clean failure substring to match at runtime.
 | TAMP | ARM cross-toolchain/runtime | README pins GCC 4.6.1; GPR uses `arm-none-eabi-gnatmake` | `s-trasym.adb" must be compiled` |
 | YAML-Ada | generated binding | source imports absent `C.yaml`; README requires `headmaster` | `missing Ada symbol 'yaml.yaml_mark_t'` |
 
-Ocarina is not excluded: its generator is present in the pinned tree. The
-low-closure `Charset.To_Lower(String)` control records 62 edges, and deleting
-`charset.adb` is recovered from local Git in one round and records 107 edges.
+Ocarina is in scope: its generator is present in the pinned tree. The
+low-closure `Charset.To_Lower(String)` control records 62 edges; after
+`charset.adb` is deleted, BHF recovers it from local Git in one round and
+records 107 edges.
 
 ## Repair-Round Default
 
@@ -171,10 +173,10 @@ The successful population is 95 samples: 47 controls plus 48 damaged runs.
 | 16 | 95/95 (100%) |
 
 Repair rounds have p50 1, p90 5, p95 6, p99 14, and maximum 14. The c-ares
-control requires 12 rounds and its damaged copy requires 14, so the old
-eight-round claim would lose valid targets. The default remains 16, providing
-two rounds of measured headroom. No failed build exhausted the 16-round cap;
-failed external cases stopped earlier when no new repair was available.
+control requires 12 rounds and its damaged copy requires 14, so a cap of
+eight rounds would lose valid targets. The default stays at 16, two rounds
+above the measured maximum. No failed build reached the 16-round cap; failed
+external cases stopped earlier when no new repair was available.
 
 ## Systemic Fixes
 
@@ -192,12 +194,11 @@ The campaign added or verified:
   in-scope denominators, verified external constraints, and process-group
   timeout cleanup.
 
-## Confidence Boundary
+## Result Scope
 
-This result supports offline projects that contain their required source,
+This result covers offline projects that contain their required source,
 generated dependencies, compiler/runtime, and local Git history: every such
 project in the pinned 53-repository population reached the selected real target
-before and after destructive mutation. It does not claim that missing source
-semantics, generated bindings, or a version/cross-matched compiler can be
-recreated from no information. Those cases remain explicit, evidence-backed
-failures rather than fabricated fuzz success.
+before and after destructive mutation. When the source, a generated binding,
+or a version- or cross-matched compiler is missing, BHF reports an explicit
+failure with its evidence.

@@ -1,44 +1,47 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Design: Platform-neutral runtime-event collector + native Windows provider (#60)
 
-> Status: **implemented** in part (85e4781, the collector contract, the Linux
+> Status: **implemented** (85e4781, the collector contract, the Linux
 > provider and the native Windows ETW provider; binary-fuzz confirmation in
-> 6ba0795 and d34266f). The Windows provider is validated on a Windows host,
-> not in Linux CI. Feeds the #55 semantic predicates and #61 relational policy
-> fuzzing.
->
-> Not delivered:
+> 6ba0795 and d34266f). The Windows job in `.github/workflows/ci.yml` builds
+> and tests the Windows provider. Follow-ups delivered:
 > - starting the collector before the target and keeping its testcase and
->   PID: [#76](https://github.com/Tarmo-Technologies/bhf/issues/76);
-> - replaying retained testcases under the collector in the harness lanes
->   ([#246](https://github.com/Tarmo-Technologies/bhf/issues/246)) and in `bhf binary fuzz` ([#247](https://github.com/Tarmo-Technologies/bhf/issues/247));
-> - `--collector` on `bhf auto`: [#278](https://github.com/Tarmo-Technologies/bhf/issues/278).
+>   PID: 83e080c ([#76](https://github.com/Tarmo-Technologies/bhf/issues/76));
+> - replaying each retained input under the collector in the harness lanes,
+>   7a5ca61 ([#246](https://github.com/Tarmo-Technologies/bhf/issues/246)),
+>   and in `bhf binary fuzz`, 8237686
+>   ([#247](https://github.com/Tarmo-Technologies/bhf/issues/247));
+> - `--collector` on `bhf auto`: 83e080c ([#278](https://github.com/Tarmo-Technologies/bhf/issues/278)).
+>
+> User guide: [Runtime Oracles, Collectors and Postconditions](../site/cli.md#runtime-oracles-collectors-and-postconditions).
+> Feeds the #55 semantic predicates and #61 relational policy fuzzing.
 
 ## Problem
 
-bhf's behavioural oracles depend on the Linux `LD_PRELOAD` runtrace shim, which
-is unavailable on native Windows and under Wine/QEMU/cross-emulation. A large
-class of high-impact defects exits successfully and is visible only as a runtime
-effect: `CreateProcess*`/`ShellExecute*` launching an attacker-selected target, a
-file op resolving outside an allowed root, `LoadLibrary*` from an unsafe location,
-a descendant process performing the security-relevant action, or a registry/
-network/service effect. #55 gives a place to *classify* an arbitrary
-postcondition, but bhf lacks a portable *event feed* that exposes these effects
-consistently to built-in or private oracles.
+bhf's behavioural oracles depend on the Linux `LD_PRELOAD` runtrace shim,
+which does not run on native Windows or under Wine/QEMU/cross-emulation. A
+large class of high-impact defects exits successfully and is visible only as a
+runtime effect: `CreateProcess*`/`ShellExecute*` launching an
+attacker-selected target, a file op resolving outside an allowed root,
+`LoadLibrary*` from an unsafe location, a descendant process performing the
+security-relevant action, or a registry/network/service effect. #55 gives a
+place to *classify* an arbitrary postcondition, but bhf lacks a portable
+*event feed* that exposes these effects consistently to built-in or private
+oracles.
 
 ## Goals
 
-- A versioned, platform-neutral **runtime-event collector contract** (a sidecar
-  protocol) that any provider can implement, feeding the existing oracle registry
-  and the #55 semantic predicates.
-- An initial native **Windows provider** observing process/file/module-load
-  events (ETW a plausible base), usable from an ordinary user session where the
+- A versioned, platform-neutral **runtime-event collector contract** (a
+  sidecar protocol) that any provider can implement, feeding the existing
+  oracle registry and the #55 semantic predicates.
+- A first native **Windows provider** observing process/file/module-load
+  events (ETW is a likely base), usable from an ordinary user session where the
   OS permits, with explicit fidelity/loss metadata.
 
 ## Non-goals
 
-- Replacing the Linux `LD_PRELOAD` shim (it stays; this is the portable
-  superset for configs the shim cannot reach).
+- Replacing the Linux `LD_PRELOAD` shim. The shim stays; the collector is the
+  portable superset for configurations the shim cannot reach.
 - A Linux provider beyond a thin adapter over the existing runtrace events
   (optional, to prove the contract is platform-neutral).
 
@@ -47,9 +50,10 @@ consistently to built-in or private oracles.
 ### Collector contract (sidecar protocol)
 
 A provider is a subprocess (or OS tracer) that emits normalised events to a
-sink the host reads, keyed by case. Reuse the #57 framed-JSON transport where a
-subprocess provider fits; an OS tracer (ETW) writes the same JSON event schema to
-the per-case audit stream bhf already models (`BHF_RUNTRACE_LOG`-style).
+sink the host reads, keyed by case. Reuse the #57 framed-JSON transport where
+a subprocess provider fits; an OS tracer (ETW) writes the same JSON event
+schema to the per-case audit stream bhf already models
+(`BHF_RUNTRACE_LOG`-style).
 
 Event schema (superset of the Linux runtrace vocabulary, so one oracle layer
 consumes both):
@@ -65,12 +69,13 @@ consumes both):
   "fidelity": { "lost": 0, "unsupported_fields": [], "permission_denied": false } }
 ```
 
-Contract requirements (from the issue): testcase begin/end + worker ids; observed
-process identity, parent/ancestor, user/token, session where available;
-timestamp/order; normalised process/file/module-load/network/optional-registry
-events; raw backend evidence references; event-loss / unsupported-field /
-permission-failure / fidelity metadata; and a **bounded post-exit observation
-window** for descendant effects.
+Contract requirements (from the issue): testcase begin/end + worker ids;
+observed process identity, parent/ancestor, user/token, session where
+available; timestamp/order; normalised
+process/file/module-load/network/optional-registry events; raw backend
+evidence references; event-loss / unsupported-field / permission-failure /
+fidelity metadata; and a **bounded post-exit observation window** for
+descendant effects.
 
 ### Architecture
 
@@ -81,10 +86,9 @@ window** for descendant effects.
   `ORACLE_REGISTRY` and #55 predicates consume it unchanged).
 - **Windows provider** (`bhf-collector-win`, a separate binary, built only on
   Windows): an ETW consumer subscribing to process/file/image-load providers,
-  attributing events to the testcase's descendant process tree, emitting the JSON
-  schema. Runs without admin where the OS permits a user-session ETW session;
-  missing visibility is reported as `fidelity.permission_denied`, never silently
-  dropped.
+  attributing events to the testcase's descendant process tree, emitting the
+  JSON schema. Runs without admin where the OS permits a user-session ETW
+  session; missing visibility is reported as `fidelity.permission_denied`.
 - Host integration: `bhf binary fuzz`/`bhf fuzz` gain `--collector <auto|path>`;
   when set, the host starts the provider per case (or attaches the OS tracer),
   waits the bounded post-exit window, then runs oracle + #55 evaluation over the
@@ -100,27 +104,28 @@ window** for descendant effects.
 
 ## Risks / open questions
 
-- **Validation gap**: no Windows CI runner here. Recommend landing the
-  platform-neutral `runtime_collector` crate + schema + a Linux adapter (proving
-  the contract against existing runtrace events) FIRST, entirely on Linux, then
-  the Windows provider as a separately-validated deliverable on a Windows runner.
-- ETW specifics (session setup, non-admin capability, event loss under load) are
-  provider-implementation details the contract deliberately does not mandate.
-- Ordering/attribution: ancestor attribution needs the process-create tree before
-  file/module events can be blamed on the testcase; the post-exit window handles
-  late descendant effects.
+- **Validation**: at design time there was no Windows CI runner. Land the
+  platform-neutral `runtime_collector` crate, schema and a Linux adapter
+  (proving the contract against existing runtrace events) first, entirely on
+  Linux, then the Windows provider as a separately validated deliverable on a
+  Windows runner.
+- ETW specifics (session setup, non-admin capability, event loss under load)
+  are left to each provider implementation.
+- Ordering/attribution: ancestor attribution needs the process-create tree
+  before file/module events can be blamed on the testcase; the post-exit
+  window handles late descendant effects.
 
 ## Phased plan
 
-1. `runtime_collector` crate: schema, `CollectorSession`, normalisation, event →
-   `OracleRuntimeEvent` mapping. Pure, Linux-testable.
+1. `runtime_collector` crate: schema, `CollectorSession`, normalisation, and
+   the event-to-`OracleRuntimeEvent` mapping. Pure, Linux-testable.
 2. A Linux adapter that feeds existing runtrace events through the contract
-   (proves platform-neutrality; no behaviour change).
+   (proves platform-neutrality; behaviour unchanged).
 3. `--collector` wiring on `bhf fuzz`/`bhf binary fuzz` (host side), bounded
    post-exit window, oracle + #55 evaluation over collected events.
-4. **Windows provider** (`bhf-collector-win`, ETW) — built + validated on a
+4. **Windows provider** (`bhf-collector-win`, ETW): built and validated on a
    Windows runner; the five event classes above.
 5. Docs + fidelity/loss reporting.
 
-Phases 1–3 are Linux-only and self-contained; phase 4 is the cross-platform piece
-that needs a Windows environment to land and test.
+Phases 1–3 are Linux-only and self-contained; phase 4 is the cross-platform
+piece that needs a Windows environment to land and test.

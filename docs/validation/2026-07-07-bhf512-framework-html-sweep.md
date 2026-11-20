@@ -1,9 +1,10 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # BHF-512 Framework Raw-HTML Sweep - 2026-07-07
 
-This memo records validation for the `BHF-512` JavaScript raw-HTML sink expansion:
-DOM `outerHTML` / `insertAdjacentHTML` / `setHTMLUnsafe`, Vue `v-html`, Svelte
-`{@html}`, Angular `bypassSecurityTrustHtml`, and `.vue` / `.svelte` scan routing.
+This memo records validation for the `BHF-512` JavaScript raw-HTML sink
+expansion: DOM `outerHTML` / `insertAdjacentHTML` / `setHTMLUnsafe`, Vue
+`v-html`, Svelte `{@html}`, Angular `bypassSecurityTrustHtml`, and `.vue` /
+`.svelte` scan routing.
 
 ## Scope
 
@@ -17,17 +18,19 @@ DOM `outerHTML` / `insertAdjacentHTML` / `setHTMLUnsafe`, Vue `v-html`, Svelte
 
 - MDN documents `insertAdjacentHTML` and `setHTMLUnsafe` as injection sinks that
   require TrustedHTML / sanitizer handling.
-- Vue documents `v-html` as raw HTML rendering and warns against untrusted content.
-- Svelte documents `{@html}` as raw HTML rendering and warns that content must be
-  escaped or trusted.
+- Vue documents `v-html` as raw HTML rendering and warns against untrusted
+  content.
+- Svelte documents `{@html}` as raw HTML rendering and warns that content must
+  be escaped or trusted.
 - Angular documents `bypassSecurityTrustHtml` as an explicit security bypass.
 
 ## Initial Sweep
 
 - Repos cloned: 50 / 50
 - Successful scans: 49 / 50
-- Timeout: `next` (Next.js), even with a later 600 second focused retry
-- Initial real `BHF-512` findings: 20
+- Timeout: `next` (Next.js), also on a later 600 second focused retry (see the
+  [Next.js follow-up](2026-07-08-nextjs-static-scan-generated-pruning.md))
+- Initial `BHF-512` findings: 20
 
 Initial hit repos:
 
@@ -41,13 +44,13 @@ Initial hit repos:
 ## Fixes From Triage
 
 - Suppress response XSS findings when the immediate response context sets
-  `Content-Type` to `text/plain` or `application/json`; the backward scan stops at
-  branch boundaries so an earlier JSON branch does not suppress a later error branch.
-- Match tainted aliases only in code tokens, not inside quoted string literals.
-- Avoid treating property names such as `page.path` as uses of an alias named
+  `Content-Type` to `text/plain` or `application/json`; the backward scan stops
+  at branch boundaries so an earlier JSON branch does not suppress a later
+  error branch.
+- Match tainted aliases in code tokens only, skipping quoted string literals.
+- Stop treating property names such as `page.path` as uses of an alias named
   `path`.
-- Treat Gatsby page-data loader helpers as JSON/data object producers, not raw
-  HTML producers.
+- Treat Gatsby page-data loader helpers as JSON/data object producers.
 - Suppress `BHF-512` in `e2e-test` / `e2e-tests` fixture directories.
 
 ## Final Focused Rescan
@@ -62,14 +65,15 @@ After the fixes, the hit repos were rescanned into `out-fixed/`:
 | `juice-shop` | ok | 0 |
 | `next` | timeout | 0 |
 
-The two remaining Storybook findings are both reflected `req.params.name` values
-written directly into `res.end(...)` error responses under the manifest JSON route:
+The two remaining Storybook findings are both reflected `req.params.name`
+values written directly into `res.end(...)` error responses under the manifest
+JSON route:
 
 - `code/core/src/core-server/utils/manifests/manifests.ts:368`
 - `code/core/src/core-server/utils/manifests/manifests.ts:383`
 
-They are defensible `BHF-512` reports for the current source-only rule because the
-responses do not set a non-HTML content type in those branches.
+Both fit the source-only `BHF-512` rule: those branches set no non-HTML
+content type on the response.
 
 ## Commands
 

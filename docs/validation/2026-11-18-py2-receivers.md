@@ -1,8 +1,9 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Py-2 receiver re-run, 2026-11-18
 
-This re-runs, by name, every Python target that the 2026-07-28 campaign sweep
-(`results-0728`) skipped because its class's `__init__` takes arguments:
+This record re-runs, by name, every Python target that the 2026-07-28
+campaign sweep (`results-0728`) skipped because its class's `__init__` takes
+arguments:
 `only no-arg-constructible receivers are supported`. That is the Py-2 class of
 [expected-gaps.md](../expected-gaps.md). Each project is re-run at the commit
 that sweep measured. The bhf under test is a release build of the wave-11
@@ -49,8 +50,8 @@ What stops the rest:
 - **A missing dependency** (10): `werkzeug` for flask (4), `bubus` for
   browser-use (2), the compiled `caffe._caffe` (2), `colour` for manim and
   `mrjob` for system-design-primer. With the receiver built, these targets
-  reach the import that the July sweep never got to. Installing the
-  dependency fixes them.
+  reach the import that the July sweep never got to. They need that
+  dependency installed.
 - **A constructor argument bhf cannot build** (3): an object of the
   project's own class (manim's `scene: Scene`, flask's `app: App`), and
   markitdown's `client: Any`. bhf builds scalars, `str`, `bytes`,
@@ -63,7 +64,7 @@ What stops the rest:
 ## What it took
 
 Building the receiver from its decoded arguments reached 4 of the 21. Two
-more changes reached the rest:
+more changes brought it to 6:
 
 - **Unions and paths.** `str | Path` and `str | os.PathLike[str]` are decoded
   as their first member bhf can build, and a `Path` annotation as a

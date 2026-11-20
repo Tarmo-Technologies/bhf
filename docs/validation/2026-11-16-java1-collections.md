@@ -1,11 +1,11 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Java collection parameters (Java-1), 2026-11-16
 
-This re-runs, by name, every Java target the 2026-07-28 campaign sweep
+This record re-runs, by name, every Java target the 2026-07-28 campaign sweep
 (`results-0728`) skipped as Java-1, `parameter #N has an unsupported type`. It
-backs the Java-1 entry of [expected-gaps.md](../expected-gaps.md). Each project is
-cloned at the commit that sweep measured. The bhf under test is a release build
-of the wave-8 branch (`bhf 0.3.0-dev`).
+backs the Java-1 entry of [expected-gaps.md](../expected-gaps.md). Each project
+is cloned at the commit that sweep measured. The bhf under test is a release
+build of the wave-8 branch (`bhf 0.3.0-dev`).
 
 The harness declared every local with `var`. For a collection built from the
 input, `var` infers the wrong element type, so a `List<String>` or
@@ -55,7 +55,7 @@ class. The seven targets the change moved:
 | JeecgBoot `parseTemplate`, `parseTemplateContent` (3) | `Map<String, Object>` | Needs the Maven build, which fails to resolve the parent POM |
 | zxing `ExpandedProductParsedResult` | `Map<String,String>` | Needs the Maven build, which finds no plugin for a prefix; the Android integration module does not compile |
 | retrofit `create` | `Random` | Needs the Gradle build; javac on the tree finds a duplicate class (`src/main/java16` multi-release sources) |
-| hello-algorithm `FindNumbersWithSum` | `int[]` | javac on the tree finds a duplicate class `Solution` (many exercise dirs, one default package) |
+| hello-algorithm `FindNumbersWithSum` | `int[]` | javac on the tree finds a duplicate class `Solution` (many exercise directories, one default package) |
 | proleap-cobol-parser `CobolCompilationUnitVisitorImpl` | `List<String>` | Its next parameter, ANTLR's `CommonTokenStream`, is unsupported |
 
 Under the sweep's flags, bhf does not run a project's own build, and five of

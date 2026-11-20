@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # JS-2 browser globals re-run, 2026-11-18
 
-This re-runs, by name, every JavaScript and TypeScript target that the
+This record re-runs, by name, every JavaScript and TypeScript target that the
 2026-07-28 campaign sweep (`results-0728`) skipped because a browser global was
 missing under Node: `ReferenceError: window is not defined`, and the same for
 `navigator`, `self` and `document`. That is the JS-2 class of
@@ -50,18 +50,21 @@ By project, after:
 | go-gitea/gitea | 5 | 5 | |
 | open-webui/open-webui | 2 | 2 | |
 | jeecgboot/JeecgBoot | 1 | 1 | |
-| gorhill/uBlock | 5 | 0 | `chrome.declarativeNetRequest`: a browser-extension API, not a page global |
+| gorhill/uBlock | 5 | 0 | `chrome.declarativeNetRequest`, a browser-extension API |
 | hakimel/reveal.js | 5 | 0 | the minified plugin's exports are not functions (`BHF_JS_EXPORT 'A' is not a function`) |
 | gohugoio/hugo | 3 | 0 | the same: the live-reload bundle's exports are not functions |
 | github-linguist/linguist | 1 | 0 | `React is not defined`: a JSX sample with no React import |
 
-What the 14 hit is not JS-2. Loading past the missing global exposed the next
-precondition, and none of these is a page global the driver should invent.
+Once the missing global is stood in for, the 14 stop at the next
+precondition: an extension API, exports that are not functions, or a missing
+React import. The driver stands in for page globals only, so these stay
+unloadable.
 
 ## What it took
 
 The first version installed the stand-ins and retried `require` in the same
-process. That reached 16 of the 37 targets. Three changes reached the rest:
+process. That reached 16 of the 37 targets. Three more changes brought it to
+23:
 
 - **An ES module keeps its error.** jQuery's sources are ES modules loaded
   through `require`. Node keeps a module whose evaluation threw in its errored

@@ -72,8 +72,10 @@ Toolchain gaps:
   flattening source directories into the harness project. On this validation
   host, the imported project selects `util-dates-to_ada_time_64.adb`, which
   calls `Ada.Calendar.Conversions.To_Duration_64` and `To_Ada_Time_64`.
-  Those APIs are not present in GNAT 13, so the runner classifies the result
-  as a host toolchain gap rather than a BHF harness-generation gap.
+  GNAT 13 lacks those APIs, so the runner classifies the result as a host
+  toolchain gap. The manifest
+  (`tests/fixtures/real_code_validation/manifest.toml`) declares this gap as
+  a check and as a scenario, so `toolchain_gaps` counts it twice.
 
 ## Issue Found And Fixed
 
@@ -84,19 +86,19 @@ C harnesses can compile under real C89 project flags.
 
 The AdaYaml GPR build exposed two Ada parity gaps that were also fixed:
 
-- `generate-harness --project` now imports the real GPR project instead of
-  claiming ownership of the project's source directories in the harness GPR.
-  This preserves real project `Naming`, external variables, library settings,
-  and avoids "unit belongs to several projects" failures.
+- `generate-harness --project` now imports the real GPR project; the
+  harness GPR no longer claims the project's source directories as its own.
+  This preserves the project's `Naming`, external variables and library
+  settings, and avoids "unit belongs to several projects" failures.
 - Return types from package specs and child-package parent specs are resolved
   to qualified Ada names, so generated harnesses emit declarations such as
   `Yaml.Dom.Document_Reference` instead of non-visible short names.
 
 ## Current Readiness Signal
 
-C, C++, and Ada are now validated against real codebases for target discovery
-and generated harness build. C/C++ additionally exercise compile-database
-ingestion and broken-header `needed_for_build` reporting. Ada exercises real
-GPR project imports and generated GPR builds; ada-util remains visible as a
-host compiler/runtime mismatch for this validation environment, not as a
-BHF known gap.
+On these four repositories, target discovery and generated-harness builds
+work for C, C++, and Ada. The C and C++ runs also exercise compile-database
+ingestion and broken-header `needed_for_build` reporting. The Ada runs
+exercise real GPR project imports and generated GPR builds; ada-util is
+reported as a host compiler/runtime mismatch on this host (GNAT 13), counted
+under `toolchain_gaps`, with `known_gaps` at 0.

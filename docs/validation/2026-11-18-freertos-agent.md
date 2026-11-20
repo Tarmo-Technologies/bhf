@@ -1,10 +1,10 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Reference agent as a FreeRTOS task under QEMU, 2026-11-18
 
-The agent lane (`--target-transport agent:tcp` / `agent:serial`) had been run
-only against mocks. This record runs the reference target-side agent
-(`c_runtime/bhf_agent.c`, #289) as a FreeRTOS task on an emulated Cortex-M3
-(#290), driven by the shipped `bhf fuzz` and `bhf replay`.
+Before this record, the agent lane (`--target-transport agent:tcp` /
+`agent:serial`) ran against mocks. This record runs the reference target-side
+agent (`c_runtime/bhf_agent.c`, #289) as a FreeRTOS task on an emulated
+Cortex-M3 (#290), driven by the shipped `bhf fuzz` and `bhf replay`.
 
 ## Setup
 
@@ -46,6 +46,8 @@ in 2.2 s on the local toolchain:
 | `A` | clean again in the same boot: the task recovered from the fault |
 | `bhf replay <finding>` | `MATCH`, re-driven through the agent in the same guest |
 
-What this does not cover is a physical board, `agent:serial` on a real UART,
-and an image whose fault handler cannot return to the task. The last of these
-is the reset-and-report path that `BHF_AGENT_NO_SETJMP` is for.
+The run used QEMU, `agent:tcp`, and a fault handler that returns to the
+task. An image whose fault handler cannot return uses the reset-and-report
+path that `BHF_AGENT_NO_SETJMP` selects; the
+[Zephyr record](2026-11-18-zephyr-agent.md) runs that path under QEMU. A
+physical board and `agent:serial` on a real UART are not yet tested.

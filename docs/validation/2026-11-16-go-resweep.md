@@ -1,11 +1,12 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Go lane re-sweep, 2026-11-16
 
-This re-runs the Go lane of the 2026-07-28 campaign sweep (`results-0728`): the
-same 40 Go projects, each cloned at the commit that sweep measured. It is
-acceptance test 5 of the [enterprise harness gap plan](../enterprise-harness-gap-plan.md),
-and it backs the Go rows of [expected-gaps.md](../expected-gaps.md). The bhf under
-test is a release build of the wave-6 branch (`bhf 0.3.0-dev`).
+This record re-runs the Go lane of the 2026-07-28 campaign sweep
+(`results-0728`): the same 40 Go projects, each cloned at the commit that
+sweep measured. It is acceptance test 5 of the
+[enterprise harness gap plan](../enterprise-harness-gap-plan.md), and it backs
+the Go rows of [expected-gaps.md](../expected-gaps.md). The bhf under test is a
+release build of the wave-6 branch (`bhf 0.3.0-dev`).
 
 The rows are under `benchmarks/campaign-2026-07-25/`:
 
@@ -51,7 +52,7 @@ Each project attempts its ten top-ranked targets (`--max-attempts 10`).
 | Built, target not entered | 0 | 1 | 2 |
 | Findings, all lanes | 17 | 24 | 40 |
 
-These numbers are less comparable than they look.
+Four differences between the columns shape these numbers:
 
 - **The toolchain decides most of it.** On Go 1.22.2, half the attempted
   targets stop at Go-4: a dependency needs `go >= 1.23` to `go >= 1.26.4`, and
@@ -73,7 +74,7 @@ These numbers are less comparable than they look.
   build's cause from `reason`, but bhf records it as `last_errors`.
   `run_sweep.py` now reads it, for the next run.
 
-## Go-1: the actual resolved count
+## Go-1: the resolved count
 
 The histogram cannot say how many Go-1 targets are now drivable, because most
 of the 59 were not among the ten targets attempted again. `go1_rerun.py`
@@ -126,9 +127,10 @@ On Go 1.22.2, 2 of the 23 findings are from Go harnesses, both in v2ray-core:
   causes it.
 
 The other 21 are in the projects' C, JavaScript, TypeScript and Python code.
-Six JS/TS findings are not bugs: `ReferenceError: FileReader is not defined` (three),
-`app is not defined`, `store is not defined` and `Javy is not defined` are
-browser or host APIs the Node harness does not provide (#398).
+Six JS/TS findings are harness gaps: `ReferenceError: FileReader is not
+defined` (three), `app is not defined`, `store is not defined` and `Javy is
+not defined` name browser or host APIs the Node harness does not provide
+(#398).
 
 On Go 1.27.4, 19 of the 40 findings are from Go harnesses:
 
@@ -139,7 +141,7 @@ On Go 1.27.4, 19 of the 40 findings are from Go harnesses:
 | v2ray-core's `crypto/hmac` constructor | 1 | Target, under a current Go, independent of the input |
 | An index, slice or nil fault, or a library panic, in a parser: Xray-core `encryption.DecodeHeader`, terraform `stackaddrs.ParseAbsComponentInstanceOnly`, lazygit `patch.Parse` and `oscommands`, lazydocker `commands` (2, one through `mgutz/str.ToArgv`), fzf `tui.HexToColor`, CLIProxyAPI `misc.antigravityBaseUserAgent` | 8 | Candidates for the target; not yet triaged against each project's callers |
 
-So 11 of the 19 are not a finding a user should act on. Both causes are now
+So 11 of the 19 are not findings a user should act on. Both causes are now
 issues: #398 for a failure every input hits before the target, and #399 for a
 `Must*` contract panic. No crash is in generated harness code: every top frame
 is the project's or a dependency's. None comes from a zero-valued receiver

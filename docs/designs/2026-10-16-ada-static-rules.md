@@ -1,40 +1,41 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Design: Ada static rules
 
-> Status: implemented (`crates/static_analysis/src/ada_rules.rs`).
+> Status: implemented (bf57c71, `crates/static_analysis/src/ada_rules.rs`).
 
 ## Problem
 
 The Ada lane of `bhf static-scan` had six line-matching rules. Four of them
 reported the use of a language feature rather than a defect: every
 `Unchecked_Conversion` or `Unchecked_Deallocation` instantiation (BHF-409,
-BHF-410), every task, protected object, `accept` or `select` (BHF-411), and every
-`Spawn` call (BHF-412). BHF-405 matched any line containing `open (` and
-`path`. On the 18 permissive Ada projects listed below, main reports 979 Ada
-findings, and almost none of them point at a weakness. This pack reports 131. Findings from this
-pass are used as review and training data, so a finding that teaches nothing
-costs reviewer time and teaches the wrong lesson.
+BHF-410), every task, protected object, `accept` or `select` (BHF-411), and
+every `Spawn` call (BHF-412). BHF-405 matched any line containing `open (` and
+`path`. On the 18 permissive Ada projects listed below, those rules reported
+979 Ada findings, almost none of them pointing at a weakness. The rules in
+this design report 131. Static findings are reviewed and used as labelled
+training data, so a finding that points at no weakness costs reviewer time and
+teaches the wrong label.
 
 ## Approach
 
-`ada_rules.rs` lexes Ada (string literals with `""` escapes, character literals
-versus the attribute tick, comments) and splits the token stream into
+`ada_rules.rs` lexes Ada (string literals with `""` escapes, character
+literals versus the attribute tick, comments) and splits the token stream into
 statements. It tracks frames: package, subprogram, task body, protected body,
-declare/begin block, and control constructs. Each frame records its declarations,
-formal parameters, phase (declarative part, statements, handler) and the
-exception choices of its handlers. Rules then ask structural questions, such as
-"is this object declared in the enclosing subprogram", "is this argument a
-constant", or "does this frame have a `when others` handler", instead of
-matching text.
+declare/begin block, and control constructs. Each frame records its
+declarations, formal parameters, phase (declarative part, statements, handler)
+and the exception choices of its handlers. Rules then ask structural
+questions, such as "is this object declared in the enclosing subprogram", "is
+this argument a constant", or "does this frame have a `when others` handler",
+instead of matching text.
 
-`ada_parser` was not used. It wraps a tree-sitter C grammar, which would add a C
-build dependency to `static_analysis`, and the rules need declarations and
-scopes more than a full syntax tree.
+The rules do not use `ada_parser`. It wraps a tree-sitter C grammar, which
+would add a C build dependency to `static_analysis`, and the rules need
+declarations and scopes more than a full syntax tree.
 
 Findings go through the existing `static_finding` path, so JSON and SARIF output
 (rule id, CWE, file, line, message, snippet, triage) is unchanged.
 
-Scope exclusions that apply to every rule in the pack:
+Every rule in the pack skips:
 
 - test trees below the scan root (`test`, `tests`, `regtests`, `testsuite`,
   `testing`, `unit_tests`, `*-tests.adb`, `*_test.adb`);
@@ -70,21 +71,20 @@ GNATcheck predefined rules, and CWE.
 | BHF-570 | CWE-248 | A subprogram exported with C convention whose body has no `when others` handler. | TR [DJS] [OYB]; GNATcheck Exception_Propagation_From_Export | Bodies that cannot raise. Not reported: `null` bodies and units with `No_Exception_Propagation`. |
 | BHF-571 | CWE-460 | A `raise` (or re-raise) that can leave a controlled `Finalize (Obj : in out T)`. | TR [OYB] | None found in measurement. |
 
-BHF-405 (path traversal) is now reported for Ada only by the taint engine's
-Ada.*_IO Open/Create sinks. The line heuristic is removed. Hardcoded credentials
-are already covered for Ada by the generic BHF-429 assignment detector, which
-handles `:=`.
+For Ada, the taint engine's Ada.*_IO Open/Create sinks now report BHF-405
+(path traversal); the line heuristic is removed. The generic BHF-429
+assignment detector, which handles `:=`, reports hardcoded credentials in Ada.
 
-Not implemented, because they cannot be decided from source with useful
-precision: modular wrap-around in size/index computations (needs type
-resolution across units), unprotected shared variables accessed through
+Three candidate rules are left out because source alone cannot decide them
+with useful precision: modular wrap-around in size/index computations (needs
+type resolution across units), unprotected shared variables accessed through
 subprogram calls from several tasks (needs a call graph per task), and missing
 `'Valid` after Unchecked_Conversion of input bytes.
 
 ## Measurement
 
 Tuning and precision projects (shallow clones at the commit shown). All are
-permissively licensed, and all are excluded from the evaluation panels:
+permissively licensed, and none is in the project sets used to evaluate bhf:
 
 - https://github.com/stcarrez/ada-util (897d197)
 - https://github.com/stcarrez/ada-ado (0f35d42)
@@ -105,8 +105,8 @@ permissively licensed, and all are excluded from the evaluation panels:
 - https://github.com/wookey-project/ewok-kernel (ca8e2a0)
 - https://github.com/vivianjia123/Password-Manager (c61523b)
 
-Four more projects were scanned during tuning before the evaluation project
-list reached this work:
+Four more projects were scanned during tuning, before the list of evaluation
+projects was available to this work:
 
 - https://github.com/jrcarter/Ada_GUI
 - https://github.com/ytomino/drake
@@ -114,8 +114,8 @@ list reached this work:
 - https://github.com/jrmarino/libsodium-ada
 
 drake prompted the runtime-unit skip and the `'Size`-check overlay exemption;
-the other three only had their hits reviewed. All four have been dropped from
-the evaluation panels, and none of them is counted below.
+for the other three, only the hits were reviewed. All four have been removed
+from the project sets used to evaluate bhf, and none of them is counted below.
 
 Every hit was read in context when a rule had 18 or fewer hits. For BHF-409
 and BHF-567, 25 hits were sampled with a fixed seed. Verdicts:

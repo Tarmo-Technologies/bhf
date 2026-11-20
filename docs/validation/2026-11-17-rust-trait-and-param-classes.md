@@ -7,8 +7,8 @@
 - Rust-4: a static method of a trait impl whose trait is not the crate's
   own, 11 targets.
 
-This reruns both classes by name with `go1_rerun.py --lang rust`, on the
-corpus checkouts pinned to the 0728 commits. The rows are in
+This record reruns both classes by name with `go1_rerun.py --lang rust`, on
+the corpus checkouts pinned to the 0728 commits. The rows are in
 `benchmarks/campaign-2026-07-25/results-1117-*`.
 
 ## Rust-4
@@ -93,8 +93,8 @@ Rust-1. The 12 left have no decoder:
 - engine handles (`&mut v8::PinScope`, `Arc<AuthManager>`);
 - `&Path`, and the `bytes` crate's `Bytes` (3).
 
-`Bytes` could decode from a `Vec<u8>` once the harness crate depends on
-`bytes`, as it now does for a trait's crate.
+A possible next step, untested: decode `Bytes` from a `Vec<u8>` once the
+harness crate depends on `bytes`, as it now depends on a trait's crate.
 
 ## Reproduce
 

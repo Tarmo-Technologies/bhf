@@ -5,8 +5,8 @@ The `qemu-system:` lane restored its `savevm` baseline with a QMP `stop` plus
 HMP `loadvm` before every input and recorded no throughput. `reset=persistent`
 restores only before the first input and after a crash, a hang or an
 inconclusive run; between clean inputs the firmware's own loop reads the next
-input. This record measures both modes on the RV-3 image and the checks behind
-the mode.
+input. This record measures both modes on the RV-3 image, and lists the
+checks behind the mode.
 
 ## Environment
 
@@ -26,11 +26,12 @@ the mode.
 
 `live_fullsystem_persistent_loop_outruns_a_loadvm_per_input` (`#[ignore]`,
 run by `scripts/hil-emu.sh` on the nightly schedule, a manual dispatch or a
-local run, not on a pull request or a push) boots two guests from the same
-image, one per mode, and gives each 3 s in six 500 ms slices taken in turn,
-so a change in the host's load meets both alike. It runs alternating clean inputs (`0x42`,
-`0x00`), checks every run's exit and coverage, and requires the persistent
-count to be at least 3x the `loadvm` count.
+local run; the script skips it on a pull request or a push) boots two guests
+from the same image, one per mode, and gives each 3 s in six 500 ms slices
+taken in turn, so a change in the host's load meets both alike. It runs
+alternating clean inputs (`0x42`, `0x00`), checks every run's exit and
+coverage, and requires the persistent count to be at least 3x the `loadvm`
+count.
 
 ```sh
 cargo test -p target_transport --test live_fullsystem -- --ignored --nocapture
@@ -64,9 +65,10 @@ A persistent run costs a breakpoint remove, step and insert, two ring-word
 writes, the input write, the `c`, and the fault-word and ring reads (and,
 until the loop is proven, a `g` before and after the step). A
 `loadvm` run costs the QMP `stop` and `loadvm` in place of the step and the
-ring writes. This board's RAM is small, so its `loadvm` is about as cheap as
-one gets; a larger guest costs more per `loadvm`, and the persistent loop
-does not.
+ring writes. This board's RAM is small, so its `loadvm` restores little. A
+`loadvm` restores the guest's whole RAM and a persistent continuation
+restores none, so a `loadvm` costs more on a guest with more RAM and a
+continuation does not.
 
 After the persistent window (over 1,600 continuations) the same test runs the
 planted fault: it is a `Crash`, and the next input shows the `0x50` crumb and
@@ -122,19 +124,20 @@ a second `loadvm` on the QMP channel.
 
 ## Limits
 
-- Emulator only; the board lane (`gdb:`) and Renode keep their own resets.
+- `reset=persistent` runs on QEMU; the board lane (`gdb:`) and Renode keep
+  their own resets.
 - Between clean inputs the guest's state carries over, as in any
   persistent-mode fuzzer. A finding that needs the inputs before it may not
   replay from the snapshot, and its transport profile says so.
-- The loop is proven by coverage: a firmware that records none cannot prove
-  it and is refused after three continuations, and needs `reset=loadvm`.
+- The loop is proven by coverage: a firmware that records no coverage is
+  refused after three continuations and needs `reset=loadvm`.
 - The session lane refuses `reset=persistent`.
-- The benchmark has run on this host only; its margin on hosted runners
-  waits on a nightly HIL-emu run.
+- The benchmark has run on this host; its margin on hosted runners waits on
+  a nightly HIL-emu run.
 - The rates are wall-clock host rates for a minimal image and include the gdb
-  round trips; they are not target execution time.
+  round trips.
 - Much of either mode's run is bhf's gdb client, which reads the link one byte
   per `read` call and reads the coverage ring's whole capacity. With the gdb
   stream buffered on the test side, the rates rose to about 1,050 and 218
-  exec/s (4.8x). Those costs are shared with the `gdb:` and `renode:` lanes and
-  are not changed here.
+  exec/s (4.8x). The `gdb:` and `renode:` lanes share those costs; the
+  `reset=persistent` change leaves them as they were.

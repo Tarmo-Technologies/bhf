@@ -1,5 +1,5 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
-# Multi-engine fuzzing trade study — BHF vs AFL++ vs libFuzzer vs honggfuzz
+# Multi-engine fuzzing trade study: BHF, AFL++, libFuzzer and honggfuzz
 
 Generated: 2026-09-28T04:14:13Z · elapsed 5602.6s · 160 raw trial rows.
 
@@ -10,17 +10,33 @@ Generated: 2026-09-28T04:14:13Z · elapsed 5602.6s · 160 raw trial rows.
 ## Tool versions
 
 - **BHF:** `bhf 0.2.32-62-ga4c9e6c-dirty`
-- **AFL++:** system build **4.09c** at `/usr/bin` (afl-cc wraps `Ubuntu clang version 17.0.6 (9ubuntu1)`). **NOTE: this differs from the prior study's pinned 5.03c — this run is a fresh 4-engine measurement, NOT a splice into the old 5.03c file.**
+- **AFL++:** system build **4.09c** at `/usr/bin` (afl-cc wraps `Ubuntu clang
+  version 17.0.6 (9ubuntu1)`). The earlier study pinned AFL++ 5.03c; this run
+  measured all four engines afresh, with 4.09c.
 - **libFuzzer / clang:** `Ubuntu clang version 18.1.3 (1ubuntu1)`
 - **honggfuzz:** source build at `/tmp/honggfuzz`
 
 ## Methodology
 
-- **Targets:** controlled coverage-gated bug fixtures — a human-audited bug sits behind a gate (a magic value / length field) so the metric is how well each engine's mutator reaches deep, guarded code. Each fixture defines one `target_one_input(data,size)`; every engine drives the SAME source.
-- **Independent crash oracle:** each engine's saved crash artifact AND its final corpus are replayed through one ASan+UBSan binary the engines never see; only oracle-confirmed crashes count. This neutralizes each engine's own crash classifier (honggfuzz's persistent+ASan loop, for instance, keeps the crasher in its corpus without flagging it).
-- **Engine-neutral coverage:** every engine's final corpus is merged through ONE shared libFuzzer-sancov binary (`-merge=1`), so `edges`/`features` use identical instrumentation and are directly comparable — not each engine's own counter.
-- **Time-to-first-crash (TTFC):** wall seconds from campaign start to the first oracle-confirmed crash artifact, polled at 10 ms. Only engines that write a native crash artifact get a TTFC (honggfuzz reports crash REACHABILITY via the corpus backstop, no TTFC).
-- **Setup/build time is separated from campaign time.** Native exec/s is recorded but is **not** cross-engine comparable (each engine defines an execution differently).
+- **Targets:** controlled, coverage-gated bug fixtures. A human-audited bug
+  sits behind a gate (a magic value or a length field), so the metric is how
+  well each engine's mutator reaches deep, guarded code. Each fixture defines
+  one `target_one_input(data,size)`, and every engine drives the same source.
+- **Independent crash oracle:** each engine's saved crash artifact and its
+  final corpus are replayed through one ASan+UBSan binary the engines never
+  see; only oracle-confirmed crashes count. This removes each engine's own
+  crash classifier from the count (honggfuzz's persistent+ASan loop, for
+  instance, keeps the crasher in its corpus without flagging it).
+- **Engine-neutral coverage:** every engine's final corpus is merged through
+  one shared libFuzzer-sancov binary (`-merge=1`), so `edges` and `features`
+  use identical instrumentation and are directly comparable across engines.
+- **Time-to-first-crash (TTFC):** wall seconds from campaign start to the
+  first oracle-confirmed crash artifact, polled at 10 ms. TTFC needs a native
+  crash artifact; honggfuzz's crashes are counted through the corpus replay,
+  which gives a crash-find rate and no TTFC.
+- **Setup and build time are separate from campaign time.** Native exec/s
+  uses each engine's own definition of an execution, so compare it within one
+  engine only.
 
 ## Target: `magic_byte`
 
@@ -84,10 +100,25 @@ _magic 32-bit integer comparison → bug (cmplog/redqueen probe)_
 | libFuzzer | 40/40 | 100% |
 | honggfuzz | 40/40 | 100% |
 
-## Caveats
+## BHF re-run after the RedQueen change
 
-- These are **controlled micro-fixtures** with planted, gated bugs — they isolate mutator reach and magic-value solving, not whole-program throughput on production code. They do not establish enterprise superiority on real targets; pair with the real-code reach study in `benchmarks/harness-parity-20/` (BHF-generated vs expert harness).
-- Single-core, one host, bounded budget. `min_ttfc` and rate are the robust signals; a single median can hide variance — the raw rows are in the evidence JSON.
-- Native exec/s differs in definition per engine and is reported for context only.
-- A licensed Mayhem comparison is out of scope (no license/environment).
+In this run, the builtin engine behind `bhf fuzz` did not arm its RedQueen
+(input-to-state) and value-profile channels; `bhf auto` already did. Commit
+`9d5bdfbf` arms both by default for `bhf fuzz`. The BHF-only re-run on
+2026-09-28 (`bhf 0.2.32-63-gdfee887-dirty`, evidence in
+`trade-study-bhf-refix-20260928.json`) confirmed a crash in 10/10 trials on
+every target, `redqueen_int` included (median TTFC 0.426 s).
+
+## Scope
+
+- The targets are **controlled micro-fixtures** with planted, gated bugs.
+  They measure mutator reach and magic-value solving. For reach on real code,
+  see the [harness parity study](../../harness-parity-20/README.md)
+  (BHF-generated against expert harnesses).
+- Each campaign ran on one core of one host, with a 30 s budget. The minimum
+  TTFC and the crash-find rate are the steadier signals; a median can hide
+  variance, and the raw rows are in the evidence JSON
+  (`trade-study-4engine-20260927.json`).
+- Native exec/s uses each engine's own definition and is reported for
+  context.
 

@@ -2,12 +2,13 @@
 
 # Fuzzer Research And BHF Dogfood - 2026-07-01
 
-This memo records a July 2026 ecosystem review plus a broad BHF dogfood
-campaign. It complements the May 2026 landscape memo by validating current
-BHF behavior across fuzzing, SBOM/vulnerability matching, reporting, static
-scan, and binary fuzzing.
+This memo records a July 2026 ecosystem review and a broad BHF dogfood
+campaign. It follows the May 2026
+[landscape memo](../fuzzing-landscape-2026-05-20.md) and checks BHF behavior
+across fuzzing, SBOM/vulnerability matching, reporting, static scan, and
+binary fuzzing.
 
-Artifacts from this run are intentionally outside the repository:
+The run's artifacts are outside the repository:
 
 - Broad campaign root: `/tmp/bhf-dogfood-2026-07-01`
 - Extended soak root: `/tmp/bhf-dogfood-long-2026-07-01`
@@ -49,22 +50,22 @@ Community and issue-tracker signals:
 - Jazzer discussion on seed corpus importance and non-byte-array target docs:
   https://github.com/CodeIntelligenceTesting/jazzer/discussions/881
 
-Community sources are anecdotal and should be treated as product-direction
-signals, not population-level evidence. X/Twitter claims were excluded because
-the available public results were not reliable enough to cite.
+The community sources are anecdotes, used here as product-direction signals.
+X/Twitter posts were left out because the available public results were not
+reliable enough to cite.
 
 ## Ecosystem Baseline
 
-The best fuzzing systems cluster around these feature families:
+Mature fuzzing systems share these feature families:
 
 | Area | Mature examples | BHF implication |
 |---|---|---|
 | Multi-engine execution | OSS-Fuzz supports libFuzzer, AFL++, Honggfuzz, and Centipede. FuzzBench exists because fuzzer performance is target-dependent. | Keep engine adapters first-class and make comparison output easier to interpret. |
 | Comparison guidance | AFL++ has CmpLog/RedQueen, LAF/CompCov, auto dictionaries, context/NGRAM coverage, persistent mode, shared-memory testcases, and custom/grammar mutators. libFuzzer has trace-cmp/value-profile/dictionaries/custom mutators. | Invest in automatic dictionary, typed-input, and comparison-blocker visibility. |
 | Corpus lifecycle | Distributed fuzzing writeups emphasize saving corpora, merging findings back, and restoring the latest corpus in CI. | BHF should make corpus persistence/merge/reuse explicit in `auto` and CI reports. |
-| Structure-aware fuzzing | Community discussions repeatedly note that raw byte mutation stalls on JSON/protobuf-like and protocol inputs. | BHF should grow schema/grammar/message-sequence lanes, especially for protocol and legacy record formats. |
-| Triage/reproduction | Community issues show pain around minimization, non-reproducible findings, timeouts, and unclear progress/stalls. | Reporting is a BHF strength, but progress health and replay bundle quality need continued work. |
-| Language/runtime coverage | OSS-Fuzz covers C/C++, Rust, Go, Python, Java/JVM, JavaScript, Lua; syzkaller handles OS kernels; Jazzer covers JVM code and bug detectors. | BHF's broad language discovery is useful, but non-C reporting and SBOM mapping need polish. |
+| Structure-aware fuzzing | Community discussions report that raw byte mutation stalls on JSON/protobuf-like and protocol inputs. | BHF should grow schema/grammar/message-sequence lanes, especially for protocol and legacy record formats. |
+| Triage/reproduction | Community issues show pain around minimization, non-reproducible findings, timeouts, and unclear progress/stalls. | BHF reports already support triage; progress health and replay bundle quality need more work. |
+| Language/runtime coverage | OSS-Fuzz covers C/C++, Rust, Go, Python, Java/JVM, JavaScript, Lua; syzkaller handles OS kernels; Jazzer covers JVM code and bug detectors. | BHF discovers targets in many languages; non-C reporting and SBOM mapping need work. |
 
 ## Local Campaigns
 
@@ -144,12 +145,12 @@ Binary surface:
   legacy/IDL/CORBA-pattern fixtures in one validation pass.
 - External AFL++ execution worked and reached much higher throughput than the
   built-in engine on the C benchmark lane.
-- Ada multi-directory/GPR workflows built and fuzzed successfully.
-- Java and Rust unsupported-target skips were understandable:
+- Ada multi-directory/GPR workflows built and fuzzed.
+- The Java and Rust unsupported-target skips gave clear reasons:
   an unsafe Rust function requiring caller-upheld safety, and a Java instance
   method without a no-arg constructor.
-- The reporting surface is useful. Generated Markdown, SARIF, JUnit, CSV, and
-  replay commands were enough to triage the seeded CWE findings.
+- The generated Markdown, SARIF, JUnit, CSV, and replay commands were enough
+  to triage the seeded CWE findings.
 - Static scan, SBOM gating, and binary fuzzing all produced actionable artifacts
   and correct nonzero gate behavior.
 
@@ -168,8 +169,8 @@ BHF reported these as external dependencies:
   newline-bearing fuzz inputs; `wc -l` saw 132,202 and 404,057 physical lines.
 
 This makes the "bring missing dependencies" workflow unusable for fuzzed file
-paths. Runtime fuzz-controlled paths should be separated from build/runtime
-environment dependencies, escaped safely, capped, and summarized once per target.
+paths. Runtime fuzz-controlled paths should be kept apart from build/runtime
+environment dependencies, escaped, capped, and summarized once per target.
 
 ### P1: Non-C Language Rollups Are Incomplete
 
@@ -203,8 +204,9 @@ but `fuzz_driven` reported 0 executions:
 - Python: empty 156, rng 117, fuzz_driven 0.
 - Perl: empty 483, rng 304, fuzz_driven 0.
 
-This may be a pass-selection issue or an accounting issue. Either way, `auto`
-should warn when a selected pass consumes budget but records zero executions.
+The cause may be pass selection or execution accounting. In both cases,
+`auto` should warn when a selected pass consumes budget but records zero
+executions.
 
 ### P1: SBOM Reachability Can Be Misleading For Source Packages
 
@@ -230,15 +232,15 @@ simple constructors, factory methods, or fixture hints.
 
 ### P2: Corpus Lifecycle UX Should Be More Explicit
 
-The ecosystem strongly values persistent corpora, distributed corpus merge, and
-reuse across CI. BHF has corpus artifacts, but `auto` reports should make
-the lifecycle obvious: where the corpus lives, what was imported, what changed,
+Mature fuzzing setups keep persistent corpora, merge them across workers,
+and reuse them in CI. BHF has corpus artifacts; `auto` reports should also
+show the lifecycle: where the corpus lives, what was imported, what changed,
 how to merge it, and the exact command to reuse it.
 
 ### P2: Add Protocol/Stateful And Structure-Aware Lanes
 
-Community pain around network protocols and structured formats maps directly to
-BHF opportunities:
+The community reports about network protocols and structured formats point
+to these BHF lanes:
 
 - protocol/message-sequence harness generation;
 - dictionaries from string literals, enums, constants, and comparisons;

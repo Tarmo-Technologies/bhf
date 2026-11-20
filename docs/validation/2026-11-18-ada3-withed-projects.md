@@ -1,9 +1,10 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Ada-3 withed-project re-run, 2026-11-18
 
-This re-runs, by name, every Ada target that the 2026-07-28 campaign sweep
-(`results-0728`) failed to build because a unit "cannot belong to several
-projects". That is the Ada-3 class of [expected-gaps.md](../expected-gaps.md).
+This record re-runs, by name, every Ada target that the 2026-07-28 campaign
+sweep (`results-0728`) failed to build because a unit "cannot belong to
+several projects". That is the Ada-3 class of
+[expected-gaps.md](../expected-gaps.md).
 The project is re-run at the commit that sweep measured. The bhf under test is
 a release build of the wave-12 branch, which leaves the units of the projects
 a target's project `with`s to those projects (#287).
@@ -49,10 +50,10 @@ That is a harness generation gap, tracked as #418.
 
 The run reported 9 findings. 7 are in the project's own code: index and range
 checks in the word comparisons (`Word_Package`, 4), the Roman-numeral parser
-(1) and the inflection record reader (2), on input they do not validate. 2
-are the harness's, and false: an `out` parameter of the fixed-length
-`Stem_Type` is declared as an empty `String`, so the call fails its length
-check before the project's code runs. That is #418 too.
+(1) and the inflection record reader (2), on input they do not validate. The
+other 2 are false positives from the harness: an `out` parameter of the
+fixed-length `Stem_Type` is declared as an empty `String`, so the call fails
+its length check before the project's code runs. That is #418 too.
 
 ## What it took
 
@@ -60,7 +61,7 @@ bhf staged an instrumented copy of every unit the target's closure needs in
 one directory, and built it with a project that extends the target's own. A
 unit of a project the target's project `with`s then had two owners, the
 staged copy and the withed project, and gprbuild refused it. Four changes
-reached the 7:
+got the 7 built and fuzzed:
 
 - **A withed project's units are left to it.** bhf reads the closure of
   projects the governing one `with`s (following `extends` and the project

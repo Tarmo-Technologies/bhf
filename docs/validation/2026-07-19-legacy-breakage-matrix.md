@@ -5,10 +5,11 @@
 BHF passed 12 of 13 destructive legacy-project scenarios: **92.3%**
 against a required **90%** gate.
 
-This is a measured compatibility gate, not a claim that every possible damaged
-source tree is recoverable. The matrix deliberately deletes a required source,
-header, or Ada child-unit body from pinned real repositories and then requires
-the surviving real target to build and execute under fuzzing.
+The matrix deletes a required source, header, or Ada child-unit body from
+pinned real repositories and then requires the surviving real target to build
+and execute under fuzzing. The
+[expanded 53-repository matrix](2026-07-19-expanded-legacy-breakage-matrix.md)
+extends it.
 
 ## Reproduction
 
@@ -39,8 +40,8 @@ following:
 - the selected target itself was not stubbed.
 
 Scenario timeouts kill the complete process session, including harness and
-sanitizer descendants, so a timed-out run is recorded as a failure rather than
-wedging the matrix.
+sanitizer descendants, so a timed-out run is recorded as a failure and the
+matrix moves on.
 
 ## Results
 
@@ -63,8 +64,8 @@ wedging the matrix.
 Totals for passing scenarios: 109 recorded repairs, 89 fuzz executions, and
 5,846 coverage edges. Language rates were Ada 4/4, C 5/5, and C++ 3/4.
 
-TinyXML2 remains an explicit unsupported recovery shape: deleting its only
-implementation translation unit leaves the selected header-declared method
-without enough surviving implementation structure for the current C++ repair
-path. It is counted in the denominator and remains available as the next
-regression target.
+TinyXML2 fails: deleting its only implementation translation unit leaves the
+selected header-declared method without enough surviving implementation
+structure for the C++ repair path of this date. The failure counts in the
+denominator, and the scenario stays in the manifest as the next regression
+target.

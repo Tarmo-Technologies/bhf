@@ -13,10 +13,10 @@ from a dynamically-built string.
 - dynamic-string evidence (`+` concatenation, an f-string, or `.format(`), and
 - GraphQL operation syntax (`query`/`mutation`/`subscription`).
 
-A literal operation document with request data bound through `variable_values`
-is the safe form and does not fire. This mirrors the SQL rule (`BHF-419`): the
-sink requires concat/format evidence, so a parameterized/variable-bound query is
-clean.
+A literal operation document with request data bound through
+`variable_values` is the safe form and does not fire. This mirrors the SQL
+rule (`BHF-419`): the sink requires concat/format evidence, so a
+parameterized or variable-bound query does not fire.
 
 ## Sweep
 
@@ -30,23 +30,23 @@ clean.
 | `strawberry-graphql/strawberry` | 8 | 0 | 0 |
 | `graphql-python/graphene` | 5 | 0 | 0 |
 
-The two server frameworks (strawberry, graphene) build schemas rather than
-client-side operation strings, so they produce zero `BHF-545` noise — the rule is
-scoped to the `gql()` client pattern.
+The two server frameworks (strawberry, graphene) build schemas, with no
+client-side operation strings, so they produce no `BHF-545` reports; the rule
+targets the `gql()` client pattern.
 
 All 71 `gql` reports are in that library's own test suite, in the shape
-`gql(subscription_str.format(count=count))` — a genuine dynamic operation
-document. Whether the interpolated value is attacker-controlled is a taint
-question the syntactic rule does not resolve, exactly as with `BHF-419`; the
-library source itself produced no reports.
+`gql(subscription_str.format(count=count))`, a dynamic operation document.
+Like `BHF-419`, the rule is syntactic: whether the interpolated value is
+attacker-controlled is a taint question it leaves open. The library source
+itself produced no reports.
 
 ## Unit coverage
 
 `python_rule_pack_flags_dynamic_graphql_documents` asserts three positive shapes
-(concat, f-string, `.format`) and a negative block covering: a literal document
-bound with `variable_values`, `gql(CONST)`, a dynamic SQL `execute` on the same
-tree (fires `BHF-419`, not `BHF-545`), and a `gql(` needle that appears only inside
-a string literal.
+(concat, f-string, `.format`) and a negative block covering: a literal
+document bound with `variable_values`, `gql(CONST)`, a dynamic SQL `execute`
+on the same tree (fires `BHF-419`, not `BHF-545`), and a `gql(` needle that
+appears only inside a string literal.
 
 ## Commands
 

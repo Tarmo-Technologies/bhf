@@ -12,15 +12,18 @@
 - Compiler used by BHF: Red Hat Developer Toolset
   `llvm-toolset-7.0-clang` 7.0.1
 
-CentOS 7.9 is the closest freely obtainable RHEL 7-compatible guest used for
-this run because licensed RHEL 7 media was not available. The official CentOS
+Licensed RHEL 7 media was not available, so the guest is CentOS 7.9, the
+closest freely obtainable RHEL 7-compatible system. The official CentOS
 GenericCloud image was verified against its published SHA-256 checksum before
-import. This validates the EL7 userspace ABI and package behavior; it is not a
-Red Hat certification claim.
+import. The run validates the EL7 userspace ABI and package behavior.
 
-CentOS 7 is end-of-life, so its base and Software Collections repositories had
-to be redirected to the CentOS vault. Packages retained their normal RPM
-signature checks.
+CentOS 7 is end-of-life, so its base and Software Collections repositories
+were redirected to the CentOS vault. Packages kept their normal RPM signature
+checks.
+
+The earlier [RHEL 9 validation](2026-07-20-rhel9-proxmox.md) used an
+AlmaLinux 9 guest; the [platform matrix](2026-07-21-current-platform-matrix.md)
+extends this record to RHEL 8 to 10, Ubuntu LTS and Windows.
 
 ## Compatibility work validated
 
@@ -31,9 +34,9 @@ signature checks.
    are below the EL7 `GLIBC_2.17` ceiling.
 3. The Bash 4.2-compatible offline installer detected EL7 and installed the
    signed Software Collections LLVM packages needed for sanitizer coverage.
-4. The stock CentOS 7 Clang 3.4 was tested with every supported sanitizer
-   coverage spelling and correctly rejected because it provides none. BHF
-   then found and activated `/opt/rh/llvm-toolset-7.0/root/usr` automatically.
+4. BHF tried every supported sanitizer-coverage spelling with the stock
+   CentOS 7 Clang 3.4 and rejected it, since it supports none. BHF then found
+   and activated `/opt/rh/llvm-toolset-7.0/root/usr` automatically.
 5. The packaged content signature and SHA-256 manifest were verified before
    installation with SELinux still enforcing.
 
@@ -58,9 +61,9 @@ SHA256 d908f84876166b7e6cfb5ee3c0989c45f52411cea40f95148504b7f8fe115f0a
 - miniz 3.1.2 at commit `77d0dce` was tested as a real project. Its
   top three targets all built and fuzzed, totaling 96 executions and 239
   coverage edges.
-- The miniz run reported one reproducible LeakSanitizer finding in the selected
-  target/harness path; it did not block compilation, execution, coverage, or
-  EL7 compatibility.
+- The miniz run also reported one reproducible LeakSanitizer finding in the
+  selected target/harness path; compilation, execution and coverage completed
+  around it.
 
 The installed trees and retained reports are under:
 

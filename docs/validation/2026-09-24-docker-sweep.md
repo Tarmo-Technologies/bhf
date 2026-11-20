@@ -1,10 +1,11 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Docker validation — 32-project sixteen-language sweep (2026-09-24)
 
-This record validates the production container (`Dockerfile`) end to end: a single
-image that can **build, harness, and fuzz** every one of bhf's sixteen languages,
-proven against a reproducible corpus of **two small, real, SHA-pinned projects per
-language (32 total)**.
+This record validates the production container (`Dockerfile`) end to end: one
+image that can **build, harness, and fuzz** all sixteen of bhf's languages,
+tested against a reproducible corpus of **two small, real, SHA-pinned projects
+per language (32 total)**. For how to build and run the image, see the
+[Docker guide](../site/docker.md).
 
 ## Environment
 
@@ -13,23 +14,22 @@ language (32 total)**.
 | Host | Linux 6.8, x86_64, 6 vCPU, 13.6 GiB RAM, cgroup v2 |
 | Docker | 29.1.3, overlay2, BuildKit |
 | Base image | `ubuntu:24.04` (digest-pinned) |
-| Image size | 3.62 GB (1.25 GB as `docker save \| gzip`) — fits a single-layer DVD-5 |
+| Image size | 3.62 GB (1.25 GB as `docker save \| gzip`); fits a single-layer DVD-5 |
 | bhf | 0.2.32 (built from source in the builder stage) |
 
 ## Method
 
-- **Corpus:** `docker/sweep-manifest.tsv` — 2 projects × 16 languages, each pinned
-  to a full commit SHA, each a small single-purpose parser/decoder with a public,
-  auto-harnessable entry point (prime fuzz targets).
+- **Corpus:** `docker/sweep-manifest.tsv`, 2 projects × 16 languages, each
+  pinned to a full commit SHA, each a small single-purpose parser/decoder with
+  a public, auto-harnessable entry point.
 - **Runner:** `docker/bhf-sweep.sh` runs `bhf auto` per project with real build
-  recovery (`--unsafe-search-and-run-build-commands`) and `--force`, under a bounded
-  budget: 10 s/target, 2 targets/project, 120 s campaign, `--jobs 1`.
+  recovery (`--unsafe-search-and-run-build-commands`) and `--force`, under a
+  bounded budget: 10 s/target, 2 targets/project, 120 s campaign, `--jobs 1`.
 - **Hardening posture under test:** the sweep ran with `--cap-drop=ALL
   --cap-add=SYS_PTRACE --security-opt no-new-privileges --shm-size=2g
-  --memory=12g`, as the unprivileged `fuzzer` user — the exact production posture,
-  not a permissive one.
-- **PASS** = bhf built ≥1 harness, instrumented it, and executed the fuzzer against
-  real library code (executions > 0).
+  --memory=12g`, as the unprivileged `fuzzer` user: the production posture.
+- **PASS** = bhf built ≥1 harness, instrumented it, and executed the fuzzer
+  against real library code (executions > 0).
 
 ## Result
 
@@ -74,27 +74,29 @@ language (32 total)**.
 
 ## Defects found and fixed during validation
 
-Validation surfaced two real defects, both fixed:
+Validation found two defects, both fixed:
 
-1. **Rust lane could not build any harness from a source-built binary.** bhf stages
-   its embedded `rust_runtime` crate into a temp dir and a generated harness
-   path-depends on it, but `crates/rust_runtime/Cargo.toml` inherited every package
-   field (`edition`, `version`, …) from the workspace root. Staged standalone there
-   is no workspace root, so cargo failed with *"failed to find a workspace root"* and
-   the whole Rust lane produced zero executions. Fixed by making the runtime crate's
-   manifest self-contained (concrete fields) — it is designed to be staged and built
-   alone. Both Rust projects went from 0 → hundreds of thousands of executions.
+1. **Rust lane could not build any harness from a source-built binary.** bhf
+   stages its embedded `rust_runtime` crate into a temp dir and a generated
+   harness path-depends on it, but `crates/rust_runtime/Cargo.toml` inherited
+   every package field (`edition`, `version`, ...) from the workspace root.
+   Staged standalone, there is no workspace root, so cargo failed with
+   *"failed to find a workspace root"* and the whole Rust lane produced zero
+   executions. Fixed by making the runtime crate's manifest self-contained
+   (concrete fields), since it is staged and built alone. Both Rust projects
+   went from zero executions to the counts in the table above.
 
-2. **Sweep runner consumed its own manifest via stdin.** The `while read` loop fed
-   the manifest on stdin, and a build-recovery subprocess (e.g. Maven) read stdin
-   and swallowed the remaining rows, so the first run stopped after 9 projects.
-   Fixed by reading the manifest on FD 3 and giving `bhf` `</dev/null`.
+2. **Sweep runner consumed its own manifest via stdin.** The `while read` loop
+   fed the manifest on stdin, and a build-recovery subprocess (e.g. Maven) read
+   stdin and swallowed the remaining rows, so the first run stopped after 9
+   projects. Fixed by reading the manifest on FD 3 and giving `bhf`
+   `</dev/null`.
 
-## bhf capability boundaries observed (not container defects)
+## bhf auto-harness boundaries observed
 
-Four initially-chosen projects did not fuzz; each exposed a genuine limit of bhf's
-*auto*-harnesser, not a container problem, and each language's paired project fuzzed
-cleanly the whole time. They were swapped for better-fit targets:
+Four initially chosen projects did not fuzz. Each hit a limit of bhf's
+*auto*-harnesser, and in each language the paired project fuzzed throughout.
+They were swapped for better-fit targets:
 
 | Language | Dropped | Why it could not auto-harness | Replaced with |
 |---|---|---|---|
@@ -103,47 +105,48 @@ cleanly the whole time. They were swapped for better-fit targets:
 | csharp | commandline | discovered targets are `internal` types, uncallable from an external harness assembly | `sprache/Sprache` (public API) |
 | go | gjson | transitive deps (`tidwall/match`,`pretty`) don't resolve in the generated harness module | `valyala/fastjson` (zero-dep) |
 
-These are honest boundaries: bhf auto-harnesses functions whose parameters it can
-drive from bytes and whose symbols it can link; internal-only APIs, instance methods
-without a constructible receiver, and (for now) Go targets with external module
-dependencies fall outside that envelope. The container reproduces bhf's real behavior
-faithfully in every case.
+bhf auto-harnesses functions whose parameters it can drive from bytes and
+whose symbols it can link. At the time of this sweep, internal-only APIs,
+instance methods without a constructible receiver, and Go targets with
+external module dependencies fell outside that set. In each case bhf behaved
+inside the container as it does outside.
 
 ## Follow-up: offline hardening, compile-DB fix, and size reduction
 
-A second pass hardened the image for air-gapped use, fixed a compile-database
-footgun, and cut the image to fit a DVD.
+A second pass hardened the image for air-gapped use, fixed a bug that deleted
+a user's compile database, and cut the image to fit a DVD.
 
 ### Offline / air-gap: staged bhf's own instrumentation deps
 
-On a disconnected host two lanes failed because bhf fetched its OWN
-instrumentation from the internet (the target's deps are separately
-operator-staged). Both are now staged at build time and verified with
-`--network none`:
+On a disconnected host, two lanes failed because bhf fetched its own
+instrumentation dependencies from the internet (the operator stages the
+target's dependencies separately). Both are now staged at build time and
+verified with `--network none`:
 
-- **Java** — `java_runtime/build-agent.sh` curled `asm`/`asm-tree` from Maven
+- **Java:** `java_runtime/build-agent.sh` curled `asm`/`asm-tree` from Maven
   Central to shade into the JVM coverage agent; offline every Java target
   failed with `could not build the bhf JVM agent jar: curl: Could not resolve
   host: repo1.maven.org`. Fix: install `libasm-java` and set
   `ASM_JAR_DIR=/usr/share/java`. Verified: `mvn -o clean compile` under
-  `--network none` → 2 built+fuzzed, 76 877 executions.
-- **C#** — the harness restores `SharpFuzz` from NuGet; the image now primes
+  `--network none` → 2 built+fuzzed, 76,877 executions.
+- **C#:** the harness restores `SharpFuzz` from NuGet; the image now primes
   the default NuGet cache with SharpFuzz 2.3.0. A target's own
   `PackageReference`s still need staging into `NUGET_PACKAGES`, exactly like a
   Maven target's `~/.m2`.
 
 ### compile_commands.json: `--probe-build` no longer deletes a user database
 
-`probe_build` wiped `<tree>/.bhf-build/` before regenerating — the very path its
-own failure message names — so a user who placed their `compile_commands.json`
-there (even via symlink) had it silently deleted when regeneration failed
-offline. Fixed in `crates/cli/src/auto/build_probe.rs`: the pre-existing database
-is captured before the wipe and restored + used if regeneration produces none
-(regression test `probe_build_restores_a_user_supplied_compile_db_when_regeneration_fails`).
-Verified in-image: the user file is PRESERVED and the harness builds with its
-flags. (A `compile_commands.json` in the project root or a `build/` dir — real or
-symlinked — is already used without `--probe-build`; that path was confirmed
-working and was never the bug.)
+`probe_build` wiped `<tree>/.bhf-build/` before regenerating. That is the
+path its own failure message names, so a `compile_commands.json` a user placed
+there (even through a symlink) was deleted without warning when regeneration
+failed offline. Fixed in `crates/cli/src/auto/build_probe.rs`: the existing
+database is saved before the wipe, then restored and used if regeneration
+produces none (regression test
+`probe_build_restores_a_user_supplied_compile_db_when_regeneration_fails`).
+Verified in the image: the user's file is kept and the harness builds with its
+flags. A `compile_commands.json` in the project root or a `build/` directory,
+real or symlinked, is used without `--probe-build`; that path already
+worked.
 
 ### Size: 5.01 GB → 3.62 GB (1.25 GB compressed)
 
@@ -153,38 +156,40 @@ working and was never the bug.)
 | Headless JDK + drop Gradle (removes the AWT/Mesa + second-LLVM pull) | ~0.4 GB |
 | Drop the `rust-src` component (bhf instruments via SanitizerCoverage, not `-Zbuild-std`) | ~0.09 GB |
 
-The remaining two-LLVM footprint (clang-18 for the C/C++ lane, clang-17 pulled by
-AFL++) is the cost of the optional AFL++ engine; drop `afl++` from the Dockerfile
-for a further ~0.2 GB if you only use the built-in engine.
+The remaining two-LLVM footprint (clang-18 for the C/C++ lane, clang-17 pulled
+by AFL++) is the cost of the optional AFL++ engine; drop `afl++` from the
+Dockerfile for a further ~0.2 GB if you only use the built-in engine.
 
 ### gcc-recovered flags no longer break the clang harness build
 
 bhf recovers a project's real compile flags but builds the harness (and the
-instrumented static libraries) with **clang** for SanitizerCoverage. Two classes
-of gcc flag leaked through and failed builds the untouched gcc build compiles
-cleanly:
+instrumented static libraries) with **clang** for SanitizerCoverage. Two kinds
+of gcc flag leaked through and broke harness builds for projects whose own gcc
+build compiles cleanly:
 
 - **`-Werror` + a clang warning.** A project built `-Werror`, and a recovered
   flag such as `-fcx-fortran-rules` trips clang's `-Woverriding-option`, so the
   replay died with `clang++: error: overriding '' option with
   '-fcx-fortran-rules' [-Werror,-Woverriding-option]`. Fix: the injected
-  instrumentation now appends `-Wno-error` (bhf is not the project's CI), and the
-  per-harness allowlist drops `-Werror`/`-Werror=*` (`build_probe.rs`,
-  `generate_harness.rs`).
+  instrumentation now appends `-Wno-error`, so a project warning cannot fail
+  the harness build, and the per-harness allowlist drops `-Werror`/`-Werror=*`
+  (`build_probe.rs`, `generate_harness.rs`).
 - **gcc-only `-m` machine flags.** The `-m*` allowlist forwarded flags like
   `-mindirect-branch=thunk` that clang rejects with a hard `unknown argument`
   that `-Wno-error` cannot rescue. Fix: each forwarded `-m` flag is probed
   against clang once (cached) and dropped if rejected, keeping the valid ones
   (`-mavx`, `-march=…`). Regression tests
   `warnings_as_errors_are_not_forwarded_from_compile_db` and
-  `gcc_only_machine_flag_clang_rejects_is_dropped`; both reproductions verified to
-  build+fuzz with no sanitizing needed.
+  `gcc_only_machine_flag_clang_rejects_is_dropped`; both reproductions were
+  verified to build and fuzz with no sanitizing needed.
 
 ## Runtime notes confirmed
 
-- `--cap-add=SYS_PTRACE` is required for the ASan/LeakSanitizer stop-the-world; the C
-  lane's LSan findings reproduce with it and degrade without it.
-- All lanes function under `--cap-drop=ALL` + `no-new-privileges` (git clone, every
-  compiler, and the fuzzers need no extra capabilities).
-- Build recovery runs each target's own build system; the container is the sandbox
-  that makes `--unsafe-search-and-run-build-commands` safe to run on real trees.
+- `--cap-add=SYS_PTRACE` is required for the ASan/LeakSanitizer
+  stop-the-world; the C lane's LSan findings reproduce with it and degrade
+  without it.
+- All lanes work under `--cap-drop=ALL` + `no-new-privileges` (git clone,
+  every compiler, and the fuzzers need no extra capabilities).
+- Build recovery runs each target's own build system; the container is the
+  sandbox that confines what `--unsafe-search-and-run-build-commands` runs on
+  real trees.

@@ -2,7 +2,9 @@
 
 # Real Codebase Validation - 2026-05-12
 
-Issue: <https://github.com/Tarmo-Technologies/bhf/issues/200>
+Issue: #200 in bhf's earlier tracker. This repository's issue tracker starts
+on 2026-08-31, so the issue numbers in this record (#200 to #217) name issues
+in that earlier tracker; the same numbers on GitHub are different issues.
 
 Workspace: `/tmp/bhf-validation-200`
 
@@ -69,9 +71,9 @@ main.adb:10:06: error: file "util.ads" not found
 gprbuild: *** compilation phase failed
 ```
 
-The highest-ranked `AdaYaml` and `ada-util` targets also showed the expected
-current M3 limitation for direct-call harnesses: unsupported non-scalar,
-non-string parameters.
+The highest-ranked `AdaYaml` and `ada-util` targets take non-scalar,
+non-string parameters. The direct-call harness of milestone M3 in
+[ROADMAP.md](../../ROADMAP.md) handled scalar and string parameters only.
 
 ### IDL / Fake CORBA
 
@@ -95,13 +97,18 @@ unexpected character '@' at line 8, column 3
 
 ## Issues Opened
 
-- <https://github.com/Tarmo-Technologies/bhf/issues/211> - scanner should not abort project scans on non-UTF-8 Ada files.
-- <https://github.com/Tarmo-Technologies/bhf/issues/212> - generated harness projects need real project source roots/dependencies.
-- <https://github.com/Tarmo-Technologies/bhf/issues/213> - IDL parser should tolerate DDS/OpenDDS annotations.
-- <https://github.com/Tarmo-Technologies/bhf/issues/214> - `fake-corba --idl` should not require an existing `src_instrumented` tree.
-- <https://github.com/Tarmo-Technologies/bhf/issues/215> - harness source-root support should discover or expand real Ada source trees.
-- <https://github.com/Tarmo-Technologies/bhf/issues/216> - IDL parser needs include path support for real OpenDDS include trees.
-- <https://github.com/Tarmo-Technologies/bhf/issues/217> - IDL partial parsing should recover from missing includes and unsupported preprocessor branches.
+- #211: the scanner should not abort project scans on non-UTF-8 Ada files.
+- #212: generated harness projects need real project source roots and
+  dependencies.
+- #213: the IDL parser should tolerate DDS/OpenDDS annotations.
+- #214: `fake-corba --idl` should not require an existing `src_instrumented`
+  tree.
+- #215: harness source-root support should discover or expand real Ada source
+  trees.
+- #216: the IDL parser needs include-path support for real OpenDDS include
+  trees.
+- #217: IDL partial parsing should recover from missing includes and
+  unsupported preprocessor branches.
 
 ## Reduced Reproducer
 
@@ -135,8 +142,8 @@ Results:
 - `cargo test --workspace`: passed.
 - `npm test` in `editors/vscode`: passed, 13 tests.
 - `python3 -m pytest editors/gnatstudio/tests`: passed, 11 tests.
-- `python -m pytest ...` was attempted first and failed because `python` is not
-  installed; `python3` is present and works.
+- `python -m pytest ...` failed first: the host has `python3` but no
+  `python`.
 
 ### Target Discovery And Scan
 
@@ -173,9 +180,9 @@ Both commands exited 0 and wrote an instrumented source file plus
 
 ### Harness Generation And Build
 
-`--source-root` is now accepted, but passing the broad repository `src`
-directory is insufficient for real GNAT source lookup because generated GPR
-`Source_Dirs` are non-recursive:
+`--source-root` is now accepted. Passing the broad repository `src`
+directory still fails GNAT source lookup, because generated GPR `Source_Dirs`
+are non-recursive:
 
 ```sh
 cargo run -p bhf -- generate-harness /tmp/bhf-validation-200/repos/ada-util/src/base/dates/util-dates-iso8601.adb \
@@ -211,8 +218,7 @@ The remaining source-root discovery/ergonomics gap is tracked in #215.
 ### IDL / Fake CORBA
 
 Running `fake-corba --idl` against a fresh work directory still fails unless
-`<work-dir>/src_instrumented` exists, even when the validation intent is IDL
-only:
+`<work-dir>/src_instrumented` exists, even for an IDL-only run:
 
 ```text
 generate fake CORBA under '/tmp/bhf-validation-200/rerun-2026-05-12/results/corba-example-work/fake_corba': No such file or directory (os error 2)
@@ -232,7 +238,8 @@ cargo run -p bhf -- fake-corba /tmp/bhf-validation-200/rerun-2026-05-12/results/
 
 Results:
 
-- `corba-example/echo.idl`: generated 4 fake CORBA files and 9 IDL mapping files.
+- `corba-example/echo.idl`: generated 4 fake CORBA files and 9 IDL mapping
+  files.
 - `OpenDDS/dds/CorbaSeq/StringSeq.idl`: generated 4 fake CORBA files and 2 IDL
   mapping files.
 - `OpenDDS/DevGuideExamples/DCPS/Messenger/Messenger.idl`: generated 4 fake
@@ -267,10 +274,9 @@ Date: 2026-05-12
 
 Workspace: `/tmp/bhf-validation-200/final-2026-05-12`
 
-This rerun covered the combined pending branches for #214, #215, #216, and #217
-after making missing or partial software inputs recoverable for
-`fake-corba --idl`. Until those code PRs are merged, this section is evidence
-for the staged validation branch set rather than a claim about `main`.
+This rerun used the combined branches for #214, #215, #216, and #217, which
+make missing or partial software inputs recoverable for `fake-corba --idl`.
+The branches had not yet merged to `main` when this rerun was recorded.
 
 ### Verification Gates
 
@@ -335,7 +341,8 @@ cargo run -p bhf -- fake-corba /tmp/bhf-validation-200/final-2026-05-12/results/
 
 Results:
 
-- `corba-example/echo.idl`: generated 4 fake CORBA files and 9 IDL mapping files.
+- `corba-example/echo.idl`: generated 4 fake CORBA files and 9 IDL mapping
+  files.
 - `OpenDDS/dds/CorbaSeq/StringSeq.idl`: generated 4 fake CORBA files and 2 IDL
   mapping files.
 - `OpenDDS/DevGuideExamples/DCPS/Messenger/Messenger.idl`: generated 4 fake
@@ -345,6 +352,6 @@ Results:
 
 The include-heavy OpenDDS run produced recoverable warnings for missing TAO
 headers, unsupported preprocessor branches, ignored DDS annotations, named
-bounds, arrays, and union declarations. The run did not abort. This validates
-the #217 policy that incomplete source trees should degrade with warnings and
-continue wherever the remaining IDL can still be used.
+bounds, arrays, and union declarations, and ran to completion. This validates
+the #217 policy: an incomplete source tree degrades with warnings, and
+generation continues wherever the remaining IDL can still be used.

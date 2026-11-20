@@ -41,8 +41,9 @@ the `west build` included:
 
 The glue also runs on the host, against a stand-in for the Zephyr API it
 uses (`crates/target_transport/tests/agent/zephyr_host/`), in
-`agent_loopback`. That test needs no Zephyr tree and runs on every build: three
-faults in a row, each followed by a clean input on a new agent thread.
+`agent_loopback`. That test needs clang but no Zephyr tree, so it runs with
+the ordinary `cargo test` (it skips when clang is not on `PATH`). It drives
+three faults in a row, each followed by a clean input on a new agent thread.
 
-What this does not cover is a physical board and `agent:serial` on a real
-UART.
+The run used QEMU and `agent:tcp`. A physical board and `agent:serial` on a
+real UART are not yet tested.

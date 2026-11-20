@@ -2,7 +2,8 @@
 # Next.js Static-Scan Generated-Bundle Pruning - 2026-07-08
 
 This memo records the follow-up validation for the `next` timeout found during
-the 50-project `BHF-512` framework raw-HTML sweep.
+the 50-project
+[`BHF-512` framework raw-HTML sweep](2026-07-07-bhf512-framework-html-sweep.md).
 
 ## Scope
 
@@ -19,7 +20,7 @@ The Next.js tree contains many generated and vendored JavaScript bundles under
 `packages/next/src/compiled`. Scanning that subtree produced zero `BHF-512`
 findings but consumed most of the `packages/next/src` budget:
 
-| Path | Current pre-fix time | Findings |
+| Path | Pre-fix time | Findings |
 |---|---:|---:|
 | `packages/next/src/compiled` | 142.14 s | 0 |
 | `packages/next/src` | 169.82 s | 0 |
@@ -29,15 +30,15 @@ findings but consumed most of the `packages/next/src` budget:
 | `.github/actions` | 0.55 s | 0 |
 | `examples` | 7.48 s | 0 |
 
-This matched the scanner's existing SAST/SCA boundary: source SAST should scan
-the project code, while dependency and generated payloads are handled by
-SBOM/SCA inventory rather than source taint rules.
+This fits the scanner's existing SAST/SCA split: source SAST scans the
+project's own code, and SBOM/SCA inventory covers dependency and generated
+payloads.
 
 ## Fix
 
 The static scanner now prunes directory components named `compiled` during the
-tree walk, alongside `node_modules`, `dist`, `vendor`, `third_party`, virtualenvs,
-caches, and other dependency/build outputs.
+tree walk, alongside `node_modules`, `dist`, `vendor`, `third_party`,
+virtualenvs, caches, and other dependency/build outputs.
 
 ## Focused Rescan
 

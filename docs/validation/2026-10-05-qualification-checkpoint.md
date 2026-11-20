@@ -1,30 +1,36 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
-# Contractor qualification checkpoint
+# 0.3.0 qualification checkpoint
 
-Decision: **READY_FOR_PROTECTED_HANDOFF**. Packaged customer workflows and the
-requested 100-project qualification campaign have completed. The campaign found
-two release-blocking timeout defects in the original candidate; both exact
-projects completed after the fix in `2469411f6cbb86b9194282ef2aca7d534c0ca449`.
-No release or publisher signature has been made.
+Decision: **READY_FOR_PROTECTED_HANDOFF**. The packaged install-and-run
+workflows and the requested 100-project qualification campaign have completed.
+The campaign found two release-blocking timeout defects in the original
+candidate; both projects completed after the fix in
+`2469411f6cbb86b9194282ef2aca7d534c0ca449`. No release has been published and
+no publisher signature has been made.
+
+In this record, an *owned* fixture or control is a small test program written
+for bhf's own checks.
 
 Live baseline: PR #91 remains open at
 `37582ed1849d18b11e5d6438b049ee6ed5034b69`; main is
 `2e9ea97def2a71e66bf00b5d50d4c5f5a9112bd6`. The release candidate is now
 version 0.3.0.
-Latest published release is 0.2.34; prior releases are preserved.
-The final customer-command check exposed a Windows default-run failure after
-the earlier sanitizer-disabled smoke passed. The first failure was the missing
-Clang ASan DLL search path. After resolving it, the driver's first-chance
-exception handler still terminated valid sanitized inputs. A corrected driver
-completed 64 executions with 11 coverage edges on Server 2019 and detected the
-owned fixture's intentional out-of-bounds write. This is a diagnostic build,
-not final packaged release acceptance. The shared Windows CI smoke now uses
-the README command with default sanitizers and requires executions, coverage,
-and the documented output files. Fresh packaged acceptance subsequently passed
-on the retained Server 2019 and Windows 11 guests, as recorded below.
-The exception-filter fix also covers the embedded C/C++ driver templates.
+The latest published release is 0.2.34; prior releases are preserved.
+
+The final README-command check exposed a Windows default-run failure after
+the earlier sanitizer-disabled smoke test passed. The first failure was the
+missing Clang ASan DLL search path. After that fix, the driver's first-chance
+exception handler still terminated valid sanitized inputs. A corrected driver,
+built for diagnosis, completed 64 executions with 11 coverage edges on Server
+2019 and detected the owned fixture's intentional out-of-bounds write. The
+shared Windows CI smoke test now uses the README command with default
+sanitizers and requires executions, coverage, and the documented output files.
+Fresh packaged acceptance then passed on the retained Server 2019 and Windows
+11 guests, as recorded below. The exception-filter fix also covers the
+embedded C/C++ driver templates.
+
 When every attempted fuzz pass fails, `auto` now records the last runtime
-error instead of a build-only success. A run with no other successful target
+error in place of a build-only success. A run with no other successful target
 therefore exits nonzero and keeps the error in `auto/run.json`.
 
 The EL7 generated installer now installs successfully past its glibc check;
@@ -32,39 +38,41 @@ the following archive identity check incorrectly counted a license directory
 named `bhf` as a second executable. That check now counts regular files only
 and still rejects missing or duplicate executables. Its three regression tests
 and the full 242-test CI policy suite pass locally.
-Read-only protection lookup: strict `CI acceptance`, admin enforcement enabled,
-force pushes/deletions disabled. No required-review entry appeared in the
-protection response. The listed Copilot ruleset is disabled; no settings changed.
-PR #91 had no submitted reviews. Earlier-head CI is not acceptance of this work.
+
+A read-only branch-protection lookup showed strict `CI acceptance`, admin
+enforcement enabled, and force pushes and deletions disabled. The protection
+response had no required-review entry, and no settings were changed. PR #91
+had no submitted reviews. Its CI runs on earlier heads predate this work.
 
 Local runner at the initial checkpoint: 6 CPUs, 13 GiB RAM, 8 GiB swap,
-179 GiB free disk;
-Docker 29.1.3, unprivileged workload support. No new paid resources authorized.
-Build concurrency: one image, two Cargo jobs. Functional containers: disconnected,
-read-only root, at most 4 GiB RAM, 512 PIDs, two CPUs, disposable work/tmp space.
-No external projects or credentials are mounted into these functional checks.
+179 GiB free disk, Docker 29.1.3 with unprivileged workload support. Build
+concurrency: one image, two Cargo jobs. Functional containers ran
+disconnected, with a read-only root, at most 4 GiB RAM, 512 PIDs, two CPUs,
+and disposable work and tmp space. The functional checks mount no external
+projects or credentials.
 
 ## Audit to action
 
 | Area | Action and evidence status |
 |---|---|
-| Language selection | Shared resolver implemented. The exact `12d6066` default, sixteen singleton, and three mixed images passed construction, selection receipt, exclusion, and lifecycle checks. |
-| Native installation | Shared resolver, pre-side-effect rejection, dry-run dependency closure, and authenticated install/tamper/upgrade/rollback tests passed 30/30. Final CI and actual packaged customer-command checks passed after correcting the installer and Windows default-run defects. The final Linux bundle passed authenticated installation with its smoke enabled, default C execution, and resume. The final Windows component archives passed default sanitized C execution on all three retained guests and clean C++ execution on Server 2019. |
-| Default no AI | Selected CLI/daemon compiled graph excludes `llm_harness_gen`; all twenty images passed dummy-provider and command/MCP exposure controls. |
+| Language selection | Shared resolver implemented. The `12d6066` default, sixteen single-language, and three mixed images passed construction, selection receipt, exclusion, and lifecycle checks. |
+| Native installation | Shared resolver, rejection before side effects, dry-run dependency closure, and authenticated install/tamper/upgrade/rollback tests passed 30/30. Final CI and the packaged README-command checks passed after the installer and Windows default-run defects were fixed. The final Linux bundle passed authenticated installation with its smoke test enabled, default C execution, and resume. The final Windows component archives passed default sanitized C execution on all three retained guests and clean C++ execution on Server 2019. |
+| Default build without a model provider | The selected CLI/daemon compiled graph excludes `llm_harness_gen`; all twenty images passed the dummy-provider controls (with dummy API keys set, no `llm` subcommand exists and no provider is called) and the command/MCP exposure controls. |
 | Functional controls | All sixteen BHF-owned clean controls entered non-stub targets through public `bhf auto`, executed inputs, produced measured feedback, and emitted valid JSON. Dependency-bearing Java controls also passed. |
-| Artifact sizes | Exact local configuration IDs and unpacked bytes recorded for twenty images. The exact-head default image's compressed Docker archive and complete review archive are also recorded. Compressed and largest-layer comparison remains incomplete across every subset. |
-| Inventory and signing | Independent verifier tests passed 8/8. Exact-head inventory, scan, acceptance record, BHF source, and all 108 requested Ubuntu source packages are in an unsigned review archive. The scan has zero policy blockers and 829 residual matches requiring review; no publisher key creation or release publication occurred. |
-| 100 upstream projects | Completed against the original `229a638` candidate: 98 projects fully measured and two hit release-blocking 510-second timeouts. Exact post-fix reruns completed both projects, yielding a 100/100 measured composite with zero campaign problems and 176 built-and-fuzzed targets. |
-| Release support | Final installer CI, sixteen-language target-entry, default container execution, authenticated Linux customer installation/resume, retained Windows default component execution, source-bound unsigned archive validation, and the 100-project qualification passed. Redistribution review and publisher-authenticated handoff remain incomplete. The user excluded protected human approval from this execution; no protected workflow setting or review decision was changed. |
-| Optional limits | Physical boards, arbitrary RTOS fidelity, Windows ETW and broad private-resource Rust remain scoped capability limitations. |
+| Artifact sizes | Local configuration IDs and unpacked bytes are recorded for twenty images, plus the exact-head default image's compressed Docker archive and complete review archive. Compressed and largest-layer sizes are not yet compared across every subset. |
+| Inventory and signing | Independent verifier tests passed 8/8. The exact-head inventory, scan, acceptance record, BHF source, and all 108 requested Ubuntu source packages are in an unsigned review archive. The scan has zero policy blockers and 829 residual matches that need review. No publisher key has been created and no release has been published. |
+| 100 upstream projects | Run against the original `229a638` candidate: 98 projects fully measured and two hit release-blocking 510-second timeouts. Post-fix reruns completed both projects, giving a 100/100 measured composite with zero campaign problems and 176 built-and-fuzzed targets. |
+| Release support | Final installer CI, sixteen-language target entry, default container execution, authenticated Linux installation and resume, retained Windows default component execution, source-bound unsigned archive validation, and the 100-project qualification passed. Redistribution review and the publisher-authenticated handoff are still open. Protected human approval is pending; no protected workflow setting or review decision was changed. |
+| Scope limits | The qualified scope excludes physical boards, arbitrary RTOS fidelity, Windows ETW, and broad private-resource Rust. |
 
 The 100-project qualification budget is up to 50 CPU-hours of requested target
 execution alone (100 × 3 × 5 × 120 seconds), before preparation and builds.
-Compiler smoke and short owned fixtures do not satisfy that preset, and no
-failed project is removed from the scored denominator. An initial audit covering
-September 28 through October 5 found no completed run. The required campaign was
-then run against the 0.3.0 candidate and its two timeout cases were rerun against
-the fix, as recorded in the final campaign section below.
+Only the upstream-project runs count toward that preset; compiler smoke tests
+and short owned fixtures are separate. Failed projects stay in the scored
+denominator. An initial audit covering September 28 through October 5 found no
+completed run. The campaign was then run against the 0.3.0 candidate, and its
+two timeout cases were rerun against the fix, as recorded in
+[the campaign section](#100-project-campaign-and-timeout-correction).
 
 ## Resumed packaging and owned-control work
 
@@ -72,7 +80,7 @@ The interrupted `ccdb343` matrix was continued from a detached checkout of that
 exact source, preserving its first four rows and interrupted Java log. It
 completed all twenty selections: nineteen compiler/lifecycle rows passed; the
 Ruby-only build failed because the patched zlib gem needed development headers.
-This older matrix did not include the stronger automatic controls added below.
+The stronger automatic controls described below were added after this matrix.
 
 The native installer regression expected the removed `none` language selector.
 Its assertion and the packaged help were brought into agreement with the
@@ -92,40 +100,43 @@ and exit status 1. Original source integrity was checked. JSON checkpoints and
 artifact hashes survive disposable-volume cleanup even on assertion failure.
 
 Additional clean packet/checksum fixtures exercise all sixteen lanes through
-`bhf auto`; they are fixtures, not upstream-project slots. Initial runs exposed
-Go replacement-path quoting on spaced paths and missing PHP `pcov` feedback.
-The Go correction passed its 25 builder tests and all four integration tests,
-including real target coverage with spaced source/work directories. The Ruby
-dependency closure and PHP coverage extension were corrected and passed in the
-final selected images. The first scalar-only Fortran fixture was ineligible by
-design. Its character-input replacement entered successfully, and the initial
-failure remains in local evidence. C/C++ spaced paths remain explicitly
-unsupported by strict Makefile input validation. Ordinary-path controls passed
-for those lanes.
+`bhf auto`. They are owned fixtures, counted separately from the upstream
+projects. The first runs exposed Go replacement-path quoting on paths with
+spaces and missing PHP `pcov` feedback. The Go fix passed its 25 builder tests
+and all four integration tests, including real target coverage with source
+and work directories whose paths contain spaces. The Ruby dependency closure
+and the PHP coverage extension were fixed and passed in the final selected
+images. The first Fortran fixture took only scalar inputs and was ineligible
+by design. Its replacement with a character input entered, and the first
+failure is kept in the local evidence. Strict Makefile input validation
+rejects C and C++ paths that contain spaces; the C and C++ controls passed on
+ordinary paths.
 
-The matrix now supports source/hash-checked resumption, preserves interrupted
-attempt logs, checks ecosystem exclusions, and can require owned automatic
-controls. An explicitly requested workflow matrix gates candidate packaging.
-The exact `12d6066662daa68cbe242919d311f663d90ea0bf` matrix then passed all
-twenty rows: the all-language default, each of sixteen singleton selections,
-and Java/Python, C/C++/Ada, and JavaScript/TypeScript mixes. Source archive
-SHA-256 was `2f6ff150ec95613cc31527dbbf3427c6d55f4e4fe8f969ce6fda37394479e2a0`.
-Every row passed build, non-root disconnected/read-only runtime, termination,
-malformed-option, dummy-provider/no-LLM, toolchain receipt/exclusion, and owned
-automatic controls. The matrix checkpoint hashes to
+The matrix now supports source- and hash-checked resumption, preserves
+interrupted attempt logs, checks ecosystem exclusions, and can require owned
+automatic controls. An explicitly requested workflow matrix gates candidate
+packaging. The `12d6066662daa68cbe242919d311f663d90ea0bf` matrix then passed
+all twenty rows: the all-language default, each of the sixteen single-language
+selections, and the Java/Python, C/C++/Ada, and JavaScript/TypeScript mixes.
+The source archive SHA-256 was
+`2f6ff150ec95613cc31527dbbf3427c6d55f4e4fe8f969ce6fda37394479e2a0`.
+Every row passed the build, non-root disconnected read-only runtime,
+termination, malformed-option, dummy-provider, toolchain receipt and
+exclusion, and owned automatic controls. The matrix checkpoint hashes to
 `aa83811a4e6bb652b4a9b703aada7ede8ac3a96f98f3b0b74258efcc6d1e9711`.
 
 The final default image is
 `sha256:a3565b7e4c3c74754ab19068b565d254723e5da0f671bc06dfe6b73dd981f5f8`
-at 3,647,380,700 unpacked bytes. Singleton images range from 1,053,558,558
-bytes (Perl) to 2,096,099,063 bytes (Rust), showing real toolchain exclusion
-rather than inheritance from the full image. The all-language owned-control
+at 3,647,380,700 unpacked bytes. Single-language images range from
+1,053,558,558 bytes (Perl) to 2,096,099,063 bytes (Rust), consistent with each
+image carrying only its own toolchains. The all-language owned-control
 JSON hashes to `f916723ad99fe00c7e6c000197f29f29f1e49d0f9bd2db89d6c182b441f4256a`.
 Each language entered exactly one clean target for 32 executions. Measured edge
 counts were Ada 107, C 6, C++ 18, Rust 27, Java 17, Python 2, Perl 7, Go 14,
 COBOL 37, Fortran 151, C# 5, JavaScript 3, TypeScript 10, Ruby 1, Lua 4,
-and PHP 4. All produced zero findings, as expected for these clean controls.
-These are functionality checks, not the 100-project qualification sweep.
+and PHP 4. All produced zero findings, as expected for clean controls. These
+are functionality checks; the 100-project sweep is recorded in
+[the campaign section](#100-project-campaign-and-timeout-correction).
 
 Exact-head CI on PR #92 passed its acceptance gate at `12d6066`, including
 Rust 1.88, build/test, core and default container jobs, RHEL 7/8/9/10,
@@ -133,16 +144,15 @@ Ubuntu 22.04/24.04/26.04, Windows build and Server 2025 compatibility,
 license audit, SBOM, docs, and the hermetic target-entry gate.
 
 The documentation and release-document contract review was pushed as
-`e95d2d08048e77db72dc95436853d251ffaae1de`. Repository-wide Markdown scans
-identified and removed first-person drafting residue and unsupported overall
-rankings; dated benchmark conclusions were scoped to their pinned corpora.
-Local site/link generation, SPDX validation, 239 CI policy tests, and 16
-documentation/release-contract tests passed. Hosted full CI run `37266433513`
-then passed for this commit, including the complete platform and container
-matrix. Separate docs, license, SBOM, dogfood, and hermetic target-entry jobs
-also passed. The public comparison's final accuracy pass additionally removed
-an unmeasured raw-throughput ranking and distinguished average SLOC deviation
-from per-repository deviation.
+`e95d2d08048e77db72dc95436853d251ffaae1de`. A repository-wide Markdown review
+removed unsupported overall rankings and scoped dated benchmark conclusions to
+their pinned corpora. Local site and link generation, SPDX validation, 239 CI
+policy tests, and 16 documentation and release-contract tests passed. Hosted
+full CI run `37266433513` then passed for this commit, including the complete
+platform and container matrix. Separate docs, license, SBOM, dogfood, and
+hermetic target-entry jobs also passed. The final accuracy pass on the public
+comparison also removed an unmeasured raw-throughput ranking and separated
+average SLOC deviation from per-repository deviation.
 
 At documentation head `b1b9bec379d430cb3f672401f2a234d11528fadf`, a clean
 locked release workspace build was packaged into a 17,109,697-byte offline
@@ -158,8 +168,7 @@ The archive SHA-256 is
 and the 64-byte detached signature's SHA-256 is
 `62a0ddd35591c86ca6c1c7581670f447bd00544b06cc39990a34eb057f828936`.
 The disposable private key was deleted after the receipts were captured. This
-single-host test does not replace installation on every supported OS or
-publisher signing.
+test ran on one host with a test key; the per-OS installation matrix follows.
 
 The EL7-baseline binaries retained by exact implementation-head CI run
 `37254610365` were also packaged from the clean `12d6066` source with a new
@@ -172,8 +181,9 @@ The real bundle installer authenticated and installed the Python selection on
 the pinned CentOS 7 ABI image, AlmaLinux 8.10, 9.8, and 10.2, and Ubuntu 22.04,
 24.04, and 26.04. Every row loaded the CLI, daemon, and two shims without a
 missing library and reported `bhf 0.2.35`. Network, system-package installation,
-rustup, symlink creation, and the bundled C smoke were disabled for this matrix;
-it establishes archive authentication, installation, and binary compatibility.
+rustup, symlink creation, and the bundled C smoke test were disabled for this
+matrix; it checks archive authentication, installation, and binary
+compatibility.
 Separate exact-head jobs and the all-language container matrix cover toolchains
 and target entry. Hosted CI also extracted and exercised the native Windows
 archive on Server 2022 and 2025. The disposable matrix key was deleted.
@@ -217,38 +227,35 @@ and the candidate checksum passed. The archive has 374 members, with 370 files
 bound into its release manifest; it is 2,263,872,500 bytes and hashes to
 `b40b890b9ec208bff185aaa03d2b401b016682468f64629af3ea5e73c9e097f9`.
 Its manifest state is `requires_detached_signature`. These materials make the
-candidate reviewable; they do not complete license review, accept residual
-vulnerability risk, or authenticate a publisher.
+candidate reviewable. License review, residual-risk acceptance, and publisher
+authentication are still open.
 
 For the retained `27fa1bb` candidate, a local reviewer handoff under
 `/tmp/bhf-qualification-20261005/reviewer-handoff-27fa1bb` contains every one
 of the 829 residual matches in `residual-findings.csv`, plus
 `package-summary.csv` and `review-summary.json`. The matches span 115
 package/version pairs and 175 unique vulnerability IDs. All match decisions
-remain `under_investigation`; grouping does not remove rows or accept risk.
+remain `under_investigation`; the grouped summaries keep every row.
 The complete CSV hashes to
 `1f350bd4bda4fe9ba8d992ace126599195a964a82cf7333a6e58d7f7c468c528`,
 and the package summary hashes to
 `633e5049c968780437225494a3cd700189a593609e62d33976b7875066eab0a2`.
-These convenience files describe the earlier retained candidate, not a release
-rebuilt from the documentation-review commit.
+These convenience files describe the earlier retained `27fa1bb` candidate.
 
-Raw execution evidence is retained locally under
-`/tmp/bhf-qualification-20261005`; this is a workspace location, not a contractor
-download link. Final generated-installer CI and customer-path checks passed. The
-100-project sweep also completed. Redistribution and residual-risk review and the
-publisher-authenticated handoff remain incomplete. Decision is
-**READY_FOR_PROTECTED_HANDOFF**. Protected human approval is outside this
-execution at the user's request; it has not been recorded as granted.
+Raw execution evidence stays on the build host under
+`/tmp/bhf-qualification-20261005` and is not published. Final
+generated-installer CI and packaged-path checks passed. The 100-project sweep
+also completed. Redistribution and residual-risk review and the
+publisher-authenticated handoff are still open. Decision is
+**READY_FOR_PROTECTED_HANDOFF**. Protected human approval has not been
+recorded as granted.
 
-## Proxmox and installer follow-up
+## Windows guest and installer follow-up
 
-Proxmox SSH aliases now select the existing key for `proxmox`, `10.100.0.1`,
-`ms01`, and `192.168.48.22`. Each alias checks the existing trusted host record
-for `10.100.0.1`. Direct IP and hostname authentication passed. The retained
-Windows Server 2019, Windows 11 25H2, and Windows 11 LTSC 2024 guests then passed
-actual generated component installation and native C execution. Their source
-identity, artifact hashes, scoped results, and VM cleanup are recorded in the
+The retained Windows Server 2019, Windows 11 25H2, and Windows 11 LTSC 2024
+guests on Proxmox passed generated component installation and native C
+execution. Their source identity, artifact hashes, scoped results, and VM
+cleanup are recorded in the
 [Windows installer results](2026-10-05-windows-installer-results.md).
 
 The new CI installer checks exposed three issues: the host-owned checkout was
@@ -280,57 +287,57 @@ The retained `27fa1bb` redistribution review files now also include 64 packaged
 toolchain notice texts and their hashes. That JSON hashes to
 `972081931f44f337c02bbfbc14cc7cf3cb66ee7dcfb67557bfa9ba4ee1cc26f2`.
 Literal component-name references were found for 105 of the 1,549 records with
-missing scanner license metadata. These are unreviewed text pointers, not
-license assignments. The matching `dotnet8` corresponding-source request is
-present. This material does not complete redistribution review.
+missing scanner license metadata. These are unreviewed text pointers to a
+component name. The matching `dotnet8` corresponding-source request is
+present. Redistribution review is still open.
 
 PR #91's cancelled dogfood check was rerun and passed. Its other checks remain
 successful; the PR is still open. No merge, version tag, publisher signature,
 or new GitHub release has been made.
 
-The customer documentation pass corrected a failing full-bundle command:
-README and the site installation guide now pass the required external trust
-policy and verify the detached archive signature before extraction. The offline
+The user-documentation pass corrected a failing full-bundle command: README
+and the site installation guide now pass the required external trust policy
+and verify the detached archive signature before extraction. The offline
 update example uses the same procedure. README and the two main help screens
-begin with a serial, one-target run and identify the results and skipped-target
-reports. Language defaults and the distinct `auto`/standalone `fuzz` corpus
-budgets were reconciled with the implementation. All 166 Markdown documents
-were rescanned for drafting residue and vague promotional language. Site/link
-generation, SPDX validation, 239 CI policy tests, existing help contracts, and
-13 release/document contract tests passed locally. The final packaged customer
-workflow still needs execution against the rebuilt artifacts.
+begin with a serial, one-target run and name the results and skipped-target
+reports. Language defaults and the separate `auto` and standalone `fuzz`
+corpus budgets were reconciled with the implementation. All 166 Markdown
+documents were rescanned for vague promotional language. Site and link
+generation, SPDX validation, 239 CI policy tests, the existing help contracts,
+and 13 release and document contract tests passed locally. The final packaged
+workflow still had to be run against the rebuilt artifacts; that run follows.
 
 The compact matrix identities, sizes, per-language owned-control measurements,
 and scan hashes are in the
 [language-selection results](2026-10-05-language-selection-results.md).
 
-## Final packaged customer-workflow validation
+## Final packaged-workflow validation
 
-Customer workflow decision: **PASS** for branch source
+Packaged-workflow decision: **PASS** for branch source
 `d3509e35766c56a377f6735bfd5a5b228492c5c4`. Hosted CI run
 `37321367468` passed every required check, including all supported Linux
 compatibility jobs and Windows Server 2022/2025. The native artifacts report
 CI merge source `d1bd11b74f690bbe70e8ccf61b0a223cbd65e63c`; its tracked tree
-is identical to the branch source. These source identities are preserved;
-subsequent documentation-only commits are not represented by these artifacts.
+is identical to the branch source. Later documentation-only commits came after
+these artifacts.
 
-The actual EL7 CI binaries were packaged with a disposable test key. The
-independent Python verifier authenticated a private copy before extraction.
+The EL7 CI binaries were packaged with a disposable test key. The independent
+Python verifier authenticated a private copy before extraction.
 The extracted installer ran with its smoke enabled, an external test policy,
 a new prefix, and no package-manager, Rust, or symlink changes. The installed
 CLI then ran the README command with default sanitizers against a clean owned
 C fixture: one non-stub target, 103,814 executions, eight measured edges,
 zero findings, and both documented report paths. Repeating that command with
 `--resume` reloaded one completed target and reran zero targets. The private
-key was deleted. This proves the authentication workflow with a test identity;
-it does not authenticate a publisher.
+key was deleted. This run exercised the authentication workflow with a test
+identity.
 
 The 16,850,074-byte Linux bundle hashes to
 `7d6c731b7af92beb41e8d207376a558c0ea62776e025f8e5999fe6173efa4e25`.
 Its receipt hashes to
 `e78da0cbdc999da858d9e60b7b8bffedc2b8a15b4795bbbabc9655b639aa4d46`.
-Raw evidence is under
-`/tmp/bhf-qualification-20261005/customer-native-d3509e3`.
+Raw evidence for this run is in the local qualification workspace under
+`/tmp/bhf-qualification-20261005`.
 
 The final default container is
 `sha256:ae789a83a8140534bfbeb65e540ca7f8e2fc21c3b1cbdd7e9ef78d3ab64199bb`.
@@ -349,9 +356,9 @@ all 108 matching Ubuntu source-package requests, and sealed inventory/scan data.
 It is 2,263,886,372 bytes and hashes to
 `eb61458454348a1f64e7c31c0a2b696328bdff1d0230c348aa30daa37907cb1b`.
 An independent streaming read checked all 370 manifest files against their
-hashes and matched the source/image identity. The scan still has zero policy
-blockers and 829 residual matches under investigation. No risk acceptance or
-publisher signature is implied.
+hashes and matched the source and image identity. The scan still has zero
+policy blockers and 829 residual matches under investigation. Risk acceptance
+and the publisher signature are still open.
 
 The documentation-complete `f46f885671b0e8f700cdb26671202c552905492d`
 revision was then rebuilt and rechecked. Hosted CI run `37326679648` passed all
@@ -382,7 +389,7 @@ protected review.
 
 The 0.3.0 EL7 artifact ZIP hashes to
 `af9a5f147d0635dc177f0af6c807ce1902b3a467af5f5ef38036719fbe694a79`.
-Its actual binaries reported the exact CI merge source. A disposable-key bundle
+Its binaries reported the exact CI merge source. A disposable-key bundle
 then passed independent verified-copy extraction, installer smoke, and the
 installed README default command: 99,511 executions, eight measured edges, and
 zero findings. Explicit `--resume` reloaded one target and reran none. The
@@ -406,23 +413,16 @@ A clean default C++ run on Server 2019 completed 30,507 executions and 38
 measured edges with zero findings on the code-identical 0.2.35 candidate. See
 [the Windows evidence record](2026-10-05-windows-installer-results.md).
 All three guests were shut down and their original boot orders restored.
-Horizon remained running.
 
-The final documentation review checked README/install steps against the actual
-installer, source, and packaged command output. The root help and all 41 command
-interfaces returned valid help with a `Usage` section. The documentation site
-and link build, SPDX check, 242 CI policy tests, real all-inputs-rejected
-regression, and 12 help-related unit tests passed. A language scan covered all
-183 tracked documentation files and found no drafting residue or AI filler.
-Four flagged phrases describe
-statistical or fault-tolerance properties; placeholder matches are literal
-syntax or repair behavior, and the one credential-like phrase refers to
-sanitizer option names. The release checklist now assigns bundle
-creation/signing to the actual protected job and requires archive authentication
-before extraction. The unavailable dedicated documentation-review skill was
-replaced by direct source, command, and evidence review.
+The final documentation review checked the README and install steps against
+the installer, the source, and the packaged command output. The root help and
+all 41 command interfaces returned valid help with a `Usage` section. The
+documentation site and link build, SPDX check, 242 CI policy tests, real
+all-inputs-rejected regression, and 12 help-related unit tests passed. The
+release checklist now assigns bundle creation and signing to the protected
+release job and requires archive authentication before extraction.
 
-The download examples now target the 0.3.0 candidate instead of the previous
+The download examples now target the 0.3.0 candidate in place of the previous
 published release. The documentation contract checks those examples against
 the workspace release version. All 13 release-document/manifest contract tests
 pass. The candidate remains unpublished until the release process completes.
@@ -446,13 +446,13 @@ rerun completed in 27.12 seconds with five fuzzed targets. Both exited zero
 without a timeout. The resulting composite is 100/100 measured, with zero
 campaign problems and 176 built-and-fuzzed targets.
 
-The campaign operator retained 229 evidence files under
-`campaigns/v0.3.0-rc-100-2026-10-05` on the campaign host and reported that every
-entry in `SHA256SUMS` verifies. Those files were intentionally excluded from the
-source commit and are not represented as independently reverified in this
-checkout. The complete local CLI library suite independently passed 1,914/1,914
-tests on the transplanted fix. Exact-revision hosted CI and rebuilt customer
-artifacts remain required before publication.
+The campaign host keeps 229 evidence files under
+`campaigns/v0.3.0-rc-100-2026-10-05`, and the campaign operator reported that
+every entry in `SHA256SUMS` verifies. The evidence files are kept out of the
+source tree; the `SHA256SUMS` result is the operator's report. The complete
+local CLI library suite passed 1,914/1,914 tests on the transplanted fix.
+Exact-revision hosted CI and rebuilt release artifacts are required before
+publication.
 
-Protected human approval remains excluded from this execution, with no workflow
-setting or review decision changed.
+Protected human approval is still pending; no workflow setting or review
+decision was changed.

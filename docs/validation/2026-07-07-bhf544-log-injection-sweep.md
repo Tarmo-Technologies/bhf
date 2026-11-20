@@ -20,8 +20,8 @@ forging), added to the static taint engine.
 - `BHF-544` findings after FP fixes: 9
 - Precision benchmark: 97 TP, 0 FP, 0 FN
 
-The first sweep produced 20 `BHF-544` findings. Manual triage identified and fixed
-four noisy shapes:
+The first sweep produced 20 `BHF-544` findings. Manual triage found four
+false-positive shapes, all fixed:
 
 - Plain string literals containing source words such as "Request" were parsed as
   tainted log message arguments.
@@ -31,10 +31,10 @@ four noisy shapes:
 - Log calls that pass a returned error object, and logs of parsed client/socket
   address scalars, were over-reported.
 
-The final rescan removed those FPs. The remaining `BHF-544` reports were in Log4j
-examples/core text rendering, pip CacheControl URL logging, and a mitmproxy XSS
-scanner example that logs reflected URL data; those are defensible source-to-log
-flows for the current static rule.
+The final rescan removed those false positives. The remaining `BHF-544`
+reports were in Log4j examples/core text rendering, pip CacheControl URL
+logging, and a mitmproxy XSS scanner example that logs reflected URL data;
+each is a source-to-log flow the static rule targets.
 
 ## Commands
 

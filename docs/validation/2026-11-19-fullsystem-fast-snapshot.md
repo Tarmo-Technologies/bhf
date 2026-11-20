@@ -7,8 +7,9 @@ crash, a hang or an inconclusive run is still followed by a full `loadvm`.
 CPUs and devices, and bhf writes back only the RAM pages the last run wrote,
 which its QEMU TCG plugin logs, with the Cortex-M writes the plugin cannot
 see (bit-band stores and the exception frames still stacked at the stop)
-added. What it does not restore is under Limits. This record measures the
-reset against a `loadvm` on the RV-3 image and the checks behind the mode.
+added. [Limits](#limits) lists what it does not restore. This record measures
+the reset against a `loadvm` on the RV-3 image, and lists the checks behind
+the mode.
 
 ## Environment
 
@@ -144,8 +145,8 @@ load 4.9, with five pages per reset.
 
 ## Limits
 
-- Emulator only, through QEMU's TCG plugin interface (`-plugin`); the board
-  lane (`gdb:`) and Renode keep their own resets.
+- `reset=fast` runs on QEMU, through its TCG plugin interface (`-plugin`);
+  the board lane (`gdb:`) and Renode keep their own resets.
 - The baseline is the machine as a reset leaves it. A firmware that must
   boot past its reset vector before the input is staged runs that boot for
   every input, as it does under `reset=loadvm` from a `-S` start.
@@ -157,9 +158,10 @@ load 4.9, with five pages per reset.
   are found from the stop's registers: the stack up to the baseline's stack
   pointer when the stop's lies within 64 KiB below it, else the 4 KiB above
   the stop's, and 0xD8 bytes at `PSP`.
-- The plugin declares plugin API version 1, which QEMU 8.x takes; another
-  QEMU needs `-DBHF_QEMU_PLUGIN_VERSION=N`. Only QEMU 8.2.2 was run here.
-- The rates are wall-clock host rates for a minimal image and include the
-  gdb round trips, in a debug build; they are not target execution time. The
-  benchmark has run on this host only; its margin on hosted runners waits on
-  a nightly HIL-emu run.
+- The plugin declares plugin API version 1, which QEMU 8.x takes. Another
+  QEMU needs the plugin built with `-DBHF_QEMU_PLUGIN_VERSION=N`; when bhf
+  builds it, set the environment variable `BHF_QEMU_PLUGIN_VERSION=N`. This
+  record ran QEMU 8.2.2.
+- The rates are wall-clock host rates for a minimal image, measured in a
+  debug build, and include the gdb round trips. The benchmark has run on this
+  host; its margin on hosted runners waits on a nightly HIL-emu run.
