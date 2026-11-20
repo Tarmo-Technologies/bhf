@@ -303,12 +303,30 @@ to the built-in engine.
 ```sh
 # Debian/Ubuntu
 sudo apt-get install gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 wine64
-# Initialize the wine prefix once and disable the crash dialog so an unhandled
-# guest fault exits fast instead of blocking on a debugger popup (the driver's
-# own exception handler already terminates on a fault, but this is belt-and-suspenders):
-wineboot -i
+# Optional: turn off Wine's crash dialog. The driver's exception handler
+# already ends the harness on a fault; this stops a debugger popup on a
+# desktop if a fault gets past it.
 wine reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f
 ```
+
+Wine keeps its settings in a prefix directory, `$WINEPREFIX` or `~/.wine` by
+default. When the prefix does not exist yet, bhf creates it before the first
+harness runs under Wine and prints `bhf: creating the Wine prefix ...`. This
+applies to `bhf auto` and to every command that runs a harness under Wine:
+`bhf replay`, `bhf minimize`, `bhf fuzz`, `bhf decode-args`, `bhf corpus
+minimize`, `bhf report --backfill`, and `bhf binary fuzz --runner wine`
+(which `bhf project` uses).
+So a finding replayed on a machine that has never run Wine works on the
+first try. bhf runs `wine wineboot --init`, then `wineserver --wait`, with
+`WINEDEBUG=-all`. It skips Wine's Mono and Gecko add-ons, which a harness does
+not use, unless `WINEDLLOVERRIDES` is already set. Creating a prefix takes
+about 15 seconds and does not count against `--per-target-time`. If the prefix
+exists, bhf checks only that its `system.reg` file is there and adds no start-up
+time. If Wine fails to create the prefix, or takes more than 5 minutes, `bhf
+auto` reports the target as `missing_toolchain` with Wine's own error text,
+not as a target the fuzzer never entered, and does not try again for the
+run's other Windows targets. The other commands stop with that error. To
+create a prefix yourself, run `WINEPREFIX=<dir> wineboot --init`.
 
 The coverage / cmplog shared-memory maps are backed by real files, so the engine
 (running on the Linux host) and the wine'd harness see the same bytes; wine maps

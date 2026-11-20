@@ -282,6 +282,18 @@ impl TargetInvocation {
         Ok(())
     }
 
+    /// Get the runner ready before the target's first run (#394): a Wine
+    /// runner's prefix is created when it is missing, since Wine creating it
+    /// on the first run outlasts the run's timeout.
+    fn prepare_runner(&self) -> anyhow::Result<()> {
+        match &self.runner {
+            Some(runner) => {
+                crate::runner::prepare_runner_program(Path::new(runner)).map_err(|e| anyhow!(e))
+            }
+            None => Ok(()),
+        }
+    }
+
     /// The `(program, argv)` to spawn for one execution. `input_path` is the fuzz
     /// testcase file for file mode, `None` for stdin. A `@@` target-arg is
     /// replaced by the input path; in file mode with no `@@`, the input path is
@@ -381,6 +393,7 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
     let engine = resolve_binary_engine(args.engine)?;
     let invocation = TargetInvocation::from_args(&args);
     invocation.validate(args.input_mode, matches!(engine, ResolvedEngine::Afl(_)))?;
+    invocation.prepare_runner()?;
     // #55: user postconditions are a builtin-engine capability; the afl-qemu
     // adapter path is out of scope here.
     if args.oracle_command.is_some() && matches!(engine, ResolvedEngine::Afl(_)) {
@@ -1687,6 +1700,7 @@ pub(crate) fn minimize_binary_finding(
     let original = fs::read(finding_dir.join("testcase.bin"))
         .with_context(|| format!("read {}", finding_dir.join("testcase.bin").display()))?;
     let invocation = finding_invocation(&finding, binary);
+    invocation.prepare_runner()?;
     let scratch = crate::minimize::ScratchDir::create(finding_dir.join("binary_minimize_tmp"))?;
     let tmp_dir = scratch.path().to_path_buf();
     // Reduce against the finding's OWN oracle: a crash signature, a runtime-oracle
@@ -1790,6 +1804,7 @@ fn replay_binary_finding_inner(finding_dir: &Path, binary: &Path) -> anyhow::Res
     let scratch = crate::minimize::ScratchDir::create(finding_dir.join("binary_replay_tmp"))?;
     let tmp_dir = scratch.path().to_path_buf();
     let invocation = finding_invocation(&finding, binary);
+    invocation.prepare_runner()?;
     let mode = finding_input_mode(&finding)?;
     let env = finding_env(&finding)?;
     let timeout = finding_timeout(&finding);

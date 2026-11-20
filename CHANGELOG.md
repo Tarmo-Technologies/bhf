@@ -285,6 +285,19 @@
   Ubuntu archive snapshot moves to 20261120T000000Z, which carries the fixed
   `openjdk-21-jdk-headless` and `openjdk-21-jre-headless` for CVE-2026-114938
   through CVE-2026-114946, so the image scan reports no blockers.
+- `bhf auto` creates a missing Wine prefix before the first harness runs
+  under Wine (#394). It runs `wine wineboot --init`, then `wineserver --wait`,
+  with `WINEDEBUG=-all`, and prints `bhf: creating the Wine prefix ...`.
+  Before this, Wine created the prefix on the first harness start, which took
+  longer than the fork server's wait and every input's timeout, so the first
+  run executed no input and reported the target as `built_not_entered`. A
+  prefix Wine cannot create makes the target `missing_toolchain`, with Wine's
+  error text, and is not tried again for the run's other targets. `bhf
+  replay`, `minimize`, `fuzz`, `decode-args`, `corpus minimize`, `report
+  --backfill` and `binary fuzz --runner wine` (and so `bhf project`) create a
+  missing prefix the same way, so a Windows finding replayed on a new machine
+  no longer times out on its first run. An existing prefix costs one file
+  check.
 - A SEGV on a fixed address is taken for a missing device register only when
   the target reads that address as a register: a volatile access that is no
   poison or sentinel value (#437). A fault on a plain pointer constant, such

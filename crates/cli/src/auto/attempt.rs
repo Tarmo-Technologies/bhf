@@ -3806,6 +3806,16 @@ fn run_attempt(
                 // "ipc_channel_reachable" for findings + the report (the enhancement
                 // surfaced by shared-memory RTOS dogfooding).
                 let mut ipc_channel_observed = false;
+                // #394: a Wine runner's prefix exists before the first harness
+                // starts in it, and creating it does not use the fuzz budget.
+                if let Some(Err(reason)) = cross_runner.as_ref().map(crate::runner::prepare_wrapper)
+                {
+                    return Ok(AttemptResult {
+                        candidate: candidate.clone(),
+                        outcome: Outcome::MissingToolchain { reason },
+                        harness_dir,
+                    });
+                }
                 let fuzz_started = std::time::Instant::now();
                 // #402: all passes share one per-target deadline so the
                 // per-target wall stays ≈ the requested total (`--per-target-time`,

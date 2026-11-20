@@ -2107,6 +2107,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/runner/wine_prefix.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/runners.rs",
       "license": "Apache-2.0"
     },
