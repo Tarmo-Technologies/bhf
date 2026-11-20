@@ -465,6 +465,24 @@ jobs:
               exit 1
             }
           done
+      # Every component archive carries docs/, examples/ and schemas/ beside
+      # README.md, so the links of its front pages resolve offline.
+      - name: Validate the documentation in every Linux component archive
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for component in bhf bhf-daemon bhf_runtrace_shim bhf_cc_intercept; do
+            archive="target/distrib/$component-$DIST_TARGET.tar.xz"
+            extract=$(mktemp -d)
+            tar -xJf "$archive" -C "$extract"
+            root="$extract/$component-$DIST_TARGET"
+            for dir in docs/site examples schemas; do
+              test -d "$root/$dir" || { echo "missing $dir/ from $archive" >&2; exit 1; }
+            done
+            python3 scripts/check-doc-links.py --root "$root" README.md INSTALL.md docs/site/index.md
+            rm -rf "$extract"
+          done
       # No signed bundle carries the aarch64 binaries through an install
       # smoke, so run the archives this job uploads on the ARM64 runner.
       - name: Smoke-test the aarch64 archives on the ARM64 runner

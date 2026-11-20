@@ -26,6 +26,20 @@ include = [
     "../../python_runtime",
     "../../ruby_runtime",
     "../rust_runtime",
+    # The documentation, laid out as in the repository so the relative links
+    # in README.md, INSTALL.md and docs/ resolve inside the archive. cargo-dist
+    # adds README.md, LICENSE and CHANGELOG.md itself.
+    "../../RELEASE_NOTES.md",
+    "../../NOTICE",
+    "../../THIRD_PARTY.md",
+    "../../SECURITY.md",
+    "../../CONTRIBUTING.md",
+    "../../CODE_OF_CONDUCT.md",
+    "../../ROADMAP.md",
+    "../../docs",
+    "../../examples",
+    "../../schemas",
+    "../../benchmarks",
 ]
 
 [package.metadata.dist.binaries]

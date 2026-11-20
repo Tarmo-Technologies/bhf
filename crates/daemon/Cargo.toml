@@ -11,7 +11,23 @@ repository.workspace = true
 [package.metadata.dist]
 dist = true
 targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
-include = ["../../INSTALL.md"]
+include = [
+    "../../INSTALL.md",
+    # The documentation, laid out as in the repository so the relative links
+    # in README.md, INSTALL.md and docs/ resolve inside the archive. cargo-dist
+    # adds README.md, LICENSE and CHANGELOG.md itself.
+    "../../RELEASE_NOTES.md",
+    "../../NOTICE",
+    "../../THIRD_PARTY.md",
+    "../../SECURITY.md",
+    "../../CONTRIBUTING.md",
+    "../../CODE_OF_CONDUCT.md",
+    "../../ROADMAP.md",
+    "../../docs",
+    "../../examples",
+    "../../schemas",
+    "../../benchmarks",
+]
 
 [package.metadata.dist.binaries]
 x86_64-unknown-linux-gnu = ["bhf-daemon"]

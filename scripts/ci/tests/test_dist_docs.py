@@ -6,22 +6,44 @@ repository layout, install.sh copies it into the install prefix, and
 scripts/check-doc-links.py checks that the relative links of the front pages
 resolve there. These tests stage the documentation, install a minimal bundle
 with the real installer, and check the links in both places, and that every
-guide is within two links of README.md.
+guide is within two links of README.md. Every cargo-dist component archive
+(the CLI, the daemon and the two Linux shims) carries the same documentation
+beside its README.md; those tests lay an archive out from the package's
+include list the way cargo-dist does, check its links, and check the layout
+against `dist manifest` when cargo-dist is installed.
 """
 from __future__ import annotations
 
 from collections import deque
 import importlib.util
+import json
 import os
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import tempfile
+import textwrap
+import tomllib
 import unittest
 
 ROOT = Path(__file__).resolve().parents[3]
 STAGE = ROOT / "scripts/stage-dist-docs.sh"
 CHECKER = ROOT / "scripts/check-doc-links.py"
 FRONT_PAGES = ["README.md", "INSTALL.md", "docs/README.md", "docs/site/index.md"]
+# The packages that cargo-dist builds a component archive for, by archive
+# name, and the pages whose links must resolve inside each archive.
+COMPONENT_PACKAGES = {
+    "bhf": ROOT / "crates/cli",
+    "bhf-daemon": ROOT / "crates/daemon",
+    "bhf_runtrace_shim": ROOT / "crates/bhf_runtrace_shim",
+    "bhf_cc_intercept": ROOT / "crates/bhf_cc_intercept",
+}
+ARCHIVE_PAGES = ["README.md", "INSTALL.md", "docs/site/index.md"]
+# cargo-dist adds these to every archive without an `include` entry: the
+# package directory's copy, or the workspace root's when the package has none.
+DIST_AUTO_INCLUDES = ("README.md", "LICENSE", "CHANGELOG.md")
+DOCS_STEP = "Validate the documentation in every Linux component archive"
 
 _spec = importlib.util.spec_from_file_location("check_doc_links", CHECKER)
 check_doc_links = importlib.util.module_from_spec(_spec)
@@ -62,6 +84,37 @@ def link_depths(root: Path, start: str = "README.md") -> dict[Path, int]:
                 depth[path] = depth[page] + 1
                 queue.append(path)
     return depth
+
+
+def component_archive_entries(package: Path) -> dict[str, Path]:
+    """The top-level entries of `package`'s cargo-dist archive, each with its
+    source: the auto-included files, then every `include` path under its own
+    name (a directory is copied whole)."""
+    config = tomllib.loads((package / "Cargo.toml").read_text())["package"]["metadata"]["dist"]
+    entries = {}
+    for name in DIST_AUTO_INCLUDES:
+        entries[name] = package / name if (package / name).is_file() else ROOT / name
+    for include in config.get("include", []):
+        source = (package / include).resolve()
+        entries[source.name] = source
+    return entries
+
+
+def stage_component_archive(package: Path, dest: Path) -> Path:
+    dest.mkdir(parents=True)
+    for name, source in component_archive_entries(package).items():
+        if source.is_dir():
+            shutil.copytree(source, dest / name)
+        else:
+            shutil.copy2(source, dest / name)
+    return dest
+
+
+def release_step_script(name: str) -> str:
+    """The `run:` script of the release workflow step called `name`."""
+    workflow = (ROOT / ".github/workflows/release.yml").read_text()
+    step = workflow.split(f"      - name: {name}\n", 1)[1].split("\n      - ", 1)[0]
+    return textwrap.dedent(step.split("        run: |\n", 1)[1])
 
 
 class StagedDocumentationTests(unittest.TestCase):
@@ -176,6 +229,92 @@ class PackagingWiringTests(unittest.TestCase):
         self.assertIn('python3 scripts/check-doc-links.py --root "$bundle_root"', workflow)
         self.assertIn('python3 scripts/check-doc-links.py --root "$install_root/prefix"', workflow)
         self.assertIn('test -d "$bundle_root/docs/site/img"', workflow)
+
+
+class ComponentArchiveTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory(prefix="bhf component archives ")
+        cls.archives = {name: stage_component_archive(package, Path(cls.tmp.name) / name)
+                        for name, package in COMPONENT_PACKAGES.items()}
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_every_package_cargo_dist_archives_is_checked(self):
+        archived = set()
+        for manifest in ROOT.glob("crates/*/Cargo.toml"):
+            package = tomllib.loads(manifest.read_text())["package"]
+            if package.get("metadata", {}).get("dist", {}).get("dist"):
+                archived.add(package["name"])
+        self.assertEqual(archived, set(COMPONENT_PACKAGES))
+
+    def test_each_archive_holds_the_documentation_beside_its_readme(self):
+        for name, root in self.archives.items():
+            with self.subTest(archive=name):
+                self.assertTrue((root / "README.md").is_file())
+                for directory in ("docs/site", "docs/site/img", "examples", "schemas"):
+                    self.assertTrue((root / directory).is_dir(), directory)
+                self.assertTrue((root / "schemas/bhf.findings.v1.schema.json").is_file())
+
+    def test_the_front_page_links_resolve_inside_each_archive(self):
+        for name, root in self.archives.items():
+            with self.subTest(archive=name):
+                result = check_links(root, *ARCHIVE_PAGES)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(shutil.which("dist"), "cargo-dist is not installed")
+    def test_dist_lays_out_each_archive_as_staged_here(self):
+        result = subprocess.run(["dist", "manifest", "--artifacts=all", "--output-format=json",
+                                 "--no-local-paths"], cwd=ROOT, capture_output=True, text=True,
+                                timeout=600)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        artifacts = json.loads(result.stdout)["artifacts"]
+        for name, package in COMPONENT_PACKAGES.items():
+            archives = [artifact for key, artifact in artifacts.items()
+                        if artifact.get("kind") == "executable-zip"
+                        and re.match(rf"{re.escape(name)}-(x86_64|aarch64)-", key)]
+            self.assertTrue(archives, name)
+            for archive in archives:
+                with self.subTest(archive=archive["name"]):
+                    # The built binary or shared library is the component, not an include.
+                    paths = {asset["path"] for asset in archive["assets"]
+                             if asset["kind"] not in ("executable", "c_dynamic_library")}
+                    self.assertEqual(paths, set(component_archive_entries(package)))
+
+    def run_release_check(self, drop: str | None = None) -> subprocess.CompletedProcess:
+        """Run the release workflow's documentation check over archives packed
+        from the staged layouts, with `drop` removed from the CLI archive."""
+        target = "x86_64-unknown-linux-gnu"
+        with tempfile.TemporaryDirectory(prefix="bhf release docs ") as tmp:
+            work = Path(tmp)
+            (work / "scripts").mkdir()
+            shutil.copy2(CHECKER, work / "scripts/check-doc-links.py")
+            (work / "target/distrib").mkdir(parents=True)
+            for name, staged in self.archives.items():
+                tree = work / "trees" / name / f"{name}-{target}"
+                shutil.copytree(staged, tree)
+                if drop and name == "bhf":
+                    shutil.rmtree(tree / drop)
+                subprocess.run(["tar", "-cJf", str(work / f"target/distrib/{name}-{target}.tar.xz"),
+                                "-C", str(tree.parent), tree.name], check=True, timeout=300,
+                               env=dict(os.environ, XZ_OPT="-0"))
+            return subprocess.run(["bash", "-c", release_step_script(DOCS_STEP)], cwd=work,
+                                  env=dict(os.environ, DIST_TARGET=target),
+                                  capture_output=True, text=True, timeout=300)
+
+    def test_the_release_checks_the_documentation_in_each_archive(self):
+        result = self.run_release_check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.count("every link in 3 file(s) resolves"), len(COMPONENT_PACKAGES),
+                         result.stdout)
+
+    def test_the_release_check_fails_an_archive_without_the_documentation(self):
+        result = self.run_release_check(drop="examples")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing examples/ from target/distrib/bhf-x86_64-unknown-linux-gnu.tar.xz",
+                      result.stderr)
 
 
 class CheckerTests(unittest.TestCase):

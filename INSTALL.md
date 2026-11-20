@@ -33,10 +33,7 @@ extracts to a directory of the same name:
 | `smoke/c/` | The C fixture the installer's smoke test fuzzes |
 | `VERSION` | Package name, version, target triple, build time and commit |
 
-Each component archive (`bhf-*.tar.xz`, `bhf-daemon-*`, `bhf_runtrace_shim-*`,
-`bhf_cc_intercept-*`, and the Windows `.zip` files) holds one component with
-`README.md`, `INSTALL.md`, `LICENSE` and `CHANGELOG.md`. The `bhf` archive
-also holds the harness runtimes and `bhf-bug-report.sh`.
+Each component archive (`bhf-*.tar.xz`, `bhf-daemon-*`, `bhf_runtrace_shim-*`, `bhf_cc_intercept-*`, and the Windows `.zip` files) holds one component with `README.md`, `INSTALL.md`, `LICENSE` and `CHANGELOG.md`. Each one also holds the documentation, laid out as in the repository: `docs/`, `examples/`, `schemas/`, `benchmarks/`, `RELEASE_NOTES.md`, the license notices (`NOTICE`, `THIRD_PARTY.md`) and the project pages `README.md` links. The `bhf` archive also holds the harness runtimes and `bhf-bug-report.sh`.
 
 ## Choice 1: all-in-one `install.sh` bundle
 
@@ -220,11 +217,7 @@ bhf also finds the runtrace shim in its extracted archive directory beside
 the CLI directory. The compiler-interception shim must sit beside `bhf`, or
 `BHF_CC_INTERCEPT` must name it.
 
-The component archives carry `README.md` and this guide. The complete
-documentation is in the full bundle's `docs/` directory and in the
-[source repository](https://github.com/Tarmo-Technologies/bhf);
-[Installing bhf](docs/site/install.md) lists the supported operating systems
-and each language's prerequisites.
+Every component archive carries `README.md`, this guide and the complete documentation in `docs/`, as the full bundle does; start at `docs/site/index.md`. [Installing bhf](docs/site/install.md) lists the supported operating systems and each language's prerequisites.
 
 ## Windows
 

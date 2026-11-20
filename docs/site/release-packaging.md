@@ -77,14 +77,7 @@ that has to observe compilers started by absolute path or through
 | `source.tar.gz` | Release source snapshot | source audit or rebuild |
 | `dist-manifest.json`, `sha256.sum`, `*.sha256` | dist metadata and checksums | automation and integrity checks |
 
-For a manual component install, copy `libbhf_runtrace_shim.so` and
-`libbhf_cc_intercept.so` into the extracted `bhf-*` CLI directory, or set
-`BHF_RUNTRACE_SHIM` and `BHF_CC_INTERCEPT` to their absolute paths. bhf also
-finds the runtrace shim in a sibling `bhf_runtrace_shim-*` archive
-directory; the compiler-interception shim must sit beside the CLI or be set
-explicitly. Every component archive includes an `INSTALL.md` with the exact
-commands. With the component installers, run each one you need; the `bhf`
-installer installs the CLI.
+For a manual component install, copy `libbhf_runtrace_shim.so` and `libbhf_cc_intercept.so` into the extracted `bhf-*` CLI directory, or set `BHF_RUNTRACE_SHIM` and `BHF_CC_INTERCEPT` to their absolute paths. bhf also finds the runtrace shim in a sibling `bhf_runtrace_shim-*` archive directory; the compiler-interception shim must sit beside the CLI or be set explicitly. Every component archive includes an `INSTALL.md` with the exact commands. Every component archive also carries the documentation beside `README.md` (`docs/`, `examples/`, `schemas/`, `benchmarks/` and the pages `README.md` links), and the release workflow checks that the links of `README.md`, `INSTALL.md` and `docs/site/index.md` resolve inside each Linux archive. With the component installers, run each one you need; the `bhf` installer installs the CLI.
 
 Each archive has a SHA-256 checksum sidecar. A sidecar detects changes to
 the file; it does not identify the publisher. The all-in-one bundle carries
