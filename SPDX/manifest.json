@@ -6431,6 +6431,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "tests/fixtures/kernel_guest/console/bugs.c",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "tests/fixtures/kernel_widget/linux/drivers/misc/widget.c",
       "license": "Apache-2.0"
     },

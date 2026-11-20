@@ -18,7 +18,11 @@
 //! * the guest: [`build_executor`], [`build_initramfs`] (the executor as
 //!   `/init` and the modules, in a newc cpio) and [`Guest`], a qemu-system
 //!   process whose serial console is captured and whose executor is the
-//!   client's peer, over a Unix socket QEMU connects to.
+//!   client's peer, over a Unix socket QEMU connects to;
+//! * the campaign ([`fuzz`]): KCOV PCs as the coverage map's edges
+//!   ([`coverage_ids`]), comparisons as hints and a CmpLog, and each kernel
+//!   report on the console as a finding with its program
+//!   (`results::import_syzkaller::record_guest_crash`).
 
 // The guest itself needs a Unix host; the rest is used only by it.
 #![cfg_attr(not(unix), allow(dead_code))]
@@ -328,6 +332,160 @@ impl Program<'_> {
         out
     }
 }
+
+impl Program<'_> {
+    /// The program as JSON (`decoded.json` of a finding).
+    pub(crate) fn json(&self) -> serde_json::Value {
+        let calls: Vec<serde_json::Value> = self
+            .calls
+            .iter()
+            .map(|call| {
+                let args: Vec<serde_json::Value> = call
+                    .args
+                    .iter()
+                    .map(|arg| match &arg.value {
+                        ArgValue::Const(value) => {
+                            serde_json::json!({"const": format!("{value:#x}")})
+                        }
+                        ArgValue::Result(index) => serde_json::json!({"result": index}),
+                        ArgValue::Data { offset, bytes } => serde_json::json!({"data": {
+                            "address": offset.map(|offset| format!("{:#x}", DATA_ADDR + offset)),
+                            "len": bytes.len(),
+                            "hex": self.input[bytes.clone()]
+                                .iter()
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect::<String>(),
+                        }}),
+                        ArgValue::Out { offset, len } => serde_json::json!({"out": {
+                            "address": offset.map(|offset| format!("{:#x}", DATA_ADDR + offset)),
+                            "len": len,
+                        }}),
+                    })
+                    .collect();
+                let nr = match call.sys {
+                    CallSys::Raw(nr) => Some(nr),
+                    CallSys::Named(_) => None,
+                };
+                serde_json::json!({"call": call.sys.name(), "nr": nr, "args": args})
+            })
+            .collect();
+        serde_json::json!({
+            "schema": PROGRAM_SCHEMA,
+            "data_address": format!("{DATA_ADDR:#x}"),
+            "data_size": DATA_SIZE,
+            "calls": calls,
+        })
+    }
+
+    /// The program as C: the data area mapped where the executor maps it,
+    /// the buffers copied in, then each call through `syscall(2)` with all
+    /// six arguments, as the executor makes it. A raw call the executor
+    /// refuses is refused here too.
+    pub(crate) fn c_source(&self, title: &str) -> String {
+        let title = title.replace("*/", "* /");
+        let mut out = format!(
+            "/*\n * {title}\n *\n * The program bhf kernel fuzz ran when the guest reported it, as C.\n \
+             * Build it statically for the guest and run it there as root, with the\n \
+             * modules loaded: cc -static -o repro repro.c && ./repro\n */\n\
+             #define _GNU_SOURCE\n#include <stdint.h>\n#include <string.h>\n\
+             #include <sys/mman.h>\n#include <sys/syscall.h>\n#include <unistd.h>\n"
+        );
+        let raw = self
+            .calls
+            .iter()
+            .any(|call| matches!(call.sys, CallSys::Raw(_)));
+        if raw {
+            out.push_str(DENIED_C);
+        }
+        let _ = write!(
+            out,
+            "\nint main(void)\n{{\n\tuint64_t r[{}];\n\tchar *data = mmap((void *){DATA_ADDR:#x}ul, {DATA_SIZE:#x}ul, \
+             PROT_READ | PROT_WRITE,\n\t\t\t  MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);\n\
+             \tif (data == MAP_FAILED)\n\t\treturn 1;\n",
+            self.calls.len().max(1)
+        );
+        for arg in self.calls.iter().flat_map(|call| &call.args) {
+            if let ArgValue::Data {
+                offset: Some(offset),
+                bytes,
+            } = &arg.value
+            {
+                if bytes.is_empty() {
+                    continue;
+                }
+                let literal: String = self.input[bytes.clone()]
+                    .iter()
+                    .map(|byte| format!("\\x{byte:02x}"))
+                    .collect();
+                let _ = writeln!(
+                    out,
+                    "\tmemcpy(data + {offset:#x}, \"{literal}\", {});",
+                    bytes.len()
+                );
+            }
+        }
+        for (index, call) in self.calls.iter().enumerate() {
+            let mut args: Vec<String> =
+                call.args
+                    .iter()
+                    .map(|arg| match &arg.value {
+                        ArgValue::Const(value) => format!("{value:#x}ul"),
+                        ArgValue::Result(Some(earlier)) => format!("r[{earlier}]"),
+                        ArgValue::Result(None) => "0xfffffffffffffffful".to_owned(),
+                        ArgValue::Data {
+                            offset: Some(offset),
+                            ..
+                        }
+                        | ArgValue::Out {
+                            offset: Some(offset),
+                            ..
+                        } => format!("{:#x}ul", DATA_ADDR + offset),
+                        ArgValue::Data { offset: None, .. }
+                        | ArgValue::Out { offset: None, .. } => "0ul".to_owned(),
+                    })
+                    .collect();
+            args.resize(MAX_ARGS, "0ul".to_owned());
+            let args = args.join(", ");
+            match call.sys {
+                CallSys::Named(sys) => {
+                    let _ = writeln!(
+                        out,
+                        "\tr[{index}] = (uint64_t)syscall(SYS_{}, {args});",
+                        SYSCALLS[sys]
+                    );
+                }
+                CallSys::Raw(nr) => {
+                    let _ = writeln!(
+                        out,
+                        "\tr[{index}] = denied({nr}) ? (uint64_t)-1 : (uint64_t)syscall({nr}, {args});"
+                    );
+                }
+            }
+        }
+        out.push_str("\t(void)r;\n\treturn 0;\n}\n");
+        out
+    }
+}
+
+/// The schema of a program's JSON.
+pub(crate) const PROGRAM_SCHEMA: &str = "bhf.kernel-program.v1";
+
+/// The executor's refusal of raw calls, for a C reproducer.
+const DENIED_C: &str = "\n/* The raw calls the executor refuses, as it refuses them. */\n\
+static int denied(long nr)\n{\n\tstatic const long list[] = {\n\
+\t\t__NR_reboot, __NR_kexec_load, __NR_init_module, __NR_finit_module,\n\
+\t\t__NR_delete_module, __NR_mount, __NR_umount2, __NR_pivot_root,\n\
+\t\t__NR_chroot, __NR_swapon, __NR_swapoff, __NR_syslog, __NR_ptrace,\n\
+\t\t__NR_kill, __NR_tkill, __NR_tgkill,\n\
+#ifdef __NR_kexec_file_load\n\t\t__NR_kexec_file_load,\n#endif\n\
+#ifdef __NR_iopl\n\t\t__NR_iopl,\n#endif\n\
+#ifdef __NR_ioperm\n\t\t__NR_ioperm,\n#endif\n\
+#ifdef __NR_umount\n\t\t__NR_umount,\n#endif\n\
+#ifdef __NR_move_mount\n\t\t__NR_move_mount, __NR_fsmount, __NR_open_tree,\n#endif\n\
+#ifdef __NR_pidfd_send_signal\n\t\t__NR_pidfd_send_signal,\n#endif\n\
+#ifdef __NR_process_vm_writev\n\t\t__NR_process_vm_writev,\n#endif\n\
+\t};\n\tsize_t i;\n\tfor (i = 0; i < sizeof(list) / sizeof(list[0]); i++)\n\
+\t\tif (list[i] == nr)\n\t\t\treturn 1;\n\treturn 0;\n}\n";
 
 #[cfg(test)]
 fn place_text(offset: Option<u64>) -> String {
@@ -2083,9 +2241,16 @@ pub(crate) struct SeedSet {
 /// A `bhf kernel fuzz` campaign.
 #[derive(Debug, Clone)]
 pub(crate) struct FuzzConfig {
+    /// The work directory, whose `results/` gets the findings.
+    pub work_dir: PathBuf,
     /// `<work>/kernel`: the guest's files, the corpus, the crashes, the
     /// summary.
     pub dir: PathBuf,
+    /// How the guest boots, as a finding records it for `bhf kernel
+    /// replay`.
+    pub guest_record: serde_json::Value,
+    /// Stop once this many findings were written or updated.
+    pub stop_after_findings: Option<usize>,
     pub setup: GuestSetup,
     /// Executions at most.
     pub iterations: usize,
@@ -2142,7 +2307,15 @@ pub(crate) struct FuzzSummary {
     /// Coverage once every seed had run, and at the end.
     pub coverage_after_seeds: CoverageCount,
     pub coverage: CoverageCount,
-    /// Runs the guest did not survive (it stopped, or did not answer).
+    /// Runs whose console held a kernel report.
+    pub reports: usize,
+    /// The findings those reports became (or were counted on), under
+    /// `<work>/results/findings/`.
+    pub findings: Vec<String>,
+    /// Runs of a new report's program alone, in a freshly booted guest.
+    pub confirm_runs: usize,
+    /// Runs the guest did not survive with no kernel report: it stopped, or
+    /// did not answer.
     pub crashes: usize,
     /// Where each such run's program and console are, under `<work>`.
     pub crash_dirs: Vec<String>,
@@ -2199,10 +2372,98 @@ struct Campaign<'a> {
     comparison_runs: usize,
     hints: HintQueue,
     hint_runs: usize,
+    reports: usize,
+    findings: Vec<String>,
+    confirm_runs: usize,
 }
 
 #[cfg(unix)]
 impl Campaign<'_> {
+    /// Whether the campaign has run its budget.
+    fn done(&self, start: std::time::Instant) -> bool {
+        self.executions >= self.config.iterations
+            || self
+                .config
+                .time_budget
+                .is_some_and(|budget| start.elapsed() >= budget)
+            || self
+                .config
+                .stop_after_findings
+                .is_some_and(|count| self.findings.len() >= count)
+    }
+
+    /// Look for a kernel report on `run`'s console: when there is one,
+    /// write it as a finding with `program`, its first time confirmed by a
+    /// run of the program alone in a freshly booted guest, and reset the
+    /// guest. Whether there was one.
+    ///
+    /// The finding is written before that run: when its guest does not
+    /// boot, the finding stays unconfirmed, saying why, and the next run
+    /// boots again (the campaign stops when that boot fails too).
+    fn reported(&mut self, program: &[u8], run: &GuestRun) -> anyhow::Result<bool> {
+        use results::import_syzkaller as kernel;
+        let Some(report) = kernel::console_report(&run.console) else {
+            return Ok(false);
+        };
+        // The kernel's state is suspect once it reported, and with
+        // panic_on_warn it is down.
+        self.guest = None;
+        self.reports += 1;
+        let decoded = decode(program);
+        let crash = kernel::GuestCrash {
+            report: &report,
+            console: &run.console,
+            program,
+            program_text: &decoded.text(),
+            decoded: &decoded.json(),
+            c_repro: &decoded.c_source(&report.title),
+            guest: &self.config.guest_record,
+            reproduced: false,
+            unconfirmed: Some(kernel::CONFIRMING),
+            release: self.hello.as_ref().map(|hello| hello.release.as_str()),
+        };
+        // A title found before is counted on its finding.
+        let found = kernel::record_guest_crash(&self.config.work_dir, &crash)?;
+        if !found.updated {
+            let (reproduced, unconfirmed) = match self.reproduces(program, &report.title) {
+                Ok(reproduced) => (reproduced, None),
+                Err(error) => {
+                    let error = format!("{error:#}");
+                    let first = error.lines().next().unwrap_or_default();
+                    (
+                        false,
+                        Some(format!("its confirming run could not be made: {first}")),
+                    )
+                }
+            };
+            kernel::confirm_guest_crash(
+                &self.config.work_dir,
+                &found.id,
+                reproduced,
+                unconfirmed.as_deref(),
+            )?;
+        }
+        if !self.findings.contains(&found.id) {
+            self.findings.push(found.id);
+        }
+        Ok(true)
+    }
+
+    /// Whether `program`, run alone in a freshly booted guest, makes the
+    /// kernel report `title` again.
+    fn reproduces(&mut self, program: &[u8], title: &str) -> anyhow::Result<bool> {
+        self.guest = None;
+        let timeout = self.config.timeout;
+        let run = self.guest()?.run(program, timeout);
+        self.executions += 1;
+        self.confirm_runs += 1;
+        let again = results::import_syzkaller::console_report(&run.console);
+        if again.is_some() || !matches!(run.end, RunEnd::Replied(_)) {
+            self.guest = None;
+        }
+        Ok(again.is_some_and(|report| report.title == title))
+    }
+
     /// The guest, booted when there is none (at the start, and after a run
     /// it did not survive).
     fn guest(&mut self) -> anyhow::Result<&mut Guest> {
@@ -2223,6 +2484,9 @@ impl Campaign<'_> {
         let timeout = self.config.timeout;
         let run = self.guest()?.run(program, timeout);
         self.executions += 1;
+        if self.reported(program, &run)? {
+            return Ok(());
+        }
         let RunEnd::Replied(reply) = &run.end else {
             return self.crashed(program, &run);
         };
@@ -2258,6 +2522,9 @@ impl Campaign<'_> {
             .run_collecting(program, Collect::Comparisons, timeout);
         self.executions += 1;
         self.comparison_runs += 1;
+        if self.reported(program, &run)? {
+            return Ok(());
+        }
         let RunEnd::Replied(reply) = &run.end else {
             return self.crashed(program, &run);
         };
@@ -2289,8 +2556,10 @@ impl Campaign<'_> {
 
 /// Run a campaign: boot the guest, run every seed `seeds` gives for the
 /// guest's HELLO, then mutate the corpus, coverage-guided, until the
-/// iteration cap or the time budget. A run the guest does not survive is
-/// saved under `<dir>/crashes/` and the next run boots it again.
+/// iteration cap, the time budget or the findings wanted. A kernel report
+/// on the console becomes a finding with its program, and the next run
+/// boots the guest again; a run the guest does not survive without one is
+/// saved under `<dir>/crashes/`.
 #[cfg(unix)]
 pub(crate) fn fuzz(
     config: &FuzzConfig,
@@ -2318,6 +2587,9 @@ pub(crate) fn fuzz(
         comparison_runs: 0,
         hints: HintQueue::new(MAX_PENDING_HINTS, MAX_HINTED),
         hint_runs: 0,
+        reports: 0,
+        findings: Vec::new(),
+        confirm_runs: 0,
     };
     campaign.guest()?;
     let hello = campaign.hello.clone().expect("the first boot said HELLO");
@@ -2326,12 +2598,6 @@ pub(crate) fn fuzz(
         !seed_set.programs.is_empty(),
         "no seed programs: give --seeds, --source or --device"
     );
-    let out_of_budget = |executions: usize| {
-        executions >= config.iterations
-            || config
-                .time_budget
-                .is_some_and(|budget| start.elapsed() >= budget)
-    };
     // A module under test the guest did not load leaves nothing of it to
     // reach: no program runs.
     let unloaded = hello.unloaded_modules();
@@ -2345,7 +2611,7 @@ pub(crate) fn fuzz(
         if halted.is_some() {
             break;
         }
-        if out_of_budget(campaign.executions) {
+        if campaign.done(start) {
             break;
         }
         if let Err(error) = campaign.run(program, true) {
@@ -2373,7 +2639,7 @@ pub(crate) fn fuzz(
     });
     let mut rng = MutationRng::new(config.rng_seed);
     let dictionary = Dictionary::from_tokens(seed_set.dictionary.iter().cloned());
-    'campaign: while halted.is_none() && !out_of_budget(campaign.executions) {
+    'campaign: while halted.is_none() && !campaign.done(start) {
         // The hints the corpus's comparisons suggest run first.
         if let Some(hint) = campaign.hints.pop() {
             campaign.hint_runs += 1;
@@ -2387,7 +2653,7 @@ pub(crate) fn fuzz(
             break;
         };
         for _ in 0..scheduled.energy.max(1) {
-            if out_of_budget(campaign.executions) {
+            if campaign.done(start) {
                 break 'campaign;
             }
             let program = decode(&scheduled.bytes);
@@ -2432,6 +2698,9 @@ pub(crate) fn fuzz(
         corpus: campaign.scheduler.len(),
         coverage_after_seeds,
         coverage: CoverageCount::of(&campaign.coverage),
+        reports: campaign.reports,
+        findings: campaign.findings.clone(),
+        confirm_runs: campaign.confirm_runs,
         crashes: campaign.crashes,
         crash_dirs: campaign.crash_dirs.clone(),
         boots: campaign.boots,
@@ -3350,6 +3619,112 @@ mod tests {
         operations.validate_for_input(&program).unwrap();
     }
 
+    #[test]
+    fn a_program_as_json_names_each_call_and_argument() {
+        let mut builder = ProgramBuilder::default();
+        builder
+            .call(
+                "openat",
+                &[
+                    SeedArg::Const(-100i64 as u64),
+                    SeedArg::Data(b"/dev/widget\0"),
+                    SeedArg::Const(2),
+                ],
+            )
+            .unwrap();
+        builder
+            .call("read", &[SeedArg::Result(0), SeedArg::Out(24)])
+            .unwrap();
+        builder.raw(500, &[]).unwrap();
+        let bytes = builder.finish();
+        let json = decode(&bytes).json();
+        assert_eq!(json["schema"], PROGRAM_SCHEMA);
+        assert_eq!(json["data_address"], "0x20000000");
+        assert_eq!(json["calls"][0]["call"], "openat");
+        assert_eq!(json["calls"][0]["args"][0]["const"], "0xffffffffffffff9c");
+        assert_eq!(
+            json["calls"][0]["args"][1]["data"],
+            serde_json::json!({"address": "0x20000000", "len": 12, "hex": "2f6465762f77696467657400"})
+        );
+        assert_eq!(json["calls"][1]["args"][0]["result"], 0);
+        assert_eq!(
+            json["calls"][1]["args"][1]["out"],
+            serde_json::json!({"address": "0x20000010", "len": 24})
+        );
+        assert_eq!(json["calls"][2]["call"], "syscall_500");
+        assert_eq!(json["calls"][2]["nr"], 500);
+    }
+
+    /// The C reproducer builds, makes the program's calls with the data the
+    /// executor would map, and refuses the raw calls the executor refuses.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn a_program_as_c_makes_the_same_calls() {
+        #[cfg(target_arch = "x86_64")]
+        let reboot = 169u16;
+        #[cfg(target_arch = "aarch64")]
+        let reboot = 142u16;
+        let mut builder = open_then(b"/nonexistent/widget\0", 2);
+        builder
+            .call(
+                "ioctl",
+                &[
+                    SeedArg::Result(0),
+                    SeedArg::Const(0xc028_5703),
+                    SeedArg::Data(&[4, 0, 0, 0]),
+                ],
+            )
+            .unwrap();
+        builder
+            .call(
+                "read",
+                &[SeedArg::Const(0), SeedArg::Out(8), SeedArg::Const(0)],
+            )
+            .unwrap();
+        builder.raw(reboot, &[]).unwrap();
+        let bytes = builder.finish();
+        let source = decode(&bytes).c_source("KASAN: x */ in y");
+        assert!(source.contains("KASAN: x * / in y"), "{source}");
+        assert!(
+            source.contains("memcpy(data + 0x18, \"\\x04\\x00\\x00\\x00\", 4);"),
+            "{source}"
+        );
+        assert!(
+            source.contains(
+                "r[1] = (uint64_t)syscall(SYS_ioctl, r[0], 0xc0285703ul, 0x20000018ul, 0ul, 0ul, 0ul);"
+            ),
+            "{source}"
+        );
+        assert!(source.contains("0x20000020ul"), "{source}");
+        assert!(
+            source.contains(&format!("r[3] = denied({reboot}) ? (uint64_t)-1")),
+            "{source}"
+        );
+        let dir = crate::test_support::TestDir::new("kernel-repro-c");
+        std::fs::write(dir.join("repro.c"), &source).unwrap();
+        let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_owned());
+        let built = std::process::Command::new(&cc)
+            .args(["-Wall", "-Wextra", "-Werror", "-o"])
+            .arg(dir.join("repro"))
+            .arg(dir.join("repro.c"))
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        // On the host: the open fails, the ioctl and the read fail on a bad
+        // descriptor, and the reboot is never made.
+        let ran = std::process::Command::new(dir.join("repro"))
+            .status()
+            .unwrap();
+        assert!(ran.success());
+    }
+
     // ── The initramfs and the guest's command line ─────────────────────
 
     /// An entry of a newc archive: `(name, mode, rdev, data)`.
@@ -3643,6 +4018,9 @@ while True:
         std::fs::create_dir_all(work_dir.join("kernel").join("guest")).unwrap();
         Some(FuzzConfig {
             dir: work_dir.join("kernel"),
+            work_dir,
+            guest_record: serde_json::json!({"kernel": "bzImage"}),
+            stop_after_findings: None,
             setup,
             iterations,
             time_budget: None,
@@ -3785,5 +4163,112 @@ while True:
             cache.insert(&n.to_le_bytes(), log(u64::from(n)));
         }
         assert_eq!(cache.len(), 2);
+    }
+
+    /// A guest console with a KASAN report, recorded from the widget fixture.
+    #[cfg(unix)]
+    fn kasan_console() -> String {
+        std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/kernel_guest/console/kasan-slab-out-of-bounds.log"),
+        )
+        .unwrap()
+    }
+
+    /// The finding.json of each finding the campaign in `dir/work` wrote.
+    #[cfg(unix)]
+    fn written_findings(dir: &Path) -> Vec<(PathBuf, serde_json::Value)> {
+        let findings = dir.join("work/results/findings");
+        let mut out: Vec<(PathBuf, serde_json::Value)> = std::fs::read_dir(&findings)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| path.join("finding.json").is_file())
+                    .map(|path| {
+                        let raw = serde_json::from_slice(
+                            &std::fs::read(path.join("finding.json")).unwrap(),
+                        )
+                        .unwrap();
+                        (path, raw)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// A kernel report's program is confirmed in a freshly booted guest; when
+    /// that guest does not boot, the finding is written all the same,
+    /// unconfirmed and saying why, and the campaign stops only when the
+    /// guest does not boot again.
+    #[cfg(unix)]
+    #[test]
+    fn a_report_whose_confirming_guest_does_not_boot_is_still_a_finding() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(config) = stub_campaign(
+            dir.path(),
+            &hello(true),
+            &["panic", "fail"],
+            &kasan_console(),
+            20,
+        ) else {
+            return;
+        };
+        let two_seeds = |_: &Hello| -> anyhow::Result<SeedSet> {
+            Ok(SeedSet {
+                programs: vec![
+                    open_then(b"/dev/widget\0", 2).finish(),
+                    open_then(b"/dev/widget\0", 0).finish(),
+                ],
+                ..SeedSet::default()
+            })
+        };
+        let summary = fuzz(&config, &two_seeds).unwrap();
+        let findings = written_findings(dir.path());
+        assert_eq!(findings.len(), 1, "{summary:#?}");
+        let (finding, raw) = &findings[0];
+        assert_eq!(
+            raw["kernel"]["title"],
+            "KASAN: slab-out-of-bounds Write in widget_ioctl"
+        );
+        assert_eq!(raw["kernel"]["reproduced"], false);
+        assert_eq!(raw["confidence"], "medium");
+        let unconfirmed = raw["kernel"]["unconfirmed"].as_str().unwrap_or_default();
+        assert!(
+            unconfirmed.contains("the guest did not start: qemu exited"),
+            "{raw:#}"
+        );
+        assert_eq!(
+            std::fs::read(finding.join("testcase.bin")).unwrap(),
+            open_then(b"/dev/widget\0", 2).finish()
+        );
+        assert_eq!(summary.findings, [raw["id"].as_str().unwrap()]);
+        assert_eq!((summary.reports, summary.confirm_runs), (1, 0));
+        // The second seed's guest did not boot either: the campaign stopped.
+        let halted = summary.halted.as_deref().unwrap_or_default();
+        assert!(halted.contains("the guest did not start"), "{halted}");
+        assert_eq!(stub_launches(&dir.path().join("stub")), 3);
+    }
+
+    /// A report the program alone makes again in a freshly booted guest is
+    /// a confirmed finding.
+    #[cfg(unix)]
+    #[test]
+    fn a_report_the_program_makes_again_in_a_fresh_guest_is_confirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(config) = stub_campaign(dir.path(), &hello(true), &["panic"], &kasan_console(), 2)
+        else {
+            return;
+        };
+        let summary = fuzz(&config, &widget_seed).unwrap();
+        let findings = written_findings(dir.path());
+        assert_eq!(findings.len(), 1, "{summary:#?}");
+        let raw = &findings[0].1;
+        assert_eq!(raw["kernel"]["reproduced"], true, "{raw:#}");
+        assert_eq!(raw["confidence"], "high");
+        assert!(raw["kernel"].get("unconfirmed").is_none(), "{raw:#}");
+        assert_eq!((summary.reports, summary.confirm_runs), (1, 1));
     }
 }

@@ -248,7 +248,7 @@ pub fn from_finding_report(
         producer: if rehost {
             REHOST_PRODUCER.to_owned()
         } else if kernel {
-            crate::import_syzkaller::PRODUCER.to_owned()
+            crate::import_syzkaller::producer(raw).to_owned()
         } else {
             producer_for(kind, &f.id).to_owned()
         },

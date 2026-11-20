@@ -14,7 +14,7 @@ checks.
 | Build and instrumentation support | `stub`, `instrument`, `fake-corba` |
 | Corpus and crash triage | `corpus`, `minimize`, `replay`, `capsule`, `verify-poc`, `env-capsule`, `differential`, `relational`, `cmplog`, `explain`, `cartography`, `decode-args` |
 | Source-unavailable binaries | `binary` (`scan`, `adapter`, `fuzz`, `rehost`) |
-| Linux kernel drivers (syzkaller, a qemu-system guest) | `kernel` (`syzlang`, `import`, `run`, `fuzz`); see [On-Target & Embedded §10](../on-target-fuzzing/#10-linux-kernel-drivers-syzkaller-descriptions) |
+| Linux kernel drivers (syzkaller, a qemu-system guest) | `kernel` (`syzlang`, `import`, `run`, `fuzz`, `replay`); see [On-Target & Embedded §10](../on-target-fuzzing/#10-linux-kernel-drivers-syzkaller-descriptions) |
 | External project profiles | `project` (`validate`, `list`, `run`) |
 | Out-of-process extensions | `extension` (`validate`, `evaluate`), and `fuzz --extension` |
 | Static and supply chain | `static-scan`, `sloc`, `sbom`, `license-audit`, `extract-state-machines` |
@@ -851,6 +851,12 @@ MATCH
   `collector` or `transport`) and `details`; `harness` is present only for a
   binary finding. `--show-output` prints a binary target's stderr; the other
   lanes run no local harness.
+- **Kernel crashes.** A `F-KERNEL-*` finding ran in a kernel, not a harness:
+  `bhf replay` and `bhf minimize` exit `1` and name what reproduces it,
+  `bhf kernel replay <finding>` for one `bhf kernel fuzz` found in its guest
+  (its program is `testcase.bin`, and as C `repro.c`), or the syzkaller
+  reproducer to run in the kernel's test VM for an imported one. `bhf
+  explain` shows the kernel report, the program's calls and those commands.
 - **Ada (event-log) findings.** The verdict compares event-log signatures;
   the summary says what both runs raised. `crash` is the replayed exception
   the verdict rests on (the rule and classification, then `NAME: message`),

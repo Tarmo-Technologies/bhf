@@ -162,7 +162,7 @@ COMMANDS BY AREA (run `bhf <command> --help` for details):
                 differential, relational, cmplog, explain, cartography, decode-args
   Binaries      binary (scan, adapter, fuzz, rehost — no source)
   Kernel        kernel (syzlang, import — Linux drivers with syzkaller; run,
-                fuzz — a kernel in a qemu-system guest)
+                fuzz, replay — a kernel in a qemu-system guest)
   Projects      project (validate, list, run, import-ossfuzz),
                 extension (validate, evaluate)
   Supply chain  sbom, license-audit, static-scan, sloc, extract-state-machines
@@ -288,7 +288,7 @@ enum Command {
     Binary(BinaryArgs),
 
     // ── Kernel drivers: syzkaller ───────────────────────────────────────────
-    /// Linux kernel drivers: generate syzlang descriptions of a driver's ioctl interface from its source (syzlang), import syzkaller crash reports into results (import), run system-call programs in a qemu-system guest with KCOV coverage (run) and fuzz with them (fuzz)
+    /// Linux kernel drivers: generate syzlang descriptions of a driver's ioctl interface from its source (syzlang), import syzkaller crash reports into results (import), run system-call programs in a qemu-system guest with KCOV coverage (run), fuzz with them, turning the guest's kernel reports into findings (fuzz), and replay such a finding (replay)
     Kernel(kernel::KernelArgs),
 
     // ── External project/target profiles ────────────────────────────────────

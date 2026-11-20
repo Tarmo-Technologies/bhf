@@ -236,6 +236,10 @@ pub fn run(args: ReplayArgs) -> i32 {
             crate::binary_rehost::replay_rehost_outcome(&finding_dir, args.harness.as_deref());
         return finish_lane(&finding_dir, lane, output);
     }
+    // A kernel crash ran in a kernel, not a harness: say what replays it.
+    if let Some(refusal) = crate::kernel::harness_command_refusal("replay", &finding_dir) {
+        return report_error(&output, &finding_dir, &refusal);
+    }
     // The finding already records where its harness was built; resolve it so the
     // user does not have to repeat `--harness`. An explicit `--harness` always wins.
     let harness = match resolve_harness(&finding_dir, args.harness, PASS_HARNESS_HINT) {

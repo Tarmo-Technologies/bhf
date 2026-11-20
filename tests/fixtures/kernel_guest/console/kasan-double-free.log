@@ -1,0 +1,115 @@
+[   24.341270] bhf-executor: ready (kcov on, comparisons on)
+[   24.371348] ==================================================================
+[   24.371920] BUG: KASAN: double-free in bugs_ioctl+0xd2/0x1e0 [bugs]
+[   24.373305] Free of addr ffff88800892a280 by task bhf-program/51
+[   24.373630] 
+[   24.374562] CPU: 0 UID: 0 PID: 51 Comm: bhf-program Tainted: P           O       6.12.118 #1
+[   24.375256] Tainted: [P]=PROPRIETARY_MODULE, [O]=OOT_MODULE
+[   24.375338] Hardware name: QEMU Ubuntu 24.04 PC v2 (i440FX + PIIX, arch_caps fix, 1996), BIOS 1.16.3-debian-1.16.3-2 04/01/2014
+[   24.375617] Call Trace:
+[   24.375716]  <TASK>
+[   24.375843]  dump_stack_lvl+0xab/0xe0
+[   24.376134]  print_report+0xd0/0x660
+[   24.376291]  ? __pfx__raw_spin_lock_irqsave+0x10/0x10
+[   24.376450]  ? bugs_ioctl+0xd2/0x1e0 [bugs]
+[   24.376583]  ? bugs_ioctl+0xd2/0x1e0 [bugs]
+[   24.376709]  ? bugs_ioctl+0xd2/0x1e0 [bugs]
+[   24.376832]  kasan_report_invalid_free+0xa2/0xd0
+[   24.377013]  ? bugs_ioctl+0xd2/0x1e0 [bugs]
+[   24.377142]  ? bugs_ioctl+0xd2/0x1e0 [bugs]
+[   24.377264]  check_slab_allocation+0xfa/0x120
+[   24.377399]  kfree+0x103/0x360
+[   24.377521]  ? kasan_save_track+0x14/0x30
+[   24.377662]  bugs_ioctl+0xd2/0x1e0 [bugs]
+[   24.377789]  ? __pfx_bugs_ioctl+0x10/0x10 [bugs]
+[   24.377922]  __x64_sys_ioctl+0x193/0x200
+[   24.378091]  do_syscall_64+0x9e/0x1c0
+[   24.378228]  entry_SYSCALL_64_after_hwframe+0x77/0x7f
+[   24.378452] RIP: 0033:0x42283d
+[   24.378734] Code: ff c3 66 2e 0f 1f 84 00 00 00 00 00 90 f3 0f 1e fa 48 89 f8 48 89 f7 48 89 d6 48 89 ca 4d 89 c2 4d 89 c8 4c 8b 4c 24 08 0f 05 <48> 3d 01 f0 ff ff 73 01 c3 48 c7 c1 c0 ff ff ff f7 d8 64 89 01 48
+[   24.378946] RSP: 002b:00007fffa8c312c8 EFLAGS: 00000246 ORIG_RAX: 0000000000000010
+[   24.379139] RAX: ffffffffffffffda RBX: 00007fe009440000 RCX: 000000000042283d
+[   24.379244] RDX: 0000000000000000 RSI: 0000000000004204 RDI: 0000000000000005
+[   24.379340] RBP: 0000000000000001 R08: 0000000000000000 R09: 0000000000000000
+[   24.379431] R10: 0000000000000000 R11: 0000000000000246 R12: 0000000000000010
+[   24.379527] R13: 0000000000000000 R14: 00000000004b8bb8 R15: 00007fe009640000
+[   24.379653]  </TASK>
+[   24.379761] 
+[   24.384042] Allocated by task 51:
+[   24.384396]  kasan_save_stack+0x33/0x60
+[   24.384925]  kasan_save_track+0x14/0x30
+[   24.385249]  __kasan_kmalloc+0x8f/0xa0
+[   24.385543]  bugs_ioctl+0xaf/0x1e0 [bugs]
+[   24.385859]  __x64_sys_ioctl+0x193/0x200
+[   24.386205]  do_syscall_64+0x9e/0x1c0
+[   24.386502]  entry_SYSCALL_64_after_hwframe+0x77/0x7f
+[   24.386865] 
+[   24.387057] Freed by task 51:
+[   24.387282]  kasan_save_stack+0x33/0x60
+[   24.387587]  kasan_save_track+0x14/0x30
+[   24.387890]  kasan_save_free_info+0x3b/0x60
+[   24.388179]  __kasan_slab_free+0x37/0x50
+[   24.388479]  kfree+0x121/0x360
+[   24.388751]  bugs_ioctl+0xc8/0x1e0 [bugs]
+[   24.389067]  __x64_sys_ioctl+0x193/0x200
+[   24.389404]  do_syscall_64+0x9e/0x1c0
+[   24.389689]  entry_SYSCALL_64_after_hwframe+0x77/0x7f
+[   24.390039] 
+[   24.390252] The buggy address belongs to the object at ffff88800892a280
+[   24.390252]  which belongs to the cache kmalloc-16 of size 16
+[   24.390715] The buggy address is located 0 bytes inside of
+[   24.390715]  16-byte region [ffff88800892a280, ffff88800892a290)
+[   24.391200] 
+[   24.391433] The buggy address belongs to the physical page:
+[   24.391877] page: refcount:1 mapcount:0 mapping:0000000000000000 index:0x0 pfn:0x892a
+[   24.392467] flags: 0x100000000000000(node=0|zone=1)
+[   24.393215] page_type: f5(slab)
+[   24.393969] raw: 0100000000000000 ffff888005c41640 dead000000000122 0000000000000000
+[   24.394322] raw: 0000000000000000 0000000080800080 00000001f5000000 0000000000000000
+[   24.394686] page dumped because: kasan: bad access detected
+[   24.394941] 
+[   24.395121] Memory state around the buggy address:
+[   24.395646]  ffff88800892a180: 00 04 fc fc 00 04 fc fc 00 03 fc fc 00 03 fc fc
+[   24.395970]  ffff88800892a200: 00 04 fc fc 00 04 fc fc fa fb fc fc fa fb fc fc
+[   24.396279] >ffff88800892a280: fa fb fc fc fc fc fc fc fc fc fc fc fc fc fc fc
+[   24.396570]                    ^
+[   24.396871]  ffff88800892a300: fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc
+[   24.397158]  ffff88800892a380: fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc
+[   24.397448] ==================================================================
+[   24.398560] Kernel panic - not syncing: KASAN: panic_on_warn set ...
+[   24.399549] CPU: 0 UID: 0 PID: 51 Comm: bhf-program Tainted: P           O       6.12.118 #1
+[   24.399968] Tainted: [P]=PROPRIETARY_MODULE, [O]=OOT_MODULE
+[   24.400204] Hardware name: QEMU Ubuntu 24.04 PC v2 (i440FX + PIIX, arch_caps fix, 1996), BIOS 1.16.3-debian-1.16.3-2 04/01/2014
+[   24.400528] Call Trace:
+[   24.400723]  <TASK>
+[   24.400920]  dump_stack_lvl+0x3d/0xe0
+[   24.401250]  vpanic+0x622/0x6e0
+[   24.401565]  ? __pfx_vpanic+0x10/0x10
+[   24.401900]  ? bugs_ioctl+0xd2/0x1e0 [bugs]
+[   24.402221]  panic+0xcb/0xd0
+[   24.402515]  ? __pfx_panic+0x10/0x10
+[   24.402822]  ? bugs_ioctl+0xd2/0x1e0 [bugs]
+[   24.403132]  check_panic_on_warn+0xab/0xb0
+[   24.403446]  ? bugs_ioctl+0xd2/0x1e0 [bugs]
+[   24.403737]  end_report+0xcb/0xe0
+[   24.404048]  kasan_report_invalid_free+0xb2/0xd0
+[   24.404376]  ? bugs_ioctl+0xd2/0x1e0 [bugs]
+[   24.404677]  ? bugs_ioctl+0xd2/0x1e0 [bugs]
+[   24.404981]  check_slab_allocation+0xfa/0x120
+[   24.405296]  kfree+0x103/0x360
+[   24.405568]  ? kasan_save_track+0x14/0x30
+[   24.405867]  bugs_ioctl+0xd2/0x1e0 [bugs]
+[   24.406162]  ? __pfx_bugs_ioctl+0x10/0x10 [bugs]
+[   24.406449]  __x64_sys_ioctl+0x193/0x200
+[   24.406768]  do_syscall_64+0x9e/0x1c0
+[   24.407069]  entry_SYSCALL_64_after_hwframe+0x77/0x7f
+[   24.407400] RIP: 0033:0x42283d
+[   24.407649] Code: ff c3 66 2e 0f 1f 84 00 00 00 00 00 90 f3 0f 1e fa 48 89 f8 48 89 f7 48 89 d6 48 89 ca 4d 89 c2 4d 89 c8 4c 8b 4c 24 08 0f 05 <48> 3d 01 f0 ff ff 73 01 c3 48 c7 c1 c0 ff ff ff f7 d8 64 89 01 48
+[   24.408093] RSP: 002b:00007fffa8c312c8 EFLAGS: 00000246 ORIG_RAX: 0000000000000010
+[   24.408429] RAX: ffffffffffffffda RBX: 00007fe009440000 RCX: 000000000042283d
+[   24.408682] RDX: 0000000000000000 RSI: 0000000000004204 RDI: 0000000000000005
+[   24.408940] RBP: 0000000000000001 R08: 0000000000000000 R09: 0000000000000000
+[   24.409194] R10: 0000000000000000 R11: 0000000000000246 R12: 0000000000000010
+[   24.409437] R13: 0000000000000000 R14: 00000000004b8bb8 R15: 00007fe009640000
+[   24.409696]  </TASK>
+[   24.410603] Kernel Offset: disabled

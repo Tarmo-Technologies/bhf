@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! `bhf kernel run`: a Linux kernel in a qemu-system guest, with bhf's
-//! executor (`c_runtime/kernel_executor.c`) as its `/init`.
+//! `bhf kernel run`, `fuzz` and `replay`: a Linux kernel in a qemu-system
+//! guest, with bhf's executor (`c_runtime/kernel_executor.c`) as its
+//! `/init`.
 //!
 //! These tests boot a real guest, so they run where `BHF_KERNEL_GUEST=1`,
 //! with `BHF_KERNEL_IMAGE` naming a kernel built with KCOV and KASAN
 //! (`scripts/ci/build-kcov-guest-kernel.sh` builds one, with the widget
 //! driver fixture as `BHF_KERNEL_MODULE`), and qemu-system-x86_64 and a C
 //! compiler that links statically on `PATH`. With `BHF_REQUIRE_TOOLS=1` a
-//! missing one fails the test. The protocol and the executor's decoder are
-//! tested without a guest in `kernel_guest`'s unit tests.
+//! missing one fails the test. The protocol, the executor's decoder, the
+//! coverage mapping and the report parsing are tested without a guest, on
+//! recordings, in `kernel_guest`'s and `results::import_syzkaller`'s unit
+//! tests.
 
 use serde_json::Value;
 use std::fs;
@@ -207,7 +210,7 @@ fn widget_source() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/kernel_widget/linux")
 }
 
-fn fuzz(kernel: &Path, module: &Path, work: &Path, iterations: usize) -> Output {
+fn fuzz(kernel: &Path, module: &Path, work: &Path, iterations: usize, extra: &[&str]) -> Output {
     bhf()
         .args(["kernel", "fuzz", "--timeout", "20", "--rng-seed", "7"])
         .arg("--kernel")
@@ -219,6 +222,7 @@ fn fuzz(kernel: &Path, module: &Path, work: &Path, iterations: usize) -> Output 
         .arg("--work-dir")
         .arg(work)
         .args(["--iterations", &iterations.to_string()])
+        .args(extra)
         .output()
         .expect("bhf runs")
 }
@@ -235,7 +239,7 @@ fn coverage_grows_over_a_fixed_number_of_programs() {
         return;
     };
     let work = TestDir::new("kernel-guest-fuzz");
-    let output = fuzz(&kernel, &module, &work, 150);
+    let output = fuzz(&kernel, &module, &work, 150, &[]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
@@ -258,4 +262,101 @@ fn coverage_grows_over_a_fixed_number_of_programs() {
     let kept = fs::read_dir(work.join("kernel/corpus")).unwrap().count() as u64;
     assert_eq!(kept, summary["corpus"].as_u64().unwrap(), "{summary:#}");
     assert!(stdout.contains("KCOV edges"), "{stdout}");
+}
+
+fn replay(finding: &Path) -> Output {
+    bhf()
+        .args(["kernel", "replay", "--timeout", "20"])
+        .arg(finding)
+        .output()
+        .expect("bhf runs")
+}
+
+/// The widget driver's planted slab-out-of-bounds write (slot ==
+/// WIDGET_SLOTS) is found: KASAN's report on the guest's console becomes a
+/// classified finding with the program that made it, which made it again
+/// alone in a fresh guest, and `bhf kernel replay` reproduces it; with a
+/// program that keeps to the bound, it does not.
+#[test]
+fn a_planted_kasan_bug_in_a_guest_module_is_found_and_replays() {
+    let Some(kernel) = guest_kernel() else {
+        return;
+    };
+    let Some(module) = widget_module() else {
+        return;
+    };
+    let work = TestDir::new("kernel-guest-finding");
+    let output = fuzz(
+        &kernel,
+        &module,
+        &work,
+        3000,
+        &["--stop-after-findings", "1"],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let title = "KASAN: slab-out-of-bounds Write in widget_ioctl";
+    assert!(stdout.contains(title), "{stdout}");
+    let doc: Value =
+        serde_json::from_slice(&fs::read(work.join("results/findings.json")).unwrap()).unwrap();
+    let findings = doc["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1, "{findings:#?}");
+    let finding = &findings[0];
+    let id = finding["id"].as_str().unwrap();
+    assert!(id.starts_with("F-KERNEL-0000-"), "{id}");
+    assert_eq!(finding["producer"], "kernel fuzz");
+    assert_eq!(finding["title"], title);
+    assert_eq!(finding["rule"]["id"], "BHF-201");
+    assert_eq!(finding["cwe"], serde_json::json!([122, 787]));
+    assert_eq!(finding["fuzz"]["exception"]["sanitizer"], "kasan");
+    assert_eq!(finding["fuzz"]["access"]["direction"], "write");
+    assert_eq!(
+        finding["reproduce"]["command"],
+        format!("bhf kernel replay findings/{id}")
+    );
+    let dir = work.join("results/findings").join(id);
+    let raw: Value = serde_json::from_slice(&fs::read(dir.join("finding.json")).unwrap()).unwrap();
+    assert_eq!(raw["kernel"]["reproduced"], true, "{raw:#}");
+    assert_eq!(raw["confidence"], "high");
+    // The program: WIDGET_IOC_XFER with the slot at the bound.
+    let program = fs::read_to_string(dir.join("program.txt")).unwrap();
+    assert!(program.contains("ioctl(r0, 0xc0285703"), "{program}");
+    assert!(program.contains("=x\"04000000"), "{program}");
+    let report = fs::read_to_string(dir.join("sanitizer.log")).unwrap();
+    assert!(
+        report.contains("BUG: KASAN: slab-out-of-bounds in widget_ioctl"),
+        "{report}"
+    );
+    assert!(dir.join("repro.c").is_file() && dir.join("testcase.bin").is_file());
+
+    let replayed = replay(&dir);
+    let stdout = String::from_utf8_lossy(&replayed.stdout);
+    assert_eq!(
+        replayed.status.code(),
+        Some(0),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&replayed.stderr)
+    );
+    assert_eq!(stdout.trim(), format!("MATCH: {title}"));
+
+    // The same finding with a program that keeps to the bound.
+    let control = work.join("control");
+    fs::create_dir_all(&control).unwrap();
+    fs::copy(dir.join("finding.json"), control.join("finding.json")).unwrap();
+    let mut xfer = vec![0u8; 40];
+    xfer[0] = 1;
+    Program::open(b"/dev/widget\0", 2)
+        .call(
+            4,
+            &[Arg::Result(0), Arg::Const(0xc028_5703), Arg::Data(&xfer)],
+        )
+        .write_to(&control, "testcase.bin");
+    let replayed = replay(&control);
+    let stdout = String::from_utf8_lossy(&replayed.stdout);
+    assert_eq!(replayed.status.code(), Some(1), "{stdout}");
+    assert!(stdout.starts_with("NOT REPRODUCED: "), "{stdout}");
 }

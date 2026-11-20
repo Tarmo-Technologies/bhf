@@ -61,7 +61,7 @@ binary release.
 | An on-device agent (TCP/serial) | **On-target agent** | Real device; coverage over the agent protocol | ⛔ unproven: the host side ships; no target-side agent does yet ([#289](https://github.com/Tarmo-Technologies/bhf/issues/289)), so you write one to the frame format in §3c |
 | A physical board | **HIL** (hardware-in-the-loop) | Silicon | ⛔ unproven (`BHF_HIL_GDB`) |
 | A Linux driver's source, and syzkaller | **syzkaller descriptions and crash import** (`bhf kernel syzlang`, `bhf kernel import`, §10) | syzkaller runs the kernel and its KCOV coverage; bhf describes the driver's ioctls and triages the crashes | ✅ snapshot of the widget fixture's description, and the import of a crash directory in syz-manager's layout; ⛔ syz-sysgen acceptance and a fresh syz-manager workdir gated (need syzkaller) |
-| A Linux kernel built with KCOV (and KASAN), and qemu-system | **Kernel guest** (`bhf kernel run`, `bhf kernel fuzz`, §10) | The real kernel in a qemu-system guest; bhf's executor runs system-call programs and returns each call's KCOV PCs or comparisons, which the campaign maps into its coverage map | ✅ the executor's decoder and protocol, on the host, and the edge mapping on recorded replies; ⛔ the guest itself gated (`BHF_KERNEL_GUEST=1`, a kernel from `scripts/ci/build-kcov-guest-kernel.sh`) |
+| A Linux kernel built with KCOV (and KASAN), and qemu-system | **Kernel guest** (`bhf kernel run`, `bhf kernel fuzz`, `bhf kernel replay`, §10) | The real kernel in a qemu-system guest; bhf's executor runs system-call programs and returns each call's KCOV PCs or comparisons, which the campaign maps into its coverage map; the guest's kernel reports become findings with their programs | ✅ the executor's decoder and protocol, on the host, the edge mapping on recorded replies, and the report classification on recorded console logs; ⛔ the guest itself gated (`BHF_KERNEL_GUEST=1`, a kernel from `scripts/ci/build-kcov-guest-kernel.sh`) |
 | Only a firmware image (ELF or flash dump), no source | **Rehosting** (`bhf binary rehost`, §9) | `rehosted, peripheral-modelled`: bhf's own Cortex-M interpreter runs the real instructions; peripheral reads come from per-register models (input-fed, constant, or bit-extract inferred from polling loops) in the windows the part's SVD file gives (or the whole peripheral region); interrupts the firmware enables are raised on a schedule the input chooses | ✅ fixture images in `crates/rehost/tests/fixtures/`: edge coverage that grows with the input, invalid-access, bad-PC and HardFault findings, a parser fed through a peripheral data register, a polled UART's parser bug reached through inferred models, an RX-interrupt handler's bug reached through the interrupt schedule, a read between an SVD's peripherals found as an invalid access (Arm's CMSIS example SVD parsed), `bhf replay` MATCH |
 
 ---
@@ -1418,20 +1418,62 @@ campaign runs in it:
   operation sequence (swapped, or their selector changed). Every mutated
   program decodes. `--max-len` (default 4096) caps a program; `--rng-seed`
   makes the mutations repeat.
-- **A run the guest does not survive.** A kernel report panics the guest;
-  the program, its decoded text, the console and the reason go to
-  `<work-dir>/kernel/crashes/NNNN/`, and the next run boots the guest again.
+- **Kernel reports become findings.** After every run bhf reads the
+  guest's console from the program's start with the parser `bhf kernel
+  import` uses (`results::import_syzkaller`): a KASAN, KCSAN, KMSAN, KFENCE
+  or UBSAN report, a general protection fault or NULL dereference (with
+  KASAN's `null-ptr-deref in range`, classed as a NULL dereference), a page
+  fault, `kernel BUG`, a `WARNING`, a soft lockup, a hung task, an RCU stall
+  or a panic gets the title syzkaller would give it (`KASAN:
+  slab-out-of-bounds Write in widget_ioctl`, `WARNING in bugs_ioctl`), its
+  class, rule and CWE, the stack from the blamed function down (an oops'
+  `RIP` first), the access and the object. It becomes a finding under
+  `<work-dir>/results/findings/F-KERNEL-NNNN-<hash>/`, producer `kernel
+  fuzz`: `finding.json`, the report as `sanitizer.log`, the console as
+  `console.log`, and the program as `testcase.bin`, `decoded.json`,
+  `program.txt` and `repro.c` (the same calls through `syscall(2)` on the
+  same data area; build it statically for the guest). A title found the
+  first time runs its program again alone in a freshly booted guest:
+  `kernel.reproduced` (and confidence `high`) when it made the same report.
+  The finding is written before that run; when the fresh guest does not
+  boot, it stays unconfirmed, `kernel.unconfirmed` saying why, and the
+  campaign goes on (it stops when the guest does not boot again).
+  A title found again is counted on its finding (`kernel.occurrences`).
+  Then the guest boots again, as after every report (with `--append
+  panic_on_warn=0` a guest that went on is reset too). `results/` is
+  rebuilt after the campaign, as after any producer. A panic of the
+  executor itself (`Attempted to kill init`) is no finding.
+- **A run the guest does not survive** without a kernel report (it hung,
+  or stopped): the program, its decoded text, the console and the reason go
+  to `<work-dir>/kernel/crashes/NNNN/`, and the next run boots the guest
+  again.
 - **The budget.** `--iterations` (default 1000; with `--time` alone, none)
-  counts every run, the comparison runs and hints included; `--time` bounds
-  the wall clock.
+  counts every run, the comparison, hint and confirming runs included;
+  `--time` bounds the wall clock, and `--stop-after-findings N` stops once
+  N findings were written or counted again.
 
 `<work-dir>/kernel/fuzz.json` (`bhf.kernel-fuzz.v1`) records the guest
 (release, machine, accel, KCOV and comparisons), the seeds and where they
 came from, the executions, comparison runs and hint runs, the coverage once
 the seeds had run and at the end (edges, and PCs with their hit buckets),
-the corpus, the crashes and the boots. Exit status: 0 when the campaign ran
-its budget, 1 when the guest could not boot again or no seed left it
-running.
+the corpus, the kernel reports, the findings and the confirming runs, the
+crashes and the boots. Exit status: 0 when the campaign ran its budget, 1
+when the guest could not boot again or no seed left it running.
+
+```sh
+bhf kernel replay bhf_work/results/findings/F-KERNEL-0000-0e49f8eb
+```
+
+`bhf kernel replay FINDING` boots the guest the finding records (in
+`kernel.guest`: the kernel, modules, qemu, accel, memory, CPUs, command line
+and timeout; `--kernel`, `--module`, `--qemu`, `--accel`, `--cc`,
+`--executor` and `--timeout` replace them), runs its `testcase.bin` and
+prints `MATCH: <title>` when the kernel makes the same report (exit 0),
+`MISMATCH` and the other title, or `NOT REPRODUCED` (exit 1); exit 2 when
+the finding cannot be read or the guest cannot boot. It is the finding's
+reproduce command (`bhf kernel replay findings/<id>`, from `results/`):
+`bhf replay` and `bhf minimize`, which run a harness, name it instead, and
+`bhf explain` shows the program's calls and it.
 
 ---
 
@@ -1493,10 +1535,15 @@ running.
 - **The kernel guest (§10):** the executor's program decoder is checked
   against bhf's own on programs and noise, and its protocol against a mock
   executor and against the executor itself over pipes on the host, in every
-  run, and so is the mapping of KCOV PCs into the coverage map, on replies
-  recorded from the guest (`tests/fixtures/kernel_guest/`). Booting a guest
+  run, and so are the mapping of KCOV PCs into the coverage map, on replies
+  recorded from the guest, and the classification of KASAN (out-of-bounds,
+  use-after-free, double free, NULL dereference), KCSAN, oops and WARNING
+  reports, on console logs recorded from guests
+  (`tests/fixtures/kernel_guest/`). Booting a guest
   needs a KCOV kernel: `kernel_guest_cli` (which also checks that a
-  campaign's coverage grows past its seeds') runs with
+  campaign's coverage grows past its seeds', and that the widget driver's
+  planted slab-out-of-bounds write is found as a finding that replays) runs
+  with
   `BHF_KERNEL_GUEST=1` and `BHF_KERNEL_IMAGE` (and `BHF_KERNEL_MODULE` for
   the widget driver), which `scripts/ci/build-kcov-guest-kernel.sh` builds;
   it was run on that kernel under QEMU 8.2.2 with tcg.

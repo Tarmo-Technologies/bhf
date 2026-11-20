@@ -26,7 +26,8 @@
 #         profile's serial lane
 #   RV-7  the Renode transport (#340): live_renode and the shipped CLI against
 #         the pinned Renode BHF_RENODE names (scripts/ci/install-renode.sh)
-#   RV-8  the kernel guest lane (#350, #378): bhf kernel run and fuzz
+#   RV-8  the kernel guest lane (#350, #378, #379): bhf kernel run, fuzz
+#         (coverage, and the planted KASAN bug as a finding) and replay
 #         against the KCOV/KASAN guest kernel and widget module
 #         BHF_KERNEL_IMAGE and BHF_KERNEL_MODULE name
 #         (scripts/ci/build-kcov-guest-kernel.sh)

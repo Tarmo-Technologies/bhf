@@ -18,3 +18,27 @@ this order. Each `NAME.prog` is the program, in the executor's format, and
 
 The kernel ran without KASLR (`nokaslr`): its PCs are its link-time
 addresses, and the module's are where it loaded on that boot.
+
+# Kernel guest console logs
+
+`console/` holds the serial console of guests that `bhf kernel run`
+booted, each from the executor's `ready` line (the boot before it left
+out) to the guest's end, as the parser of `bhf kernel fuzz` reads them:
+
+| Log | Kernel | What ran |
+|---|---|---|
+| `kasan-slab-out-of-bounds.log` | the KASAN kernel, `widget.ko` | `WIDGET_IOC_XFER` with slot 4 (the widget driver fixture's planted bug) |
+| `kasan-slab-use-after-free.log` | the KASAN kernel, `bugs.ko` | `BUGS_UAF` |
+| `kasan-double-free.log` | the KASAN kernel, `bugs.ko` | `BUGS_DOUBLE_FREE` |
+| `kasan-null-ptr-deref.log` | the KASAN kernel, `bugs.ko` | `BUGS_NULL` (a general protection fault on the shadow address) |
+| `warning.log` | the KASAN kernel, `bugs.ko` | `BUGS_WARN` |
+| `null-ptr-deref.log` | the KCSAN kernel, `bugs.ko`, `kunit.enable=0` | `BUGS_NULL` (a page fault) |
+| `kcsan-data-race.log` | the KCSAN kernel | nothing: KCSAN's own KUnit test (`CONFIG_KCSAN_KUNIT_TEST`) races at boot, from its first test thread on |
+
+The KASAN kernel is the one `scripts/ci/build-kcov-guest-kernel.sh`
+builds. The KCSAN kernel is the same release with the same recipe, KASAN
+off and `CONFIG_KCSAN`, `CONFIG_KUNIT` and `CONFIG_KCSAN_KUNIT_TEST` on.
+`bugs.c` is the module whose ioctl commands make the bugs, built against
+each with `-fmacro-prefix-map` so its WARNING names `drivers/misc/bugs.c`.
+Every guest booted with `panic_on_warn=1`, so each log ends at the panic
+its report caused.

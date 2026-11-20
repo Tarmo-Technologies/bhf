@@ -32,6 +32,20 @@
   and the run JSON gains `interrupts_taken`. `--no-interrupts` keeps the
   old behaviour. With interrupts on, an input buffer takes at most the
   input's first 4096 bytes, as with peripheral input.
+- `bhf kernel fuzz` turns the kernel reports on its guest's console (KASAN,
+  KCSAN, KMSAN, KFENCE, UBSAN, oops, WARNING, hangs, panics) into findings
+  (#379), with syzkaller's title and the class, rule, CWE and stack the
+  syzkaller import parser gives them, the program as `testcase.bin`,
+  `decoded.json`, `program.txt` and `repro.c`, and `kernel.reproduced` when
+  the program alone made the report again in a fresh guest (the finding is
+  written first: when that guest does not boot, `kernel.unconfirmed` says
+  why); the guest boots again after each report. `bhf replay` and `bhf
+  minimize` name `bhf kernel replay` (or an imported crash's syzkaller
+  reproducer) for a kernel crash finding, and `bhf explain` shows its
+  program and those commands. `bhf kernel replay FINDING` boots the recorded
+  guest, runs the program and prints MATCH, MISMATCH or NOT REPRODUCED.
+  `bhf.findings.v1` gains the `kernel fuzz` producer (additive; an older copy
+  of the schema rejects it). `bhf kernel run` prints a report's title.
 - `bhf kernel fuzz --kernel IMAGE [--module M.ko]... --work-dir DIR` fuzzes
   a Linux kernel in the qemu-system guest `bhf kernel run` boots (#378):
   seeds from a driver's ioctl commands (`--source`, numbers for the guest's

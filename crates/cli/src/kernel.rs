@@ -78,8 +78,9 @@ enum KernelCommand {
     /// program format: a finding's testcase.bin, a `bhf kernel fuzz` corpus
     /// file) runs in a child process with KCOV on. The kernel boots with
     /// `nokaslr panic_on_warn=1 oops=panic panic=-1`, so a kernel report
-    /// stops the guest. Exit 0 when every program ran, 1 when the guest
-    /// stopped or did not answer, or could not boot.
+    /// stops the guest; its title is printed. Exit 0 when every program ran
+    /// with no kernel report, 1 when the kernel reported, the guest stopped
+    /// or did not answer, or could not boot.
     Run(RunArgs),
     /// Fuzz a Linux kernel in a qemu-system guest: run seed programs (made from a driver's source, given, or opening --device), then mutate them, keeping each program that reaches new KCOV edges
     ///
@@ -96,14 +97,40 @@ enum KernelCommand {
     /// With KCOV comparisons in the kernel, each corpus program runs once
     /// more for the comparisons its calls made: an argument holding one
     /// operand is tried with the other (hints), and the operands are the
-    /// CmpLog its mutations splice from. A
-    /// run the guest does not survive (a kernel report panics it) is saved
-    /// under <work-dir>/kernel/crashes/ and the guest boots again. Writes
+    /// CmpLog its mutations splice from. A kernel report on the console
+    /// (with `panic_on_warn` the guest panics on it) is written
+    /// as a finding (below) and the guest boots again; a run the guest does
+    /// not survive without one is saved under <work-dir>/kernel/crashes/.
+    /// Writes
     /// <work-dir>/kernel/fuzz.json. Exit 0 when the campaign ran its budget,
     /// 1 when the guest could not boot, did not load a --module (the
     /// executor's setup notes, which bhf prints and fuzz.json keeps, say
     /// why: no program runs then), or no seed left it running.
+    ///
+    /// A KASAN, KCSAN, KMSAN, KFENCE or UBSAN report, an oops, a WARNING, a
+    /// hang or a panic on the guest's console becomes a finding in
+    /// <work-dir>/results/findings/F-KERNEL-*: syzkaller's title for it, its
+    /// class, rule and CWE, the stack, the access and the object, and the
+    /// program (testcase.bin, decoded.json, program.txt, repro.c). A new
+    /// title's program first runs alone in a freshly booted guest:
+    /// `kernel.reproduced` says whether it made the report again (the
+    /// finding is written first: when that guest does not boot,
+    /// `kernel.unconfirmed` says why). A title found again is counted on its
+    /// finding. `bhf kernel replay` replays one.
     Fuzz(KernelFuzzArgs),
+    /// Boot the guest a `bhf kernel fuzz` finding was found in, run its program again, and say whether the kernel makes the same report
+    ///
+    /// Reads the finding's finding.json (the guest it records: kernel,
+    /// modules, qemu, accel, memory, CPUs, command line, timeout) and its
+    /// program (testcase.bin), builds the executor and the initramfs in a
+    /// temporary directory, boots the guest and runs the program. Prints
+    /// MATCH and the title when the kernel reports the crash the finding
+    /// records, MISMATCH and the other title when it reports another, or
+    /// NOT REPRODUCED. `--kernel`, `--module` and the other options replace
+    /// what the finding records, for a kernel or module that moved. Exit 0
+    /// on a MATCH, 1 otherwise, 2 when the finding cannot be read or the
+    /// guest cannot boot.
+    Replay(ReplayArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -135,6 +162,41 @@ pub struct KernelFuzzArgs {
     /// Longest program a mutation makes, in bytes (at most 65536)
     #[arg(long, value_name = "BYTES", default_value_t = 4096)]
     max_len: usize,
+    /// Stop once this many findings were written (or counted again)
+    #[arg(long, value_name = "N")]
+    stop_after_findings: Option<usize>,
+}
+
+#[derive(Debug, clap::Args)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub struct ReplayArgs {
+    /// The finding: its directory (<work-dir>/results/findings/F-KERNEL-...), or its finding.json
+    #[arg(value_name = "FINDING")]
+    finding: PathBuf,
+    /// The guest kernel, in place of the one the finding names
+    #[arg(long, value_name = "PATH")]
+    kernel: Option<PathBuf>,
+    /// The modules, in place of the ones the finding names (repeat for more)
+    #[arg(long = "module", value_name = "PATH")]
+    modules: Vec<PathBuf>,
+    /// The qemu-system binary, in place of the finding's
+    #[arg(long, value_name = "PATH")]
+    qemu: Option<PathBuf>,
+    /// How QEMU runs the guest, in place of the finding's
+    #[arg(long, value_enum)]
+    accel: Option<crate::kernel_guest::Accel>,
+    /// The C compiler that builds the executor, in place of the finding's
+    #[arg(long, value_name = "CC")]
+    cc: Option<String>,
+    /// A prebuilt executor, in place of building one
+    #[arg(long, value_name = "PATH")]
+    executor: Option<PathBuf>,
+    /// Seconds the guest has to boot (at most 86400)
+    #[arg(long, value_name = "SECS", default_value_t = 300, value_parser = guest_wait())]
+    boot_timeout: u64,
+    /// Seconds the program may run (default: the finding's; at most 86400)
+    #[arg(long, value_name = "SECS", value_parser = guest_wait())]
+    timeout: Option<u64>,
 }
 
 /// A wait for the guest, in seconds: 1 to a day.
@@ -240,7 +302,15 @@ pub fn run(args: KernelArgs) -> i32 {
             }
         },
         KernelCommand::Run(args) => run_programs(&args),
-        KernelCommand::Fuzz(args) => fuzz_kernel(&args),
+        // A findings producer: results/ gets its manifest record and rebuild.
+        KernelCommand::Fuzz(args) => crate::with_results(
+            &args.work_dir,
+            results::import_syzkaller::GUEST_PRODUCER,
+            None,
+            |_| results::model::ProducerStatus::Complete,
+            || fuzz_kernel(&args),
+        ),
+        KernelCommand::Replay(args) => replay_finding(&args),
         // A findings producer: results/ gets its manifest record and rebuild.
         KernelCommand::Import(args) => crate::with_results(
             &args.work_dir,
@@ -292,6 +362,184 @@ impl GuestArgs {
 
     fn timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.timeout.max(1))
+    }
+
+    /// The guest as a finding records it, for `bhf kernel replay`: what to
+    /// boot again, its paths absolute.
+    fn record(&self) -> serde_json::Value {
+        let absolute = |path: &Path| {
+            std::path::absolute(path)
+                .unwrap_or_else(|_| path.to_path_buf())
+                .display()
+                .to_string()
+        };
+        serde_json::json!({
+            "kernel": absolute(&self.kernel),
+            "modules": self.modules.iter().map(|module| absolute(module)).collect::<Vec<_>>(),
+            "qemu": self.qemu.display().to_string(),
+            "accel": self.accel.as_str(),
+            "memory_mb": self.memory,
+            "smp": self.smp.max(1),
+            "append": self.append,
+            "qemu_args": self.qemu_args,
+            "cc": self.cc,
+            "executor": self.executor.as_deref().map(absolute),
+            "timeout_secs": self.timeout.max(1),
+        })
+    }
+}
+
+/// The guest a finding records, with `args` replacing what they name.
+#[cfg(unix)]
+fn replay_guest(record: &serde_json::Value, args: &ReplayArgs) -> Result<GuestArgs> {
+    use crate::kernel_guest::Accel;
+    let text = |key: &str| record.get(key).and_then(serde_json::Value::as_str);
+    let kernel = args
+        .kernel
+        .clone()
+        .or_else(|| text("kernel").map(PathBuf::from))
+        .context("the finding records no guest kernel (give --kernel)")?;
+    let modules = if args.modules.is_empty() {
+        record
+            .get("modules")
+            .and_then(serde_json::Value::as_array)
+            .map(|modules| {
+                modules
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(PathBuf::from)
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        args.modules.clone()
+    };
+    let accel = match (args.accel, text("accel")) {
+        (Some(accel), _) => accel,
+        (None, Some("kvm")) => Accel::Kvm,
+        (None, Some("tcg")) => Accel::Tcg,
+        _ => Accel::Auto,
+    };
+    let number = |key: &str| record.get(key).and_then(serde_json::Value::as_u64);
+    Ok(GuestArgs {
+        kernel,
+        modules,
+        qemu: args
+            .qemu
+            .clone()
+            .or_else(|| text("qemu").map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("qemu-system-x86_64")),
+        accel,
+        memory: number("memory_mb")
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(1024),
+        smp: number("smp")
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(1),
+        append: text("append").map(str::to_owned),
+        qemu_args: record
+            .get("qemu_args")
+            .and_then(serde_json::Value::as_array)
+            .map(|args| {
+                args.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        cc: args
+            .cc
+            .clone()
+            .or_else(|| text("cc").map(str::to_owned))
+            .unwrap_or_else(|| "cc".to_owned()),
+        executor: args
+            .executor
+            .clone()
+            .or_else(|| text("executor").map(PathBuf::from)),
+        boot_timeout: args.boot_timeout,
+        timeout: args
+            .timeout
+            .or_else(|| number("timeout_secs"))
+            .unwrap_or(10)
+            .clamp(1, crate::kernel_guest::MAX_WAIT_SECS),
+    })
+}
+
+#[cfg(not(unix))]
+fn replay_finding(_args: &ReplayArgs) -> i32 {
+    bhfeprintln!("bhf kernel replay: the guest lane needs a Linux or other Unix host");
+    2
+}
+
+#[cfg(unix)]
+fn replay_finding(args: &ReplayArgs) -> i32 {
+    match replay_finding_inner(args) {
+        Ok(code) => code,
+        Err(error) => {
+            bhfeprintln!("bhf kernel replay: {error:#}");
+            2
+        }
+    }
+}
+
+#[cfg(unix)]
+fn replay_finding_inner(args: &ReplayArgs) -> Result<i32> {
+    use crate::kernel_guest::{Guest, RunEnd};
+    let (dir, finding_json) = if args.finding.is_dir() {
+        (args.finding.clone(), args.finding.join("finding.json"))
+    } else {
+        (
+            args.finding
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_default(),
+            args.finding.clone(),
+        )
+    };
+    let raw: serde_json::Value = serde_json::from_slice(
+        &fs::read(&finding_json).with_context(|| format!("read {}", finding_json.display()))?,
+    )
+    .with_context(|| format!("parse {}", finding_json.display()))?;
+    anyhow::ensure!(
+        results::import_syzkaller::is_guest_crash(&raw),
+        "{} is not a crash bhf kernel fuzz found in its guest",
+        finding_json.display()
+    );
+    let title = raw["kernel"]["title"]
+        .as_str()
+        .context("the finding records no crash title")?
+        .to_owned();
+    let program = read_program(&dir.join(results::import_syzkaller::TESTCASE_FILE))?;
+    let guest_args = replay_guest(&raw["kernel"]["guest"], args)?;
+    let temp = tempfile::Builder::new()
+        .prefix("bhf-kernel-replay-")
+        .tempdir()
+        .context("create a temporary directory")?;
+    let setup = guest_args.setup(temp.path())?;
+    let mut guest = Guest::boot(&setup, None)?;
+    let run = guest.run(&program, guest_args.timeout());
+    drop(guest);
+    match results::import_syzkaller::console_report(&run.console) {
+        Some(report) if report.title == title => {
+            println!("MATCH: {title}");
+            Ok(0)
+        }
+        Some(report) => {
+            println!(
+                "MISMATCH: the finding records `{title}`; the kernel reported `{}`",
+                report.title
+            );
+            Ok(1)
+        }
+        None => {
+            let how = match &run.end {
+                RunEnd::Replied(reply) => format!("the program ran ({})", reply.status.describe()),
+                RunEnd::Stopped(reason) => format!("the guest stopped: {reason}"),
+                RunEnd::NoReply => "the guest did not answer".to_owned(),
+            };
+            println!("NOT REPRODUCED: `{title}`: {how}, and the kernel reported nothing");
+            Ok(1)
+        }
     }
 }
 
@@ -420,6 +668,14 @@ fn run_programs_inner(args: &RunArgs) -> Result<i32> {
     let mut code = 0;
     for (path, program) in &programs {
         let run = guest.run(program, args.guest.timeout());
+        let report =
+            results::import_syzkaller::console_report(&run.console).map(|report| report.title);
+        if let Some(title) = &report {
+            if !args.json {
+                println!("{}: the kernel reported: {title}", path.display());
+            }
+            code = 1;
+        }
         match &run.end {
             RunEnd::Replied(reply) => {
                 if args.json {
@@ -448,6 +704,7 @@ fn run_programs_inner(args: &RunArgs) -> Result<i32> {
                             "pcs": reply.calls.iter().map(|call| call.pcs.len()).sum::<usize>(),
                             "edges": reply.edges(),
                             "elapsed_ms": run.elapsed.as_millis() as u64,
+                            "report": report,
                         })
                     );
                 } else {
@@ -475,6 +732,7 @@ fn run_programs_inner(args: &RunArgs) -> Result<i32> {
                         "program": path.display().to_string(),
                         "status": "stopped",
                         "reason": reason,
+                        "report": report,
                         "console": run.console,
                     })
                 );
@@ -607,7 +865,10 @@ fn fuzz_kernel_inner(args: &KernelFuzzArgs) -> Result<i32> {
         Ok(set)
     };
     let config = guest::FuzzConfig {
+        work_dir: args.work_dir.clone(),
         dir: dir.clone(),
+        guest_record: args.guest.record(),
+        stop_after_findings: args.stop_after_findings,
         setup,
         iterations: args.iterations.unwrap_or(if args.time.is_some() {
             usize::MAX
@@ -633,8 +894,8 @@ fn fuzz_kernel_inner(args: &KernelFuzzArgs) -> Result<i32> {
 }
 
 /// What `bhf kernel fuzz` prints of its campaign: the guest and its setup
-/// notes (each module loaded, or why not), the coverage and the crashes,
-/// under `work_dir`.
+/// notes (each module loaded, or why not), the coverage, the crashes and
+/// the findings, under `work_dir`.
 #[cfg(unix)]
 fn fuzz_report(summary: &crate::kernel_guest::FuzzSummary, work_dir: &Path) -> Vec<String> {
     let plural = |count: usize| if count == 1 { "" } else { "s" };
@@ -667,6 +928,38 @@ fn fuzz_report(summary: &crate::kernel_guest::FuzzSummary, work_dir: &Path) -> V
     for crash in &summary.crash_dirs {
         lines.push(format!("    {}", work_dir.join(crash).display()));
     }
+    if !summary.findings.is_empty() {
+        lines.push(format!(
+            "  {} kernel report{} ({} run{} of a program alone to confirm one), {} finding{}:",
+            summary.reports,
+            plural(summary.reports),
+            summary.confirm_runs,
+            plural(summary.confirm_runs),
+            summary.findings.len(),
+            plural(summary.findings.len())
+        ));
+        for id in &summary.findings {
+            let finding = work_dir
+                .join("results/findings")
+                .join(id)
+                .join("finding.json");
+            let raw: serde_json::Value = fs::read(&finding)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default();
+            let confirmed = match raw["kernel"]["unconfirmed"].as_str() {
+                _ if raw["kernel"]["reproduced"] == true => {
+                    "the program alone made it again".to_owned()
+                }
+                Some(why) => format!("not confirmed: {why}"),
+                None => "not made again by the program alone".to_owned(),
+            };
+            lines.push(format!(
+                "    {id}: {} ({confirmed})",
+                raw["message"].as_str().unwrap_or("?")
+            ));
+        }
+    }
     if !summary.kcov {
         lines.push(
             "  KCOV is off in the guest (no coverage): build the kernel with CONFIG_KCOV and \
@@ -679,6 +972,153 @@ fn fuzz_report(summary: &crate::kernel_guest::FuzzSummary, work_dir: &Path) -> V
         work_dir.join("kernel").join("fuzz.json").display()
     ));
     lines
+}
+
+// ── Kernel crash findings in the generic triage commands ────────────────
+
+/// Most bytes of a finding's program.txt `bhf explain` reads.
+const MAX_PROGRAM_TEXT: u64 = 64 << 10;
+/// Most calls of it `bhf explain` prints.
+const PROGRAM_LINES_SHOWN: usize = 40;
+
+/// The `finding.json` of `finding_dir` when it is a kernel crash's (one
+/// `bhf kernel fuzz` found in its guest, or one `bhf kernel import` brought
+/// in from syzkaller).
+fn kernel_crash_record(finding_dir: &Path) -> Option<serde_json::Value> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    fs::File::open(finding_dir.join("finding.json"))
+        .ok()?
+        .take(16 << 20)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let raw: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    results::import_syzkaller::is_kernel_crash(&raw).then_some(raw)
+}
+
+/// Why `bhf <command>` (replay, minimize), which runs a harness, does not
+/// take the kernel crash finding in `finding_dir`, and what reproduces it
+/// instead. `None` for any other finding.
+pub(crate) fn harness_command_refusal(command: &str, finding_dir: &Path) -> Option<String> {
+    let raw = kernel_crash_record(finding_dir)?;
+    let id = raw["id"].as_str().unwrap_or("the finding");
+    let dir = crate::repro_lane::host_word(&finding_dir.to_string_lossy());
+    Some(if results::import_syzkaller::is_guest_crash(&raw) {
+        format!(
+            "{id} is a kernel crash bhf kernel fuzz found in a qemu-system guest, which no \
+             harness runs, so bhf {command} does not take it: `bhf kernel replay {dir}` boots \
+             the guest it was found in and runs its program (testcase.bin; repro.c makes the \
+             same calls)"
+        )
+    } else {
+        let how = match imported_reproduce_command(finding_dir, &raw) {
+            Some(reproduce) => {
+                format!("run `{reproduce}` from the results directory in the kernel's test VM")
+            }
+            None => format!(
+                "syzkaller found no reproducer; {} holds the programs it ran before the crash",
+                results::import_syzkaller::CONSOLE_FILE
+            ),
+        };
+        format!(
+            "{id} is a kernel crash syzkaller found (bhf kernel import), which no harness runs, \
+             so bhf {command} does not take it: {how}"
+        )
+    })
+}
+
+/// The reproduce command of an imported syzkaller crash, relative to
+/// `results/`.
+fn imported_reproduce_command(finding_dir: &Path, raw: &serde_json::Value) -> Option<String> {
+    use results::import_syzkaller::{reproduce_command, C_REPRO_FILE, SYZ_REPRO_FILE};
+    reproduce_command(
+        raw["id"].as_str()?,
+        raw,
+        finding_dir.join(C_REPRO_FILE).is_file(),
+        finding_dir.join(SYZ_REPRO_FILE).is_file(),
+    )
+}
+
+/// What `bhf explain` says of a kernel crash finding in place of a
+/// harness's arguments: the program's calls, from program.txt (a guest
+/// crash's; an imported one has none). Empty for any other finding.
+pub(crate) fn program_lines(finding_dir: &Path) -> Vec<String> {
+    use std::io::Read;
+    if kernel_crash_record(finding_dir).is_none() {
+        return Vec::new();
+    }
+    let mut text = String::new();
+    let read = fs::File::open(finding_dir.join(results::import_syzkaller::PROGRAM_FILE))
+        .and_then(|file| file.take(MAX_PROGRAM_TEXT).read_to_string(&mut text));
+    if read.is_err() || text.trim().is_empty() {
+        return Vec::new();
+    }
+    let calls: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let mut lines = vec![format!(
+        "\nTHE PROGRAM  ({}: the calls {} makes, in order)",
+        results::import_syzkaller::PROGRAM_FILE,
+        results::import_syzkaller::TESTCASE_FILE
+    )];
+    lines.extend(
+        calls
+            .iter()
+            .take(PROGRAM_LINES_SHOWN)
+            .map(|call| format!("  {}", crate::terminal_text::terminal_safe(call))),
+    );
+    if calls.len() > PROGRAM_LINES_SHOWN {
+        lines.push(format!(
+            "  ... and {} more",
+            calls.len() - PROGRAM_LINES_SHOWN
+        ));
+    }
+    lines
+}
+
+/// `bhf explain`'s REPRODUCE OFFLINE lines for a kernel crash finding:
+/// `bhf kernel replay` and repro.c for one `bhf kernel fuzz` found, the
+/// syzkaller reproducer for an imported one. `None` for any other finding.
+pub(crate) fn reproduce_lines(finding_dir: &Path) -> Option<Vec<String>> {
+    let raw = kernel_crash_record(finding_dir)?;
+    let mut lines = Vec::new();
+    if results::import_syzkaller::is_guest_crash(&raw) {
+        let dir = crate::repro_lane::host_word(&finding_dir.to_string_lossy());
+        let repro = crate::repro_lane::host_word(
+            &finding_dir
+                .join(results::import_syzkaller::C_REPRO_FILE)
+                .to_string_lossy(),
+        );
+        lines.push(format!(
+            "bhf kernel replay {dir}   # boots the guest it was found in and runs testcase.bin"
+        ));
+        lines.push(format!(
+            "cc -static -o repro {repro}   # the same calls; run ./repro in a guest of the same \
+             kernel and modules"
+        ));
+        let kernel = &raw["kernel"];
+        if kernel["reproduced"] != true {
+            lines.push(match kernel["unconfirmed"].as_str() {
+                Some(why) => format!("(not confirmed when it was found: {why})"),
+                None => "(its program alone did not make the report again in a freshly booted \
+                         guest when it was found: the crash may depend on what ran before it)"
+                    .to_owned(),
+            });
+        }
+    } else {
+        match imported_reproduce_command(finding_dir, &raw) {
+            Some(command) => {
+                lines.push("In the kernel's test VM, from the results directory:".to_owned());
+                lines.push(format!("  {command}"));
+            }
+            None => lines.push(format!(
+                "syzkaller found no reproducer; {} holds the programs it ran before the crash.",
+                results::import_syzkaller::CONSOLE_FILE
+            )),
+        }
+    }
+    Some(lines)
 }
 
 /// `O_RDWR`, which the seeds open device nodes with.
@@ -3480,6 +3920,229 @@ mod tests {
         assert!(error.to_string().contains("no ioctl handler"), "{error}");
     }
 
+    /// A campaign that booted once, with its setup notes, and ran nothing.
+    #[cfg(unix)]
+    fn campaign_summary() -> crate::kernel_guest::FuzzSummary {
+        crate::kernel_guest::FuzzSummary {
+            schema: crate::kernel_guest::FUZZ_SUMMARY_SCHEMA,
+            kernel: "bzImage".to_owned(),
+            release: "6.12.118".to_owned(),
+            machine: "x86_64".to_owned(),
+            accel: "tcg",
+            kcov: true,
+            notes: vec![
+                "module 00-broken.ko: not loaded: Exec format error".to_owned(),
+                "ready (kcov on, comparisons on)".to_owned(),
+            ],
+            seeds: 1,
+            seed_origin: Vec::new(),
+            executions: 0,
+            comparisons: true,
+            comparison_runs: 0,
+            hint_runs: 0,
+            corpus_new: 0,
+            corpus: 0,
+            coverage_after_seeds: Default::default(),
+            coverage: Default::default(),
+            reports: 0,
+            findings: Vec::new(),
+            confirm_runs: 0,
+            crashes: 0,
+            crash_dirs: Vec::new(),
+            boots: 1,
+            halted: Some("the guest did not load every --module".to_owned()),
+            elapsed_secs: 1.0,
+            executions_per_sec: 0.0,
+        }
+    }
+
+    /// A campaign's report says what the guest's executor did at setup:
+    /// each module it loaded, or why not.
+    #[cfg(unix)]
+    #[test]
+    fn a_campaign_report_prints_the_guests_setup_notes() {
+        let lines = fuzz_report(&campaign_summary(), Path::new("work"));
+        assert_eq!(
+            lines[..3],
+            [
+                "bhf kernel fuzz: 0 executions (0.0/s) in Linux 6.12.118 x86_64 (tcg), 1 seeds",
+                "  guest setup: module 00-broken.ko: not loaded: Exec format error",
+                "  guest setup: ready (kcov on, comparisons on)",
+            ]
+        );
+        assert!(
+            lines[3].starts_with("  coverage: 0 KCOV edges"),
+            "{lines:#?}"
+        );
+        assert_eq!(lines.last().unwrap(), "  summary: work/kernel/fuzz.json");
+    }
+
+    /// A finding whose program could not run alone in a fresh guest is
+    /// reported as not confirmed, with the reason.
+    #[cfg(unix)]
+    #[test]
+    fn a_campaign_report_says_why_a_finding_is_not_confirmed() {
+        use results::import_syzkaller as kernel;
+        let work = tempfile::tempdir().unwrap();
+        let console = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/kernel_guest/console/kasan-slab-out-of-bounds.log"),
+        )
+        .unwrap();
+        let report = kernel::console_report(&console).unwrap();
+        let why = "its confirming run could not be made: the guest did not start";
+        let found = kernel::record_guest_crash(
+            work.path(),
+            &kernel::GuestCrash {
+                report: &report,
+                console: &console,
+                program: b"program",
+                program_text: "",
+                decoded: &serde_json::Value::Null,
+                c_repro: "",
+                guest: &serde_json::Value::Null,
+                reproduced: false,
+                unconfirmed: Some(why),
+                release: None,
+            },
+        )
+        .unwrap();
+        let summary = crate::kernel_guest::FuzzSummary {
+            reports: 1,
+            findings: vec![found.id.clone()],
+            ..campaign_summary()
+        };
+        let lines = fuzz_report(&summary, work.path());
+        let line = format!(
+            "    {}: KASAN: slab-out-of-bounds Write in widget_ioctl (not confirmed: {why})",
+            found.id
+        );
+        assert!(lines.contains(&line), "{lines:#?}");
+        kernel::confirm_guest_crash(work.path(), &found.id, true, None).unwrap();
+        let lines = fuzz_report(&summary, work.path());
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.ends_with("(the program alone made it again)")),
+            "{lines:#?}"
+        );
+    }
+
+    /// The guest's waits are seconds a u64 holds: one longer than a day is
+    /// refused when the command line is read, not left to overflow a
+    /// deadline.
+    #[test]
+    fn a_guest_wait_longer_than_a_day_is_refused() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            run: RunArgs,
+        }
+        let parse = |flag: &str, secs: &str| {
+            <Cli as clap::Parser>::try_parse_from([
+                "bhf", "--kernel", "bzImage", flag, secs, "prog.bin",
+            ])
+        };
+        for flag in ["--boot-timeout", "--timeout"] {
+            let error = match parse(flag, "18446744073709551615") {
+                Ok(_) => panic!("{flag} 18446744073709551615 was accepted"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("1..=86400"), "{flag}: {error}");
+            assert!(parse(flag, "86400").is_ok(), "{flag} 86400");
+        }
+        let cli = parse("--timeout", "86400").unwrap();
+        assert_eq!(
+            (cli.run.guest.boot_timeout, cli.run.guest.timeout),
+            (300, 86400)
+        );
+    }
+
+    /// A finding records the guest it was found in; a replay boots it
+    /// again, with what its options replace.
+    #[cfg(unix)]
+    #[test]
+    fn a_replay_boots_the_guest_the_finding_records() {
+        use crate::kernel_guest::Accel;
+        let guest = GuestArgs {
+            kernel: PathBuf::from("bzImage"),
+            modules: vec![PathBuf::from("/m/widget.ko")],
+            qemu: PathBuf::from("/q/qemu-system-x86_64"),
+            accel: Accel::Tcg,
+            memory: 2048,
+            smp: 2,
+            append: Some("kasan.fault=report".to_owned()),
+            qemu_args: vec!["-machine".to_owned(), "q35".to_owned()],
+            cc: "gcc".to_owned(),
+            executor: None,
+            boot_timeout: 30,
+            timeout: 7,
+        };
+        let record = guest.record();
+        // Relative paths are recorded absolute.
+        let kernel = record["kernel"].as_str().unwrap();
+        assert!(
+            Path::new(kernel).is_absolute() && kernel.ends_with("bzImage"),
+            "{kernel}"
+        );
+        let args = |extra: &[&str]| {
+            #[derive(clap::Parser)]
+            struct Cli {
+                #[command(flatten)]
+                replay: ReplayArgs,
+            }
+            let mut argv = vec!["bhf", "F-KERNEL-0000-x"];
+            argv.extend_from_slice(extra);
+            <Cli as clap::Parser>::parse_from(argv).replay
+        };
+        let again = replay_guest(&record, &args(&[])).unwrap();
+        assert_eq!(again.kernel, PathBuf::from(kernel));
+        assert_eq!(again.modules, guest.modules);
+        assert_eq!(again.qemu, guest.qemu);
+        assert_eq!(again.accel, Accel::Tcg);
+        assert_eq!((again.memory, again.smp, again.timeout), (2048, 2, 7));
+        assert_eq!(again.append, guest.append);
+        assert_eq!(again.qemu_args, guest.qemu_args);
+        assert_eq!(again.cc, "gcc");
+        let moved = replay_guest(
+            &record,
+            &args(&[
+                "--kernel",
+                "/new/bzImage",
+                "--module",
+                "/new/a.ko",
+                "--accel",
+                "kvm",
+                "--timeout",
+                "3",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(moved.kernel, PathBuf::from("/new/bzImage"));
+        assert_eq!(moved.modules, vec![PathBuf::from("/new/a.ko")]);
+        assert_eq!((moved.accel, moved.timeout), (Accel::Kvm, 3));
+        let error = replay_guest(&serde_json::json!({}), &args(&[])).unwrap_err();
+        assert!(error.to_string().contains("--kernel"), "{error}");
+        // A finding's timeout past a day is cut to it; an option's is refused.
+        let mut long = record.clone();
+        long["timeout_secs"] = serde_json::json!(u64::MAX);
+        assert_eq!(replay_guest(&long, &args(&[])).unwrap().timeout, 86_400);
+        #[derive(clap::Parser)]
+        struct Replay {
+            #[command(flatten)]
+            replay: ReplayArgs,
+        }
+        for flag in ["--boot-timeout", "--timeout"] {
+            let parsed = <Replay as clap::Parser>::try_parse_from([
+                "bhf",
+                "F-KERNEL-0000-x",
+                flag,
+                "18446744073709551615",
+            ]);
+            assert!(parsed.is_err(), "{flag} 18446744073709551615 was accepted");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_device_alone_is_opened_read_written_and_called() {
@@ -4125,85 +4788,5 @@ mod tests {
         assert_eq!(device_path("widget"), "/dev/widget");
         assert_eq!(device_path("widget%d"), "/dev/widget#");
         assert_eq!(device_path("widget/ctl%lu"), "/dev/widget/ctl#");
-    }
-
-    /// A campaign's report says what the guest's executor did at setup:
-    /// each module it loaded, or why not.
-    #[cfg(unix)]
-    #[test]
-    fn a_campaign_report_prints_the_guests_setup_notes() {
-        use crate::kernel_guest::{FuzzSummary, FUZZ_SUMMARY_SCHEMA};
-        let summary = FuzzSummary {
-            schema: FUZZ_SUMMARY_SCHEMA,
-            kernel: "bzImage".to_owned(),
-            release: "6.12.118".to_owned(),
-            machine: "x86_64".to_owned(),
-            accel: "tcg",
-            kcov: true,
-            notes: vec![
-                "module 00-broken.ko: not loaded: Exec format error".to_owned(),
-                "ready (kcov on, comparisons on)".to_owned(),
-            ],
-            seeds: 1,
-            seed_origin: Vec::new(),
-            executions: 0,
-            comparisons: true,
-            comparison_runs: 0,
-            hint_runs: 0,
-            corpus_new: 0,
-            corpus: 0,
-            coverage_after_seeds: Default::default(),
-            coverage: Default::default(),
-            crashes: 0,
-            crash_dirs: Vec::new(),
-            boots: 1,
-            halted: Some("the guest did not load every --module".to_owned()),
-            elapsed_secs: 1.0,
-            executions_per_sec: 0.0,
-        };
-        let lines = fuzz_report(&summary, Path::new("work"));
-        assert_eq!(
-            lines[..3],
-            [
-                "bhf kernel fuzz: 0 executions (0.0/s) in Linux 6.12.118 x86_64 (tcg), 1 seeds",
-                "  guest setup: module 00-broken.ko: not loaded: Exec format error",
-                "  guest setup: ready (kcov on, comparisons on)",
-            ]
-        );
-        assert!(
-            lines[3].starts_with("  coverage: 0 KCOV edges"),
-            "{lines:#?}"
-        );
-        assert_eq!(lines.last().unwrap(), "  summary: work/kernel/fuzz.json");
-    }
-
-    /// The guest's waits are seconds a u64 holds: one longer than a day is
-    /// refused when the command line is read, not left to overflow a
-    /// deadline.
-    #[test]
-    fn a_guest_wait_longer_than_a_day_is_refused() {
-        #[derive(clap::Parser)]
-        struct Cli {
-            #[command(flatten)]
-            run: RunArgs,
-        }
-        let parse = |flag: &str, secs: &str| {
-            <Cli as clap::Parser>::try_parse_from([
-                "bhf", "--kernel", "bzImage", flag, secs, "prog.bin",
-            ])
-        };
-        for flag in ["--boot-timeout", "--timeout"] {
-            let error = match parse(flag, "18446744073709551615") {
-                Ok(_) => panic!("{flag} 18446744073709551615 was accepted"),
-                Err(error) => error.to_string(),
-            };
-            assert!(error.contains("1..=86400"), "{flag}: {error}");
-            assert!(parse(flag, "86400").is_ok(), "{flag} 86400");
-        }
-        let cli = parse("--timeout", "86400").unwrap();
-        assert_eq!(
-            (cli.run.guest.boot_timeout, cli.run.guest.timeout),
-            (300, 86400)
-        );
     }
 }
