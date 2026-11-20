@@ -63,30 +63,50 @@ pub struct ProjectArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ProjectCommand {
-    /// Resolve and hash every referenced asset, type-check each target's launch, and report problems (missing assets, duplicate ids, unsupported schema/bhf version, invalid relative paths, unsafe secret interpolation, a -fsanitize=fuzzer binary without bhf's driver on the builtin engine) WITHOUT running a campaign or the build command
+    /// Check a project manifest's assets and target launches, without building or fuzzing
+    ///
+    /// Hashes every asset the manifest names, type-checks each target's
+    /// launch, and reports missing assets, duplicate ids, an unsupported schema or bhf
+    /// version, invalid relative paths, unsafe secret interpolation, and a
+    /// `-fsanitize=fuzzer` binary without bhf's driver on the builtin engine.
+    /// It runs neither the build command nor a campaign.
     Validate(ValidateArgs),
-    /// List the targets declared in the manifest with their engine, input mode, and a summary of declared seeds/dictionaries/grammar
+    /// List the manifest's targets with their engine, input mode, seeds, dictionaries and grammar
     List(ListArgs),
-    /// Materialize an isolated work directory from a target, resolve+hash its assets, write provenance, and run its campaign on the configured engine (builtin/afl++ or binary)
+    /// Build and fuzz one manifest target in a work directory of its own
+    ///
+    /// bhf hashes the target's assets, records provenance, runs its build
+    /// command (unless --skip-build) and fuzzes it on its engine: builtin,
+    /// afl++ or binary.
     Run(RunArgs),
-    /// Run a project's OSS-Fuzz build.sh in a sandbox (no network, writes only to $SRC, $WORK and $OUT) with the OSS-Fuzz build variables ($CC, $CXX, $CFLAGS, $CXXFLAGS, $LIB_FUZZING_ENGINE, $SRC, $WORK, $OUT), $LIB_FUZZING_ENGINE being bhf's own driver, and register each fuzzer it leaves in $OUT as a harness of the work dir (`bhf fuzz <work> --harness <name>`) and a target of <work>/ossfuzz/bhf.project.toml (`bhf project run`), with its <name>_seed_corpus.zip (unpacked with the system unzip), dictionaries and [libfuzzer] options
+    /// Build an OSS-Fuzz project's fuzzers in a sandbox and register them as bhf harnesses
+    ///
+    /// Runs build.sh in a sandbox (see `--sandbox`) with no network that
+    /// writes only to $SRC, $WORK and $OUT, with the OSS-Fuzz build variables
+    /// set ($CC, $CXX,
+    /// $CFLAGS, $CXXFLAGS, $LIB_FUZZING_ENGINE, $SRC, $WORK, $OUT), where
+    /// $LIB_FUZZING_ENGINE is bhf's own driver. Each fuzzer the build leaves in
+    /// $OUT becomes a harness of the work directory (`bhf fuzz <work> --harness
+    /// <name>`) and a target of <work>/ossfuzz/bhf.project.toml (`bhf project
+    /// run`), with its <name>_seed_corpus.zip (unpacked with the system unzip),
+    /// its dictionaries and its [libfuzzer] options.
     ImportOssfuzz(crate::ossfuzz_import::ImportArgs),
 }
 
 #[derive(Debug, clap::Args)]
 pub struct ValidateArgs {
-    /// Path to the `bhf.project.v1` manifest (TOML). Explicit load is the trust
-    /// boundary; this is never auto-discovered.
+    /// Path to the `bhf.project.v1` manifest (TOML). bhf reads only the
+    /// manifest named here and never searches for one.
     #[arg(long)]
     manifest: PathBuf,
     /// Validate only this target (default: every declared target).
     #[arg(long)]
     target: Option<String>,
-    /// Permit assets outside the manifest directory (absolute paths / `..`
-    /// escapes). Off by default; a path escape is otherwise rejected.
+    /// Allow assets outside the manifest's directory (absolute paths or `..`).
+    /// Without it, such a path is an error.
     #[arg(long = "allow-external-paths")]
     allow_external_paths: bool,
-    /// Emit a machine-readable JSON report instead of human-readable lines.
+    /// Print a JSON report instead of text lines.
     #[arg(long)]
     json: bool,
 }
@@ -96,33 +116,31 @@ pub struct ListArgs {
     /// Path to the `bhf.project.v1` manifest (TOML).
     #[arg(long)]
     manifest: PathBuf,
-    /// Emit a machine-readable JSON summary instead of human-readable lines.
+    /// Print a JSON summary instead of text lines.
     #[arg(long)]
     json: bool,
 }
 
 #[derive(Debug, clap::Args)]
 pub struct RunArgs {
-    /// Path to the `bhf.project.v1` manifest (TOML). Explicit load is the trust
-    /// boundary: `run` executes this target's build command because the manifest
-    /// was named explicitly.
+    /// Path to the `bhf.project.v1` manifest (TOML). `run` executes the
+    /// target's build command because you named this manifest.
     #[arg(long)]
     manifest: PathBuf,
-    /// Which target to run (required).
+    /// The target to run.
     #[arg(long)]
     target: String,
-    /// Isolated work directory. Default:
+    /// Work directory for this target. Default:
     /// `./bhf_work_project/<project-id>/<target-id>`.
     #[arg(long = "work-dir")]
     work_dir: Option<PathBuf>,
-    /// Permit assets outside the manifest directory (absolute paths / `..`
-    /// escapes).
+    /// Allow assets outside the manifest's directory (absolute paths or `..`).
     #[arg(long = "allow-external-paths")]
     allow_external_paths: bool,
-    /// Reuse a prebuilt binary; do NOT run the manifest's trusted build command.
+    /// Use the prebuilt binary and skip the manifest's build command.
     #[arg(long = "skip-build")]
     skip_build: bool,
-    /// Emit the resolved provenance as JSON on stdout before the run starts.
+    /// Print the resolved provenance as JSON on stdout before the run starts.
     #[arg(long)]
     json: bool,
 }

@@ -58,7 +58,8 @@ const WINDOWS_BUILD_COMMAND: &str = "powershell -NoProfile -ExecutionPolicy Bypa
 /// `⚠ not portable: <file> names <path>`.
 #[derive(Debug, clap::Args)]
 pub struct CapsuleArgs {
-    /// Work directory of a prior `auto` run to read findings + harnesses from.
+    /// Work directory of an earlier `bhf auto` run, with its findings and
+    /// harnesses.
     #[arg(long = "work-dir", default_value = "bhf_work")]
     pub work_dir: PathBuf,
 
@@ -68,11 +69,11 @@ pub struct CapsuleArgs {
     #[arg(long = "finding-id", value_name = "ID")]
     pub finding_id: Option<String>,
 
-    /// Directory to write capsules under. Default `<work-dir>/capsules`.
+    /// Directory to write the capsules under. Default: `<work-dir>/capsules`.
     #[arg(long, short = 'o', value_name = "DIR")]
     pub out: Option<PathBuf>,
 
-    /// Also emit a `.tar.gz` next to each capsule dir (via the system `tar`).
+    /// Also write a `.tar.gz` of each capsule beside it, with the system `tar`.
     #[arg(long)]
     pub tar: bool,
 

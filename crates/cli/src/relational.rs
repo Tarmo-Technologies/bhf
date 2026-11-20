@@ -76,51 +76,55 @@ pub struct RelationalArgs {
 
 #[derive(Debug, Subcommand)]
 enum RelationalCommand {
-    /// Coverage-guided relational campaign: mutate a shared testcase, run it under every named role/session profile, retain inputs that reach new code or a new cross-profile outcome, and emit a finding when a declarative policy relation is violated
+    /// Run a relational fuzzing campaign over the profiles of a policy file
+    ///
+    /// bhf mutates one shared input, runs it under every profile, keeps the
+    /// inputs that reach new code or a new combination of profile outcomes,
+    /// and writes a finding when a declared relation breaks.
     Run(RunArgs),
-    /// Re-run every profile required by a relational finding and re-confirm the violated relation (secret values stay redacted)
+    /// Re-run the profiles a relational finding needs and check that its relation still breaks (secret values stay redacted)
     Replay(ReplayArgs),
-    /// Shrink a relational finding's testcase while the violated relation still holds, preserving the minimal required profile set
+    /// Shrink a relational finding's input while its relation still breaks under the same profiles
     Minimize(MinimizeArgs),
 }
 
 #[derive(Debug, Args)]
 struct RunArgs {
-    /// TOML policy file (schema = "bhf.relational.v1") declaring profiles and relational predicates.
+    /// TOML policy file (schema = "bhf.relational.v1") that declares the profiles and the relations between their results.
     #[arg(long, value_name = "FILE")]
     config: PathBuf,
-    /// Directory of seed inputs for the shared testcase mutator.
+    /// Directory of seed inputs.
     #[arg(long, value_name = "DIR")]
     seeds: PathBuf,
-    /// Findings output / work directory; findings go to <out>/results/findings/F-REL-*.
+    /// Work directory; findings go to <out>/results/findings/F-REL-*.
     #[arg(long, value_name = "DIR", default_value = "findings_relational")]
     out: PathBuf,
-    /// Maximum number of testcases to execute.
+    /// Most inputs to run (each under every profile).
     #[arg(long, default_value_t = 10_000)]
     max_execs: usize,
-    /// Per-profile per-case timeout in seconds.
+    /// Timeout of one profile's run of one input, in seconds.
     #[arg(long, default_value_t = 5)]
     timeout_secs: u64,
-    /// Deterministic mutation RNG seed.
+    /// Seed of the mutation RNG, so a campaign repeats exactly.
     #[arg(long, default_value_t = 0)]
     seed: u64,
-    /// Maximum mutated input length.
+    /// Longest input a mutation makes, in bytes.
     #[arg(long, default_value_t = 4096)]
     max_len: usize,
-    /// Stop once this many distinct findings have been recorded.
+    /// Stop once this many distinct findings are written.
     #[arg(long, default_value_t = 1024)]
     max_findings: usize,
 }
 
 #[derive(Debug, Args)]
 struct ReplayArgs {
-    /// A finding id or a finding directory (containing finding.json + testcase.bin).
+    /// A finding id, or a finding directory (with finding.json and testcase.bin).
     #[arg(long, value_name = "ID_OR_DIR")]
     finding: String,
-    /// TOML policy file; defaults to the policy persisted beside the finding.
+    /// TOML policy file. Default: the copy the run saved as results/relational-policy.toml.
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
-    /// Work directory used to resolve a bare finding id.
+    /// Work directory a bare finding id is looked up in.
     #[arg(
         long = "work-dir",
         value_name = "DIR",
@@ -134,13 +138,13 @@ struct ReplayArgs {
 
 #[derive(Debug, Args)]
 struct MinimizeArgs {
-    /// A finding id or a finding directory (containing finding.json + testcase.bin).
+    /// A finding id, or a finding directory (with finding.json and testcase.bin).
     #[arg(long, value_name = "ID_OR_DIR")]
     finding: String,
-    /// TOML policy file; defaults to the policy persisted beside the finding.
+    /// TOML policy file. Default: the copy the run saved as results/relational-policy.toml.
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
-    /// Work directory used to resolve a bare finding id.
+    /// Work directory a bare finding id is looked up in.
     #[arg(
         long = "work-dir",
         value_name = "DIR",

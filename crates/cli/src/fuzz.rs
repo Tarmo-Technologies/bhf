@@ -253,20 +253,23 @@ fn ensure_harness_scratch(work_dir: &Path) -> Result<PathBuf, String> {
 
 #[derive(Debug, clap::Args)]
 pub struct FuzzArgs {
-    /// Path to bhf_work directory containing build/<harness-id>/.
+    /// Work directory that holds the built harness, in `harnesses/<id>/` or
+    /// `build/<id>/`.
     pub work_dir: PathBuf,
 
-    /// Harness id under build/<harness-id>/.
+    /// Harness id: the harness's directory name under `harnesses/` or
+    /// `build/`.
     #[arg(long)]
     pub harness: String,
 
-    /// Fuzz engine: the built-in coverage-guided engine (default), AFL++ via
-    /// subprocess (`afl++`, needs `afl-fuzz`/`afl-clang-fast` on PATH),
+    /// Fuzz engine: bhf's built-in coverage-guided engine (default), AFL++ as
+    /// a subprocess (`afl++`, needs `afl-fuzz` and `afl-clang-fast` on PATH),
     /// libFuzzer (`libfuzzer`, the harness's `main_libfuzzer`, built with
-    /// `make libfuzzer` when absent), honggfuzz (`honggfuzz`, on the harness's
+    /// `make libfuzzer` when absent), honggfuzz (`honggfuzz`, the harness's
     /// `main_honggfuzz`; needs honggfuzz on PATH or in `BHF_HONGGFUZZ_PATH`),
-    /// or WinAFL (`winafl`, native Windows only;
-    /// needs WinAFL and DynamoRIO, see `--winafl-path` and `--dynamorio-path`).
+    /// WinAFL (`winafl`, native Windows only; needs WinAFL and DynamoRIO, see
+    /// `--winafl-path` and `--dynamorio-path`), or LibAFL (`libafl`, in a bhf
+    /// built with the `libafl-engine` feature).
     #[arg(long, value_enum, default_value_t = FuzzEngine::Builtin)]
     pub engine: FuzzEngine,
 
@@ -284,7 +287,7 @@ pub struct FuzzArgs {
 
     /// How WinAFL collects coverage: `dynamorio` (default, `afl-fuzz -D`) or
     /// `intel-pt` (`afl-fuzz -P`; needs an Intel CPU with Processor Trace and
-    /// a WinAFL built with `-DINTELPT=1`, and does not run in most VMs).
+    /// a WinAFL built with `-DINTELPT=1`; most VMs do not pass PT through).
     #[arg(long = "winafl-instrumentation", value_enum, default_value_t = WinaflInstrumentation::Dynamorio)]
     pub winafl_instrumentation: WinaflInstrumentation,
 
@@ -329,20 +332,19 @@ pub struct FuzzArgs {
     #[arg(long = "afl-inst-range", value_name = "RANGE")]
     pub afl_inst_ranges: Vec<String>,
 
-    /// Run multiple fuzz workers. Use a number or `auto`. Each worker fuzzes an
-    /// exact copy of the harness dirs in `<work>/worker-<id>-N/` and logs its
-    /// stderr there; when every worker fails, the command exits non-zero and
-    /// prints each worker's stderr tail.
+    /// Run several fuzz workers: a number, or `auto`. Each worker fuzzes its
+    /// own copy of the harness directories in `<work>/worker-<id>-N/` and logs
+    /// its stderr there. When every worker fails, the command exits non-zero
+    /// and prints the end of each worker's stderr.
     #[arg(long, value_parser = parse_worker_count)]
     pub workers: Option<FuzzWorkerCount>,
 
-    /// Maximum number of harness executions. Defaults to 256 when neither this
-    /// nor `--time` is given; when `--time` is set and this is omitted, the run
-    /// is bounded only by the time budget (not silently capped at 256).
+    /// Most harness executions. Default 256 when `--time` is not given; with
+    /// `--time` and no `--iterations`, only the time budget ends the run.
     #[arg(long)]
     pub iterations: Option<usize>,
 
-    /// Optional wall-clock budget such as 30s, 5m, 1h or 1.5h.
+    /// Wall-clock budget, such as 30s, 5m, 1h or 1.5h.
     #[arg(long, value_parser = parse_duration)]
     pub time: Option<Duration>,
 
@@ -355,29 +357,27 @@ pub struct FuzzArgs {
 
     /// Adaptive length control (libFuzzer's `-len_control`). The effective
     /// mutation length starts small and doubles toward `--max-len` after this
-    /// many executions without a new corpus signature, so early fuzzing explores
-    /// shallow/fast and deepens as it plateaus. `0` disables it (always use the
-    /// full `--max-len`).
+    /// many executions without a new corpus signature, so short inputs are
+    /// explored first and longer ones once coverage stops growing. `0` turns
+    /// it off and uses the full `--max-len` from the start.
     #[arg(long = "len-control", default_value_t = DEFAULT_LEN_CONTROL)]
     pub len_control: usize,
 
     /// Per-input timeout (libFuzzer's `-timeout`): a single C/C++ harness
     /// execution that runs longer than this is killed, and an input that hangs
     /// again when re-run with twice the timeout is a hang finding (BHF-230).
-    /// Distinct from `--time`, the whole-campaign budget. Defaults to 10s;
-    /// `500ms` and `0.5s` are half a second. (The Ada lane bounds runaway
-    /// inputs via CPU rlimits instead.)
+    /// `--time` is the whole campaign's budget. Default 10s; `500ms` and
+    /// `0.5s` are half a second. An Ada harness is bounded by a CPU-time limit
+    /// instead.
     #[arg(long = "timeout", value_parser = parse_duration)]
     pub timeout: Option<Duration>,
 
-    /// Real-time response deadline (the timing oracle, off by default). Distinct
-    /// from `--timeout`, the coarse hang-kill backstop that reports only an
-    /// input that hangs again at twice it: `--deadline` is a "must respond
-    /// within D" budget, and any input whose host-side wall-clock execution
-    /// exceeds it is recorded as a *finding* (BHF-555, a CWE-400
-    /// timing/availability failure). Use it for watchdog / RTOS / radar
-    /// targets where overrunning a budget is a fault, not just "it hung".
-    /// Accepts the same duration spec as `--time` (`250ms`, `0.5s`, `2s`).
+    /// Response deadline, the timing oracle (off by default): an input whose
+    /// execution takes longer than this, measured on the host, is a finding
+    /// (BHF-555, CWE-400). Use it for watchdog, RTOS or radar targets, where
+    /// missing a deadline is a fault. `--timeout` kills a run and reports only
+    /// an input that hangs again at twice the timeout. Takes the same
+    /// durations as `--time` (`250ms`, `0.5s`, `2s`).
     #[arg(long = "deadline", value_parser = parse_duration)]
     pub deadline: Option<Duration>,
 
@@ -398,24 +398,24 @@ pub struct FuzzArgs {
     /// Resident-memory ceiling in MB for a single C/C++ harness execution
     /// (libFuzzer's `-rss_limit_mb`). An execution whose RSS exceeds this is
     /// killed and reported as an out-of-memory finding. `0` (default) disables
-    /// it. (RSS is polled rather than an `RLIMIT_AS` cap, which would break
-    /// ASan's large virtual-address reservation.)
+    /// it. bhf polls RSS in place of setting `RLIMIT_AS`, which would break
+    /// ASan's large virtual-address reservation.
     #[arg(long = "rss-limit-mb", default_value_t = 0)]
     pub rss_limit_mb: usize,
 
-    /// Force the persistent fork-server execution mode (it is the default for
-    /// the builtin engine; this only matters to override `--no-fork-server` or
-    /// `BHF_FORK_SERVER=0`). One harness process is kept alive and fed inputs
-    /// over a framed protocol, amortizing fork/exec/elaboration (~38x more
-    /// execs/sec) while preserving the coverage-guided feedback. Every finding is
-    /// replay-validated in a fresh process, so a global-state artifact never
-    /// escapes; a hard crash falls back to a per-spawn run and respawns.
+    /// Use the persistent fork server, the builtin engine's default; this
+    /// overrides `--no-fork-server` or `BHF_FORK_SERVER=0`. One harness process
+    /// stays alive and is fed inputs over a framed protocol, which saves a
+    /// process start per input. Every finding is replayed in a fresh process
+    /// before it is kept, so state left over from earlier inputs cannot make
+    /// one. After a hard crash the input runs again in its own process and the
+    /// server is restarted.
     #[arg(long)]
     pub fork_server: bool,
 
-    /// Disable the fork-server and run a fresh process per input. Use for a
-    /// target that intentionally carries fuzz-relevant global state across calls
-    /// (a stateful state machine), where the per-spawn dynamics are preferred.
+    /// Run a fresh process per input, without the fork server. Use it for a
+    /// target that keeps state across calls on purpose, such as a state
+    /// machine, so each input starts from a fresh state.
     #[arg(long)]
     pub no_fork_server: bool,
 
@@ -426,8 +426,8 @@ pub struct FuzzArgs {
     /// rejected, crashed, hung) and on what it observed: the bytes the target
     /// hands `bhf_diff_observe(ptr, len)`, the target's return value in a
     /// generated harness, and `bhf_run_one`'s. Its process runs every input
-    /// the fuzzed build's runs, and both start over when either dies, so a
-    /// target that keeps state holds the same state in both. An input they
+    /// the fuzzed build's process runs, and both start over when either dies,
+    /// so a target that keeps state holds the same state in both. An input they
     /// disagree on, and still disagree on when each re-runs it in a fresh
     /// process (with twice `--timeout`, and once more to check each repeats
     /// itself), is a BHF-301 divergence finding, which `bhf replay` re-runs
@@ -487,45 +487,48 @@ pub struct FuzzArgs {
     #[arg(long = "seeds-layout-prefixed", hide = true)]
     pub seeds_layout_prefixed: bool,
 
-    /// Path to an explicitly-trusted extension manifest (`bhf.extension-manifest.v1`,
-    /// TOML). When set, after the campaign the retained corpus is driven through
-    /// the extension's out-of-process `oracle.evaluate` so a clean-exit semantic
-    /// violation becomes a finding. Explicit load is the trust boundary; an
-    /// extension is never auto-discovered. An extension crash/timeout/malformed
-    /// reply is a bounded infrastructure result that never aborts the campaign nor
-    /// becomes a target finding. (Evaluation runs post-run on retained inputs, not
-    /// in the hot mutation loop; supported by the builtin engine.)
+    /// Extension manifest (`bhf.extension-manifest.v1`, TOML) whose oracle
+    /// judges the kept corpus after the campaign: each input runs through the
+    /// extension's out-of-process `oracle.evaluate`, and a semantic violation
+    /// on a clean exit becomes a finding. bhf runs an extension only from a
+    /// manifest you name. An extension that crashes, times out or sends a malformed reply
+    /// is reported as an extension error; the campaign's results stand and no
+    /// finding is written for it. Builtin engine only.
     #[arg(long = "extension", value_name = "MANIFEST")]
     pub extension: Option<PathBuf>,
 
-    /// Sanitizer campaign matrix to arm, comma-separated (asan, msan, ubsan, tsan,
-    /// lsan, and on an AArch64 host hwasan in place of asan), or the standalone
-    /// value `none` (build coverage-only with no `-fsanitize=` — crash-only
-    /// fuzzing without ASan/UBSan false positives).
+    /// Sanitizers to run the campaign with, comma-separated: asan, msan,
+    /// ubsan, tsan, lsan, and on an AArch64 host hwasan in place of asan. Or
+    /// `none` on its own: a coverage build with no `-fsanitize=`, where the
+    /// findings are crashes and ASan/UBSan raise no false positives.
     #[arg(long = "sanitizers", value_delimiter = ',')]
     pub sanitizers: Vec<String>,
 
-    /// Ada source file to mine guarded literals into prototype symbolic seeds.
+    /// Ada source file whose guarded literals (the constants its conditions
+    /// compare against) become seeds. Repeatable.
     #[arg(long = "symbolic-seed-source")]
     pub symbolic_seed_sources: Vec<PathBuf>,
 
-    /// Deterministic RNG seed for built-in mutation.
+    /// Seed of the builtin engine's mutation RNG, so a run repeats exactly.
     #[arg(long, default_value_t = 0x4756_4655_5a5a)]
     pub rng_seed: u64,
 
-    /// Sandbox wrapper for harness execution.
+    /// Sandbox the harness runs in. `auto` uses bubblewrap, else firejail, and
+    /// runs without one when neither works on this host.
     #[arg(long, value_enum, default_value_t = SandboxModeArg::Auto)]
     pub sandbox: SandboxModeArg,
 
-    /// Actionability profile to optimize for.
+    /// Actionability profile the findings are classified under: `reporting`
+    /// or `attacking`.
     #[arg(long, default_value_t = actionability::RunMode::Reporting)]
     pub mode: actionability::RunMode,
 
-    /// Override sandbox wrapper executable.
+    /// The firejail or bubblewrap executable to use.
     #[arg(long, value_name = "PATH", requires = "sandbox")]
     pub sandbox_tool: Option<PathBuf>,
 
-    /// Fail if the requested sandbox tool is unavailable.
+    /// Fail when the requested sandbox is unavailable, in place of running
+    /// without it.
     #[arg(long)]
     pub sandbox_strict: bool,
 
@@ -543,22 +546,20 @@ pub struct FuzzArgs {
     )]
     pub extra_env: Vec<(String, String)>,
 
-    /// Load the runtime sink oracles via the LD_PRELOAD runtrace shim (#59), so a
-    /// clean-exit semantic violation — a fuzz-controlled command execution, path
-    /// escape, dlopen, network egress, or SQL query — becomes a finding even when
-    /// the target exits zero. `off` (default) is crash-only, preserving existing
-    /// behaviour; `auto` enables them when the shim and platform (Linux) support
-    /// it and skips otherwise; `on` requires them (errors if unavailable). A no-op
-    /// when `bhf auto` already armed the shim through `extra_env`.
+    /// Load the runtime sink oracles through the LD_PRELOAD runtrace shim
+    /// (Linux), so a semantic violation becomes a finding even when the target
+    /// exits zero: a command execution, path escape, dlopen, network
+    /// connection or SQL query that the fuzz input controls. `off` (default)
+    /// loads none, so the findings are crashes; `auto` loads them when the
+    /// shim and the platform support it; `on` requires them. No effect when
+    /// `bhf auto` already loaded the shim for the run.
     #[arg(long = "runtime-oracles", value_enum, default_value_t = crate::runtime_oracles::RuntimeOracleMode::Off)]
     pub runtime_oracles: crate::runtime_oracles::RuntimeOracleMode,
 
-    /// Path to a previously captured runtrace audit log produced
-    /// with `BHF_CMPLOG=1`. When set, recovered cmplog operands
-    /// seed both the mutator dictionary (positional-info-free token
-    /// insert) and an offset-aware RedQueen-style splice that
-    /// replaces operand_a with operand_b at the exact offset
-    /// operand_a appears in the current input.
+    /// A runtrace log captured earlier with `BHF_CMPLOG=1`. Its comparison
+    /// operands are added to the mutator's dictionary, and a RedQueen-style
+    /// mutation replaces one operand with the other where the first appears
+    /// in the current input.
     #[arg(long, value_name = "PATH")]
     pub cmplog_log: Option<PathBuf>,
 
@@ -590,7 +591,8 @@ pub struct FuzzArgs {
     #[arg(long = "dict", value_name = "PATH")]
     pub dict_file: Option<PathBuf>,
 
-    /// Structure-aware input synthesis for the built-in engine.
+    /// Structure-aware input generation for the builtin engine: `auto` tries
+    /// every format, `off` none, and a format name only that one.
     #[arg(long = "structured-inputs", value_enum, default_value_t = StructuredInputMode::Auto)]
     pub structured_inputs: StructuredInputMode,
 
@@ -606,9 +608,8 @@ pub struct FuzzArgs {
     #[arg(skip)]
     pub stop_after_findings: Option<usize>,
 
-    /// Fuzz an off-host / on-target backend through the `target_transport` seam
-    /// (HDF-1b) instead of the host libFuzzer/AFL lane. Additive: when this is
-    /// absent the default host path runs byte-for-byte as before. Spec forms:
+    /// Fuzz a target on another machine, board or emulator in place of a host
+    /// harness. Spec forms:
     /// `agent:tcp:HOST:PORT`, `agent:serial:/dev/ttyX[,baud=N]` (on-target agent),
     /// `gdb:HOST:PORT` (debug-probe/emulator gdbstub; needs
     /// `--transport-coverage-map`), and
@@ -620,8 +621,8 @@ pub struct FuzzArgs {
     /// bhf's QEMU plugin logs, and needs `dirty_log=PATH`), and
     /// `renode:monitor=HOST:PORT,gdb=HOST:PORT[,snapshot=PATH]` (a Renode
     /// board: its telnet monitor saves and loads the baseline; needs
-    /// `--transport-coverage-map`). Live agent/gdb/qemu/renode backends are
-    /// hardware/emulator-gated; a malformed spec is a descriptive error.
+    /// `--transport-coverage-map`). Each needs its board or emulator running;
+    /// a malformed spec is an error that says what is wrong.
     #[arg(long = "target-transport", value_name = "SPEC")]
     pub target_transport: Option<String>,
 
@@ -631,14 +632,14 @@ pub struct FuzzArgs {
     /// plus `input_len=<addr>` when the firmware reads the input's length from
     /// a `u32` there, and `cmplog=<addr>,cmplog_cap=<n>` for the comparison
     /// record the firmware fills for CmpLog (each value decimal or `0x`-hex).
-    /// `input_cap` is the
-    /// staging buffer's size: no input is written past it. The `agent`
-    /// transport carries coverage over its protocol and rejects this option.
+    /// `input_cap` is the staging buffer's size: no input is written past it.
+    /// The `agent` transport carries coverage over its protocol and rejects
+    /// this option.
     #[arg(long = "transport-coverage-map", value_name = "SPEC")]
     pub transport_coverage_map: Option<String>,
 
     /// Take `--target-transport` and `--transport-coverage-map` from a board
-    /// profile (#293): a TOML file of one board's transport contract, with
+    /// profile: a TOML file of one board's transport settings, with
     /// `gdb` and `coverage_map` for its debug probe and `serial` for the
     /// reference agent on its UART. See docs/hil-bringup.md.
     #[arg(long = "board-profile", value_name = "PATH")]
@@ -654,23 +655,24 @@ pub struct FuzzArgs {
     )]
     pub board_lane: crate::board_profile::BoardLane,
 
-    /// Load a versioned protocol profile (TOML, `bhf.protocol.v1`) and fuzz the
-    /// target as a response-dependent, multi-message session (HDF-7) instead of
-    /// single opaque inputs. Additive: when this is absent the default host /
-    /// transport paths run byte-for-byte as before. Presence routes to the
-    /// session lane, which needs `--session-transport`. A testcase is a sequence
-    /// of structured messages; mutation edits field values AND sequence structure
-    /// and a repair pass recomputes derived length/CRC fields and re-resolves
-    /// response back-references before send. Findings (a clean-exit protocol
-    /// violation, no crash) are written through the usual `results/` layout for
-    /// importers / SARIF / vulnerability-management tools.
+    /// Fuzz the target as a multi-message session whose messages depend on
+    /// its responses, described by a protocol profile (TOML, `bhf.protocol.v1`).
+    /// This is the session lane, and it needs `--session-transport`. A
+    /// testcase is a sequence of structured messages: a mutation edits field
+    /// values and the sequence itself, and before each message is sent, a
+    /// repair pass recomputes its length and CRC fields and fills in the
+    /// values it takes from earlier responses. A protocol violation on a clean
+    /// exit is a finding, written to `results/` like any other.
     #[arg(long = "protocol-profile", value_name = "PATH")]
     pub protocol_profile: Option<PathBuf>,
 
-    /// Request/response backend for the session lane. `tcp:HOST:PORT` connects a
-    /// socket per session; `udp:HOST:PORT` sends each message as a datagram from
-    /// a socket of its own per session and waits for one reply datagram.
-    /// Required when `--protocol-profile` is set.
+    /// Request/response backend for the session lane, required with
+    /// `--protocol-profile`. `tcp:HOST:PORT` connects a socket per session;
+    /// `udp:HOST:PORT` sends each message as a datagram from a socket of its
+    /// own per session and waits for one reply datagram;
+    /// `serial:PATH[,baud=N]` talks to a serial device (a UART or a pty);
+    /// `transport:SPEC` sends each message as one execution on a
+    /// `--target-transport` backend, with `--transport-coverage-map`.
     #[arg(long = "session-transport", value_name = "SPEC")]
     pub session_transport: Option<String>,
 
@@ -686,24 +688,22 @@ pub struct FuzzArgs {
     pub session_server_cmd: Option<String>,
 
     /// How long the session lane waits for a reply before the target is taken
-    /// to have ended the session (default 5s over TCP, 1s over UDP).
+    /// to have ended the session (default 1s over UDP, 5s otherwise).
     #[arg(long = "session-reply-timeout", value_parser = parse_duration, value_name = "DURATION")]
     pub session_reply_timeout: Option<Duration>,
 
-    /// How a session is reset between testcases: `reconnect` (default; a fresh
-    /// connection gives fresh per-session target state, so a new handle / id /
-    /// nonce is captured each run) or `none`. Recorded as the run's reset
-    /// fidelity.
+    /// How a session is reset between testcases: `reconnect` or `none`. The
+    /// run records the choice as its reset fidelity.
     #[arg(long = "session-reset", value_enum, default_value_t = crate::session_fuzz::SessionResetMode::Reconnect)]
     pub session_reset: crate::session_fuzz::SessionResetMode,
 
-    /// Bounded cap on messages per session (default 64); a sequence mutation that
-    /// would exceed it fails with a diagnostic rather than growing unbounded.
+    /// Most messages in one session. A sequence mutation that would pass it
+    /// fails with a message saying so.
     #[arg(long = "max-session-messages", default_value_t = 64)]
     pub max_session_messages: usize,
 
     /// Runtime-event collector that observes process, filesystem, and module-load
-    /// effects the harness performs even on a clean exit (#60). `auto` selects the
+    /// effects the harness performs even on a clean exit. `auto` selects the
     /// built-in provider for the platform: the native Windows ETW provider
     /// `bhf-collector-win`, or on Linux the in-process `LD_PRELOAD` runtrace
     /// adapter, which arms the runtrace shim for the run (with `--runtime-oracles
@@ -715,9 +715,8 @@ pub struct FuzzArgs {
     #[arg(long = "collector", value_parser = crate::collector_run::parse_collector_spec, default_value = "none")]
     pub collector: crate::collector_run::CollectorSpec,
 
-    /// How long, in milliseconds, to keep observing descendant-process effects
-    /// after the testcase process exits — the bounded post-exit observation
-    /// window (#60).
+    /// How long, in milliseconds, the collector keeps observing the effects of
+    /// descendant processes after the testcase process exits.
     #[arg(long = "collector-window-ms", default_value_t = crate::collector_run::DEFAULT_WINDOW_MS)]
     pub collector_window_ms: u64,
 }
@@ -916,18 +915,20 @@ fn resolve_iterations(explicit: Option<usize>, has_time_budget: bool) -> usize {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum FuzzEngine {
+    /// bhf's built-in coverage-guided engine. The default.
     Builtin,
+    /// AFL++ as a subprocess, on the harness's AFL++ build.
     #[value(name = "afl++")]
     AflPlusPlus,
     /// WinAFL on native Windows (DynamoRIO or Intel PT instrumentation).
     Winafl,
-    /// libFuzzer, in process (#294): the harness's `main_libfuzzer`, built
-    /// with `make libfuzzer` when there is none.
+    /// libFuzzer, in process: the harness's `main_libfuzzer`, built with
+    /// `make libfuzzer` when there is none.
     Libfuzzer,
-    /// honggfuzz in persistent mode (#295): the harness's `main_honggfuzz`,
-    /// built with `make honggfuzz` (`hfuzz-clang`) when there is none.
+    /// honggfuzz in persistent mode: the harness's `main_honggfuzz`, built
+    /// with `make honggfuzz` (`hfuzz-clang`) when there is none.
     Honggfuzz,
-    /// A LibAFL campaign over the harness (#296), in a bhf built with the
+    /// A LibAFL campaign over the harness, in a bhf built with the
     /// `libafl-engine` feature.
     Libafl,
 }

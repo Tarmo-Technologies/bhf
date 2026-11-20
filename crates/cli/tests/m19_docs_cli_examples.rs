@@ -16,9 +16,14 @@ fn docs_cli_flow_uses_current_command_flags() {
     assert!(!docs.contains("bhf report --findings findings --out reports"));
     // Manual C/C++ harnesses go where `bhf auto` puts its own, so every triage
     // command finds them; the Ada example above keeps generated_harnesses.
-    assert!(docs.contains(
-        "bhf generate-harness src/parser.cpp --target Parser::parse --output bhf_work/harnesses"
-    ));
+    let cpp_example = docs
+        .lines()
+        .find(|line| line.starts_with("bhf generate-harness src/parser.cpp --target Parser::parse"))
+        .expect("the C++ generate-harness example");
+    assert!(
+        cpp_example.ends_with("--output bhf_work/harnesses"),
+        "{cpp_example}"
+    );
     assert!(!docs.contains("src/parser.cpp --target parse --output bhf_work/generated_harnesses"));
     assert!(!docs.contains("generate-harness path/to/project --target Pkg.Parse --out"));
     assert!(!docs.contains("instrument bhf_work --out"));

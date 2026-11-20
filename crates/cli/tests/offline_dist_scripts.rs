@@ -701,6 +701,7 @@ fn offline_dist_readme_documents_install_options_without_source_tree_note() {
         "RELEASE_NOTES.md",
         "manually co-locate",
         "bhf-bug-report",
+        "docs/site/index.md",
     ] {
         assert!(
             readme.contains(expected),
@@ -753,6 +754,19 @@ fn offline_dist_run_guide_is_packaged_and_documents_core_workflows() {
         "RUN-BHF should point operators at the detailed offline auto runbook"
     );
 
+    // The run guide names the results/ layout a run writes, not the 0.2.x
+    // paths (`bhf_work/findings/`, `auto/findings.csv`, `reports/last.*`).
+    for stale in [
+        "bhf_work/findings/",
+        "--findings bhf_work/findings ",
+        "auto/findings.csv",
+        "reports/last.",
+    ] {
+        assert!(
+            !run_guide.contains(stale),
+            "RUN-BHF names the stale path {stale:?}"
+        );
+    }
     for expected in [
         "bhf --help",
         "VERSION",
@@ -763,9 +777,11 @@ fn offline_dist_run_guide_is_packaged_and_documents_core_workflows() {
         "auto/run.md",
         "auto/run.json",
         "bhf report",
-        "--findings bhf_work/findings",
+        "--findings bhf_work/results/findings",
         "--csv",
-        "reports/last.csv",
+        "reports/run-last.csv",
+        "results/INDEX.md",
+        "docs/site/index.md",
         "bhf fuzz",
         "10 minutes",
         "bhf replay",
@@ -804,7 +820,7 @@ fn offline_auto_runbook_documents_trusted_and_forced_recovery_flows() {
         "IDL and Generated Source",
         "--force",
         "different work directory",
-        "Do not use `--install-deps`",
+        "`--install-deps` needs the network",
         "positive coverage",
         "Compact Scrubbed Support Report",
         "bhf-bug-report /results/bhf-real",
@@ -1405,6 +1421,52 @@ fn signed_offline_package_install_and_tamper_rejection_with_external_trust() {
         "independent OpenSSL archive verification",
     );
 
+    // The archive carries the user documentation beside README.md, and the
+    // links of its front pages resolve in the extracted archive and, after
+    // install.sh, in the prefix: the documentation works offline.
+    let check_doc_links = |root: &Path| {
+        Command::new("python3")
+            .arg(repo_root().join("scripts/check-doc-links.py"))
+            .arg("--root")
+            .arg(root)
+            .args([
+                "README.md",
+                "INSTALL.md",
+                "docs/README.md",
+                "docs/site/index.md",
+            ])
+            .output()
+            .unwrap()
+    };
+    let extracted = work.join("extracted");
+    fs::create_dir_all(&extracted).unwrap();
+    assert_success(
+        Command::new("tar")
+            .arg("-xzf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&extracted)
+            .output()
+            .unwrap(),
+        "extract the signed fixture archive",
+    );
+    let extracted = extracted.join("signed-fixture");
+    for page in [
+        "RUN-BHF.md",
+        "README-DIST.md",
+        "NOTICE",
+        "docs/README.md",
+        "docs/site/index.md",
+        "docs/site/img/sast-signal.png",
+        "examples/access_param/README.md",
+    ] {
+        assert!(extracted.join(page).is_file(), "the archive lacks {page}");
+    }
+    assert_success(
+        check_doc_links(&extracted),
+        "documentation links in the extracted archive",
+    );
+
     let prefix = work.join("installed");
     let bin_dir = work.join("bin");
     fs::create_dir_all(&prefix).unwrap();
@@ -1420,6 +1482,13 @@ fn signed_offline_package_install_and_tamper_rejection_with_external_trust() {
             .unwrap()
     };
     assert_success(install(), "signed fixture install");
+    for page in ["README.md", "RUN-BHF.md", "VERSION", "docs/site/index.md"] {
+        assert!(prefix.join(page).is_file(), "the prefix lacks {page}");
+    }
+    assert_success(
+        check_doc_links(&prefix),
+        "documentation links in the install prefix",
+    );
     let pack_id = "bhf-content-fixture";
     let receipt: serde_json::Value = serde_json::from_slice(
         &fs::read(prefix.join("packs").join(pack_id).join("install.json")).unwrap(),

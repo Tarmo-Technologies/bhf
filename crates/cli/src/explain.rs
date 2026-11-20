@@ -56,11 +56,9 @@ pub struct ExplainArgs {
     pub finding_id: Option<String>,
 
     /// Explain every finding of a root-cause group. By default a group (the
-    /// findings with one root-cause key, such as one site reached through
-    /// several harnesses: their `cluster_key_full`, or for a finding an
-    /// earlier release keyed on one constant per rule, the key its report
-    /// gets now) is explained once, by its first finding, which lists the
-    /// others and their harnesses.
+    /// findings with one root-cause key, `cluster_key_full`, such as one site
+    /// reached through several harnesses) is explained once, by its first
+    /// finding, which lists the others and their harnesses.
     #[arg(long = "all-members")]
     pub all_members: bool,
 }

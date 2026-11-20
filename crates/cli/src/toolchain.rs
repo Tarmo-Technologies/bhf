@@ -64,14 +64,14 @@ pub struct CToolchainArgs {
     #[arg(long = "cxx", value_name = "PROGRAM")]
     pub cxx: Option<String>,
 
-    /// Extra C compiler flags, APPENDED to bhf's coverage and sanitizer flags
-    /// (whitespace-separated; repeatable). Their preprocessor words (-D, -U,
-    /// -I, -isystem, -include) reach every build lane of a C harness; the
-    /// rest only the lanes built with this toolchain's compiler. A CFLAGS in
-    /// the environment is appended to the main build too, unless bhf builds
-    /// it with a compiler it picked in place of the operator's (a platform
-    /// guard's cross lane, the --sanitizers clang fallback). Config key:
-    /// `toolchain.cflags`.
+    /// Extra C compiler flags, appended after bhf's coverage and sanitizer
+    /// flags (whitespace-separated; repeatable). Their preprocessor words (-D,
+    /// -U, -I, -isystem, -include) reach every build variant (lane) of a C
+    /// harness; the other flags reach only the lanes built with this
+    /// toolchain's compiler. A CFLAGS in the environment is appended to the
+    /// main build too, unless bhf builds it with a compiler it picked in place
+    /// of yours (a platform guard's cross lane, the --sanitizers clang
+    /// fallback). Config key: `toolchain.cflags`.
     #[arg(long = "cflags", value_name = "FLAGS", allow_hyphen_values = true)]
     pub cflags: Vec<String>,
 
@@ -85,9 +85,9 @@ pub struct CToolchainArgs {
 
     /// Extra link flags for the harness binary (whitespace-separated;
     /// repeatable). Library operands (-L, -l, archives, objects, linker
-    /// options -Wl,... and -Xlinker ..., -pthread) reach every build lane's
-    /// link, in their order; the rest only the lanes
-    /// built with this toolchain's compiler. Config key: `toolchain.ldflags`.
+    /// options -Wl,... and -Xlinker ..., -pthread) reach the link of every
+    /// build lane, in their order; the other flags reach only the lanes built
+    /// with this toolchain's compiler. Config key: `toolchain.ldflags`.
     #[arg(long = "ldflags", value_name = "FLAGS", allow_hyphen_values = true)]
     pub ldflags: Vec<String>,
 
@@ -108,8 +108,9 @@ pub struct CToolchainArgs {
 
     /// Build without `-DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION`, which every
     /// C/C++ lane otherwise defines (OSS-Fuzz's convention; AFL++'s compiler
-    /// wrappers define it too), so code a project compiles out of fuzz builds
-    /// (a signature check) runs. `BHF_FUZZING_BUILD_MODE=0` does the same.
+    /// wrappers define it too), so code that a project leaves out of fuzz
+    /// builds, such as a signature check, runs. `BHF_FUZZING_BUILD_MODE=0` does
+    /// the same.
     #[arg(long = "no-fuzzing-build-mode")]
     pub no_fuzzing_build_mode: bool,
 }
@@ -224,8 +225,8 @@ pub struct AutoToolchainArgs {
     #[arg(long = "ada-switch", value_name = "SWITCH", allow_hyphen_values = true)]
     pub ada_switches: Vec<String>,
 
-    /// AdaFuzz.Probe runtime backend compiled into each Ada harness
-    /// (host_file, memory_buffer, semihosting, stub; default host_file).
+    /// Backend of the probe runtime (AdaFuzz.Probe) compiled into each Ada
+    /// harness: host_file (default), memory_buffer, semihosting or stub.
     /// Config key: `toolchain.ada.probe-backend`.
     #[arg(long = "probe-backend", value_name = "BACKEND")]
     pub probe_backend: Option<String>,

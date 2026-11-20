@@ -35,21 +35,21 @@ RECOMMENDED SWEEP:
     --sloc sloc.txt \\
     --debug
 
-  --work-dir   where everything lands; keep it OUTSIDE the scanned tree
-  --jobs       targets built+fuzzed at once; child RAM is ~jobs x --rss-limit-mb
-               leave additional room for BHF, compiler processes, and the OS
-  --per-target-time  fuzz seconds per target (libFuzzer -max_total_time parity)
-  --campaign-time    hard cap for the whole sweep, in seconds
-  --max-targets      stop once N targets actually FUZZED (failures don't count)
+  --work-dir   where everything is written; keep it outside the scanned tree
+  --jobs       targets built and fuzzed at once; their memory is about
+               jobs x --rss-limit-mb, plus room for bhf, compilers and the OS
+  --per-target-time  fuzz seconds per target (libFuzzer -max_total_time)
+  --campaign-time    limit for the whole sweep, in seconds
+  --max-targets      stop once N targets have fuzzed (failures do not count)
   --unsafe-search-and-run-build-commands
-                     RUNS the tree's own build to recover real compile flags —
-                     trusted sources only; drop it otherwise
-  --force      retry what phase 1 could not fuzz, on fabricated inputs/stubs;
-               those findings are stamped low-confidence
-  --static     also analyze the whole tree statically, not just what fuzzed
-  --sbom       evidence-graded SBOM + VEX at campaign end
-  --sloc FILE  per-language SLOC breakdown (.json for JSON)
-  --debug      backtrace on a bhf-internal panic; enriches the bug report
+                     runs the tree's own build to recover its compile flags;
+                     use it only on sources you trust
+  --force      retry the targets the first phase could not fuzz, with
+               fabricated inputs and stubs; their findings are low-confidence
+  --static     also analyze the whole tree statically
+  --sbom       SBOM and VEX at the end of the run
+  --sloc FILE  per-language line counts (.json for JSON)
+  --debug      backtrace if bhf itself panics; adds detail to the bug report
 
   Read bhf_work/results/INDEX.md first. Full guide: RECOMMENDED-SWEEP.md
   (docs/recommended-sweep.md in the repository).";
@@ -70,16 +70,21 @@ FIRST RUN:
     --jobs 1 --max-targets 1 --per-target-time 10
 
 Keep the work directory outside the source tree. Install the compiler or
-interpreter for the languages you select. For Windows C/C++, install VS Build
-Tools with the C++ workload (bhf finds it and its clang; no Developer shell
-needed) and GNU make; `--cc cl` builds the harnesses with cl.exe. A Visual
-Studio solution in the tree is imported for its include dirs and defines.
-Harnesses the project already ships (Go native fuzz tests, Atheris harnesses)
-are fuzzed first, from the seeds and dictionaries that come with them, and so
-are the fuzzers a `bhf project import-ossfuzz` registered in the work dir.
-Read results/INDEX.md for findings
-and auto/summary.txt for targets that built, fuzzed, or were skipped.
-Add --resume to the same command to continue a stopped run.";
+interpreter for the languages you select.
+
+On Windows, C and C++ need Visual Studio Build Tools with the C++ workload and
+GNU make. bhf finds Build Tools and its clang, so no Developer shell is
+needed; `--cc cl` builds the harnesses with cl.exe. A Visual Studio solution
+in the tree is read for its include directories and defines.
+
+Fuzz harnesses the project already has (Go native fuzz tests, Atheris
+harnesses) are fuzzed first, from the seeds and dictionaries that come with
+them, and so are the fuzzers `bhf project import-ossfuzz` registered in the
+work directory.
+
+When the run ends, read results/INDEX.md for the findings and
+auto/summary.txt for the targets that built, fuzzed or were skipped. To
+continue a stopped run, run the same command again with --resume.";
 
 #[derive(Debug, clap::Args)]
 #[command(after_help = RECOMMENDED_SWEEP, after_long_help = RECOMMENDED_SWEEP)]
@@ -87,39 +92,38 @@ pub struct AutoArgs {
     /// Source root to sweep.
     pub path: PathBuf,
 
-    /// Work directory. Default ./bhf_work/.
+    /// Work directory, where everything the run writes goes.
     #[arg(long, default_value = "bhf_work")]
     pub work_dir: PathBuf,
 
-    /// Stop starting new targets once the BHF work directory reaches this
-    /// allocated size in MiB. Completed and in-flight targets are preserved and
-    /// reported, so parallel jobs can overshoot by their final artifacts. Default
-    /// 4096 MiB; pass 0 to disable. Findings are never deleted to satisfy the cap.
+    /// Stop starting new targets once the work directory takes up this many
+    /// MiB on disk; 0 turns the limit off. Finished and running targets keep
+    /// their results, so parallel jobs can go past the limit by what they
+    /// write last. Findings are kept whatever the size.
     #[arg(long = "max-work-dir-mb", default_value_t = crate::auto::storage::DEFAULT_MAX_WORK_DIR_MIB)]
     pub max_work_dir_mb: u64,
 
-    /// Maximum retained coverage corpus per target, in MiB. This bounds both the
-    /// in-memory mutation pool and `corpus/<harness-id>/queue/` written to disk.
-    /// Findings/testcases are separate and are never discarded by this limit.
+    /// Largest corpus kept per target, in MiB: both the inputs held in memory
+    /// for mutation and `corpus/<harness-id>/queue/` on disk. Findings and
+    /// their testcases do not count toward it.
     #[arg(long = "max-corpus-mb", default_value_t = 64, value_parser = parse_positive_mib)]
     pub max_corpus_mb: usize,
 
-    /// Explicit discovery-cache file, overriding the default
-    /// `<work-dir>/discovery-cache.json`. Pin it to a stable absolute path so the
-    /// default-on cache is found regardless of the current directory or work dir
-    /// and can live on a known-good volume.
+    /// Discovery cache file, in place of `<work-dir>/discovery-cache.json`.
+    /// Give an absolute path so the cache is found whatever the current or
+    /// work directory, or to keep it on another volume.
     #[arg(long = "discovery-cache", value_name = "PATH")]
     pub discovery_cache: Option<PathBuf>,
 
-    /// Load run options from a TOML config file. Persists common flags so a project's
-    /// runs are reproducible; CLI flags always override it, and relative paths in it
-    /// resolve against the file's directory. Without this, a `.bhf.toml` in the
-    /// scanned tree root is auto-loaded — but an auto-loaded config honors only SAFE
-    /// knobs (keys that EXECUTE something, `build-command`, `run-untrusted`,
-    /// `unsafe-search-and-run-build-commands`, `probe-build`, `msbuild-evaluate`,
-    /// `winafl-path`, `dynamorio-path` and the `[toolchain]` table, require this
-    /// explicit flag). Only these flags have a
-    /// key, spelled as the flag: per-target-time, max-targets, jobs, rss-limit-mb,
+    /// Load run options from a TOML config file, so a project's runs repeat
+    /// with the same settings. Command-line flags override it, and relative
+    /// paths in it resolve against the file's directory. Without this flag, bhf
+    /// loads a `.bhf.toml` at the root of the scanned tree, but takes only its
+    /// safe keys from it (keys that EXECUTE something, `build-command`,
+    /// `run-untrusted`, `unsafe-search-and-run-build-commands`, `probe-build`,
+    /// `msbuild-evaluate`, `winafl-path`, `dynamorio-path` and the
+    /// `[toolchain]` table, require this explicit flag). Only these flags have
+    /// a key, spelled as the flag: per-target-time, max-targets, jobs, rss-limit-mb,
     /// max-work-dir-mb, max-corpus-mb, cxx-std, max-len, timeout, deadline, grammar,
     /// extra-include, extra-source, exclude-path, cxx-expected-exception, seed-file, seed-dir, sanitizers,
     /// nonblocking, engine, languages, project, ada-deps, passes, force, rust-private, build-command,
@@ -131,9 +135,9 @@ pub struct AutoArgs {
     /// `[toolchain]` / `[toolchain.ada]` table, the same table `bhf build --config`
     /// reads. `[cross.<lane>]` tables (lanes mingw, aarch64, armhf, ppc64le, ppc64,
     /// ppc, mipsel, mips, sparc64; keys cc, cxx, target, sysroot, runner,
-    /// runner-args) override the toolchain and emulator of a guard-driven cross
-    /// lane; like `[toolchain]`, they need this explicit flag. Any other key is an
-    /// error.
+    /// runner-args) set the toolchain and emulator of the cross lane a
+    /// platform guard selects; like `[toolchain]`, they need this explicit
+    /// flag. Any other key is an error.
     #[arg(long = "config", value_name = "PATH")]
     pub config: Option<PathBuf>,
 
@@ -159,28 +163,30 @@ pub struct AutoArgs {
     #[command(flatten)]
     pub(crate) toolchain: crate::toolchain::AutoToolchainArgs,
 
-    /// Override the governing Ada project (`.gpr`). By default
-    /// `auto` selects the project that OWNS each target's source (the non-aggregate
-    /// component whose active Source_Dirs contain it); pass this to force a specific
-    /// project when a multi-project layout is ambiguous. The same project is used
-    /// for generation analysis, source staging, scenario exclusions, and the build.
-    /// Errors if the path is missing.
+    /// The Ada project (`.gpr`) to build every Ada target with. By default bhf
+    /// picks, for each target, the non-aggregate project whose active
+    /// Source_Dirs hold its source; name one when that is ambiguous in a
+    /// multi-project layout. The project is used for harness generation,
+    /// source staging, scenario exclusions and the build. A missing file is an
+    /// error.
     #[arg(long = "project", value_name = "PATH")]
     pub project: Option<PathBuf>,
 
-    /// Path to a JSON grammar describing the target's input format for structure-aware
-    /// generation (a Nautilus-style grammar mutator), applied to every fuzzed target.
-    /// Each rule maps a non-terminal to production strings where `{NAME}` references
-    /// another rule; the start symbol is `START` or the first rule. See
-    /// `bhf fuzz --grammar`.
+    /// Path to a JSON grammar of the targets' input format, used for every
+    /// fuzzed target: the builtin engine generates inputs from it and mutates
+    /// them on their derivation trees, as `bhf fuzz --grammar` describes. Each
+    /// rule maps a non-terminal to production strings where `{NAME}`
+    /// references another rule; the start symbol is `START` or the first
+    /// rule.
     #[arg(long = "grammar", value_name = "PATH")]
     pub grammar_file: Option<PathBuf>,
 
-    /// Maximum fuzz input length. `auto` (the default) grows the effective length
-    /// adaptively per target — free up to ~1 MiB, and beyond that only while longer
-    /// inputs keep finding new coverage — so a large-object target (image, archive,
-    /// firmware) is handled WITHOUT a seed corpus, and a small-format one is never
-    /// grown into huge inputs pointlessly. A positive integer sets a fixed cap instead.
+    /// Longest fuzz input, in bytes. `auto` (default) grows the length per
+    /// target: freely up to about 1 MiB, and beyond that only while longer
+    /// inputs keep finding new coverage. A target that takes large objects
+    /// (images, archives, firmware) then gets large inputs without a seed
+    /// corpus, and a target with a small format keeps small ones. A number
+    /// sets a fixed limit.
     #[arg(long = "max-len", default_value = "auto")]
     pub max_len: String,
 
@@ -214,26 +220,24 @@ pub struct AutoArgs {
     pub collector_window_ms: u64,
 
     /// A C++ exception type an API throws to tell its callers about bad input
-    /// (`std::invalid_argument`, `json::parse_error`; `*` for any), so one
-    /// that leaves the target is not an uncaught-exception finding (BHF-231).
-    /// Repeatable. Without it every exception that leaves a C++ target is one,
-    /// as it would terminate a program that calls the target the same way.
+    /// (`std::invalid_argument`, `json::parse_error`; `*` for any). One that
+    /// leaves the target is then not an uncaught-exception finding (BHF-231).
+    /// Repeatable. Without it every exception that leaves a C++ target is a
+    /// finding, as it would end a program that calls the target the same way.
     #[arg(long = "cxx-expected-exception", value_name = "TYPE")]
     pub cxx_expected_exceptions: Vec<String>,
 
-    /// Force the C++ standard for every harness build (e.g. `gnu++14`, `c++03`),
-    /// pinning the dialect for legacy C++. Without it, `auto` builds C++ at the modern
-    /// default and, on a dialect failure, automatically retries successively older
-    /// standards until one builds — so an explicit value is only needed to override
-    /// that search.
+    /// The C++ standard for every harness build, such as `gnu++14` or `c++03`.
+    /// Without it, bhf builds C++ as gnu++20 and, when the build fails on the
+    /// dialect, retries gnu++17, gnu++14 and gnu++11 in turn.
     #[arg(long = "cxx-std", value_name = "STD")]
     pub cxx_std: Option<String>,
 
-    /// TOTAL per-target fuzz wall-clock budget in seconds, split evenly across the
-    /// passes (`auto` runs empty / rng / fuzz-driven) under one shared deadline,
-    /// so the per-target wall ≈ this regardless of pass count. libFuzzer
-    /// `-max_total_time` / AFL `-V` / honggfuzz `--run_time` parity. For a
-    /// whole-RUN cap across all targets use `--campaign-time`.
+    /// Fuzzing time per target, in seconds, split evenly across its passes
+    /// (empty, rng and fuzz-driven) under one deadline, so a target takes
+    /// about this long however many passes run. Like libFuzzer's
+    /// `-max_total_time`, AFL's `-V` and honggfuzz's `--run_time`. To limit
+    /// the whole run, use `--campaign-time`.
     #[arg(long, default_value_t = 60)]
     pub per_target_time: u64,
 
@@ -243,33 +247,31 @@ pub struct AutoArgs {
     #[arg(long, hide = true)]
     pub total_time: Option<u64>,
 
-    /// Stop fuzzing a target as soon as it has produced this many DISTINCT
-    /// findings (crash signatures), or when its `--per-target-time` budget is
-    /// spent — whichever comes first. Checked mid-pass, so the target stops the
-    /// instant the Nth finding lands and remaining passes are skipped. `1` mimics
-    /// libFuzzer's stop-on-first-crash. Unset (default) = collect every finding
-    /// within the time budget (current behavior).
+    /// Stop fuzzing a target once it has this many distinct findings (crash
+    /// signatures), or when its `--per-target-time` is spent, whichever comes
+    /// first. The count is checked during a pass, so the target stops when the
+    /// Nth finding lands and its remaining passes are skipped. `1` stops at the
+    /// first crash, as libFuzzer does. Without it, a target runs its whole time
+    /// budget.
     #[arg(long = "per-target-finding-count", value_name = "N")]
     pub per_target_finding_count: Option<usize>,
 
-    /// Budget in seconds for the SWEEP across ALL targets, charged from the first
-    /// build attempt — discovery and preflight are not billed to it, so a large
-    /// tree whose indexing takes minutes still fuzzes (libFuzzer `-max_total_time`
-    /// / AFL `-V` semantics). Default mode: a hard OUTER wall-clock cap — once
-    /// exceeded, `auto` stops STARTING new (ranked) targets (the in-flight one
-    /// finishes) and reports how many of the N discovered were reached. With
-    /// `--min-target-time`, switches to SPLIT mode: this becomes the total fuzz
-    /// budget DIVIDED across the attempted targets. Unset (default) = run every
-    /// target with its own `--per-target-time`.
+    /// Time limit of the whole sweep, in seconds, counted from the first build
+    /// attempt; discovery and preflight do not count, so a large tree whose
+    /// indexing takes minutes still gets fuzzed. Once it passes, bhf starts no
+    /// new target (the running ones finish) and reports how many of the
+    /// discovered targets it reached. With `--min-target-time` it is instead
+    /// the total fuzzing time, divided across the targets attempted. Without
+    /// it, every target runs its own `--per-target-time`.
     #[arg(long)]
     pub campaign_time: Option<u64>,
 
-    /// SPLIT-mode floor (seconds), used only with `--campaign-time`: divide the
-    /// campaign budget across the N attempted targets, giving each
-    /// `max(min, campaign / N)` of fuzz time and attempting only the top
-    /// `floor(campaign / per_target)` ranked targets (the rest logged unfuzzed) —
-    /// never less than this floor per target. Requires `--campaign-time`;
-    /// overrides `--per-target-time`.
+    /// Least fuzzing time per target, in seconds, when `--campaign-time` is
+    /// divided across targets (it requires `--campaign-time` and overrides
+    /// `--per-target-time`). Each of the N targets attempted gets
+    /// `max(min, campaign / N)`, and only the top `floor(campaign /
+    /// per_target)` ranked targets are attempted; the rest are logged as not
+    /// fuzzed.
     #[arg(
         long = "min-target-time",
         value_name = "SECS",
@@ -277,62 +279,57 @@ pub struct AutoArgs {
     )]
     pub min_target_time: Option<u64>,
 
-    /// Cap on the number of targets that reach the FUZZ phase (successful
-    /// builds), NOT on candidates inspected. The sweep attempts ranked candidates
-    /// in order and stops once N of them fuzz; unsupported params and build
-    /// failures never consume the cap, so lower-ranked viable endpoints are
-    /// backfilled instead of being starved by a nonviable prefix. Stops at the cap,
-    /// the `--campaign-time` deadline, or candidate exhaustion. Unset (default) =
-    /// fuzz every viable target. Use `--max-attempts` to also bound inspection.
+    /// Most targets that reach the fuzz phase (that build). The sweep tries
+    /// ranked candidates in order and stops once N of them fuzz; a target with
+    /// unsupported parameters or a failed build does not count, so lower-ranked
+    /// targets that do build are backfilled in its place. The sweep stops at
+    /// the limit, at the `--campaign-time` deadline, or when it runs out of
+    /// candidates. Without it, every target that builds is fuzzed. To limit
+    /// how many candidates are tried, use `--max-attempts`.
     #[arg(long = "max-targets", value_name = "N")]
     pub max_targets: Option<usize>,
 
-    /// Hard ceiling on the number of ranked candidates INSPECTED (built/
-    /// attempted), independent of how many fuzz. Bounds a huge legacy tree where
-    /// most candidates are nonviable so `--max-targets` backfill can't grind the
-    /// whole tree. Unset (default) = inspect as many as needed to reach the
-    /// `--max-targets` success cap (or all of them).
+    /// Most ranked candidates to try (build and attempt), however many of
+    /// them fuzz. On a large tree where most candidates do not build, it stops
+    /// the `--max-targets` backfill from working through the whole tree.
+    /// Without it, bhf tries as many as it needs to reach `--max-targets`, or
+    /// all of them.
     #[arg(long = "max-attempts", value_name = "N")]
     pub max_attempts: Option<usize>,
 
-    /// Cap on build-fail -> repair -> retry rounds per target (default 16). Each
-    /// round only runs when the previous one applied a NEW repair (the no-progress
-    /// early-break is preserved), so this is a ceiling, not a fixed cost. A LOW
-    /// value (2-3) fails un-buildable targets fast — useful for a quick triage
-    /// sweep over a huge tree where deep multi-file dependency convergence isn't
-    /// worth the per-target build time.
+    /// Most build, repair and retry rounds per target. A round runs only when
+    /// the one before it applied a new repair, so this is a ceiling, not a
+    /// fixed cost. A low value (2 or 3) gives up early on targets that do not
+    /// build, for a quick sweep over a large tree.
     #[arg(long = "max-repair-rounds", default_value_t = crate::auto::attempt::DEFAULT_MAX_REPAIR_ROUNDS)]
     pub max_repair_rounds: usize,
 
-    /// Restrict the per-target fuzz cascade to a comma-separated subset of passes
-    /// instead of all three. Names: `empty`, `rng`, `fuzz` (alias for
-    /// `fuzz_driven`). E.g. `--passes fuzz` runs only the fuzz-driven pass — ~3x
-    /// the throughput of the default 3-pass cascade for a triage sweep. Order is
-    /// preserved as given. Unset (default) = all passes (empty, rng, fuzz_driven).
-    /// Ignored under `--deps-only` (which fuzzes nothing).
+    /// The fuzz passes to run per target, comma-separated, in the order given:
+    /// `empty`, `rng`, `fuzz` (alias of `fuzz_driven`). The passes share
+    /// `--per-target-time`, so `--passes fuzz` gives the fuzz-driven pass the
+    /// whole budget. Default: all three (empty, rng, fuzz_driven). Ignored with
+    /// `--deps-only`, which fuzzes nothing.
     #[arg(long = "passes", value_name = "SET", conflicts_with = "single_pass")]
     pub passes: Option<String>,
 
-    /// Convenience for `--passes fuzz`: run ONLY the fuzz-driven pass per target,
-    /// skipping the empty/rng passes. ~3x a triage sweep's throughput. Mutually
-    /// exclusive with `--passes`.
+    /// Same as `--passes fuzz`: run only the fuzz-driven pass per target. Not
+    /// with `--passes`.
     #[arg(long = "single-pass")]
     pub single_pass: bool,
 
-    /// Number of candidates to build+fuzz CONCURRENTLY. Defaults to half the
-    /// host's parallelism (capped, minimum 1); pass `--jobs 1` for the historical
-    /// serial sweep. Up to N targets' build+fuzz run in parallel via a bounded
-    /// worker pool. MEMORY: each concurrent fuzz uses up to `--rss-limit-mb` of
-    /// RAM. Budget `jobs x rss-limit-mb` for children plus BHF, compiler, and OS
-    /// overhead (a too-high value OOM-kills, e.g. inside a cgroup MemoryMax slice),
-    /// which is why the default is half the cores rather than all of them.
-    /// Results are aggregated deterministically regardless of completion order.
-    /// Ada targets build serially regardless: they share the staged source tree.
+    /// Targets to build and fuzz at the same time. Default: half the host's
+    /// cores (capped, at least 1); `--jobs 1` runs one target at a time. Each
+    /// running fuzz uses up to `--rss-limit-mb` of memory, so allow `jobs x
+    /// rss-limit-mb` plus room for bhf, the compilers and the OS; too high a
+    /// value gets processes killed for lack of memory, as in a cgroup with
+    /// MemoryMax. Results are the same whatever order targets finish in. Ada
+    /// targets build one at a time, because they share the staged source
+    /// tree.
     #[arg(long = "jobs", short = 'j', default_value_t = default_auto_jobs(), value_name = "N")]
     pub jobs: usize,
 
-    /// Run each target's builtin fuzz passes on N cores (#332): every pass is
-    /// a campaign of N `bhf fuzz` workers, each in its own copy of the work
+    /// Run each target's builtin fuzz passes on N cores: every pass is a
+    /// campaign of N `bhf fuzz` workers, each in its own copy of the work
     /// dir, that share the corpus entries they keep as they run (every
     /// BHF_SYNC_INTERVAL_MS, default 10000) and whose queues and findings are
     /// merged into the target's when the pass ends. With `--jobs J` that is
@@ -354,101 +351,99 @@ pub struct AutoArgs {
     #[arg(long = "reuse-discovery", hide = true)]
     pub reuse_discovery: bool,
 
-    /// Disable the discovery cache entirely: do not read or write
-    /// `<work-dir>/discovery-cache.json`; always run a fresh tree-sitter parse +
-    /// rank. (Discovery caching is on by default — a re-run over an unchanged
-    /// source tree reuses the prior ranked candidate list, skipping the dominant
-    /// cost of a big-tree re-run. A content fingerprint of the target source +
-    /// dir-filter guards every load, so any source/`--exclude-dir`/`--include-dir`
-    /// change auto-invalidates it; a stale cache is never used silently.)
+    /// Do not read or write the discovery cache
+    /// (`<work-dir>/discovery-cache.json`); parse and rank the tree afresh. The
+    /// cache is on by default: a run over an unchanged tree reuses the ranked
+    /// candidate list of the run before, which saves most of the start-up time
+    /// on a large tree. Each load checks a fingerprint of the sources and of
+    /// `--exclude-dir`/`--include-dir`, so a change to either makes bhf
+    /// discover again.
     #[arg(long = "no-discovery-cache")]
     pub no_discovery_cache: bool,
 
-    /// Force a fresh discovery THIS run, ignoring any existing cache, then
-    /// overwrite the cache with the new result. Use when you deliberately want to
-    /// re-discover (the cache otherwise only re-runs discovery when the target
-    /// source or dir-filter actually changed). No effect with
-    /// `--no-discovery-cache`.
+    /// Discover afresh in this run, ignoring the cache, and write the result to
+    /// the cache. Without it, bhf discovers again only when the sources or the
+    /// directory filters changed. No effect with `--no-discovery-cache`.
     #[arg(long = "fresh-discovery")]
     pub fresh_discovery: bool,
 
-    /// Resume a prior sweep over the SAME work-dir: skip targets that already
-    /// completed (a per-target `harnesses/<id>/result.json` marker is written the
-    /// moment each target's attempt finishes, so an INTERRUPTED run is resumable),
-    /// re-running only the not-yet-attempted ones. Requires the discovery cache to
-    /// hit (target source unchanged) — otherwise the prior per-target results may
-    /// be stale and every target is re-attempted. Each skipped target's prior
-    /// artifacts (`harnesses/<id>/`, `findings/`, `fuzz_runs/`) remain on disk; the new
+    /// Continue an earlier sweep in the same work directory: skip the targets
+    /// that finished and run only the ones not yet attempted. Each target
+    /// writes `harnesses/<id>/result.json` when its attempt finishes, so an
+    /// interrupted run can be resumed. Results are reused while the build
+    /// context (compile database, `.gpr`, IDL and harness options) is
+    /// unchanged; a target whose own source file changed runs again. With
+    /// `--no-discovery-cache` bhf records no source files, so a target whose
+    /// file changed is reused too. Skipped targets keep their files
+    /// (`harnesses/<id>/`, `results/findings/`, `fuzz_runs/`), and the new
     /// run's report counts them as `resumed`.
     #[arg(long = "resume")]
     pub resume: bool,
 
-    /// Per-pass execution cap. Unset (or `0`) lets `--per-target-time` govern
-    /// depth; a positive value caps each fuzz pass (libFuzzer `-runs`). The old
-    /// hardcoded 1024 cap is retired — without this flag wall-clock governs.
+    /// Most executions per fuzz pass, like libFuzzer's `-runs`. Without it, or
+    /// with `0`, `--per-target-time` alone ends each pass.
     #[arg(long)]
     pub iterations: Option<usize>,
 
-    /// Per-harness resident-set memory cap in MB. A test case that allocates
-    /// past this is killed and reported as an OOM finding (BHF-209) instead of
-    /// OOM-killing the host. Mirrors libFuzzer's `-rss_limit_mb`; the default is
-    /// one quarter of available host/cgroup memory, clamped to 512..8192 MiB.
-    /// Pass an exact value (or 0 to disable) when the derived allowance is not
-    /// appropriate for the target.
+    /// Resident-memory limit of a harness, in MiB, like libFuzzer's
+    /// `-rss_limit_mb`. A test case that allocates past it is killed and
+    /// reported as an out-of-memory finding (BHF-209), and the host keeps its
+    /// memory. Default: a quarter of the memory free on the host or in its
+    /// cgroup, between 512 and 8192 MiB. Give a number to set it, or 0 to
+    /// turn it off.
     #[arg(long = "rss-limit-mb", default_value_t = default_auto_rss_limit_mb())]
     pub rss_limit_mb: usize,
 
-    /// Skip auto-stubbing entirely (diagnostics-only).
+    /// Do not generate stubs for missing symbols: a target that does not build
+    /// as it is fails, with its build diagnostics.
     #[arg(long)]
     pub no_stubs: bool,
 
-    /// Print the fake-resource plugin inventory and exit.
+    /// Print the runtrace shim's fake-resource plugins (the calls each one
+    /// intercepts, and the variable that turns on a gated one) and exit.
     #[arg(long)]
     pub list_fakes: bool,
 
-    /// Attempt only targets this name selects: the full discovered name (as
-    /// --list-targets prints it), the bare function name, or a trailing
-    /// qualified suffix such as `Class::method`, each optionally with its
+    /// Attempt only the targets this name selects: the full discovered name
+    /// (as --list-targets prints it), the bare function name, or a trailing
+    /// qualified suffix such as `Class::method`, each with or without its
     /// parameter list. An exact spelling wins: the suffix match applies only
     /// when no target has exactly this name, and a leading `::` names the
-    /// global namespace only. Repeatable. Useful when a source drop contains
-    /// vendored support code but the sweep should exercise a known wrapper
-    /// target. A project fuzz driver (`LLVMFuzzerTestOneInput`) is skipped when
-    /// the tree has other targets, unless this option, --target-file, or
-    /// --harness-id selects it.
+    /// global namespace only. Repeatable. A project's own fuzz driver
+    /// (`LLVMFuzzerTestOneInput`) is skipped when the tree has other targets,
+    /// unless this option, --target-file or --harness-id selects it.
     #[arg(long = "target")]
     pub targets: Vec<String>,
 
-    /// Attempt only targets whose stable harness id exactly matches this value.
-    /// Repeatable. Useful for rerunning a target printed by auto/run reports.
+    /// Attempt only the target with this harness id, as the run reports print
+    /// it. Repeatable.
     #[arg(long = "harness-id")]
     pub harness_ids: Vec<String>,
 
-    /// Attempt only targets discovered in this source file. Accepts an absolute
-    /// path or a path relative to the sweep root. Repeatable.
+    /// Attempt only the targets in this source file: an absolute path, or one
+    /// relative to the scanned tree. Repeatable.
     #[arg(long = "target-file", value_name = "PATH")]
     pub target_files: Vec<PathBuf>,
 
-    /// Exclude paths whose normalized relative path contains this text. Repeatable.
+    /// Leave out files whose relative path contains this text. Repeatable.
     #[arg(long = "exclude-path")]
     pub exclude_paths: Vec<String>,
 
-    /// Exclude common project areas. Accepts comma-separated values: tests, tools, examples.
+    /// Leave out common project areas, comma-separated: tests, tools, examples.
     #[arg(long = "exclude", value_enum, value_delimiter = ',')]
     pub exclude: Vec<ExcludeCategory>,
 
-    /// Additional local directories of dependency source to put on the Ada
-    /// build path (offline: never fetched). Point at vendored/air-gapped
-    /// dependency crates so a project that `with`s an external library (e.g.
-    /// ada-util's `Util.Encoders`) can build. Repeatable. Locally-cached Alire
-    /// dependencies under the project are also picked up automatically.
+    /// Local directory of dependency source to put on the Ada build path, so
+    /// a project that `with`s an external library (such as ada-util's
+    /// `Util.Encoders`) builds. Nothing is fetched. Repeatable. Alire
+    /// dependencies already cached under the project are found without it.
     #[arg(long = "ada-deps", value_name = "DIR")]
     pub ada_deps: Vec<PathBuf>,
 
-    /// Seed input file whose bytes bootstrap every target's fuzz corpus.
-    /// Provide valid/structured examples (a real `.zip`, `.bz2`, a sample
-    /// document) so parser/decompressor targets reach deep code instead of
-    /// bouncing off the header check. Repeatable.
+    /// Seed input file whose bytes start every target's corpus. Give valid
+    /// examples of the input format (a real `.zip` or `.bz2`, a sample
+    /// document), so parser and decompressor targets get past their header
+    /// checks. Repeatable.
     #[arg(long = "seed-file", value_name = "PATH")]
     pub seed_files: Vec<PathBuf>,
 
@@ -457,11 +452,11 @@ pub struct AutoArgs {
     #[arg(long = "seed-dir", value_name = "DIR")]
     pub seed_dirs: Vec<PathBuf>,
 
-    /// Do not harvest seeds from the tree's own test-data directories. Without
-    /// `--seed-file`/`--seed-dir`, auto otherwise seeds every target from the
-    /// data files it finds there (source, build and IDE files excluded). The
-    /// seeds a run used are listed in `auto/seeds.json` (and with `-v`). Also
-    /// settable as `seed-mining = false` in the project config.
+    /// Do not take seeds from the tree's own test-data directories. Without
+    /// this flag, and without `--seed-file` or `--seed-dir`, bhf seeds every
+    /// target from the data files it finds there (source, build and IDE files
+    /// left out). The seeds a run used are listed in `auto/seeds.json`, and
+    /// printed with `-v`. Config: `seed-mining = false`.
     #[arg(long = "no-seed-mining")]
     pub no_seed_mining: bool,
 
@@ -474,17 +469,19 @@ pub struct AutoArgs {
     #[arg(long = "reuse-legacy-corpus")]
     pub reuse_legacy_corpus: bool,
 
-    /// Actionability profile to optimize for.
+    /// Actionability profile: `reporting` (default) or `attacking`, which
+    /// fuzzes first the targets that look externally reachable and
+    /// security-relevant.
     #[arg(long, default_value_t = actionability::RunMode::Reporting)]
     pub mode: actionability::RunMode,
 
-    /// Fuzz engine(s) for the per-target fuzz phase, comma-separated. `builtin`
-    /// (default) is the in-process coverage-guided engine. `afl++` drives AFL++
-    /// on the auto-recovered build (C/C++, COBOL, Fortran, Rust and Ada targets; needs
-    /// `afl-fuzz` + `afl-clang-fast` on PATH, else it falls back to builtin with
-    /// a warning). `--engine builtin,afl++` runs BOTH per target, splitting
-    /// `--per-target-time` evenly across them. For a target of another lane an
-    /// `afl++` selection falls back to builtin. `winafl` drives WinAFL on
+    /// Fuzz engines for each target's fuzz phase, comma-separated. `builtin`
+    /// (default) is bhf's coverage-guided engine. `afl++` runs AFL++ on the
+    /// recovered build of C/C++, COBOL, Fortran, Rust and Ada targets; it needs
+    /// `afl-fuzz` and `afl-clang-fast` on PATH, and without them bhf warns and
+    /// uses builtin. `--engine builtin,afl++` runs both per target, splitting
+    /// `--per-target-time` evenly between them. A target in another language
+    /// gets builtin. `winafl` runs WinAFL on
     /// native Windows (C/C++ targets; needs WinAFL and DynamoRIO, see
     /// `--winafl-path` / `--dynamorio-path`; refused on other hosts): it fuzzes
     /// a build without sanitizers and replays each saved crash and hang through
@@ -532,19 +529,18 @@ pub struct AutoArgs {
     #[arg(short, long)]
     pub verbose: bool,
 
-    /// Recover the project's real compile wiring by running its own build
-    /// (CMake configure + instrumented static-library targets, or `make` under a
-    /// compiler-interposing wrapper) once,
-    /// offline, before harnessing. It builds under the work dir
-    /// (`<work>/probe/`), never in the tree: CMake and Meson into a build
-    /// directory there, Make in a copy of the tree there. Produces
-    /// `compile_commands.json`, generated headers, and compatible static
-    /// archives so each harness builds with the real translation-unit and link
-    /// context.
+    /// Run the project's own build once, offline, before writing harnesses, to
+    /// recover how it really compiles: a CMake configure and its instrumented
+    /// static-library targets, or `make` under a wrapper that records each
+    /// compiler call. It builds under `<work>/probe/`, never in the tree: CMake
+    /// and Meson into a build directory there, Make in a copy of the tree. It
+    /// produces `compile_commands.json`, generated headers and compatible
+    /// static archives, so each harness builds with the project's real compile
+    /// and link settings.
     ///
-    /// This EXECUTES the project's untrusted build scripts; it runs under
-    /// bhf's sandbox (bwrap/firejail) when one is available and degrades to a
-    /// direct run otherwise. Off by default.
+    /// This runs the project's build scripts, which come from the scanned
+    /// tree. They run under bhf's sandbox (bubblewrap or firejail) when one is
+    /// available, and directly otherwise. Off by default.
     #[arg(long = "probe-build")]
     pub probe_build: bool,
 
@@ -584,53 +580,46 @@ pub struct AutoArgs {
     #[arg(long = "msbuild-evaluate")]
     pub msbuild_evaluate: bool,
 
-    /// Dependency-scan mode: discover, build each target as far as possible
-    /// (stubbing whatever is missing), and emit the missing-dependency manifest —
-    /// but SKIP fuzzing. The fast "what does this tree need?" pass: find every
-    /// missing dependency in one go (see `<work>/auto/missing-deps.txt`) so you
-    /// can bring them all to the offline machine at once, instead of
-    /// build-hit-copy-repeat. A normal `auto` run also writes the manifest; this
-    /// just gets it without paying for the fuzz phase.
+    /// Dependency scan: discover, build each target as far as it goes
+    /// (stubbing what is missing) and write the missing-dependency list
+    /// (`<work>/auto/missing-deps.txt`), without fuzzing. It finds every
+    /// missing dependency in one run, so you can bring them all to an offline
+    /// host at once. A normal run writes the same list.
     #[arg(long = "deps-only")]
     pub deps_only: bool,
 
-    /// Discovery dry-run: print the ranked fuzz targets the engine would harness
-    /// (highest score first, with file:line, language, and input-reachability) and
-    /// exit WITHOUT building or fuzzing anything. The fast way to see what `auto`
-    /// considers the best places to fuzz in a project — and to validate the
-    /// entry-point ranking on a new codebase before committing a full run.
+    /// Print the ranked targets bhf would harness, highest score first, with
+    /// file:line, language and input reachability, and exit without building or
+    /// fuzzing. Use it to check the ranking on a new codebase before a full
+    /// run.
     #[arg(long = "list-targets")]
     pub list_targets: bool,
 
-    /// Plan only: discover + rank targets, run the toolchain preflight, and report the
-    /// build-recovery plan, then EXIT without building or fuzzing. Validate scope,
-    /// config, and toolchains before committing to a long run.
+    /// Discover and rank the targets, run the toolchain preflight, print the
+    /// build-recovery plan, and exit without building or fuzzing. Use it to
+    /// check scope, config and toolchains before a long run.
     #[arg(long = "dry-run")]
     pub dry_run: bool,
 
-    /// Extra directory NAMES to skip during discovery, on top of the built-in
-    /// defaults (tests/examples/benchmarks/vendored deps/docs). Matched on the
-    /// exact path component, case-insensitively. Repeatable. Use it when a project
-    /// keeps non-library code under an unusual dir name.
+    /// A directory name to skip during discovery, besides the built-in ones
+    /// (tests, examples, benchmarks, vendored dependencies, docs). It matches a
+    /// whole path component, ignoring case. Repeatable.
     #[arg(long = "exclude-dir", value_name = "NAME")]
     pub exclude_dir: Vec<String>,
 
-    /// Directory NAMES to KEEP in discovery even though a built-in default would
-    /// skip them — e.g. `--include-dir samples` for a project whose real fuzzable
-    /// code lives under `samples/`. Repeatable; overrides the default exclusions.
+    /// A directory name to keep in discovery that the built-in list skips,
+    /// such as `--include-dir samples` for a project whose code lives under
+    /// `samples/`. Repeatable.
     #[arg(long = "include-dir", value_name = "NAME")]
     pub include_dir: Vec<String>,
 
-    /// Restrict the sweep to a comma-separated subset of the sixteen source
-    /// languages listed under "possible values" below. Candidates in any other
-    /// language are dropped after discovery — before the build/fuzz sweep and
-    /// before `--list-targets`, so the ranked list reflects the filter too.
-    /// Common spellings are accepted (`c++`/`cxx`/`cc`→cpp, `rs`→rust,
-    /// `py`→python, `pl`→perl, `golang`→go); matching is case-insensitive.
-    /// Unset (default) = consider all sixteen supported languages. Unsupported
-    /// targets, missing dependencies, and denied project builds are reported as
-    /// incomplete work, not successful fuzzing. The SBOM/SCA pass is unaffected — it always scans the whole tree across all
-    /// ecosystems regardless of this fuzzing-lane filter.
+    /// Fuzz only these languages, comma-separated, from the sixteen listed
+    /// under "possible values" below. Targets in other languages are dropped
+    /// after discovery, so `--list-targets` shows the filtered list too. Common
+    /// spellings work (`c++`/`cxx`/`cc` for cpp, `rs`, `py`, `pl`, `golang`),
+    /// in any case. Default: all sixteen. Unsupported targets, missing
+    /// dependencies and denied project builds are reported as incomplete work.
+    /// The SBOM pass still scans the whole tree, in every ecosystem.
     #[arg(
         long = "languages",
         visible_alias = "lang",
@@ -641,12 +630,12 @@ pub struct AutoArgs {
     )]
     pub languages: Vec<crate::auto::candidate::LangSelector>,
 
-    /// Run the CPP-lite preprocessor over C/C++ before parsing for discovery
-    /// (§27.6): resolve `#ifdef`/`#if` branches and expand object-like macros so a
-    /// function compiled out under the active config is not discovered, with a
-    /// preprocessed->original line map keeping reported locations accurate.
-    /// `auto` (default) preprocesses only files with heavy conditional compilation;
-    /// `always` forces it on every C/C++ file; `never` parses raw source.
+    /// Run bhf's light C preprocessor over C/C++ before discovery parses it:
+    /// it resolves `#ifdef`/`#if` branches and expands object-like macros, so a
+    /// function the active configuration compiles out is not discovered, and
+    /// it maps each line back so reported locations stay right. `auto`
+    /// (default) preprocesses only files with heavy conditional compilation;
+    /// `always` preprocesses every C/C++ file; `never` parses the raw source.
     #[arg(
         long = "preprocess",
         value_enum,
@@ -655,108 +644,107 @@ pub struct AutoArgs {
     )]
     pub preprocess: crate::auto::discovery::PreprocessMode,
 
-    /// After the sweep, attempt to fetch the still-blocking dependencies from the
-    /// manifest using whatever package managers are present (apt-get for known
-    /// headers/libs, `alr get` for Ada units). Opt-in and ONLINE — the only part
-    /// of `auto` that touches the network. Nothing is fatal: a manager that's
-    /// absent or fails (no root for apt, offline, unknown package) is reported
-    /// with the command to run by hand. Re-run `auto` afterward to build against
-    /// the installed dependencies. Pairs well with `--deps-only` for a fast
-    /// scan-then-fetch.
+    /// After the sweep, try to install the dependencies that still block
+    /// targets, with the package managers present (apt-get for known headers
+    /// and libraries, `alr get` for Ada units). This is the only part of
+    /// `bhf auto` that uses the network, and it is off by default. A manager
+    /// that is missing or fails (no root for apt, no network, unknown package)
+    /// is reported with the command to run by hand. Run `bhf auto` again to
+    /// build with the installed dependencies; `--deps-only` first finds them
+    /// quickly.
     #[arg(long = "install-deps")]
     pub install_deps: bool,
 
-    /// Consent gate for running the project's own (untrusted) build/codegen to
-    /// materialize generated dependencies before harnessing, including Java
-    /// Maven/Gradle, Rust Cargo, and C# MSBuild project builds. Also covers
-    /// `--probe-build` (CMake/Make configure+codegen) plus an Ada build probe
-    /// (`alr build` / `gprbuild`) that generates Alire config + codegen outputs.
-    /// Implies `--probe-build`. EXECUTES untrusted scripts; probe builds use
-    /// bhf's sandbox when available. Language project builds run as the calling
-    /// user and need deployment isolation. Maven/Gradle/Cargo/NuGet dependency
-    /// resolution uses staged local caches; script egress requires OS isolation.
-    /// Off by default. Denied project builds are reported as unsupported.
-    /// Direct compilers, interpreters, and the selected target still execute
-    /// during an auto run; this flag is not a general no-execution mode.
+    /// Allow bhf to run the project's own build and code generation before
+    /// writing harnesses, to produce generated dependencies: Java
+    /// Maven/Gradle, Rust Cargo and C# MSBuild project builds, the
+    /// `--probe-build` CMake/Make configure and code generation (it implies
+    /// `--probe-build`), and an Ada build probe (`alr build` or `gprbuild`)
+    /// that generates the Alire config and code. These run scripts from the
+    /// scanned tree. Probe builds use bhf's sandbox when one is available;
+    /// language project builds run as you, so isolate the host yourself.
+    /// Maven, Gradle, Cargo and NuGet resolve dependencies from staged local
+    /// caches; keeping the scripts off the network needs OS isolation. Off by
+    /// default: without it, a target that needs a project build is reported
+    /// as unsupported. Compilers, interpreters and the fuzzed targets run in
+    /// every `bhf auto` run either way.
     #[arg(long = "run-untrusted")]
     pub run_untrusted: bool,
 
-    /// Recover compile flags from a CUSTOM build by running this exact command
-    /// (e.g. `--build-command ./build.sh`, `--build-command "bazel build //lib"`,
-    /// `--build-command scons`) under a compiler-intercepting shim: every
-    /// `cc`/`gcc`/`clang` — and named vendor compilers (Wind River Diab,
-    /// Green Hills, QNX, Keil/IAR, TI) plus cross-prefixed GNU/LLVM toolchains —
-    /// is logged into a `compile_commands.json`. The universal escape hatch for
-    /// build systems bhf doesn't natively probe (Bazel, SCons, Waf, a bare
-    /// `build.sh`, a vendor RTOS build). EXECUTES the command (via `sh -c`) and
-    /// runs under bhf's sandbox when one is available. Implies the build
-    /// probe; takes precedence over the auto-detected CMake/Meson/Make tier.
+    /// Recover compile flags from a custom build by running this command (such
+    /// as `./build.sh`, `"bazel build //lib"` or `scons`) under a shim that
+    /// records each compiler call into a `compile_commands.json`: `cc`, `gcc`
+    /// and `clang`, vendor compilers (Wind River Diab, Green Hills, QNX,
+    /// Keil/IAR, TI) and cross-prefixed GNU/LLVM toolchains. Use it for a build
+    /// system bhf does not probe itself (Bazel, SCons, Waf, a plain
+    /// `build.sh`, a vendor RTOS build). bhf runs the command with `sh -c`,
+    /// under its sandbox when one is available. Implies the build probe, and
+    /// takes the place of the CMake, Meson or Make probe bhf would choose.
     #[arg(long = "build-command", value_name = "CMD")]
     pub build_command: Option<String>,
 
-    /// UNSAFE: search the tree for its own build entry point and EXECUTE it to recover
-    /// compile flags — the auto-run bhf otherwise gates behind explicit consent
-    /// (see `--build-command`). Detects a custom build (build.sh, autotools
+    /// Find the tree's own build entry point and run it to recover compile
+    /// flags. bhf finds a custom build (build.sh, autotools
     /// bootstrap/autogen/configure, SCons, Waf, Bazel) and runs it under the
-    /// compiler-intercepting shim, and enables the `--probe-build` tiers
-    /// (CMake/Meson/Make) plus the Ada build probe. Runs under bhf's sandbox when
-    /// one is available, but you are running UNTRUSTED code from the scanned tree —
-    /// only use it on sources you trust. An explicit `--build-command` overrides the
-    /// search.
+    /// compiler-recording shim, as `--build-command` does, and turns on the
+    /// `--probe-build` CMake/Meson/Make probes and the Ada build probe. This
+    /// runs code from the scanned tree, under bhf's sandbox when one is
+    /// available: use it only on sources you trust. An explicit
+    /// `--build-command` is used in place of the search.
     #[arg(long = "unsafe-search-and-run-build-commands")]
     pub unsafe_search_and_run_build_commands: bool,
 
-    /// Extra include directories for C/C++ harness builds. Point at dependency
-    /// headers that live outside the swept tree — e.g. cFE's OSAL/PSP includes,
-    /// a vendored SDK's `include/` — so real struct layouts and typedefs compile
-    /// in. Seeded onto every harness `-I` path before the repair loop (so real
-    /// headers win over synthesized placeholders) and folded into cross-dir
-    /// header resolution. Read from local disk only; nothing is fetched.
-    /// Paths with spaces, parentheses or apostrophes (`C:/Program Files
-    /// (x86)/...`) are quoted in the build. Repeatable.
+    /// Extra include directory for C/C++ harness builds, for dependency
+    /// headers outside the scanned tree (cFE's OSAL/PSP includes, a vendored
+    /// SDK's `include/`), so the real struct layouts and typedefs compile in.
+    /// It goes on every harness's `-I` path before the repair loop runs, so
+    /// real headers win over generated placeholders, and header lookup across
+    /// directories uses it too. Nothing is fetched. Paths with spaces,
+    /// parentheses or apostrophes (`C:/Program Files (x86)/...`) are quoted in
+    /// the build. Repeatable.
     #[arg(long = "extra-include", value_name = "DIR")]
     pub extra_includes: Vec<PathBuf>,
 
-    /// Additional C/C++ source files (`.c`/`.cpp`) to compile and link into the
-    /// harness. Use this for a multi-file library whose target function's
-    /// dependencies live in sibling translation units the auto-linker would
-    /// otherwise blind-stub (e.g. libACPI's `AMLParserProcessBuffer` calling
-    /// across `AMLRouter.c`/`AMLName.c`/…): pass the real sources so the symbols
-    /// resolve and nothing is stubbed. Read from local disk only; nothing is
-    /// fetched. Paths with spaces are quoted in the build. Repeatable.
+    /// Extra C/C++ source file (`.c`/`.cpp`) to compile and link into each
+    /// harness. Use it for a multi-file library whose target calls functions
+    /// in other source files that bhf would otherwise stub (such as libACPI's
+    /// `AMLParserProcessBuffer`, which calls into `AMLRouter.c` and
+    /// `AMLName.c`), so the real code links in. Nothing is fetched. Paths with
+    /// spaces are quoted in the build. Repeatable.
     #[arg(long = "extra-source", value_name = "FILE")]
     pub extra_sources: Vec<PathBuf>,
 
-    /// Enable laf-intel comparison-progress coverage (#421): the C/C++ driver
-    /// records, per compare site, how many LEADING bytes of each comparison an
-    /// input matched, and the engine rewards an input that matches more — a
-    /// gradient that defeats multi-byte magic / format gates (bzip2/lz4/libpng/
-    /// expat) which a whole-compare edge gives no signal on. Opt-in; composes
-    /// with cmplog, value-profile, ASan, and the #420 hit-count buckets.
+    /// Comparison-progress coverage, as laf-intel does it: the C/C++ driver
+    /// records, for each comparison, how many leading bytes an input matched,
+    /// and the engine keeps an input that matches more. This helps the fuzzer
+    /// past multi-byte magic values and format checks (bzip2, lz4, libpng,
+    /// expat), where an edge gives no signal until the whole comparison
+    /// passes. Off by default; works together with cmplog, value profiles,
+    /// ASan and hit-count buckets.
     #[arg(long = "comparison-progress", alias = "cmp-progress")]
     pub comparison_progress: bool,
 
-    /// Sanitizer matrix to arm for the harnesses `auto` BUILDS and RUNS,
-    /// comma-separated (asan, ubsan, msan, tsan, lsan). Each C/C++ harness is
-    /// compiled+linked with exactly the requested `-fsanitize=` set (plus the
-    /// engine's coverage instrumentation) instead of the default `address,undefined`,
-    /// and every fuzz pass runs with the matching `<SAN>_OPTIONS`
-    /// (`abort_on_error=1:halt_on_error=1:detect_leaks=1`) so UBSan/LSan reports
-    /// become crashes the engine saves instead of silently-printed warnings — the
-    /// same arming `bhf fuzz --sanitizers` does, now for the auto pipeline.
-    /// Default (empty) leaves the build and run env unchanged. Compatible set is
-    /// `asan,ubsan,lsan`; `msan`/`tsan` are mutually exclusive with those and each
-    /// other. On an AArch64 host, `hwasan` (HWAddressSanitizer) takes ASan's
-    /// place: it finds the same memory errors with pointer tags, and is refused
-    /// beside `asan` and on any other host. `cfi` is never armed in the fuzzed build: it adds a control-flow
-    /// integrity replay of each C/C++ harness's corpus (`make cfi`) after the
-    /// fuzz passes. The special value `none` (standalone — not combinable with a
-    /// sanitizer) builds each native C/C++ harness with coverage but NO
-    /// `-fsanitize=`, i.e. crash-only fuzzing with zero ASan/UBSan false positives
-    /// — the escape hatch for shared-memory / custom-allocator / RTOS code that
-    /// FP-storms under ASan. This matrix controls native C/C++ only; every other
-    /// language lane owns its coverage/error instrumentation, and cross-compiled
-    /// qemu-user/wine paths omit host sanitizers.
+    /// Sanitizers for the C/C++ harnesses bhf builds and runs, comma-separated
+    /// (asan, ubsan, msan, tsan, lsan), in place of the default
+    /// `address,undefined`. Each harness is compiled and linked with exactly
+    /// that `-fsanitize=` set (plus coverage instrumentation), and every fuzz
+    /// pass runs with the matching `<SAN>_OPTIONS`
+    /// (`abort_on_error=1:halt_on_error=1:detect_leaks=1`), so a UBSan or LSan
+    /// report is a crash the engine saves, as with `bhf fuzz --sanitizers`.
+    /// `asan`, `ubsan` and `lsan` combine; `msan` and `tsan` each go alone. On
+    /// an AArch64 host, `hwasan` (HWAddressSanitizer) takes ASan's place: it
+    /// finds the same memory errors with pointer tags; it is refused beside
+    /// `asan` and on any other host. `cfi` and `realtime` (RealtimeSanitizer,
+    /// clang 20 or later) never go into the fuzzed build: each adds a replay
+    /// of the corpus through a build of its own after the fuzz passes, `cfi`
+    /// for control-flow integrity (`make cfi`), `realtime` for the targets
+    /// `--nonblocking` names. `none`, on its own, builds each native C/C++
+    /// harness with coverage and no `-fsanitize=`: the findings are crashes,
+    /// with no ASan or UBSan false positives, for shared-memory,
+    /// custom-allocator or RTOS code that ASan reports too much on. This
+    /// setting applies to native C/C++ only: every other language has its own
+    /// instrumentation, and harnesses cross-compiled to run under qemu-user or
+    /// wine get no host sanitizers.
     ///
     /// With an operator's compiler (CC/CXX, --cc/--cxx, `[toolchain]`), bhf first
     /// links and runs a trivial program with the requested sanitizers: with CC
@@ -764,50 +752,47 @@ pub struct AutoArgs {
     /// link it, or whose runtime cannot start on this host, is replaced by
     /// clang (clang++ for CXX) with a note naming it and the runtime's message.
     ///
-    /// To tame (rather than disable) the FP storm, export the sanitizer's own
-    /// options before running — bhf MERGES your inherited `<SAN>_OPTIONS` and
-    /// keeps its required keys last, e.g.
+    /// To cut false positives without turning a sanitizer off, export its own
+    /// options before the run: bhf merges your `<SAN>_OPTIONS` with its own and
+    /// puts its required keys last, for example
     /// `ASAN_OPTIONS=verify_asan_link_order=0:detect_container_overflow=0:suppressions=$PWD/asan.supp`
-    /// and `LSAN_OPTIONS=suppressions=$PWD/lsan.supp` (#435).
+    /// and `LSAN_OPTIONS=suppressions=$PWD/lsan.supp`.
     #[arg(long = "sanitizers", value_delimiter = ',')]
     pub sanitizers: Vec<String>,
 
     /// The targets that must not block, for the RealtimeSanitizer replay
-    /// (`--sanitizers realtime`, #298): `entry-points` (the default: interrupt
-    /// handlers such as `USART1_IRQHandler` and RTOS task bodies, a function
-    /// with no result taking a `void *` with `task` or `thread` in its name),
-    /// `all`, or a target's name. Each runs in a real-time context under the
+    /// (`--sanitizers realtime`): `entry-points` (the default: interrupt
+    /// handlers, named `*_Handler`, `*IRQHandler`, `*_isr`, `isr_*` or
+    /// `*_irq_handler`, and RTOS task bodies, a `void` function with `task` or
+    /// `thread` in its name that takes one `void *`, one `ULONG` (ThreadX) or
+    /// three `void *` (Zephyr)), `all`, or a target's name. Each runs in a real-time context under the
     /// `rtsan` build, so an allocation, a lock or a blocking call it makes is a
     /// finding. Repeatable.
     #[arg(long = "nonblocking", value_name = "TARGET")]
     pub nonblocking: Vec<String>,
 
-    /// Emit an evidence-graded SBOM + VEX bundle at campaign end, into
-    /// `<work-dir>/sbom/`. The bundle is generated where `FuzzReached` evidence is
-    /// freshest: the scanned tree's components are enriched with the campaign's
-    /// own `auto/run.json` (and any produced binary inventories), so libraries a
-    /// harness actually drove are marked exercised. Off by default to keep `auto`
-    /// fast — turn it on for a supply-chain deliverable. Writes all artifacts
-    /// (sbom.json, cyclonedx.json, vulnerabilities.json, openvex.json, sbom.csv);
-    /// use the standalone `bhf sbom` for finer `--emit`/`--ecosystems` control.
+    /// Write an SBOM and VEX bundle at the end of the run, into
+    /// `<work-dir>/sbom/`. The scanned tree's components are matched with the
+    /// run's own `auto/run.json` (and any binary inventories it produced), so
+    /// the libraries a harness reached are marked as exercised. Writes
+    /// sbom.json, cyclonedx.json, vulnerabilities.json, openvex.json and
+    /// sbom.csv; `bhf sbom` offers `--emit` and `--ecosystems` to choose.
     #[arg(long = "sbom")]
     pub sbom: bool,
 
-    /// Always run the static analyzer over the whole scanned tree, IN ADDITION to
-    /// fuzzing — not only when a target can't be built/fuzzed. Its findings
-    /// (classification `static_scan`) are merged into the unified report next to
-    /// the fuzz findings, so a target that built+fuzzed still gets static coverage
-    /// and files with no fuzzable subprogram are analyzed too. Same engine as the
-    /// standalone `bhf static-scan`.
+    /// Also run the static analyzer over the whole scanned tree. Without it,
+    /// it runs only on targets that cannot be built or fuzzed. Its findings
+    /// (classification `static_scan`) go into the same report as the fuzz
+    /// findings, and files with no fuzzable function are analyzed too. It is
+    /// the engine `bhf static-scan` runs.
     #[arg(long = "static")]
     pub static_scan: bool,
 
-    /// Also drive installed EXTERNAL static analyzers (gosec/Bandit/semgrep/
-    /// GNATcheck) as subprocesses and merge their findings into the report (so the
-    /// fuzz-confirmation join confirms them too). Each tool runs only if the active
-    /// license profile permits its subprocess — `strict-permissive` runs none, so
-    /// the default profile never invokes a GPL tool. Missing tools are skipped.
-    /// Implies `--static`.
+    /// Also run the external static analyzers that are installed (gosec,
+    /// Bandit, semgrep, GNATcheck) as subprocesses and merge their findings
+    /// into the report, where fuzz results can confirm them. A tool runs only
+    /// when the license profile allows it: `strict-permissive` (the default)
+    /// runs none of them. Missing tools are skipped. Implies `--static`.
     #[arg(long = "external-tools")]
     pub external_tools: bool,
 
@@ -829,23 +814,23 @@ pub struct AutoArgs {
     #[arg(long = "symcc")]
     pub symcc: bool,
 
-    /// Force-fuzz mode: a SECOND phase over the targets the normal (unforced) run
-    /// could not fuzz, so it can never lower the fuzzed count. Attempts a target
-    /// even when a parameter type can't be driven or a type/symbol is undefined —
-    /// synthesize a best-effort driver, stub whatever the compiler reports missing,
-    /// and never hard-fail (report-only is the floor). C/C++/Ada fabricate the
-    /// parameter and stub the missing symbol; Go drives an undrivable parameter as
-    /// its type's zero value and calls a method on a zero receiver; C# allocates a
-    /// receiver whose type has no accessible parameterless constructor without
-    /// running one. Findings from a forced/stub-heavy build are stamped
-    /// low-confidence with a caveat note — a fabricated value can crash on its own
-    /// account. Repair persistence honors `--max-repair-rounds`.
+    /// Force-fuzz: a second phase over the targets the first phase could not
+    /// fuzz, so the fuzzed count can only grow. It attempts a target even when a
+    /// parameter type cannot be driven or a type or symbol is undefined: bhf
+    /// writes a driver as best it can and stubs whatever the compiler reports
+    /// missing, and a target that still fails is reported, not fuzzed. C, C++
+    /// and Ada fabricate the parameter and stub the missing symbol; Go passes
+    /// its type's zero value and calls a method on a zero receiver; C#
+    /// allocates a receiver whose type has no accessible parameterless
+    /// constructor without running one. Findings from such a build are marked
+    /// low-confidence with a note, because a fabricated value can cause a
+    /// crash by itself. Repair rounds follow `--max-repair-rounds`.
     #[arg(long = "force", visible_alias = "force-fuzz")]
     pub force: bool,
 
-    /// Harness private Rust targets in-crate (#83): admit `pub(crate)` and
-    /// private functions and methods, and inject each harness as a module into
-    /// a copy of the crate, so it can call what no external crate can.
+    /// Harness private Rust functions from inside the crate: admit
+    /// `pub(crate)` and private functions and methods, and add each harness as
+    /// a module to a copy of the crate, so it can call what no other crate can.
     /// Off by default; `rust-private = true` in the config, or
     /// `BHF_RUST_INCRATE_PRIVATE=1`, turns it on too. A target the lane admits
     /// but cannot set up (a parameter or resource it has no recipe for) is
@@ -853,17 +838,17 @@ pub struct AutoArgs {
     #[arg(long = "rust-private")]
     pub rust_private: bool,
 
-    /// Two-compiler differential fuzzing (C/C++). Format `A:B`, e.g. `clang:gcc`:
-    /// after the normal run, rebuild each C/C++ harness under both compilers via a
-    /// portable build and replay the fuzz corpus through both, flagging any input
-    /// on which their exit/crash behavior diverges (a codegen- or UB-dependent bug
-    /// one compiler exposes and the other hides) as a BHF-301 finding. Either side
-    /// may be a path to a compiler; one with spaces is quoted in the build recipe.
+    /// Two-compiler differential fuzzing for C/C++, as `A:B` such as
+    /// `clang:gcc`: after the normal run, rebuild each C/C++ harness with both
+    /// compilers and replay the corpus through both. An input on which their
+    /// exit or crash behaviour differs (a bug that depends on code generation
+    /// or undefined behaviour) is a BHF-301 finding. Either side may be a path
+    /// to a compiler; a path with spaces is quoted in the build.
     #[arg(long, value_name = "A:B")]
     pub differential: Option<String>,
 
-    /// Write an accurate per-language SLOC breakdown (LANGUAGE, FILES, TOTAL,
-    /// COMMENTS, BLANKS, SLOC) of the source tree, then continue the normal run. A
+    /// Write a per-language line count (LANGUAGE, FILES, TOTAL, COMMENTS,
+    /// BLANKS, SLOC) of the source tree, then go on with the run. A
     /// relative path lands beside the other run outputs in `<work-dir>/auto/`; an
     /// absolute path is written as given. A `.json` extension emits JSON; anything
     /// else emits an aligned text table. Uses the scanner's dependency/build-tree
@@ -875,14 +860,15 @@ pub struct AutoArgs {
     #[arg(long = "static-dynamic")]
     pub static_dynamic: bool,
 
-    /// Skip minimizing each root-cause representative after fuzzing (bounded to 30 s per group, 5 min total).
+    /// Do not minimize the representative finding of each root-cause group
+    /// after fuzzing. Minimization takes at most 30 s per group and 5 min in
+    /// all.
     #[arg(long = "no-minimize")]
     pub no_minimize: bool,
 
-    /// Configurable C/C++ decoder synthesis caps (§27.11): `--max-decode-depth`,
+    /// C/C++ argument-decoder limits: `--max-decode-depth`,
     /// `--max-array-elems`, `--max-decl-bytes` (C) and `--container-size-max`,
-    /// `--bitset-max-size`, `--array-max-size` (C++). Each unset flag keeps the
-    /// historical default, so omitting them all leaves harness emission unchanged.
+    /// `--bitset-max-size`, `--array-max-size` (C++). Each has a default.
     #[command(flatten)]
     pub decoder_limits: crate::generate_harness::DecoderLimitArgs,
 }
@@ -2063,8 +2049,9 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         bhfeprintln!(
             "bhf auto: {} candidates discovered; by default every one is analyzed and fuzzed with \
              no outer time cap, which can take several minutes on a large tree. Bound it with \
-             --max-targets N (inspect at most N) and/or --campaign-time SECONDS (total fuzz \
-             budget); raise --jobs for more build+fuzz concurrency.",
+             --max-targets N (stop once N targets have fuzzed), --max-attempts N (inspect at \
+             most N candidates) or --campaign-time SECONDS (the whole sweep's budget); raise \
+             --jobs for more build+fuzz concurrency.",
             candidates.len()
         );
     }

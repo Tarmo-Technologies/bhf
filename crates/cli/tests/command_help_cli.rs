@@ -76,7 +76,7 @@ fn license_audit_help() {
     let text = help(&["license-audit"]);
     assert!(text.contains("bhf's own Cargo dependencies"), "{text}");
     assert!(
-        text.contains("Not a license check of a scanned project"),
+        text.contains("To list a scanned tree's dependencies and their licenses, use `bhf sbom`"),
         "{text}"
     );
     let top = help(&[]);

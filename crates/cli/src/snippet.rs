@@ -25,30 +25,29 @@ use crate::auto::candidate::LangSelector;
 /// `bhf snippet [INPUT]` — fuzz a single pasted function.
 #[derive(Debug, clap::Args)]
 pub struct SnippetArgs {
-    /// File containing the function to fuzz. Omit to read the snippet from stdin
-    /// (e.g. `pbpaste | bhf snippet --lang c`).
+    /// File containing the function to fuzz. Omit it to read the snippet from
+    /// stdin (`cat fn.c | bhf snippet --lang c`).
     pub input: Option<PathBuf>,
 
-    /// Source language of the snippet. Auto-detected from the input file's
-    /// extension or the snippet's content when omitted; pass it explicitly for a
-    /// stdin paste whose language is ambiguous.
+    /// Source language of the snippet. Without it, bhf detects the language
+    /// from the file's extension or the snippet's content; name it for a stdin
+    /// paste whose language is ambiguous.
     #[arg(long, visible_alias = "lang", value_enum)]
     pub language: Option<LangSelector>,
 
-    /// Per-target fuzz wall-clock budget in seconds (default 15 — a snippet is one
-    /// function, so a short budget usually suffices). Threaded straight through to
-    /// `auto --per-target-time`.
+    /// Fuzzing time for the function, in seconds. Passed to
+    /// `bhf auto --per-target-time`.
     #[arg(long = "per-target-time", default_value_t = 15)]
     pub per_target_time: u64,
 
-    /// Work directory for the synthesized project, harnesses, and report. Default
-    /// `./bhf_snippet`. Kept after the run so you can inspect the generated
-    /// harness and re-run `bhf report` over `<work-dir>`.
+    /// Work directory for the generated project, harness and report. It is
+    /// kept after the run, so you can read the generated harness and run
+    /// `bhf report --work-dir <work-dir>` again.
     #[arg(long = "work-dir", default_value = "bhf_snippet")]
     pub work_dir: PathBuf,
 
-    /// Print the per-target outcome detail (repairs applied, per-pass exec/finding
-    /// counts) — forwarded to `auto --verbose`.
+    /// Print the outcome detail: repairs applied, executions and findings per
+    /// pass. Passed to `bhf auto --verbose`.
     #[arg(short, long)]
     pub verbose: bool,
 }

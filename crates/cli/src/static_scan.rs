@@ -16,7 +16,8 @@ pub struct StaticScanArgs {
     #[arg(long)]
     pub out: Option<PathBuf>,
 
-    /// JSON suppression file with exact rule/path/line suppressions.
+    /// JSON suppression file: each entry suppresses one rule at one path and
+    /// line.
     #[arg(long)]
     pub suppressions: Option<PathBuf>,
 
@@ -24,15 +25,15 @@ pub struct StaticScanArgs {
     #[arg(long)]
     pub baseline: Option<PathBuf>,
 
-    /// BHF policy-as-code JSON file; rule enabled/disabled sets are honored.
+    /// Policy-as-code JSON file; its enabled and disabled rules apply.
     #[arg(long)]
     pub policy: Option<PathBuf>,
 
-    /// Only emit these rule ids. Repeatable.
+    /// Report only this rule id. Repeatable.
     #[arg(long = "enable-rule")]
     pub enabled_rules: Vec<String>,
 
-    /// Suppress these rule ids before baseline comparison. Repeatable.
+    /// Suppress this rule id before the baseline comparison. Repeatable.
     #[arg(long = "disable-rule")]
     pub disabled_rules: Vec<String>,
 
@@ -40,12 +41,13 @@ pub struct StaticScanArgs {
     #[arg(long)]
     pub sarif: bool,
 
-    /// Write an accurate per-language SLOC breakdown (LANGUAGE, FILES, TOTAL,
-    /// COMMENTS, BLANKS, SLOC). A relative path lands in the `--out` report
+    /// Write a per-language line count (LANGUAGE, FILES, TOTAL, COMMENTS,
+    /// BLANKS, SLOC). A relative path lands in the `--out` report
     /// directory, beside static-report.json; an absolute path is written as given.
     /// A `.json` extension emits JSON; anything else emits an aligned text table.
-    /// Uses the same dependency/build-tree pruning and language-aware comment
-    /// stripping as the scan, so counts exclude vendored/`node_modules`/`.venv` code.
+    /// It skips the same dependency and build trees as the scan and strips
+    /// comments per language, so vendored, `node_modules` and `.venv` code is
+    /// not counted.
     #[arg(long)]
     pub sloc: Option<PathBuf>,
 
@@ -53,29 +55,30 @@ pub struct StaticScanArgs {
     #[arg(long, value_enum)]
     pub fail_on: Option<FailOnSeverity>,
 
-    /// Incremental scan: only analyze files changed since this git revision
-    /// (tag/branch/SHA). The dominant repeat-CI case — near-instant on a huge tree.
+    /// Incremental scan: analyze only the files changed since this git
+    /// revision (a tag, branch or SHA).
     #[arg(long)]
     pub since: Option<String>,
 
-    /// Maximum RSS for bhf's static-analysis process, in MiB. When reached,
-    /// the scanner stops admitting new files/interprocedural work and records an
-    /// analysis gap instead of risking a host OOM. By default it uses the smaller
-    /// of 80% of host-available memory and 70% of the cgroup memory limit.
+    /// Most resident memory for bhf's static-analysis process, in MiB. When it
+    /// is reached, the scanner takes on no more files or interprocedural work
+    /// and records an analysis gap, so the host does not run out of memory.
+    /// Default: the smaller of 80% of the host's available memory and 70% of
+    /// the cgroup memory limit.
     #[arg(long = "max-memory-mb", value_name = "MB")]
     pub max_memory_mb: Option<u64>,
 
-    /// Parallel static-analysis workers. Lower this on memory-constrained hosts;
-    /// each worker may temporarily hold a source file and its parsed copy.
+    /// Parallel static-analysis workers. Lower it on a host short of memory:
+    /// each worker can hold a source file and its parsed copy at once.
     #[arg(long, value_name = "N")]
     pub jobs: Option<usize>,
 
-    /// Also run installed, profile-allowed external analyzers (gosec/Bandit/semgrep/
-    /// GNATcheck) as subprocesses and fold their findings — the rule breadth bhf
-    /// deliberately doesn't reimplement (XSS/CSRF and framework rules) — into
-    /// `<out>/external-findings.json`. Breadth WITHOUT fuzzing. The license profile
-    /// gates which tools run (BHF_PROFILE; defaults to `external-tools` when this
-    /// flag is set, so the permissive tools run; never links any of them).
+    /// Also run the external analyzers that are installed and that the license
+    /// profile allows (gosec, Bandit, semgrep, GNATcheck), as subprocesses, and
+    /// write their findings, such as XSS, CSRF and framework rules that bhf's
+    /// own rules do not cover, to `<out>/external-findings.json`. The profile
+    /// comes from BHF_PROFILE and is `external-tools` when that is unset; bhf
+    /// links none of these tools.
     #[arg(long)]
     pub external_tools: bool,
 }

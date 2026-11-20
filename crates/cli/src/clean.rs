@@ -12,9 +12,9 @@ pub struct CleanArgs {
     #[arg(long)]
     pub build: bool,
 
-    /// Remove disposable compiler caches and scratch files while preserving
-    /// findings, reports, corpora, generated harness source, result checkpoints,
-    /// and final replayable harness executables.
+    /// Remove compiler caches and scratch files, and keep the findings,
+    /// reports, corpora, generated harness source, result checkpoints and the
+    /// final harness executables that replays use.
     #[arg(long)]
     pub compact: bool,
 
@@ -30,7 +30,7 @@ pub struct CleanArgs {
     #[arg(long)]
     pub findings: bool,
 
-    /// Remove all known BHF-owned workdir subtrees.
+    /// Remove every work-directory subtree bhf writes.
     #[arg(long)]
     pub all: bool,
 }

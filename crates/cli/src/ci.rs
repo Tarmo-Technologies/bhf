@@ -23,7 +23,7 @@ pub struct CiArgs {
     #[arg(skip)]
     pub(crate) given: std::collections::BTreeSet<String>,
 
-    /// Work directory. Default ./bhf_work.
+    /// Work directory.
     #[arg(long, default_value = "bhf_work")]
     pub work_dir: PathBuf,
 
@@ -35,25 +35,24 @@ pub struct CiArgs {
     #[arg(long = "regressions", value_name = "DIR")]
     pub regressions: Vec<PathBuf>,
 
-    /// Per-target TOTAL fuzz wall-clock budget in seconds (split across the
-    /// passes). Forwarded to `bhf auto`.
+    /// Fuzzing time per target, in seconds, split across its passes. Passed
+    /// to `bhf auto`.
     #[arg(long, default_value_t = 60)]
     pub per_target_time: u64,
 
-    /// Stop a target once it has produced N distinct findings (crash
-    /// signatures), or when its per-target time is spent — whichever first.
-    /// `1` ≈ libFuzzer stop-on-first-crash. Forwarded to `bhf auto`.
+    /// Stop a target once it has N distinct findings (crash signatures), or
+    /// when its per-target time is spent, whichever comes first. `1` stops at
+    /// the first crash, as libFuzzer does. Passed to `bhf auto`.
     #[arg(long = "per-target-finding-count", value_name = "N")]
     pub per_target_finding_count: Option<usize>,
 
-    /// Whole-run wall-clock budget across all targets (seconds); with
-    /// `--min-target-time` it splits the budget across targets instead.
-    /// Forwarded to `bhf auto`.
+    /// Time limit of the whole run, in seconds; with `--min-target-time` it
+    /// is divided across the targets instead. Passed to `bhf auto`.
     #[arg(long = "campaign-time", value_name = "SECS")]
     pub campaign_time: Option<u64>,
 
-    /// SPLIT-mode floor (seconds), used only with `--campaign-time`: each
-    /// attempted target gets at least this much fuzz time. Forwarded to
+    /// With `--campaign-time`: the least fuzzing time, in seconds, each
+    /// attempted target gets when the campaign time is divided. Passed to
     /// `bhf auto`.
     #[arg(
         long = "min-target-time",
@@ -62,27 +61,29 @@ pub struct CiArgs {
     )]
     pub min_target_time: Option<u64>,
 
-    /// Skip auto-stubbing entirely (diagnostics-only).
+    /// Do not generate stubs for missing symbols: a target that does not build
+    /// as it is fails, with its build diagnostics. Passed to `bhf auto`.
     #[arg(long)]
     pub no_stubs: bool,
 
-    /// Path to append a Markdown summary to. Defaults to the
-    /// `GITHUB_STEP_SUMMARY` env var when unset.
+    /// File to append the Markdown summary to. Default: the file the
+    /// `GITHUB_STEP_SUMMARY` environment variable names.
     #[arg(long, value_name = "PATH")]
     pub summary_file: Option<PathBuf>,
 
-    /// Severity threshold that triggers a non-zero exit.
+    /// Exit non-zero when a finding of this severity or higher is present;
+    /// `any` fails on every finding.
     #[arg(long, value_enum, default_value_t = FailOn::Any)]
     pub fail_on: FailOn,
 
-    /// Run mode forwarded to bhf auto.
+    /// Actionability profile (`reporting` or `attacking`), passed to
+    /// `bhf auto --mode`.
     #[arg(long, default_value_t = actionability::RunMode::Reporting)]
     pub mode: actionability::RunMode,
 
-    /// Restrict the sweep to a comma-separated subset of the sixteen source
-    /// languages listed under "possible values" below (common spellings like
-    /// `c++`/`rs`/`py` are accepted). Forwarded to `bhf auto`. Unset
-    /// (default) = fuzz every language found.
+    /// Fuzz only these languages, comma-separated, from the sixteen listed
+    /// under "possible values" below (`c++`, `rs`, `py` and other common
+    /// spellings work). Passed to `bhf auto`. Default: every language found.
     #[arg(
         long = "languages",
         visible_alias = "lang",
@@ -93,22 +94,23 @@ pub struct CiArgs {
     )]
     pub languages: Vec<crate::auto::candidate::LangSelector>,
 
-    /// PR-native mode: scope the sweep to only the files changed since this git
-    /// ref (uses `git merge-base <ref> HEAD`, so a branch behind the base does
-    /// not re-fuzz the base's own changes). Discovery still walks the tree but
-    /// only changed files' targets are built and fuzzed; the discovery cache is
-    /// reused across runs. Combine with `--campaign-time` for a bounded PR run.
+    /// Pull-request mode: build and fuzz only the targets in files changed
+    /// since this git ref, from `git merge-base <ref> HEAD`, so a branch
+    /// behind its base does not fuzz the base's own changes. Discovery still
+    /// walks the whole tree, and its cache is reused across runs. Add
+    /// `--campaign-time` to bound a pull-request run.
     #[arg(long = "changed-since", value_name = "GIT_REF")]
     pub changed_since: Option<String>,
 
-    /// Instead of asking git, read the newline-separated changed-file list from
-    /// this file (paths relative to the repo root or absolute). Useful when the
-    /// CI system already computed the PR diff. Overrides `--changed-since`.
+    /// Read the changed files from this file, one per line (relative to the
+    /// repository root, or absolute), in place of asking git; for a CI system
+    /// that has already computed the pull request's diff. Overrides
+    /// `--changed-since`.
     #[arg(long = "changed-paths-from", value_name = "PATH")]
     pub changed_paths_from: Option<PathBuf>,
 
-    /// Emit a SARIF 2.1.0 report to this path. The GitHub Action uploads it to
-    /// the code-scanning tab for inline PR annotations.
+    /// Write a SARIF 2.1.0 report to this path. The GitHub Action uploads it
+    /// to code scanning, which annotates the pull request.
     #[arg(long, value_name = "PATH")]
     pub sarif: Option<PathBuf>,
 
@@ -118,36 +120,41 @@ pub struct CiArgs {
     #[arg(long = "gitlab-sast", value_name = "PATH")]
     pub gitlab_sast: Option<PathBuf>,
 
-    /// Write a compact machine-readable CI result JSON to this path (finding
-    /// counts by severity + verdict, confirmed count, scoped file count, exit
-    /// code). Consumed by the GitHub Action to build the PR summary comment.
+    /// Write a short CI result JSON to this path: finding counts by severity
+    /// and verdict, the confirmed count, the scoped file count and the exit
+    /// code. The GitHub Action builds its pull-request comment from it.
     #[arg(long = "ci-json", value_name = "PATH")]
     pub ci_json: Option<PathBuf>,
 
-    /// PR gate policy. `confirmed` exits non-zero only when a fuzz-confirmed
-    /// finding (verdict real/likely) is present; `all` fails on any finding;
-    /// `never` never fails (annotate-only); `off` (default) keeps the existing
-    /// `--fail-on` / `--fail-on-actionability` behavior.
+    /// Pull-request gate. `confirmed` exits non-zero only when a
+    /// fuzz-confirmed finding (verdict real or likely) is present; `all` fails
+    /// on any finding; `never` never fails, and only annotates; `off`
+    /// (default) leaves the decision to `--fail-on` or
+    /// `--fail-on-actionability`.
     #[arg(long = "pr-gate", value_enum, default_value_t = PrGate::Off)]
     pub pr_gate: PrGate,
 
-    /// Actionability threshold that triggers a non-zero exit. When unset, CI keeps the existing severity gate.
+    /// Exit non-zero when a finding has this actionability verdict or a
+    /// stronger one. Without it, `--fail-on` decides.
     #[arg(long, value_enum)]
     pub fail_on_actionability: Option<FailOnActionability>,
 
-    /// Minimum actionability confidence for --fail-on-actionability.
+    /// Lowest verdict confidence that counts for --fail-on-actionability.
     #[arg(long, value_enum, default_value_t = MinActionabilityConfidence::Low)]
     pub min_actionability_confidence: MinActionabilityConfidence,
 
-    /// Optional policy file used to enrich CI gate and dashboard decisions.
+    /// Policy file whose CI gate sets the exit status, in place of the gates
+    /// above; --dashboard-out reports its decisions too.
     #[arg(long)]
     pub policy: Option<PathBuf>,
 
-    /// Optional runner assignment plan used to enrich CI budget governance evidence.
+    /// Runner assignment plan (from `bhf runners plan`) that the policy gate
+    /// and --dashboard-out take into account.
     #[arg(long)]
     pub runner_plan: Option<PathBuf>,
 
-    /// Write dashboard-friendly CI JSON to this path.
+    /// Write the CI result, with policy and runner decisions, as dashboard
+    /// JSON to this path.
     #[arg(long)]
     pub dashboard_out: Option<PathBuf>,
 }

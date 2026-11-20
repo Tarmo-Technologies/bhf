@@ -33,7 +33,8 @@ pub struct BinaryAdapterArgs {
     /// Binary artifact to analyze.
     pub target: PathBuf,
 
-    /// Adapter kind to run.
+    /// Analyzer to run: Rizin, Ghidra headless or angr, or `mock`, which
+    /// replays `--mock-output` and runs no analyzer.
     #[arg(long, value_enum)]
     pub adapter: AdapterKind,
 
@@ -41,7 +42,8 @@ pub struct BinaryAdapterArgs {
     #[arg(long)]
     pub out: PathBuf,
 
-    /// Mock adapter JSON output for deterministic contract tests.
+    /// JSON output for the `mock` adapter to report, for testing the report
+    /// format.
     #[arg(long)]
     pub mock_output: Option<PathBuf>,
 

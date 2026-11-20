@@ -11,32 +11,43 @@ pub struct AuditArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum AuditCommand {
-    /// Append one audit event to a JSONL audit log.
+    /// Append one event to a JSONL audit log
+    ///
+    /// The log is created if missing. bhf prints the record it appended, which
+    /// carries the next sequence number.
     Append(AppendArgs),
-    /// Read and summarize a JSONL audit log.
+    /// Read a JSONL audit log and print its events and their count.
     Read(ReadArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct AppendArgs {
+    /// The JSONL audit log to append to.
     #[arg(long)]
     pub log: PathBuf,
+    /// The event name to record.
     #[arg(long)]
     pub event: String,
+    /// Who did it.
     #[arg(long)]
     pub actor: String,
+    /// The actor's role.
     #[arg(long)]
     pub role: String,
+    /// The project the event belongs to.
     #[arg(long)]
     pub project: Option<String>,
+    /// Write the appended record as JSON to this path instead of stdout.
     #[arg(long)]
     pub out: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 pub struct ReadArgs {
+    /// The JSONL audit log to read.
     #[arg(long)]
     pub log: PathBuf,
+    /// Write the JSON summary to this path instead of stdout.
     #[arg(long)]
     pub out: Option<PathBuf>,
 }

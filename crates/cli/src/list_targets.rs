@@ -12,7 +12,8 @@ use target_rank::{ScoreBreakdown, Target};
 
 #[derive(Debug, clap::Args)]
 pub struct ListTargetsArgs {
-    /// Path to scan: an Ada/C/C++/Java/Rust file or a directory tree.
+    /// Path to scan: a source file or a directory tree, in any of the sixteen
+    /// languages `bhf auto` discovers.
     pub path: PathBuf,
 
     /// Show only the top N targets.
@@ -23,19 +24,18 @@ pub struct ListTargetsArgs {
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
 
-    /// Exclude paths whose normalized relative path contains this text. Repeatable.
+    /// Leave out files whose relative path contains this text. Repeatable.
     #[arg(long = "exclude-path")]
     pub exclude_paths: Vec<String>,
 
-    /// Exclude common project areas. Accepts comma-separated values: tests, tools, examples.
+    /// Leave out common project areas, comma-separated: tests, tools, examples.
     #[arg(long = "exclude", value_enum, value_delimiter = ',')]
     pub exclude: Vec<ExcludeCategory>,
 
-    /// Keep only targets in files modified between `<ref>` and HEAD.
-    /// Runs `git diff --name-only <ref>..HEAD` from the git repo
-    /// root containing the current working directory. Empty diff
-    /// yields empty output — intended CI behaviour for unchanged
-    /// commits.
+    /// Keep only targets in files changed between `<ref>` and HEAD, from
+    /// `git diff --name-only <ref>..HEAD` run at the root of the git
+    /// repository that holds the current directory. An empty diff lists no
+    /// targets.
     #[arg(long, value_name = "GIT_REF")]
     pub changed_since: Option<String>,
 

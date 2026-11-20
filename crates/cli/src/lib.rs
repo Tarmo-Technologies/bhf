@@ -140,54 +140,61 @@ pub mod workdir;
 #[command(about = "Discover targets, build harnesses, and fuzz your source tree offline")]
 #[command(long_about = "\
 Discover targets, build harnesses, and fuzz your source tree offline.
+No model or API key is required.
 
 START HERE:
   bhf auto /path/to/source --work-dir /path/to/bhf_work \\
     --jobs 1 --max-targets 1 --per-target-time 10
 
 Keep the work directory outside the source tree. Install the compiler or
-interpreter for your selected languages. C/C++ needs clang and make; Windows
-also needs Visual Studio C++ Build Tools and the Windows SDK.
-No model or API key is required.
+interpreter for the languages you fuzz: C and C++ need clang and make, and on
+Windows also Visual Studio C++ Build Tools and the Windows SDK.
 
-Read /path/to/bhf_work/results/INDEX.md for findings and
-/path/to/bhf_work/auto/summary.txt for built, fuzzed, and skipped targets.
-Run `bhf auto --help` for language selection, budgets, and build options.
-If BHF itself errors, use `--debug` and `bhf bug-report <work-dir> --preview`.
+When the run ends, read /path/to/bhf_work/results/INDEX.md for the findings
+and /path/to/bhf_work/auto/summary.txt for the targets that built, fuzzed or
+were skipped. `bhf auto --help` covers language selection, time budgets and
+build options. If bhf itself fails, run again with `--debug`, then run
+`bhf bug-report <work-dir> --preview`.
 
 COMMANDS BY AREA (run `bhf <command> --help` for details):
-  Pipeline      auto, snippet, scan, list, generate-harness, build, fuzz, report, model
-  Build support stub, instrument, fake-corba
+  Pipeline      auto, snippet, scan, list, generate-harness, build, fuzz,
+                report, model
+  Ada build     stub, instrument, fake-corba
   Crash triage  corpus, minimize, replay, capsule, verify-poc, env-capsule,
-                differential, relational, cmplog, explain, cartography, decode-args
-  Binaries      binary (scan, adapter, fuzz, rehost — no source)
-  Kernel        kernel (syzlang, import — Linux drivers with syzkaller; run,
-                fuzz, replay — a kernel in a qemu-system guest)
+                differential, relational, cmplog, explain, cartography,
+                decode-args
+  Binaries      binary (scan, adapter, fuzz, rehost: no source needed)
+  Kernel        kernel (syzlang, import: Linux drivers and syzkaller;
+                run, fuzz, replay: a kernel in a qemu-system guest)
   Projects      project (validate, list, run, import-ossfuzz),
-                extension (validate, evaluate)
+                extension (validate, evaluate, session, minimize)
   Supply chain  sbom, license-audit, static-scan, sloc, extract-state-machines
   Reference     rules, list oracles
   Governance    policy, audit, pack, export
-  Ops & CI      ci, runners, clean, introspect, bug-report
+  Ops and CI    ci, runners, clean, introspect, bug-report
 
-`list` and `binary` group related subcommands (`bhf list targets`,
-`bhf binary scan`). TIP: the list is greppable — `bhf --help | grep -i sarif`.")]
+To find a command by keyword, search this help: `bhf --help | grep -i sarif`.")]
 struct Args {
-    /// License/capability profile gating which tools may run. `strict-permissive`
-    /// (default) links only Apache-2.0/MIT/BSD code; `external-tools`
-    /// also permits GPL tools (GNAT, GPRbuild) as subprocesses.
+    /// License profile for the `--probe` checks and the `binary adapter` tools.
+    /// `strict-permissive` (default) allows no probe and refuses rizin, Ghidra
+    /// and angr; `external-tools` allows those adapters and the `gnat_actions`
+    /// probe; `research-lab` allows every tool and probe. bhf links only
+    /// Apache-2.0/MIT/BSD code, and runs GNAT, GPRbuild and AFL++, under every
+    /// profile. `auto --symcc`, the `--external-tools` analyzers and
+    /// `reset=fast` read `BHF_PROFILE` instead (default `external-tools`).
     #[arg(long, default_value = "strict-permissive", value_parser = parse_profile, global = true)]
     profile: Profile,
 
-    /// Capability probe(s) to enforce against the profile (repeatable); the run
-    /// is rejected if a probe is forbidden by the active profile.
+    /// Capability probe the run needs (`gnat_actions`, `libadalang`,
+    /// `gnatfuzz`, `gnatcoverage`, `polyorb`). bhf exits 2 when the active
+    /// `--profile` does not allow it. Repeatable.
     #[arg(long = "probe", value_name = "PROBE")]
     probes: Vec<String>,
 
-    /// Debug mode: capture a backtrace for any bhf-internal panic (sets
-    /// RUST_BACKTRACE), keep going past a file that crashes bhf, and enrich
-    /// the generated bug-report.json. Use this when bhf itself errors on your
-    /// tree so the report has enough to fix the bug offline.
+    /// Debug mode: capture a backtrace when bhf itself panics (sets
+    /// RUST_BACKTRACE), keep going past a file that crashes bhf, and add
+    /// detail to the bug-report.json it writes. Use it when bhf fails on your
+    /// tree, so the report holds what is needed to fix the bug.
     #[arg(long, global = true)]
     debug: bool,
 
@@ -225,94 +232,179 @@ enum Command {
     /// Discover targets, generate harnesses, recover builds, fuzz, and write reports
     #[command(long_about = auto::cli::FIRST_RUN_HELP)]
     Auto(auto::cli::AutoArgs),
-    /// Fuzz ONE pasted function with no project/build/deps — detect language, synthesize a one-file project, run the auto pipeline
+    /// Fuzz one pasted function with no project or build: bhf wraps it in a project and runs auto
+    ///
+    /// bhf detects the function's language from the file's extension or its
+    /// content (or takes `--language`), writes a one-file project around it,
+    /// and runs `bhf auto` on that project.
     Snippet(snippet::SnippetArgs),
-    /// Index an Ada/C/C++ source tree into scan_index.json (units, fuzzable targets, handler counts)
+    /// Index an Ada, C or C++ tree into scan_index.json: units, targets, exception handlers
     Scan(scan::ScanArgs),
-    /// List fuzzable targets in a source tree, or the bug-oracle inventory (`list targets` / `list oracles`)
+    /// List a tree's fuzzable targets (`list targets`) or bhf's bug oracles (`list oracles`)
     List(ListArgs),
-    /// Generate an Ada/C/C++ fuzzing harness for one subprogram, with build-context recovery
+    /// Generate an Ada, C or C++ fuzzing harness for one function, with the build context it needs
     ///
     /// A generated C/C++ harness prints each decoded argument to stderr when it
-    /// runs with BHF_TRACE_ARGS=1. Set BHF_BUFFER_LEN_DIMENSION=1 while generating
-    /// to give a byte buffer that has no length parameter an explicit length read
-    /// from the input (off by default: a buffer shorter than the input can make a
-    /// function with an implicit length contract overflow it). The harness records
-    /// it only when it has such a buffer.
+    /// runs with BHF_TRACE_ARGS=1. Set BHF_BUFFER_LEN_DIMENSION=1 while
+    /// generating to give a byte buffer that has no length parameter its own
+    /// length, read from the input. It is off by default: a buffer shorter than
+    /// the input can make a function with an implicit length contract overflow
+    /// it. The harness records the setting only when it has such a buffer.
     GenerateHarness(generate_harness::GenerateHarnessArgs),
-    /// Compile a generated harness (toolchain auto-detect, cross-compile, GNAT/GPRbuild/clang, probe backend)
+    /// Compile a generated harness (clang or gcc for C/C++, GPRbuild for Ada), natively or cross
     Build(build::BuildArgs),
-    /// Fuzz a built harness with the built-in coverage-guided engine (default) or AFL++ (`--engine afl++`)
+    /// Fuzz a built harness: bhf's coverage-guided engine, AFL++, libFuzzer, honggfuzz, WinAFL or LibAFL
     Fuzz(fuzz::FuzzArgs),
-    /// Render findings to Markdown, SARIF 2.1.0, JUnit XML, and CSV with crash clustering and dedupe
+    /// Write the findings report as Markdown, SARIF 2.1.0, JUnit XML and CSV, crashes deduplicated
     Report(report::ReportArgs),
     /// Train a confidence model from labeled findings, for `bhf report --model`
     Model(model::ModelArgs),
 
     // ── Build support: unblock a harness that won't compile ─────────────────
-    /// Synthesize missing type/function stubs from build-loop diagnostics to unblock a harness (Ada/C/C++)
+    /// Generate Ada stubs for what a harness build reports missing, rebuilding until it compiles
+    ///
+    /// The stubs cover the types and subprograms the GNAT build reports as
+    /// missing. bhf reads `<work-dir>/src_instrumented/` and the harness's
+    /// `main.adb`, and writes the stubs and their `manifest.json` to
+    /// `<work-dir>/generated_stubs/`. Exit 0 when the harness builds; 4 when
+    /// the build stops making progress or reaches its round limit; 5 when a
+    /// compiler message cannot be parsed; 2 when the compiler cannot be found
+    /// or run; 3 when the work directory is not laid out that way; 1 on
+    /// another error.
     Stub(stub::StubArgs),
-    /// Rewrite Ada source to capture runtrace events (probe points, breadcrumb sidecar)
+    /// Add runtrace probe points to an Ada source file, with a breadcrumbs.json that lists them
     Instrument(instrument::InstrumentArgs),
     /// Generate fake CORBA Helper/Skel/Stub Ada packages from IDL or ROS interfaces
     FakeCorba(fake_corba::FakeCorbaArgs),
 
     // ── Crash triage: corpora, reduction, reproduction ──────────────────────
-    /// Import, export, and merge corpora across AFL++, libFuzzer, Honggfuzz, and bhf layouts
+    /// Import, export, merge and minimize corpora in AFL++, libFuzzer, honggfuzz and bhf layouts
     Corpus(corpus::CorpusArgs),
-    /// Shrink a crashing input by binary search while preserving the crash (testcase reduction)
+    /// Shrink a finding's crashing input while it still triggers the same crash
+    ///
+    /// `--strategy` picks how: `bytes` delta-debugs the input's bytes, `typed`
+    /// reduces each decoded argument's value, and `grammar` reduces a grammar
+    /// finding on its derivation tree.
     Minimize(minimize::MinimizeArgs),
-    /// Re-run a finding's crash input through a harness to reproduce it: MATCH (exit 0) only on the same rule, kind, signal and sink (or reported site), MISMATCH (exit 3), or UNVERIFIED (exit 4) when where it crashed could not be compared; with a crash summary, --json and --show-output (sandbox / qemu-user)
+    /// Re-run a finding's input through its harness (natively, sandboxed or under qemu-user)
+    ///
+    /// Prints a crash summary, then the verdict. MATCH (exit 0): the replay
+    /// crashed with the same rule, kind, signal and sink (or reported site).
+    /// MISMATCH (exit 3): it did not crash, or crashed differently. UNVERIFIED
+    /// (exit 4): it crashed, but where it crashed could not be compared. Exit 1
+    /// on an error.
     Replay(replay::ReplayArgs),
-    /// Package a crash from a harness in any language bhf generates into a portable, self-verifying PoC capsule (input + harness + sources + recorded build + stubs + vendored dependencies); a harness that cannot rebuild offline is refused with the reason
+    /// Package a finding's crash as a PoC capsule that rebuilds offline and checks itself
+    ///
+    /// A capsule holds the input, the harness, its sources, the recorded build,
+    /// stubs and vendored dependencies, for a harness in any language bhf
+    /// generates. bhf rebuilds each capsule when it packages it: the minimized
+    /// input ships only when the rebuilt PoC shows the finding's crash. A
+    /// capsule is portable when no file or manifest field in it names the work
+    /// directory or the scanned tree; otherwise the summary says
+    /// `⚠ not portable: <file> names <path>`. A harness that cannot rebuild
+    /// offline is refused with the reason.
     Capsule(capsule::CapsuleArgs),
-    /// Rebuild a PoC capsule offline and assert the recorded crash reproduces, compared as bhf replay compares it (only the lane's toolchain, as the manifest lists it, + a shell needed; on Windows a C or C++ capsule rebuilds with its build.ps1 and cl, clang-cl or clang, no POSIX shell)
+    /// Rebuild a PoC capsule offline and check that its recorded crash reproduces
+    ///
+    /// A C or C++ capsule's crash is compared with the finding's field by field,
+    /// as `bhf replay` compares it (rule, kind, then sink or site): another crash
+    /// of the same sanitizer class is a MISMATCH that names the field that
+    /// differs. A capsule packaged before it recorded the finding's identity is
+    /// compared by sanitizer class, and the result says so.
+    ///
+    /// It needs the programs the capsule's manifest lists under `requires` (the
+    /// lane's compiler or interpreter, each overridable by its variable, such as
+    /// `CC`, `GPRBUILD`, `PYTHON` or `DOTNET`) and a shell, and names any that
+    /// are missing. On Windows a C or C++ capsule rebuilds with its `build.ps1`,
+    /// which needs no POSIX shell, using the compiler the harness was built with
+    /// (cl, clang-cl or clang; `CC`/`CXX` names another), as `requires_windows`
+    /// lists it.
     VerifyPoc(capsule::VerifyPocArgs),
-    /// Record + replay the shim-served faked environment so an environment-driven crash of a native harness (C, C++, Ada, Rust, COBOL, Fortran) reproduces deterministically
+    /// Capture the faked environment a native harness's crash depends on, so it replays exactly
+    ///
+    /// bhf fuzzes some targets by faking the external resources they read and
+    /// serving fuzzed bytes on each read. A crash found that way depends on
+    /// those bytes, so its input alone may not reproduce it. `env-capsule`
+    /// replays the crash under bhf's runtrace shim, records what the shim
+    /// served each resource (`env-world.jsonl`), and bundles the record with the
+    /// harness binary, the shim, the input and a `replay.sh` that serves the
+    /// same bytes again. Each capsule is checked to reproduce before it is
+    /// written. Works for a built native harness: C, C++, Ada, Rust, COBOL or
+    /// Fortran. A harness that runs in a language runtime (Python, Java) or is
+    /// statically linked (Go) is refused with the reason.
     EnvCapsule(env_capsule::EnvCapsuleArgs),
-    /// Replay inputs through two harnesses or metamorphic variants and flag divergences (BHF-301 oracle)
+    /// Report inputs on which two harnesses, or a harness and a transformed input, differ (BHF-301)
     Differential(differential::DifferentialArgs),
-    /// Coverage-guided relational policy fuzzing: run one testcase under N role/session profiles and flag broken relational policies (BHF-308..311): run, replay, minimize
+    /// Fuzz a target under several role/session profiles; report broken relations (BHF-308 to 311)
+    ///
+    /// Each input runs under every launch profile a policy file declares
+    /// (differing in runner, arguments, environment, allowlist and secrets),
+    /// and bhf reports a finding when a relation the policy declares between
+    /// their results breaks: an unexpected difference or an unexpected match.
     Relational(relational::RelationalArgs),
     /// Recover comparison operands (cmplog / RedQueen) from a runtrace log into a fuzzing dictionary
     Cmplog(cmplog_cli::CmplogArgs),
-    /// Explain, offline (no LLM), WHY a crash fired: the minimized input, the comparisons it reached, the environment it touched, reachability, each with its evidence
+    /// Explain why a crash fired, from its evidence: input, comparisons, environment, reachability
     Explain(explain::ExplainArgs),
-    /// Map which input bytes of a C/C++ crash control which sink operand (offset/size/index, or a SEGV's faulting address) via perturbation — the exploit primitive
+    /// Map which input bytes of a C/C++ crash control the sink's offset, size, index or address
+    ///
+    /// bhf replays the crash with each input byte flipped and reads how the
+    /// sanitizer report changes: the offset, size or index of the bad access,
+    /// or a SEGV's faulting address. It writes `<finding>/byte-control.json`
+    /// with the exploit primitive that implies, and adds it to the finding.
     Cartography(cartography::CartographyArgs),
-    /// Map a testcase (or a finding's) to the value each C/C++ harness parameter receives: the harness's own argument trace when it can run, else a static decode from its arg-layout.json that names what it cannot decode
+    /// Show the value each parameter of a C/C++ harness receives from a testcase or a finding's input
+    ///
+    /// Runs the harness with its argument trace on when it can run; otherwise
+    /// decodes the testcase from the harness's `arg-layout.json` and names
+    /// what it cannot decode.
     DecodeArgs(decode_args::DecodeArgsArgs),
 
     // ── Binaries: no-source / firmware analysis ─────────────────────────────
-    /// No-source analysis of compiled binaries & firmware: scan (CVE/SBOM), fuzz (black-box), rehost (Cortex-M firmware in an emulator), and the adapter stubs
+    /// Analyze binaries and firmware without source: CVE scan, disassembly, fuzzing, rehosting
     Binary(BinaryArgs),
 
     // ── Kernel drivers: syzkaller ───────────────────────────────────────────
-    /// Linux kernel drivers: generate syzlang descriptions of a driver's ioctl interface from its source (syzlang), import syzkaller crash reports into results (import), run system-call programs in a qemu-system guest with KCOV coverage (run), fuzz with them, turning the guest's kernel reports into findings (fuzz), and replay such a finding (replay)
+    /// Linux kernel drivers: syzlang descriptions, syzkaller crash import, KCOV fuzzing in QEMU
+    ///
+    /// `syzlang` writes syzkaller descriptions of a driver's ioctl interface
+    /// from its source, and `import` turns syzkaller crash reports into
+    /// findings. `run`, `fuzz` and `replay` run system-call programs in a
+    /// qemu-system guest with KCOV coverage.
     Kernel(kernel::KernelArgs),
 
     // ── External project/target profiles ────────────────────────────────────
-    /// Define, validate, and run an external project/target-profile manifest (bhf.project.v1) kept outside the source tree: validate, list, run
+    /// Validate, list and run targets of a bhf.project.v1 manifest, or import an OSS-Fuzz project
+    ///
+    /// A project manifest describes targets, their launch, seeds and engine,
+    /// and lives outside the source tree.
     Project(project::ProjectArgs),
 
     // ── Out-of-process extensions (bhf.extension.v1) ─────────────────────────
-    /// Drive an explicitly-trusted, out-of-process extension (bhf.extension.v1): validate/negotiate its protocol + capabilities, or evaluate an input through its semantic oracle (validate, evaluate)
+    /// Run an out-of-process extension (bhf.extension.v1): validate, evaluate, session, minimize
     Extension(extension::ExtensionArgs),
 
     // ── Supply chain & static analysis ──────────────────────────────────────
-    /// Generate an SBOM from source/manifest/binaries with CVE matching and vulnerability gating
-    Sbom(sbom::SbomArgs),
-    /// Check the licenses of bhf's own Cargo dependencies against its Apache-2.0/MIT/BSD policy (in a bhf source checkout)
+    /// Generate an SBOM, match it against an offline CVE database, and gate on severity
     ///
-    /// Checks the crates a bhf build links, from the Cargo.lock and THIRD_PARTY.md of a bhf
-    /// source checkout. Not a license check of a scanned project: `bhf sbom` reports a tree's
-    /// dependencies and their licenses.
+    /// Inventories a source tree, a work directory or a component manifest,
+    /// plus any binary inventories you give it.
+    Sbom(sbom::SbomArgs),
+    /// Check the licenses of bhf's own Cargo dependencies against its Apache-2.0/MIT/BSD policy
+    ///
+    /// Checks the crates a bhf build links, from the Cargo.lock and THIRD_PARTY.md
+    /// of a bhf source checkout. To list a scanned tree's dependencies and their
+    /// licenses, use `bhf sbom`.
     LicenseAudit(license_audit::LicenseAuditArgs),
-    /// Run static-analysis rules (MISRA, CWE) over source to a report/SARIF with baseline diff (SAST)
+    /// Run bhf's static-analysis rules (MISRA, CWE) over source: report, SARIF, baseline diff
     StaticScan(static_scan::StaticScanArgs),
-    /// Fast per-language SLOC counting over one or more roots — tree walk only, NO rule scanning (much faster than `static-scan --sloc`)
+    /// Count source lines per language in one or more trees, without running rules
+    ///
+    /// It runs the same count as `bhf static-scan --sloc`, without the rule
+    /// engine, so it is faster.
     Sloc(sloc::SlocArgs),
-    /// Infer Ada protected/task types from source as JSON state machines (protocol analysis)
+    /// Print the state machines of Ada protected and task types as JSON (protocol analysis)
     ExtractStateMachines(extract_state_machines::ExtractStateMachinesArgs),
 
     // ── Reference data ──────────────────────────────────────────────────────
@@ -320,27 +412,34 @@ enum Command {
     Rules(rules::RulesArgs),
 
     // ── Governance & air-gapped distribution ────────────────────────────────
-    /// Explain, validate, or dry-run BHF policy-as-code governance rules
+    /// Explain, validate or dry-run a policy-as-code file (rules, tools, runners, CI gates, waivers)
     Policy(policy::PolicyArgs),
-    /// Append to or read the JSONL compliance/audit log
+    /// Append an event to a JSONL audit log, or read and summarize one
     Audit(audit::AuditArgs),
-    /// Create, inspect, verify, or install signed air-gapped update packs (offline distribution)
+    /// Build, sign, verify and install air-gapped update packs; import OSV and NVD advisories
     Pack(pack::PackArgs),
-    /// Bundle a work directory (policy, packs, audit) into a manifest/tarball for air-gapped handoff
+    /// Write a hashed manifest of a work directory's results for an air-gapped handoff
+    ///
+    /// The manifest lists each result file with its SHA-256, plus any policy,
+    /// update packs, audit log and runner files you add. `--bundle-dir` also
+    /// copies them into one directory. `bhf export regression` writes a
+    /// standalone regression suite instead.
     Export(export_bundle::ExportArgs),
 
     // ── Ops, CI & diagnostics ───────────────────────────────────────────────
-    /// Run auto for CI: write a Markdown summary to GITHUB_STEP_SUMMARY and gate on a severity threshold
+    /// Run `bhf auto` for CI: Markdown summary to GITHUB_STEP_SUMMARY, gate on severity
     Ci(ci::CiArgs),
-    /// Manage distributed runner profiles (list/select/handoff/lease/plan/validate)
+    /// Manage runner profiles and job handoffs for distributed runs
     Runners(runners::RunnersArgs),
     /// Compact or remove selected work-directory outputs (build, corpus, reports, findings)
     Clean(clean::CleanArgs),
-    /// Compare discovered targets against a prior auto/run.json to surface coverage blockers (diagnostics)
+    /// Compare a tree's targets with a previous auto/run.json: coverage blockers per target
     Introspect(introspect::IntrospectArgs),
-    /// Create a compact scrubbed support report from a running/completed auto work directory (no source or private names)
+    /// Write a short support report from an auto work directory, with source and names scrubbed
     BugReport(support_report::SupportReportArgs),
-    /// Use Codex, Claude, API, or local LLMs for evidence-grounded planning, harness help, findings, and diagnostics
+    /// Ask a language model (the `codex` or `claude` CLI, a hosted API or a
+    /// local server) to plan runs, help with harnesses, explain findings and
+    /// diagnose failures
     #[cfg(feature = "llm")]
     Llm(llm::LlmArgs),
 
@@ -389,13 +488,19 @@ struct BinaryArgs {
 // needs the variant to hold the `Args` type directly, not `Box<Args>`.
 #[allow(clippy::large_enum_variant)]
 enum BinaryCommand {
-    /// Inventory binaries and firmware, extract archives, match CVE components for SBOM/SCA
+    /// Inventory binaries and firmware, unpack archives, match components to a CVE database
     Scan(binary_scan::BinaryScanArgs),
-    /// List a binary's functions, call edges, strings and xrefs with Rizin, Ghidra headless or angr, run as subprocesses (or the mock adapter's JSON contract)
+    /// List a binary's functions, calls, strings and xrefs with Rizin, Ghidra headless or angr, run as subprocesses
     Adapter(binary_adapter::BinaryAdapterArgs),
-    /// Fuzz a standalone executable with no source (stdin/seed inputs, sandbox, timeouts, black-box)
+    /// Fuzz an executable without source: stdin or file input, blind or AFL++ QEMU/Frida mode
     Fuzz(binary_fuzz::BinaryFuzzArgs),
-    /// Fuzz an unmodified Cortex-M firmware image (ELF or raw) in bhf's emulator: input in a fixed buffer or through MMIO-modelled peripheral reads (windows from an SVD file), interrupts on an input-chosen schedule, edge coverage, invalid access / bad PC / HardFault findings labelled rehosted, peripheral-modelled
+    /// Fuzz an unmodified Cortex-M firmware image (ELF or raw) in bhf's emulator
+    ///
+    /// The input reaches the firmware in a fixed buffer, through modelled
+    /// peripheral (MMIO) reads, whose address windows can come from an SVD
+    /// file, and through interrupts on a schedule the input chooses. bhf
+    /// records edge coverage. An invalid memory access, a bad PC or a
+    /// HardFault is a finding, labelled `rehosted, peripheral-modelled`.
     Rehost(binary_rehost::BinaryRehostArgs),
 }
 
@@ -409,9 +514,9 @@ struct ListArgs {
 
 #[derive(Debug, Subcommand)]
 enum ListCommand {
-    /// List fuzzable subprograms in a source tree, ranked, as a table or JSON
+    /// List the fuzzable functions in a source tree, ranked, as a table or JSON
     Targets(list_targets::ListTargetsArgs),
-    /// List the bug-oracle plugin inventory (threat-detection rules by API/category)
+    /// List bhf's bug oracles: each one's rule, category and the dangerous APIs it watches
     Oracles(list_oracles::ListOraclesArgs),
 }
 

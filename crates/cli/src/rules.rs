@@ -28,19 +28,17 @@ pub enum RulesCommand {
 
 #[derive(Debug, Args)]
 pub struct ListArgs {
-    /// Emit one JSON document with every rule instead of human-readable
-    /// columns. Useful for piping into jq / building dashboards.
+    /// Print one JSON document with every rule instead of the table.
     #[arg(long)]
     pub json: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct ShowArgs {
-    /// Rule identifier - either the numeric id (`BHF-201`) or the slug
-    /// (`bhf.c/heap-buffer-overflow`).
+    /// The rule: its id (`BHF-201`) or its slug (`bhf.c/heap-buffer-overflow`).
     pub rule: String,
 
-    /// Emit the rule definition as JSON instead of formatted text.
+    /// Print the rule definition as JSON instead of formatted text.
     #[arg(long)]
     pub json: bool,
 }

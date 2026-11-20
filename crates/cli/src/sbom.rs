@@ -12,60 +12,65 @@ pub struct SbomArgs {
     #[arg(long = "work-dir", default_value = "bhf_work")]
     pub work_dir: PathBuf,
 
-    /// Write the emitted artifacts (sbom.json, cyclonedx.json,
-    /// vulnerabilities.json, openvex.json, sbom.csv — see `--emit` to select a
-    /// subset) here instead, and do not update results/.
+    /// Write the artifacts here instead (sbom.json, cyclonedx.json,
+    /// vulnerabilities.json, openvex.json, sbom.csv; `--emit` picks among
+    /// them), and leave results/ as it is.
     #[arg(long)]
     pub out: Option<PathBuf>,
 
-    /// Comma-separated subset of artifacts to emit: `cyclonedx`, `sbom`,
-    /// `vulnerabilities`, `openvex`, `vex-review`, `csv`, `cyclonedx-vex`, `spdx-json`. Default emits all except
-    /// `spdx-json` (which is opt-in). An unknown name is rejected.
+    /// The artifacts to write, comma-separated: `cyclonedx`, `sbom`,
+    /// `vulnerabilities`, `openvex`, `vex-review`, `csv`, `cyclonedx-vex`,
+    /// `spdx-json`. Default: all except `spdx-json`. An unknown name is an
+    /// error.
     #[arg(long, value_name = "LIST")]
     pub emit: Option<String>,
 
-    /// Convenience alias: force the two VEX outputs (`openvex`,`cyclonedx-vex`)
-    /// into the emit set, in addition to whatever `--emit` selects.
+    /// Also write the two VEX outputs (`openvex`, `cyclonedx-vex`), besides
+    /// what `--emit` selects.
     #[arg(long)]
     pub vex: bool,
 
-    /// Convenience alias for a single output format, added to the emit set:
-    /// `spdx-json` writes `sbom.spdx.json` (SPDX-2.3). Equivalent to
-    /// `--emit spdx-json`; combine with `--emit` to add it to a wider selection.
+    /// One more output format: `spdx-json` writes `sbom.spdx.json` (SPDX 2.3).
+    /// On its own it means `--emit spdx-json`; with `--emit`, it adds the
+    /// format to that list.
     #[arg(long, value_name = "FORMAT")]
     pub format: Option<String>,
 
-    /// Comma-separated cataloger ecosystems to run (e.g. `cargo,npm`). Default
-    /// runs every cataloger that detects the tree. An unknown name is rejected.
+    /// The package ecosystems to catalog, comma-separated, such as
+    /// `cargo,npm`. Default: every ecosystem found in the tree. An unknown
+    /// name is an error.
     #[arg(long, value_name = "LIST")]
     pub ecosystems: Option<String>,
 
-    /// Explicit `auto/run.json` for runtime/fuzz reachability evidence. When
-    /// unset the conventional `<root>/auto/run.json` locations are auto-detected.
+    /// The `auto/run.json` whose fuzz results show which components a run
+    /// reached. Default: `<root>/auto/run.json` and the other usual places, if
+    /// one exists.
     #[arg(long = "run-json", value_name = "PATH")]
     pub run_json: Option<PathBuf>,
 
-    /// Offline CVE database JSON supplied by an update pack.
+    /// Offline advisory database (JSON), from an update pack or from `bhf pack
+    /// import-osv` or `import-nvd`.
     #[arg(long = "vuln-db")]
     pub vuln_db: Option<PathBuf>,
 
-    /// Policy-as-code JSON; /ci/fail_on_vulnerability_severity supplies the gate.
+    /// Policy-as-code JSON whose `/ci/fail_on_vulnerability_severity` sets the
+    /// severity gate.
     #[arg(long)]
     pub policy: Option<PathBuf>,
 
-    /// Binary inventory JSON to include as binary component evidence.
+    /// A `bhf binary scan` inventory (binary-inventory.json); its components
+    /// are added to the SBOM. Repeatable.
     #[arg(long = "binary-inventory")]
     pub binary_inventories: Vec<PathBuf>,
 
-    /// Exit non-zero when a matched vulnerability meets or exceeds this severity.
-    /// Requires an explicit advisory database: without one nothing can match,
-    /// and the gate would pass whatever the inventory holds.
+    /// Exit non-zero when a matched vulnerability meets or exceeds this
+    /// severity. Requires `--vuln-db`, the database the components are matched
+    /// against.
     #[arg(long, value_enum, requires = "vuln_db")]
     pub fail_on: Option<FailOnSeverity>,
 
-    /// Exit non-zero for matched CVEs requiring vulnerability-specific review.
-    /// Requires an explicit advisory database and always writes vex-review.json.
-    /// Zero pending matches is not a declaration that the product is safe.
+    /// Exit non-zero when a matched CVE still needs a review of whether it
+    /// applies. Requires `--vuln-db`, and always writes vex-review.json.
     #[arg(long, requires = "vuln_db")]
     pub fail_on_unreviewed: bool,
 }
