@@ -1582,7 +1582,7 @@ mod tests {
         // 6 % 4; 0xff as a signed byte; an ASCII spec byte, then "AB"; 1 & 1;
         // 0x0007 little-endian; what is left; nothing left reads as 0.
         assert_eq!(
-            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n"),
             "2 -1 AB True 7 3 b'XYZ' 0 only\n"
         );
     }

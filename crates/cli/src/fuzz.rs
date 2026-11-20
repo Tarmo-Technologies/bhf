@@ -17674,7 +17674,10 @@ exit 0
         }
         seeds.push(b"entry-1".to_vec());
         // What an earlier campaign left beside them.
-        let seed_dir = work.join("fuzz_campaigns/H-SEEDS/seed_bytes");
+        let seed_dir = work
+            .join("fuzz_campaigns")
+            .join("H-SEEDS")
+            .join("seed_bytes");
         fs::create_dir_all(&seed_dir).unwrap();
         fs::write(seed_dir.join("stale.bin"), b"stale").unwrap();
         args.seed_bytes = seeds;

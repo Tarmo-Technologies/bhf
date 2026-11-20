@@ -4091,7 +4091,7 @@ func ParseRequest(req *Request) {}
         let parse = std::fs::read_to_string(dest.join("parser/parse.go")).unwrap();
         assert!(parse.starts_with(&format!(
             "//line {}:1\npackage parser\n",
-            module.join("parser/parse.go").display()
+            module.join("parser").join("parse.go").display()
         )));
     }
 

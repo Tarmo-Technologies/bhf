@@ -937,8 +937,8 @@ mod tests {
                     c.source_path
                         .strip_prefix(&*root)
                         .unwrap()
-                        .display()
-                        .to_string(),
+                        .to_string_lossy()
+                        .replace('\\', "/"),
                     c.line,
                     c.name.as_str(),
                 )
@@ -1111,6 +1111,9 @@ mod tests {
     #[test]
     fn imported_fuzzers_are_provided_harnesses_at_the_source_that_defines_them() {
         let root = crate::test_support::TestDir::new("provided-imported");
+        // Canonical once it exists, as discovery sees it (a Windows temp dir
+        // can be an 8.3 short name that canonicalizing expands).
+        std::fs::create_dir_all(root.join("tree")).unwrap();
         let tree = crate::workdir::plain_canonical(&root.join("tree"));
         write(&tree.join("fuzz/parse_record_fuzzer.cc"), FUZZER_SOURCE);
         // Named after the fuzzer but not one: not its source.
