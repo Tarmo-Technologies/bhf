@@ -91,6 +91,11 @@ GnuCOBOL Minecraft server) and several web and CLI COBOL projects, recorded:
   GCC). Its `libcob` runtime is LGPLv3 and links into your generated harness,
   like the GNAT or GCC runtime; it is never linked into bhf.
 - `clang` and `make` for the C harness build.
+- On native Windows, GnuCOBOL's MinGW build (`choco install gnucobol`, or a
+  GnuCOBOL for Windows zip with its own gcc) and `make`. The harness builds
+  with the gcc in GnuCOBOL's `bin`, without AddressSanitizer, so libcob's
+  `-fec=all` checks are the crash oracle there and each finding's fidelity
+  says so. See [Running bhf on Windows](windows.md#notes-and-limitations).
 
 ## Limits
 

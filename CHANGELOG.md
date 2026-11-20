@@ -5,6 +5,12 @@
 ## Unreleased
 
 ### Added
+- The COBOL lane builds on native Windows (#430) with GnuCOBOL's MinGW build
+  (`choco install gnucobol`, or a GnuCOBOL zip with its own gcc): the driver,
+  glue and translated program build with the gcc in GnuCOBOL's `bin`, without
+  sanitizers, libcob's runtime checks stay the crash oracle, and each
+  finding's `fidelity.sanitizers` says `none (toolchain limit)`. The harness
+  gets the GnuCOBOL DLLs it loads beside `main.exe`.
 - `bhf binary rehost --svd FILE` takes the peripheral windows from the
   part's CMSIS-SVD file (#354): only its peripherals' address blocks
   (inherited through `derivedFrom`, arrays expanded, reserved blocks and the

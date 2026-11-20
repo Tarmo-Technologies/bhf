@@ -90,10 +90,11 @@ pub fn run_cobol_attribution(work_dir: &Path) -> usize {
             .get("harness_id")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let main_bin = crate::auto::layout::harness_dir(work_dir, harness_id).join("main");
-        if !main_bin.is_file() {
+        let Some(main_bin) = crate::auto::cobol_build::harness_binary(
+            &crate::auto::layout::harness_dir(work_dir, harness_id),
+        ) else {
             continue;
-        }
+        };
         let Some(diag) = replay_capture_libcob(&main_bin, &testcase) else {
             continue;
         };

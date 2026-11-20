@@ -898,6 +898,24 @@ jobs:
           cargo test --locked -p bhf --no-fail-fast --test auto_rust_discovery --test auto_fortran_lane
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # The COBOL lane on native Windows (#430): GnuCOBOL's MinGW build from
+      # Chocolatey. Its cobc on PATH is a shim; bhf finds GnuCOBOL's bin, and
+      # the gcc there, through COB_CONFIG_DIR, which the install sets only
+      # for later shells.
+      - name: Test the COBOL lane
+        shell: pwsh
+        env:
+          BHF_REQUIRE_TOOLS: "1"
+        run: |
+          choco install gnucobol --version=3.2.0.20240515 --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:COB_CONFIG_DIR = 'C:\ProgramData\chocolatey\lib\gnucobol\tools\config'
+          if (-not (Get-Command cobc -ErrorAction SilentlyContinue)) {
+            $env:PATH = "$env:PATH;C:\ProgramData\chocolatey\bin"
+          }
+          cargo test --locked -p bhf --no-fail-fast --test auto_cobol
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Test portable scheduler runtime reliability
         run: cargo test --locked -p continuous_daemon --lib health::tests
 

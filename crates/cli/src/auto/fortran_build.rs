@@ -47,8 +47,9 @@ pub(crate) const WINDOWS_SANITIZER_LIMIT: &str =
      bounds and pointer checks (-fcheck=bounds,pointer) stood in for it";
 
 /// The C flags a native Windows Fortran harness's driver and glue build with:
-/// the Makefile's gcc flags without the sanitizers MinGW's gcc lacks.
-const WINDOWS_C_FLAGS: &str = "-O1 -g -fsanitize-coverage=trace-pc,trace-cmp";
+/// the Makefile's gcc flags without the sanitizers MinGW's gcc lacks. The
+/// COBOL lane builds with them there too.
+pub(crate) const WINDOWS_C_FLAGS: &str = "-O1 -g -fsanitize-coverage=trace-pc,trace-cmp";
 
 /// The C compiler a native Windows Fortran harness links with: MinGW's gcc
 /// beside the gfortran on PATH, which shares its ABI and runtime, else `gcc`.
@@ -76,7 +77,7 @@ fn build_failure_lines(output: &str) -> String {
 
 /// `path` as make's recipe shell can run it: a POSIX `sh` (w64devkit's or
 /// MSYS's make) reads `\` as an escape, and `cmd.exe` takes `/` as well.
-fn make_command_path(path: &Path) -> String {
+pub(crate) fn make_command_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 

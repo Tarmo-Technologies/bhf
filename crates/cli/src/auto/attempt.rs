@@ -2805,6 +2805,7 @@ fn run_attempt(
     // in a generated LLVMFuzzerTestOneInput glue that fills the PIC X(N) LINKAGE
     // buffer from the fuzz bytes, and build on the passthrough C fork-server path —
     // reusing edge coverage, cmplog, and ASan (plus libcob `-fec` runtime aborts).
+    // On native Windows it builds with GnuCOBOL's MinGW gcc, without ASan (#430).
     // On success the build below is a pass-through. A missing `cobc` or a program
     // with no fuzzable LINKAGE surface skips cleanly.
     if matches!(candidate.lang, crate::auto::candidate::Lang::Cobol) {
@@ -7042,11 +7043,12 @@ fn try_build(
                 }
             }
         }
-        // COBOL compiled its C harness binary (`harnesses/<id>/main`) in Step 0 via
-        // cobc -C + the passthrough driver; pass-through reports Success iff it exists.
+        // COBOL compiled its C harness binary (`harnesses/<id>/main`, `main.exe` on
+        // Windows) in Step 0 via cobc -C + the passthrough driver; pass-through
+        // reports Success iff it exists.
         Lang::Cobol => {
-            let main_bin = crate::auto::layout::harness_dir(work_dir, harness_id).join("main");
-            if main_bin.is_file() {
+            let harness_dir = crate::auto::layout::harness_dir(work_dir, harness_id);
+            if crate::auto::cobol_build::harness_binary(&harness_dir).is_some() {
                 BuildOutcome::Success
             } else {
                 BuildOutcome::Failed {

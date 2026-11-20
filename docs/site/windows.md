@@ -101,7 +101,7 @@ winget install --id Rustlang.Rustup -e                  # build bhf from source
 
 Install another language's toolchain only for a lane you run.
 [Notes and limitations](#notes-and-limitations) lists what each lane needs on
-Windows; the Fortran lane, for example, runs without sanitizers there.
+Windows; the Fortran and COBOL lanes, for example, run without sanitizers there.
 
 ## Getting `bhf.exe`
 
@@ -744,9 +744,9 @@ differences.
 - The **Go** lane builds a native binary and needs `go` installed. A Go
   capsule rebuilds through `build.sh`, so `bhf verify-poc` needs a POSIX `sh`
   on `PATH` (Git for Windows' works).
-- The **Ada** and **COBOL** lanes also build native binaries. bhf's Windows
-  CI does not run them, so check them on a representative target before you
-  rely on a campaign.
+- The **Ada** lane also builds native binaries. bhf's Windows CI does not
+  run it, so check it on a representative target before you rely on a
+  campaign.
 - The **Rust** lane runs with a nightly Rust for `x86_64-pc-windows-msvc` and
   LLVM's clang. The harness crate builds as an MSVC staticlib
   (`bhf_rust_harness.lib`) with SanitizerCoverage, AddressSanitizer and the
@@ -768,6 +768,22 @@ differences.
   assumed-size array, a C buffer) goes unreported on Windows; ASan reports
   it on Linux. `bhf capsule` refuses such a harness, with the reason: its
   objects link only with MinGW's gcc, which a capsule build does not drive.
+- The **COBOL** lane runs on native Windows with GnuCOBOL's MinGW build:
+  `choco install gnucobol`, or a GnuCOBOL for Windows zip whose `bin` holds its
+  own gcc (run its `set_env.cmd`, or put that `bin` on `PATH`). GnuCOBOL's
+  `libcob` uses MinGW's ABI and C runtime, so bhf builds the driver, the glue
+  and the translated program with the gcc in GnuCOBOL's `bin`, which it finds
+  on `PATH` or beside `COB_MAIN_DIR` or `COB_CONFIG_DIR` (the Chocolatey
+  package's `cobc` on `PATH` is a shim). MinGW's GCC has no AddressSanitizer,
+  so libcob's runtime checks (`cobc -fec=all`) are the crash oracle there: an
+  out-of-range reference modification or subscript, a size error or a zero
+  divide during the target call is a crash, attributed to its `.cob` line as
+  on Linux. Each finding's `fidelity.sanitizers` says `none (toolchain
+  limit)` with the reason; memory corruption the checks do not cover goes
+  unreported on Windows. The DLLs the harness loads from GnuCOBOL's `bin`
+  (libcob, GMP, Berkeley DB, ...) are linked or copied beside `main.exe`, so
+  `bhf replay` runs it from any shell. `bhf capsule` refuses such a harness,
+  with the reason.
 - The Python lane runs on native Windows with a Python 3 on `PATH` (`python`
   or `python3`). Its `main` is a POSIX launcher, so it also writes
   `main.launch.json` beside it: the interpreter, the driver and the environment

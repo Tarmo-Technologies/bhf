@@ -97,6 +97,9 @@ pub(crate) fn adjust_model(
     ));
     match glue {
         Glue::Cobol => {
+            if let Some(reason) = mingw_refusal(glue, &harness.harness_dir) {
+                return Err(super::refuse(reason));
+            }
             model.prelude.push_str(
                 "# The GnuCOBOL runtime the translated program links against.\n\
                  COB_LIBS=$(cob-config --libs 2>/dev/null) || COB_LIBS=\n\
@@ -114,7 +117,7 @@ pub(crate) fn adjust_model(
             }
         }
         Glue::Fortran => {
-            if let Some(reason) = mingw_refusal(&harness.harness_dir) {
+            if let Some(reason) = mingw_refusal(glue, &harness.harness_dir) {
                 return Err(super::refuse(reason));
             }
             model.prelude.push_str(
@@ -144,18 +147,26 @@ pub(crate) fn adjust_model(
     Ok(())
 }
 
-/// Why a Fortran harness cannot be packaged: one built on native Windows
-/// (#327) is MinGW's, and its objects and gfortran's runtime link only with
-/// MinGW's gcc, which a capsule's build does not drive yet (#430).
-fn mingw_refusal(harness_dir: &std::path::Path) -> Option<&'static str> {
+/// Why a Fortran or COBOL harness cannot be packaged: one built on native
+/// Windows (#327, #430) is MinGW's, and its objects and its language runtime
+/// (gfortran's, libcob) link only with MinGW's gcc, which a capsule's build
+/// does not drive yet.
+fn mingw_refusal(glue: Glue, harness_dir: &std::path::Path) -> Option<&'static str> {
+    let reason = match glue {
+        Glue::Fortran => {
+            "the Fortran harness was built on native Windows with MinGW-w64's gfortran, \
+             whose objects and runtime link only with MinGW's gcc, and a capsule does not \
+             rebuild with it yet"
+        }
+        Glue::Cobol => {
+            "the COBOL harness was built on native Windows against GnuCOBOL's MinGW libcob, \
+             which links only with MinGW's gcc, and a capsule does not rebuild with it yet"
+        }
+    };
     harness_dir
         .join(crate::auto::fortran_build::SANITIZER_LIMIT_RECORD)
         .is_file()
-        .then_some(
-            "the Fortran harness was built on native Windows with MinGW-w64's gfortran, \
-             whose objects and runtime link only with MinGW's gcc, and a capsule does not \
-             rebuild with it yet",
-        )
+        .then_some(reason)
 }
 
 /// The objects `fortran-build.json` records, as build.sh compiles them: the
@@ -222,21 +233,27 @@ mod tests {
         assert_eq!(runtime_signature(Glue::Fortran, stderr), None);
     }
 
-    /// A Fortran harness built on native Windows, which records its
-    /// toolchain's sanitizer limit, is refused with the reason; any other is
-    /// packaged.
+    /// A Fortran or COBOL harness built on native Windows, which records
+    /// its toolchain's sanitizer limit, is refused with the reason; any other
+    /// is packaged.
     #[test]
     fn a_harness_built_with_mingw_is_refused() {
         let temp = tempfile::tempdir().unwrap();
-        assert_eq!(mingw_refusal(temp.path()), None);
+        assert_eq!(mingw_refusal(Glue::Fortran, temp.path()), None);
+        assert_eq!(mingw_refusal(Glue::Cobol, temp.path()), None);
         std::fs::write(
             temp.path()
                 .join(crate::auto::fortran_build::SANITIZER_LIMIT_RECORD),
             crate::auto::fortran_build::WINDOWS_SANITIZER_LIMIT,
         )
         .unwrap();
-        let reason = mingw_refusal(temp.path()).expect("refused");
+        let reason = mingw_refusal(Glue::Fortran, temp.path()).expect("refused");
         assert!(reason.contains("MinGW's gcc"), "{reason}");
+        let reason = mingw_refusal(Glue::Cobol, temp.path()).expect("refused");
+        assert!(
+            reason.contains("GnuCOBOL") && reason.contains("MinGW's gcc"),
+            "{reason}"
+        );
     }
 
     /// The recorded Fortran objects compile without coverage, with module

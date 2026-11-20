@@ -5,7 +5,9 @@
 //! reference-modification offset goes out of bounds when the input starts with
 //! `Z` — a libcob `EC-BOUND-REF-MOD` failure the harness surfaces as a crash. The
 //! trigger byte is seeded so the run is fast + deterministic. Gated on
-//! cobc + clang + make; skipped otherwise.
+//! cobc + make, and clang off Windows; skipped otherwise. On native Windows
+//! (#430) the harness builds with the MinGW gcc in GnuCOBOL's `bin`, without
+//! sanitizers, and its findings say so.
 
 use std::path::Path;
 use std::process::Command;
@@ -25,6 +27,12 @@ fn have(tool: &str) -> bool {
             .unwrap_or(false)
     };
     support::require_tool(present, tool)
+}
+
+/// What the lane needs here: cobc and make, and clang off Windows (on
+/// Windows the harness builds with the gcc beside cobc).
+fn have_toolchain() -> bool {
+    have("cobc") && have("make") && (cfg!(windows) || have("clang"))
 }
 
 fn tempdir(name: &str) -> TestDir {
@@ -64,8 +72,8 @@ const PARSEIT: &str = "       IDENTIFICATION DIVISION.\n\
 
 #[test]
 fn auto_cobol_discovers_and_crashes_on_ref_mod_oob() {
-    if !have("cobc") || !have("clang") || !have("make") {
-        eprintln!("skip: needs cobc (GnuCOBOL) + clang + make");
+    if !have_toolchain() {
+        eprintln!("skip: needs cobc (GnuCOBOL) + make, and clang off Windows");
         return;
     }
     let src = tempdir("src");
@@ -107,6 +115,19 @@ fn auto_cobol_discovers_and_crashes_on_ref_mod_oob() {
     let location = &doc["findings"][0]["location"];
     assert_eq!(location["file"], "parseit.cob", "{doc:#}");
     assert_eq!(location["line"], 11, "{doc:#}");
+    // #430: on native Windows no sanitizer ran, and the finding says why.
+    let crash = findings.iter().find(|f| f["rule_id"] == "BHF-210").unwrap();
+    let sanitizers = &crash["fidelity"]["sanitizers"];
+    if cfg!(windows) {
+        assert_eq!(sanitizers["status"], "not_exercised", "{crash:#}");
+        let reason = sanitizers["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.starts_with("none (toolchain limit): "),
+            "the finding says why no sanitizer ran: {crash:#}"
+        );
+    } else {
+        assert_eq!(sanitizers["status"], "exercised", "{crash:#}");
+    }
 }
 
 /// A COBOL finding is recorded as libcob's runtime error, not the SIGSEGV the
@@ -115,8 +136,8 @@ fn auto_cobol_discovers_and_crashes_on_ref_mod_oob() {
 /// same way, minimizes it instead of refusing it as another crash.
 #[test]
 fn auto_cobol_finding_replays_as_a_match_and_is_minimized() {
-    if !have("cobc") || !have("clang") || !have("make") {
-        eprintln!("skip: needs cobc (GnuCOBOL) + clang + make");
+    if !have_toolchain() {
+        eprintln!("skip: needs cobc (GnuCOBOL) + make, and clang off Windows");
         return;
     }
     let src = tempdir("replay-src");
@@ -194,8 +215,13 @@ fn auto_cobol_finding_replays_as_a_match_and_is_minimized() {
         "{}/parseit.cob:11",
         src.file_name().unwrap().to_string_lossy()
     );
-    for field in ["kind cobol-runtime-error", "signal SIGSEGV", site.as_str()] {
+    for field in ["kind cobol-runtime-error", site.as_str()] {
         assert!(compared.contains(field), "{field}: {stdout}");
+    }
+    // The harness dies by SIGSEGV off Windows; on Windows it ends with bhf's
+    // crash exit code, which has no signal to compare.
+    if !cfg!(windows) {
+        assert!(compared.contains("signal SIGSEGV"), "{stdout}");
     }
     for dir in [&src, &seed, &work] {
         let _ = std::fs::remove_dir_all(dir);

@@ -1964,7 +1964,10 @@ fn pe_import_directory(bytes: &[u8]) -> Option<PeImportDirectory> {
     })
 }
 
-fn pe_import_libraries(bytes: &[u8]) -> Vec<String> {
+/// The DLL names a PE image's import directory lists (`KERNEL32.dll`,
+/// `libcob-4.dll`), in table order; empty when `bytes` is not a PE image or
+/// imports nothing.
+pub fn pe_import_libraries(bytes: &[u8]) -> Vec<String> {
     let Some(directory) = pe_import_directory(bytes) else {
         return Vec::new();
     };
