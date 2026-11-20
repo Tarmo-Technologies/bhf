@@ -2,12 +2,7 @@
 
 # libFuzzer feature parity (built-in engine)
 
-bhf's built-in engine is coverage-guided and runs offline without the
-libFuzzer in-process runtime. C/C++ harnesses are compiled with the system
-clang's sanitizer instrumentation (SanitizerCoverage for coverage, ASan for
-memory errors), and bhf supplies its own mutator and coverage feedback. This
-page maps the libFuzzer options you know from `clang -fsanitize=fuzzer` to
-their bhf equivalents. Options are `bhf fuzz` flags unless marked `auto`.
+bhf's built-in engine is coverage-guided and runs offline without the libFuzzer in-process runtime. C/C++ harnesses are compiled with the system clang's sanitizer instrumentation (SanitizerCoverage for coverage, ASan for memory errors), and bhf supplies its own mutator and coverage feedback. This page maps the libFuzzer options you know from `clang -fsanitize=fuzzer` to their bhf equivalents. Options are `bhf fuzz` flags unless marked `auto`.
 
 ## Flag mapping
 
@@ -35,91 +30,30 @@ their bhf equivalents. Options are `bhf fuzz` flags unless marked `auto`.
 
 ## Coverage granularity
 
-The C/C++ driver tracks four coverage channels: edge presence
-(`trace-pc-guard`), AFL-style logarithmic hit-count buckets (the equivalent of
-libFuzzer's `inline-8bit-counters`), the opt-in laf-intel comparison-progress
-gradient (`--comparison-progress`), and the deepest stack an execution
-reached (libFuzzer's stack-depth feature). An input is kept in the corpus if
-it advances any of the four.
+The C/C++ driver tracks four coverage channels: edge presence (`trace-pc-guard`), AFL-style logarithmic hit-count buckets (the equivalent of libFuzzer's `inline-8bit-counters`), the opt-in laf-intel comparison-progress gradient (`--comparison-progress`), and the deepest stack an execution reached (libFuzzer's stack-depth feature). An input is kept in the corpus if it advances any of the four.
 
-The Ada lane is coverage-guided too. An instrumented Ada harness is compiled
-with `-fsanitize-coverage=trace-pc` (GNAT/GCC rejects `trace-pc-guard`),
-which feeds the same edge bitmap and a bounded persisted corpus. The source
-is rewritten with breadcrumb probes at exception handlers and `raise`
-statements, which feed an exception-signature signal alongside edge
-presence. Ada coverage is edge presence only; the hit-count-bucket and
-comparison-progress channels belong to the C, C++ and Rust lanes. After the
-sweep, `bhf auto` replays an Ada harness's corpus and reports the lines and
-subprograms its edges reached, in the format of the C/C++ report
-(`results/coverage/<id>/`, see [Auto](auto.md)). A `trace-pc` edge is placed
-on its Ada line with `addr2line`, and on the original source's line through
-the instrumented copy's line map.
+The Ada lane is coverage-guided too. An instrumented Ada harness is compiled with `-fsanitize-coverage=trace-pc` (GNAT/GCC rejects `trace-pc-guard`), which feeds the same edge bitmap and a bounded persisted corpus. The source is rewritten with breadcrumb probes at exception handlers and `raise` statements, which feed an exception-signature signal alongside edge presence. Ada coverage is edge presence only; the hit-count-bucket and comparison-progress channels belong to the C, C++ and Rust lanes. After the sweep, `bhf auto` replays an Ada harness's corpus and reports the lines and subprograms its edges reached, in the format of the C/C++ report (`results/coverage/<id>/`, see [Auto](auto.md)). A `trace-pc` edge is placed on its Ada line with `addr2line`, and on the original source's line through the instrumented copy's line map.
 
 ## Rust and Java coverage
 
-Rust and Java targets use the same built-in engine and corpus handling. Rust
-harnesses are built as SanitizerCoverage+ASan static libraries linked to the
-same C fork-server driver, so they get the same coverage channels as C/C++.
-Java bytecode is instrumented by bhf's own ASM agent, which feeds edge
-coverage into the same engine; the Java lane has the edge map only.
+Rust and Java targets use the same built-in engine and corpus handling. Rust harnesses are built as SanitizerCoverage+ASan static libraries linked to the same C fork-server driver, so they get the same coverage channels as C/C++. Java bytecode is instrumented by bhf's own ASM agent, which feeds edge coverage into the same engine; the Java lane has the edge map only.
 
 ## Value profile compared with cmplog (RedQueen)
 
-libFuzzer's `-use_value_profile` turns each comparison into an approximate
-coverage signal: an input that brings a comparison's operands closer is
-rewarded even when it never satisfies the branch, which helps the mutator
-climb past multi-byte comparisons and checksums.
+libFuzzer's `-use_value_profile` turns each comparison into an approximate coverage signal: an input that brings a comparison's operands closer is rewarded even when it never satisfies the branch, which helps the mutator climb past multi-byte comparisons and checksums.
 
-bhf reaches the same goal through cmplog/RedQueen rather than a distance
-signal. Comparison operands are captured two ways and fed to the mutator:
+bhf reaches the same goal through cmplog/RedQueen rather than a distance signal. Comparison operands are captured two ways and fed to the mutator:
 
-- **String and buffer gates** (`memcmp`, `strcmp`, `strncmp`, …): the
-  generated driver defines the ASan `__sanitizer_weak_hook_*` family, which
-  ASan's interceptors call with both operands (no libFuzzer runtime needed).
-  The LD_PRELOAD runtrace shim records the same under `BHF_CMPLOG=1`, in the
-  harness's own processes only (`BHF_TARGET_EXE`), not in a shell the
-  harness runs. When the driver's site-tagged records are present, the
-  shim's untagged ones add no dictionary tokens.
-- **Scalar and character gates** (`*c == '{'`, integer `==`, `switch`): the
-  driver is compiled with `-fsanitize-coverage=trace-cmp`, and its
-  `trace_cmp*` and `trace_switch` callbacks record the integer operand pairs.
+- **String and buffer gates** (`memcmp`, `strcmp`, `strncmp`, …): the generated driver defines the ASan `__sanitizer_weak_hook_*` family, which ASan's interceptors call with both operands (no libFuzzer runtime needed). The LD_PRELOAD runtrace shim records the same under `BHF_CMPLOG=1`, in the harness's own processes only (`BHF_TARGET_EXE`), not in a shell the harness runs. When the driver's site-tagged records are present, the shim's untagged ones add no dictionary tokens.
+- **Scalar and character gates** (`*c == '{'`, integer `==`, `switch`): the driver is compiled with `-fsanitize-coverage=trace-cmp`, and its `trace_cmp*` and `trace_switch` callbacks record the integer operand pairs.
 
-Both feed a per-execution operand ring (`BHF_CMP_SHM`). The engine arms
-capture for the one corpus entry it is about to mutate, runs it once, and
-turns the operands it observed into mutations two ways:
+Both feed a per-execution operand ring (`BHF_CMP_SHM`). The engine arms capture for the one corpus entry it is about to mutate, runs it once, and turns the operands it observed into mutations two ways:
 
 - a **dictionary insert** of each operand (position-independent), and
-- an **offset-aware RedQueen splice** that replaces `operand_a` with
-  `operand_b` at the exact offset `operand_a` appears in that input
-  (input-to-state).
+- an **offset-aware RedQueen splice** that replaces `operand_a` with `operand_b` at the exact offset `operand_a` appears in that input (input-to-state).
 
-Capturing operands per input (against the entry being mutated, not a global
-pre-mined pool) lets the splice find `operand_a` at the offset the parser
-compared it, so one mutation passes one gate. Before capturing, the entry is
-colorized: its coverage-irrelevant bytes are randomized to near-unique values
-while its edge footprint is preserved, so single-byte and short operands
-splice at the right offset instead of at every occurrence of a common byte.
+Capturing operands per input (against the entry being mutated, not a global pre-mined pool) lets the splice find `operand_a` at the offset the parser compared it, so one mutation passes one gate. Before capturing, the entry is colorized: its coverage-irrelevant bytes are randomized to near-unique values while its edge footprint is preserved, so single-byte and short operands splice at the right offset instead of at every occurrence of a common byte.
 
-This is operand-level feedback rather than gradient-level feedback. Instead
-of nudging an input toward a comparison value over many generations, bhf
-injects the observed value directly. That clears the magic-byte, header,
-keyword and checksum cases libFuzzer's value profile targets, often in a
-single mutation. Where a gradient still helps, the opt-in
-`--comparison-progress` flag adds a laf-intel-style channel on the C/C++
-driver: the driver records, per compare site, the longest leading-byte prefix
-an input matched, and the engine rewards an input that matches one more byte
-of a multi-byte gate.
+This is operand-level feedback rather than gradient-level feedback. Instead of nudging an input toward a comparison value over many generations, bhf injects the observed value directly. That clears the magic-byte, header, keyword and checksum cases libFuzzer's value profile targets, often in a single mutation. Where a gradient still helps, the opt-in `--comparison-progress` flag adds a laf-intel-style channel on the C/C++ driver: the driver records, per compare site, the longest leading-byte prefix an input matched, and the engine rewards an input that matches one more byte of a multi-byte gate.
 
-That leaves transformed comparisons, where the magic value is a function of
-the input that never appears verbatim as an operand (`crc32(buf) == K`,
-`a == (b ^ K)` where the compiler folds the operand into a derived form,
-length or hash arithmetic). Neither input-to-state splicing nor leading-byte
-comparison progress can synthesize those. For C/C++, `bhf auto --symcc` adds
-a hybrid concolic loop. Each harness also builds with SymCC (`main_symcc`).
-When a built-in pass's corpus stops growing, its newest entries run through
-SymCC, which solves the branch conditions they reached and writes an input
-for each branch it can flip. Those inputs run next in the pass and stay in
-the corpus when they add coverage, as AFL++'s SymCC custom mutator and
-LibAFL's concolic stage feed theirs. SymCC is GPL-3.0 and runs only as a
-subprocess, under a license profile that permits it (see
-[Licensing](licensing.md)).
+That leaves transformed comparisons, where the magic value is a function of the input that never appears verbatim as an operand (`crc32(buf) == K`, `a == (b ^ K)` where the compiler folds the operand into a derived form, length or hash arithmetic). Neither input-to-state splicing nor leading-byte comparison progress can synthesize those. For C/C++, `bhf auto --symcc` adds a hybrid concolic loop. Each harness also builds with SymCC (`main_symcc`). When a built-in pass's corpus stops growing, its newest entries run through SymCC, which solves the branch conditions they reached and writes an input for each branch it can flip. Those inputs run next in the pass and stay in the corpus when they add coverage, as AFL++'s SymCC custom mutator and LibAFL's concolic stage feed theirs. SymCC is GPL-3.0 and runs only as a subprocess, under a license profile that permits it (see [Licensing](licensing.md)).

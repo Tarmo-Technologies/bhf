@@ -1,23 +1,15 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Emulator-in-the-loop validation — live QEMU (2026-09-27)
 
-Ran `scripts/hil-emu.sh` with `BHF_HIL_REQUIRE=1` (a missing tool is a hard
-failure, so gated tests cannot skip themselves). This exercises the RTOS/radar
-HDF-1, HDF-3 and HDF-4 back-half tracks that §1a of the
-[high-demand fuzzing roadmap](../high-demand-fuzzing-roadmap.md) listed as
-**software-complete in-tree but "unproven until run"** against a live
-emulator/cross toolchain. It is the first recorded run of the live path in
-this environment.
+Ran `scripts/hil-emu.sh` with `BHF_HIL_REQUIRE=1` (a missing tool is a hard failure, so gated tests cannot skip themselves). This exercises the RTOS/radar HDF-1, HDF-3 and HDF-4 back-half tracks that §1a of the [high-demand fuzzing roadmap](../high-demand-fuzzing-roadmap.md) listed as **software-complete in-tree but "unproven until run"** against a live emulator/cross toolchain. It is the first recorded run of the live path in this environment.
 
 **Result: RV-1, RV-2 and RV-3 ran the live path and passed (exit 0).**
 
 ## Environment
 
-- git: `main` at `dfee887`. The `target_transport` crate and its live tests
-  merged to `main` in `c16f879` (2026-09-25).
+- git: `main` at `dfee887`. The `target_transport` crate and its live tests merged to `main` in `c16f879` (2026-09-25).
 - QEMU 8.2.2 (Debian): `qemu-system-arm`, `qemu-arm`, `qemu-ppc64`, `qemu-img`.
-- `arm-none-eabi-gcc` 13.2.1; `powerpc64-linux-gnu-gcc` 13.3.0;
-  `arm-linux-gnueabihf-gcc`; `nm`; `cc`.
+- `arm-none-eabi-gcc` 13.2.1; `powerpc64-linux-gnu-gcc` 13.3.0; `arm-linux-gnueabihf-gcc`; `nm`; `cc`.
 
 ## What passed
 
@@ -38,18 +30,9 @@ live_fullsystem: determinism — 0x42 again edges=[100, 101, 200, 201] (== first
 
 ## Scope
 
-- **Emulator.** The run targets QEMU. The physical-board lane
-  (`crates/target_transport/tests/hil_board.rs`, driven by
-  `BHF_HIL_GDB=host:port` against OpenOCD and a Nucleo board, as in
-  [HIL bring-up](../hil-bringup.md)) needs a board, and none was attached.
-- **Images.** The Cortex-M image is a bare-metal harness written for BHF, and
-  the ppc64 target is a Linux user-mode process. BHF ships no VxWorks,
-  INTEGRITY or QNX images or vendor toolchains, and this run used none.
-- **HDF-7** was library-only on this date: IIOP dispatch and
-  `ProtocolStateGraph` had no `bhf` command. `bhf fuzz --protocol-profile`
-  (c8c8fd0, 2026-10-02) later exposed protocol sessions, and 10060d8 added
-  the IIOP session backend; see the
-  [stateful protocol sessions design](../designs/2026-10-02-stateful-protocol-sessions.md).
+- **Emulator.** The run targets QEMU. The physical-board lane (`crates/target_transport/tests/hil_board.rs`, driven by `BHF_HIL_GDB=host:port` against OpenOCD and a Nucleo board, as in [HIL bring-up](../hil-bringup.md)) needs a board, and none was attached.
+- **Images.** The Cortex-M image is a bare-metal harness written for BHF, and the ppc64 target is a Linux user-mode process. BHF ships no VxWorks, INTEGRITY or QNX images or vendor toolchains, and this run used none.
+- **HDF-7** was library-only on this date: IIOP dispatch and `ProtocolStateGraph` had no `bhf` command. `bhf fuzz --protocol-profile` (c8c8fd0, 2026-10-02) later exposed protocol sessions, and 10060d8 added the IIOP session backend; see the [stateful protocol sessions design](../designs/2026-10-02-stateful-protocol-sessions.md).
 
 ## Reproduce
 

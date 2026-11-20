@@ -2,8 +2,7 @@
 
 # Daemon JSON-RPC
 
-`bhf-daemon` (crate `crates/daemon`) serves JSON-RPC 2.0 over stdio with
-LSP-style framing. Each message is encoded as:
+`bhf-daemon` (crate `crates/daemon`) serves JSON-RPC 2.0 over stdio with LSP-style framing. Each message is encoded as:
 
 ```text
 Content-Length: <bytes>\r\n
@@ -11,9 +10,7 @@ Content-Length: <bytes>\r\n
 <json body>
 ```
 
-[Daemon](site/daemon.md) is the user guide: starting the daemon, the
-security configuration file, tenant roles, and the continuous fuzzing
-scheduler. This page is the method reference.
+[Daemon](site/daemon.md) is the user guide: starting the daemon, the security configuration file, tenant roles, and the continuous fuzzing scheduler. This page is the method reference.
 
 ## Methods
 
@@ -29,9 +26,7 @@ scheduler. This page is the method reference.
 | `listJobs` | optional `offset`, `limit` (default 100, at most 1000) | `total` and one page of `jobs`. |
 | `cancelJob` | `job_id` | `job_id` and its new `state`. |
 
-`rankAt` and `instrumentPreview` read Ada only. The job methods need a
-daemon started with `bhf-daemon --jobs-dir DIR`; without one they return
-`-32000`. Harness generation, build, and single fuzz runs are CLI commands.
+`rankAt` and `instrumentPreview` read Ada only. The job methods need a daemon started with `bhf-daemon --jobs-dir DIR`; without one they return `-32000`. Harness generation, build, and single fuzz runs are CLI commands.
 
 Example request body:
 
@@ -89,21 +84,10 @@ A secure request carries a top-level `auth` object:
 }
 ```
 
-An authorized response carries a top-level `bhfAudit` object with the tenant,
-role, method, and workspace root. [Daemon: Security
-Modes](site/daemon.md#security-modes) lists the config file format and which
-role may call which method.
+An authorized response carries a top-level `bhfAudit` object with the tenant, role, method, and workspace root. [Daemon: Security Modes](site/daemon.md#security-modes) lists the config file format and which role may call which method.
 
 ## Model Context Protocol mode
 
-`bhf-daemon --mcp` serves newline-delimited MCP over stdio instead of the
-framed JSON-RPC above. A default build exposes three read-only tools: Ada
-structure scan, Ada/C/C++ ranked targets, and bounded finding loading. A
-build with `--features llm` adds assistance-prompt preparation and an
-Ada/C/C++ structural harness preflight. The MCP tools do not build, fuzz,
-replay, minimize, edit files, or run shell commands. MCP mode has no
-authentication, so `--mcp` and `--security-config` cannot be combined.
+`bhf-daemon --mcp` serves newline-delimited MCP over stdio instead of the framed JSON-RPC above. A default build exposes three read-only tools: Ada structure scan, Ada/C/C++ ranked targets, and bounded finding loading. A build with `--features llm` adds assistance-prompt preparation and an Ada/C/C++ structural harness preflight. The MCP tools do not build, fuzz, replay, minimize, edit files, or run shell commands. MCP mode has no authentication, so `--mcp` and `--security-config` cannot be combined.
 
-The host model does the reasoning, so BHF receives no host API token. The
-[LLM and MCP guide](site/llm.md) covers registration, schemas, provider
-choices, memory limits, privacy boundaries, and verification workflows.
+The host model does the reasoning, so BHF receives no host API token. The [LLM and MCP guide](site/llm.md) covers registration, schemas, provider choices, memory limits, privacy boundaries, and verification workflows.

@@ -2,9 +2,7 @@
 
 # IDE Parity
 
-The VS Code extension (`editors/vscode/`) and the GNAT Studio plugin
-(`editors/gnatstudio/`) offer the same finding workflows. Both use
-`bhf-daemon` (see [Daemon](site/daemon.md)) and the `bhf` CLI.
+The VS Code extension (`editors/vscode/`) and the GNAT Studio plugin (`editors/gnatstudio/`) offer the same finding workflows. Both use `bhf-daemon` (see [Daemon](site/daemon.md)) and the `bhf` CLI.
 
 | Workflow | VS Code | GNAT Studio | Notes |
 | --- | --- | --- | --- |
@@ -22,5 +20,4 @@ The VS Code extension (`editors/vscode/`) and the GNAT Studio plugin
 | Daemon lifecycle | One long-lived stdio client, restarted when the configuration changes | One daemon subprocess per refresh | GNAT Studio keeps no background process between refreshes |
 | Grouping | Per-file diagnostics and CodeLens | Per-message Locations entries and per-finding menus | Each follows its IDE's own UI model |
 
-The differences in the table are in presentation and process lifecycle; both
-editors cover the same finding workflows.
+The differences in the table are in presentation and process lifecycle; both editors cover the same finding workflows.

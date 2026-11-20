@@ -2,21 +2,13 @@
 
 # Legacy Dependency Breakage Matrix - 2026-07-19
 
-BHF passed 12 of 13 destructive legacy-project scenarios: **92.3%**
-against a required **90%** gate.
+BHF passed 12 of 13 destructive legacy-project scenarios: **92.3%** against a required **90%** gate.
 
-The matrix deletes a required source, header, or Ada child-unit body from
-pinned real repositories and then requires the surviving real target to build
-and execute under fuzzing. The
-[expanded 53-repository matrix](2026-07-19-expanded-legacy-breakage-matrix.md)
-extends it.
+The matrix deletes a required source, header, or Ada child-unit body from pinned real repositories and then requires the surviving real target to build and execute under fuzzing. The [expanded 53-repository matrix](2026-07-19-expanded-legacy-breakage-matrix.md) extends it.
 
 ## Reproduction
 
-The pinned revisions, mutation proofs, target selections, and gate settings are
-in `tests/fixtures/legacy_breakage_validation/manifest.toml`. With those
-repositories already materialized by the offline legacy campaign, the final run
-used:
+The pinned revisions, mutation proofs, target selections, and gate settings are in `tests/fixtures/legacy_breakage_validation/manifest.toml`. With those repositories already materialized by the offline legacy campaign, the final run used:
 
 ```sh
 cargo build --release -p bhf
@@ -29,19 +21,14 @@ python3 scripts/validation/legacy-breakage-matrix.py \
   --markdown-out /tmp/bhf-legacy-breakage-final-2026-07-19/summary.md
 ```
 
-For every scenario, the runner exports a clean pinned tree, verifies that the
-removed artifact originally supplies a dependency used by the surviving target
-closure, deletes it, and verifies its absence. A pass requires all of the
-following:
+For every scenario, the runner exports a clean pinned tree, verifies that the removed artifact originally supplies a dependency used by the surviving target closure, deletes it, and verifies its absence. A pass requires all of the following:
 
 - outcome `built_and_fuzzed` with at least one fuzz execution;
 - at least one recorded build repair;
 - no `fuzzed_stub_only` downgrade;
 - the selected target itself was not stubbed.
 
-Scenario timeouts kill the complete process session, including harness and
-sanitizer descendants, so a timed-out run is recorded as a failure and the
-matrix moves on.
+Scenario timeouts kill the complete process session, including harness and sanitizer descendants, so a timed-out run is recorded as a failure and the matrix moves on.
 
 ## Results
 
@@ -61,11 +48,6 @@ matrix moves on.
 | YAJL | C | dependency source | 17 | 8 | 35 | Pass |
 | zlib | C | dependency source | 4 | 1 | 11 | Pass |
 
-Totals for passing scenarios: 109 recorded repairs, 89 fuzz executions, and
-5,846 coverage edges. Language rates were Ada 4/4, C 5/5, and C++ 3/4.
+Totals for passing scenarios: 109 recorded repairs, 89 fuzz executions, and 5,846 coverage edges. Language rates were Ada 4/4, C 5/5, and C++ 3/4.
 
-TinyXML2 fails: deleting its only implementation translation unit leaves the
-selected header-declared method without enough surviving implementation
-structure for the C++ repair path of this date. The failure counts in the
-denominator, and the scenario stays in the manifest as the next regression
-target.
+TinyXML2 fails: deleting its only implementation translation unit leaves the selected header-declared method without enough surviving implementation structure for the C++ repair path of this date. The failure counts in the denominator, and the scenario stays in the manifest as the next regression target.

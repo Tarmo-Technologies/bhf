@@ -2,20 +2,15 @@
 
 # Memory-scaling benchmarks (2026-07-20)
 
-This validation exercises the memory-safety changes against real
-repositories, including Linux at 26.5M SLOC, above the 10M-SLOC target. It
-measures both whole-tree indexing/static analysis and repeated build/fuzz
-target turnover.
+This validation exercises the memory-safety changes against real repositories, including Linux at 26.5M SLOC, above the 10M-SLOC target. It measures both whole-tree indexing/static analysis and repeated build/fuzz target turnover.
 
 ## Environment
 
 - Linux host: 6 logical CPUs, 13 GiB RAM, 8 GiB swap
 - Binary: optimized `cargo build --release -p bhf`
-- Measurement: `/usr/bin/time -v`; peak values below are its maximum resident
-  set size for the BHF command
+- Measurement: `/usr/bin/time -v`; peak values below are its maximum resident set size for the BHF command
 - Large-tree concurrency: `--jobs 1` for auto, `--jobs 2` for static analysis
-- SARIF omitted from the constrained first pass, as the README recommends for
-  constrained hosts
+- SARIF omitted from the constrained first pass, as the README recommends for constrained hosts
 
 Pinned repositories:
 
@@ -26,9 +21,7 @@ Pinned repositories:
 | Linux | `adc218676eef25575469234709c2d87185ca223a` (v6.12 checkout) | 64,556 | 26,523,136 |
 | Combined SLOC pass | all three above | 64,750 | 26,549,428 |
 
-Linux contains a real 23,949,786-byte generated register-mask header, which
-tests whether the dynamic per-file allowance admits a file that large when the
-machine has room.
+Linux contains a real 23,949,786-byte generated register-mask header, which tests whether the dynamic per-file allowance admits a file that large when the machine has room.
 
 ## Results
 
@@ -44,43 +37,25 @@ machine has room.
 | cJSON auto, 50 targets | 3m46s | 122.6 MiB | 49 built+fuzzed, 1 skipped; 2,958 executions, 14 findings |
 | TinyXML2 auto, 5 targets | 22.84s | 138.0 MiB | 5/5 built+fuzzed; 640 executions, 3 findings, 453 edges |
 
-The 50-target cJSON run peaked 4.8 MiB above the five-target run while
-processing ten times as many targets. This is the retention check:
-target-local corpus, diagnostics, harness, and finding state did not grow
-linearly across the sweep.
+The 50-target cJSON run peaked 4.8 MiB above the five-target run while processing ten times as many targets. This is the retention check: target-local corpus, diagnostics, harness, and finding state did not grow linearly across the sweep.
 
-TinyXML2 produced more than 1,000 distinct sink observations in the earlier
-fixed-cap experiment. With the final memory-derived sink budget, the same
-five-target run completed with no retention warning and the same three emitted
-defects: the sink budget scales with available memory, so it keeps that
-evidence on this host.
+TinyXML2 produced more than 1,000 distinct sink observations in the earlier fixed-cap experiment. With the final memory-derived sink budget, the same five-target run completed with no retention warning and the same three emitted defects: the sink budget scales with available memory, so it keeps that evidence on this host.
 
 ## Low-memory fault injection
 
-One more Linux static scan passed `--max-memory-mb 128`, a fault-injection
-setting that forces the graceful-degradation path.
+One more Linux static scan passed `--max-memory-mb 128`, a fault-injection setting that forces the graceful-degradation path.
 
 | Wall time | Peak RSS | Result |
 |---:|---:|---|
 | 55.52s | 155.7 MiB | Valid partial report with 4,598 findings; 35,468 files recorded as skipped for memory pressure; interprocedural passes recorded explicit pressure gaps; exit 0; no swap |
 
-The overshoot above 128 MiB reflects two already-active workers, allocator
-overhead, and watchdog sampling. `--max-memory-mb` is an admission threshold
-that bhf checks; for a hard limit, use a cgroup or container boundary.
+The overshoot above 128 MiB reflects two already-active workers, allocator overhead, and watchdog sampling. `--max-memory-mb` is an admission threshold that bhf checks; for a hard limit, use a cgroup or container boundary.
 
 ## Issues found by benchmarking
 
-1. Standalone SLOC initially inherited a fixed 16 MiB static source cap and
-   aborted on Linux's 23 MiB generated header. Static and SLOC file admission is
-   now memory-derived and operator-overridable; the final full scan has no
-   file-size gap.
-2. `auto --dry-run --max-targets 5` initially printed all 585,911 filtered Linux
-   candidates (about 16 million output tokens). Dry-run now honors the sweep
-   cap; `--list-targets` still lists every candidate.
-3. Fixed corpus and sink-evidence constants could discard useful state on
-   larger hosts. Corpus, source, event, diagnostic, external-tool, and
-   sink tracking budgets now scale from available host/cgroup memory and retain
-   exact `BHF_MAX_*` overrides.
+1. Standalone SLOC initially inherited a fixed 16 MiB static source cap and aborted on Linux's 23 MiB generated header. Static and SLOC file admission is now memory-derived and operator-overridable; the final full scan has no file-size gap.
+2. `auto --dry-run --max-targets 5` initially printed all 585,911 filtered Linux candidates (about 16 million output tokens). Dry-run now honors the sweep cap; `--list-targets` still lists every candidate.
+3. Fixed corpus and sink-evidence constants could discard useful state on larger hosts. Corpus, source, event, diagnostic, external-tool, and sink tracking budgets now scale from available host/cgroup memory and retain exact `BHF_MAX_*` overrides.
 
 ## Verification
 

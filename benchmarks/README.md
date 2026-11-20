@@ -1,17 +1,11 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # bhf comparison benchmarks
 
-The scripts in this directory produce the head-to-head numbers in
-[`docs/site/comparison.md`](../docs/site/comparison.md) and the white paper
-[`docs/site/whitepaper.md`](../docs/site/whitepaper.md), on the toolchains
-listed below. The results are the scripts' output, unedited.
+The scripts in this directory produce the head-to-head numbers in [`docs/site/comparison.md`](../docs/site/comparison.md) and the white paper [`docs/site/whitepaper.md`](../docs/site/whitepaper.md), on the toolchains listed below. The results are the scripts' output, unedited.
 
 ## What is measured
 
-For each language the scripts run **bhf** and the most widely used fuzzer for
-that language on a target with a planted bug behind a gate: a magic value, a
-length field or an input-to-state comparison that the input must pass before
-the bug is reachable. Passing the gate depends on the engine's feedback.
+For each language the scripts run **bhf** and the most widely used fuzzer for that language on a target with a planted bug behind a gate: a magic value, a length field or an input-to-state comparison that the input must pass before the bug is reachable. Passing the gate depends on the engine's feedback.
 
 | Language | bhf | Compared against |
 |---|---|---|
@@ -22,30 +16,18 @@ the bug is reachable. Passing the gate depends on the engine's feedback.
 
 Metrics, per (tool, target):
 
-- **Human-authored harness LOC**: lines of fuzz-harness code a person writes
-  before fuzzing starts. bhf needs none; the other tools need a harness per
-  entry point.
+- **Human-authored harness LOC**: lines of fuzz-harness code a person writes before fuzzing starts. bhf needs none; the other tools need a harness per entry point.
 - **Crash found** within a fixed wall-clock budget.
-- **TTFC**, wall-clock time to first crash. For bhf it is end to end (raw
-  source, discovery, build, crash). For the other tools it is fuzzing time
-  only, on a hand-written, pre-built harness; the time to write that harness
-  is not counted.
+- **TTFC**, wall-clock time to first crash. For bhf it is end to end (raw source, discovery, build, crash). For the other tools it is fuzzing time only, on a hand-written, pre-built harness; the time to write that harness is not counted.
 - **Executions** and **executions per second** over the run.
 
 ## Configuration
 
-Each other tool runs in its strongest documented configuration: AFL++ with a
-CMPLOG (RedQueen) instrumented binary (`-c`), libFuzzer with
-`-use_value_profile=1`. Every tool starts from the same benign 8-byte zero seed
-(`seeds/seed`), which passes none of the gates, so no tool starts with a
-crashing input and AFL++ does not abort on its seed. bhf runs as `bhf auto`
-with only `--engine`, `--per-target-time` and `--work-dir`.
+Each other tool runs in its strongest documented configuration: AFL++ with a CMPLOG (RedQueen) instrumented binary (`-c`), libFuzzer with `-use_value_profile=1`. Every tool starts from the same benign 8-byte zero seed (`seeds/seed`), which passes none of the gates, so no tool starts with a crashing input and AFL++ does not abort on its seed. bhf runs as `bhf auto` with only `--engine`, `--per-target-time` and `--work-dir`.
 
 ## Toolchains
 
-clang/libFuzzer 18, AFL++ (`afl-clang-fast`, `afl-fuzz`), cargo-fuzz 0.13 on
-Rust nightly, standalone Jazzer on JDK 17 or later, GNAT and gprbuild. The
-published results were measured on 6 vCPU and 13 GB RAM.
+clang/libFuzzer 18, AFL++ (`afl-clang-fast`, `afl-fuzz`), cargo-fuzz 0.13 on Rust nightly, standalone Jazzer on JDK 17 or later, GNAT and gprbuild. The published results were measured on 6 vCPU and 13 GB RAM.
 
 ## Reproduce
 
@@ -59,9 +41,7 @@ bash benchmarks/run_ada.sh              # Ada  -> benchmarks/results/ada.tsv
 
 The scripts run `target/debug/bhf` and count its findings in `<work>/results/findings/`, where `bhf auto` writes them. `BUDGET` is the per-tool budget in seconds (default 25 for C, 20 for the other languages). `run_java.sh` reads Jazzer from `JAZZER` and `JAZZER_JAR` (default `/opt/jazzer/`) and labels the bhf row `bhf(builtin)`, since `bhf auto` runs bhf's own engine and JVM agent; the row recorded in `results/java.tsv` predates that label and reads `bhf(jazzer)`.
 
-The planted-bug targets are under `targets/<lang>/`, each with the entry point
-`target_one_input(bytes)`. The hand-written C and Java harnesses for the other
-tools are under `harnesses/`; the cargo-fuzz target is `targets/rust/fuzz/`.
+The planted-bug targets are under `targets/<lang>/`, each with the entry point `target_one_input(bytes)`. The hand-written C and Java harnesses for the other tools are under `harnesses/`; the cargo-fuzz target is `targets/rust/fuzz/`.
 
 ## Other benchmarks in this directory
 
@@ -77,23 +57,9 @@ tools are under `harnesses/`; the cargo-fuzz target is `targets/rust/fuzz/`.
 
 ## Result pages
 
-- Harness parity, 30 C/C++ projects:
-  [per-project results](harness-parity-20/results/summary.md).
-- Harness parity, 200 projects:
-  [the expert driver for each language](harness-parity-200/expert/README.md).
-- 2026-07-08 campaign:
-  [scorecard and gap list](campaign-2026-07-08/results/synthesis.md),
-  [`bhf auto` fuzzing](campaign-2026-07-08/results/measure_fuzzing_auto.md),
-  [report formats](campaign-2026-07-08/results/measure_reporting.md),
-  [SBOM components and CVE matching](campaign-2026-07-08/results/measure_sbom.md),
-  [SLOC counting](campaign-2026-07-08/results/measure_sloc.md),
-  [C/C++ static scan](campaign-2026-07-08/results/measure_static_c_cpp.md),
-  [Go static scan](campaign-2026-07-08/results/measure_static_go.md),
-  [Python static scan](campaign-2026-07-08/results/measure_static_python.md),
-  [Rust, Java and Perl static scan](campaign-2026-07-08/results/measure_static_rust_java_perl.md).
-- 2026-07-25 campaign:
-  [bhf against the usual tool for each job](campaign-2026-07-25/compare-section.md).
+- Harness parity, 30 C/C++ projects: [per-project results](harness-parity-20/results/summary.md).
+- Harness parity, 200 projects: [the expert driver for each language](harness-parity-200/expert/README.md).
+- 2026-07-08 campaign: [scorecard and gap list](campaign-2026-07-08/results/synthesis.md), [`bhf auto` fuzzing](campaign-2026-07-08/results/measure_fuzzing_auto.md), [report formats](campaign-2026-07-08/results/measure_reporting.md), [SBOM components and CVE matching](campaign-2026-07-08/results/measure_sbom.md), [SLOC counting](campaign-2026-07-08/results/measure_sloc.md), [C/C++ static scan](campaign-2026-07-08/results/measure_static_c_cpp.md), [Go static scan](campaign-2026-07-08/results/measure_static_go.md), [Python static scan](campaign-2026-07-08/results/measure_static_python.md), [Rust, Java and Perl static scan](campaign-2026-07-08/results/measure_static_rust_java_perl.md).
+- 2026-07-25 campaign: [bhf against the usual tool for each job](campaign-2026-07-25/compare-section.md).
 
-The engine-quality and harness-parity experiments answer different questions;
-keep their numbers apart. They run offline or on a schedule, outside per-PR CI.
-CI runs only the deterministic unit tests in `engine-comparison/test_runner.py`.
+The engine-quality and harness-parity experiments answer different questions; keep their numbers apart. They run offline or on a schedule, outside per-PR CI. CI runs only the deterministic unit tests in `engine-comparison/test_runner.py`.

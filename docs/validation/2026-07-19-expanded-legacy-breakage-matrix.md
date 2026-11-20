@@ -2,22 +2,11 @@
 
 # Expanded Legacy Breakage Matrix - 2026-07-19
 
-This campaign exercises BHF discovery, build repair, and fuzz execution
-against 53 pinned legacy C, C++, Ada, and mixed repositories. It is a hard
-compatibility gate: unmodified controls and damaged copies must both reach the
-selected real target with positive coverage. A clean failure leaves the
-in-scope denominator only when pinned repository evidence and an exact runtime
-failure signature both prove an unavailable external source, generator,
-runtime, or cross-toolchain requirement. The first, 13-scenario matrix is in
-the [legacy dependency breakage matrix](2026-07-19-legacy-breakage-matrix.md).
+This campaign exercises BHF discovery, build repair, and fuzz execution against 53 pinned legacy C, C++, Ada, and mixed repositories. It is a hard compatibility gate: unmodified controls and damaged copies must both reach the selected real target with positive coverage. A clean failure leaves the in-scope denominator only when pinned repository evidence and an exact runtime failure signature both prove an unavailable external source, generator, runtime, or cross-toolchain requirement. The first, 13-scenario matrix is in the [legacy dependency breakage matrix](2026-07-19-legacy-breakage-matrix.md).
 
 ## Scope and Reproduction
 
-The catalog contains 57 exact Git revisions. The audited manifest selects 53
-distinct repositories with a non-test, input-driven target and a
-machine-checkable mutation. The other four repositories (`cmdline`,
-`loki-lib`, `luabind`, and `Signals`) have no suitable target/dependency pair
-and stay out of the 53-case gate.
+The catalog contains 57 exact Git revisions. The audited manifest selects 53 distinct repositories with a non-test, input-driven target and a machine-checkable mutation. The other four repositories (`cmdline`, `loki-lib`, `luabind`, and `Signals`) have no suitable target/dependency pair and stay out of the 53-case gate.
 
 ```sh
 cargo build --release -p bhf
@@ -40,19 +29,14 @@ The matrix contains 12 Ada, 29 C, and 12 C++ scenarios:
 | Missing Ada spec | 6 |
 | Missing Ada body | 6 |
 
-Every scenario runs an unmodified control first, then makes a local shared Git
-clone, deletes the proved artifact, verifies its absence, and runs BHF
-offline. A pass requires all of:
+Every scenario runs an unmodified control first, then makes a local shared Git clone, deletes the proved artifact, verifies its absence, and runs BHF offline. A pass requires all of:
 
 - the exact selected target and line report `built_and_fuzzed`;
 - at least one execution and at least one coverage edge;
 - at least one damaged-tree repair;
 - no `fuzzed_stub_only` downgrade and no stub of the selected target.
 
-The local Git clone lets BHF restore the exact deleted content from the
-pinned object database without network access. Without that history, a
-source archive gets safe declaration/stub synthesis only, which cannot in
-general rebuild arbitrary deleted implementation code.
+The local Git clone lets BHF restore the exact deleted content from the pinned object database without network access. Without that history, a source archive gets safe declaration/stub synthesis only, which cannot in general rebuild arbitrary deleted implementation code.
 
 ## Results
 
@@ -64,15 +48,9 @@ The fresh run passed the 90% gate:
 | Verified external constraints | 6 | 6 |
 | In-scope repositories | **47/47 (100%)** | **47/47 (100%)** |
 
-The raw damaged numerator is 48 because the mutated TAMP case can substitute a
-host `Interfaces` unit, while its unmodified embedded runtime still fails with
-the verified cross-toolchain signature. TAMP therefore stays in the excluded
-set.
+The raw damaged numerator is 48 because the mutated TAMP case can substitute a host `Interfaces` unit, while its unmodified embedded runtime still fails with the verified cross-toolchain signature. TAMP therefore stays in the excluded set.
 
-All 47 in-scope controls and all 47 corresponding damaged copies executed the
-selected target with nonzero coverage. Damaged copies performed 192 fuzz
-executions and recorded 5,771 aggregate edges; controls performed 47 executions
-and recorded 4,113 aggregate edges. The in-scope population is:
+All 47 in-scope controls and all 47 corresponding damaged copies executed the selected target with nonzero coverage. Damaged copies performed 192 fuzz executions and recorded 5,771 aggregate edges; controls performed 47 executions and recorded 4,113 aggregate edges. The in-scope population is:
 
 | Language | In scope | Clean pass | Damaged pass |
 |---|---:|---:|---:|
@@ -89,8 +67,7 @@ and recorded 4,113 aggregate edges. The in-scope population is:
 
 ## In-Scope Audit
 
-The compact audit below records clean edges, damaged edges, damaged repair
-rounds, and exact VCS-recovery actions for every in-scope repository.
+The compact audit below records clean edges, damaged edges, damaged repair rounds, and exact VCS-recovery actions for every in-scope repository.
 
 | Scenario | Clean edges | Damaged edges | Rounds | VCS |
 |---|---:|---:|---:|---:|
@@ -144,8 +121,7 @@ rounds, and exact VCS-recovery actions for every in-scope repository.
 
 ## Verified External Constraints
 
-An exclusion requires the manifest's exact file probes/absent paths and every
-declared clean failure substring to match at runtime.
+An exclusion requires the manifest's exact file probes/absent paths and every declared clean failure substring to match at runtime.
 
 | Scenario | Constraint | Pinned evidence | Matched clean signature |
 |---|---|---|---|
@@ -156,10 +132,7 @@ declared clean failure substring to match at runtime.
 | TAMP | ARM cross-toolchain/runtime | README pins GCC 4.6.1; GPR uses `arm-none-eabi-gnatmake` | `s-trasym.adb" must be compiled` |
 | YAML-Ada | generated binding | source imports absent `C.yaml`; README requires `headmaster` | `missing Ada symbol 'yaml.yaml_mark_t'` |
 
-Ocarina is in scope: its generator is present in the pinned tree. The
-low-closure `Charset.To_Lower(String)` control records 62 edges; after
-`charset.adb` is deleted, BHF recovers it from local Git in one round and
-records 107 edges.
+Ocarina is in scope: its generator is present in the pinned tree. The low-closure `Charset.To_Lower(String)` control records 62 edges; after `charset.adb` is deleted, BHF recovers it from local Git in one round and records 107 edges.
 
 ## Repair-Round Default
 
@@ -172,33 +145,18 @@ The successful population is 95 samples: 47 controls plus 48 damaged runs.
 | 12 | 94/95 (98.9%) |
 | 16 | 95/95 (100%) |
 
-Repair rounds have p50 1, p90 5, p95 6, p99 14, and maximum 14. The c-ares
-control requires 12 rounds and its damaged copy requires 14, so a cap of
-eight rounds would lose valid targets. The default stays at 16, two rounds
-above the measured maximum. No failed build reached the 16-round cap; failed
-external cases stopped earlier when no new repair was available.
+Repair rounds have p50 1, p90 5, p95 6, p99 14, and maximum 14. The c-ares control requires 12 rounds and its damaged copy requires 14, so a cap of eight rounds would lose valid targets. The default stays at 16, two rounds above the measured maximum. No failed build reached the 16-round cap; failed external cases stopped earlier when no new repair was available.
 
 ## Systemic Fixes
 
 The campaign added or verified:
 
-- exact, path-confined recovery of deleted tracked files and Ada bodies from a
-  local Git object database, with repair provenance in `run.json`;
-- C/C++ header, source-closure, type, callback, visibility-macro, static-member,
-  stream, and legacy-language repairs;
-- Ada package/spec/body indexing and preference for a recovered real body over
-  an invented stub;
-- isolation of generated runtimes from target-header libc macro redirects
-  (c-ares redirected `getenv`, which previously disabled coverage);
-- a control-first matrix gate with positive-coverage acceptance, raw and
-  in-scope denominators, verified external constraints, and process-group
-  timeout cleanup.
+- exact, path-confined recovery of deleted tracked files and Ada bodies from a local Git object database, with repair provenance in `run.json`;
+- C/C++ header, source-closure, type, callback, visibility-macro, static-member, stream, and legacy-language repairs;
+- Ada package/spec/body indexing and preference for a recovered real body over an invented stub;
+- isolation of generated runtimes from target-header libc macro redirects (c-ares redirected `getenv`, which previously disabled coverage);
+- a control-first matrix gate with positive-coverage acceptance, raw and in-scope denominators, verified external constraints, and process-group timeout cleanup.
 
 ## Result Scope
 
-This result covers offline projects that contain their required source,
-generated dependencies, compiler/runtime, and local Git history: every such
-project in the pinned 53-repository population reached the selected real target
-before and after destructive mutation. When the source, a generated binding,
-or a version- or cross-matched compiler is missing, BHF reports an explicit
-failure with its evidence.
+This result covers offline projects that contain their required source, generated dependencies, compiler/runtime, and local Git history: every such project in the pinned 53-repository population reached the selected real target before and after destructive mutation. When the source, a generated binding, or a version- or cross-matched compiler is missing, BHF reports an explicit failure with its evidence.

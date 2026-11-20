@@ -1,10 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # `docker/`: container assets for bhf
 
-The image is built from the `Dockerfile` at the repository root.
-This directory holds what goes into the image, the Compose files and the
-validation sweep. The full guide is
-[`docs/site/docker.md`](../docs/site/docker.md).
+The image is built from the `Dockerfile` at the repository root. This directory holds what goes into the image, the Compose files and the validation sweep. The full guide is [`docs/site/docker.md`](../docs/site/docker.md).
 
 | File | Role |
 |---|---|
@@ -39,14 +36,8 @@ docker run --rm --shm-size=2g --cap-add=SYS_PTRACE -v bhf_work:/work \
   bhf:full-local bhf-sweep --fetch
 ```
 
-`docker compose -f docker/compose.yaml --profile validation run --rm sweep`
-builds and runs the same sweep through Compose.
+`docker compose -f docker/compose.yaml --profile validation run --rm sweep` builds and runs the same sweep through Compose.
 
 ## Runtime privileges
 
-Fuzzing needs two grants: `--cap-add=SYS_PTRACE` (LeakSanitizer and ASan
-stop-the-world) and `--shm-size=2g` (coverage bitmaps and cmplog shared
-memory). The container runs as UID 10001 and keeps the default seccomp
-profile; under `compose.yaml` it also gets `cap_drop: ALL` and
-`no-new-privileges`. The guide has the read-only root filesystem recipe and
-the resource and troubleshooting notes.
+Fuzzing needs two grants: `--cap-add=SYS_PTRACE` (LeakSanitizer and ASan stop-the-world) and `--shm-size=2g` (coverage bitmaps and cmplog shared memory). The container runs as UID 10001 and keeps the default seccomp profile; under `compose.yaml` it also gets `cap_drop: ALL` and `no-new-privileges`. The guide has the read-only root filesystem recipe and the resource and troubleshooting notes.

@@ -2,27 +2,13 @@
 
 # Fake-resource SDK
 
-bhf's runtrace shim (`bhf_runtrace_shim`) virtualises the libc boundary, so a
-target that depends on missing files, unreachable sockets or unset
-environment variables keeps running against a synthesised substitute. The
-fake-resource SDK is the contract for adding a new fake to the shim. See
-[Runtime virtualisation](runtime-virtualisation.md) for what the shim does at
-run time.
+bhf's runtrace shim (`bhf_runtrace_shim`) virtualises the libc boundary, so a target that depends on missing files, unreachable sockets or unset environment variables keeps running against a synthesised substitute. The fake-resource SDK is the contract for adding a new fake to the shim. See [Runtime virtualisation](runtime-virtualisation.md) for what the shim does at run time.
 
 ## Architecture
 
-The shim is an `LD_PRELOAD` `cdylib` with strict allocation discipline: hooks
-use no `malloc`, `Box`, `Vec` or `String`, because the target process may
-already be inside its own allocator on the call path being interposed.
-Plugins are compile-time unit structs that implement `FakeResource`. The
-trait carries metadata only; the dynamic linker resolves the actual
-interceptors, `#[no_mangle] extern "C" fn` declarations, by symbol name.
+The shim is an `LD_PRELOAD` `cdylib` with strict allocation discipline: hooks use no `malloc`, `Box`, `Vec` or `String`, because the target process may already be inside its own allocator on the call path being interposed. Plugins are compile-time unit structs that implement `FakeResource`. The trait carries metadata only; the dynamic linker resolves the actual interceptors, `#[no_mangle] extern "C" fn` declarations, by symbol name.
 
-A plain-data `ManifestEntry` slice (`MANIFEST`, defined in the
-`runtrace_manifest` crate, which the CLI can link, and re-exported as
-`manifest::MANIFEST`) mirrors the trait registry, so the CLI can list the
-inventory without linking the interceptors. A unit test in `registry.rs`
-keeps the two in sync.
+A plain-data `ManifestEntry` slice (`MANIFEST`, defined in the `runtrace_manifest` crate, which the CLI can link, and re-exported as `manifest::MANIFEST`) mirrors the trait registry, so the CLI can list the inventory without linking the interceptors. A unit test in `registry.rs` keeps the two in sync.
 
 ## Adding a plugin
 
@@ -30,41 +16,27 @@ For a hypothetical `uname` plugin that fakes `uname`:
 
 1. Create `crates/bhf_runtrace_shim/src/hooks/uname.rs` with:
    - a unit struct (`pub struct Uname;`);
-   - an `impl crate::sdk::FakeResource for Uname` returning
-     `name = "uname"`, the intercept list, an `is_enabled` that reads a
-     `BHF_FAKE_UNAME` environment variable, and a one-line description;
-   - a `#[no_mangle] extern "C" fn uname(...)` that fills a deterministic
-     `utsname` when enabled and forwards to the real symbol otherwise.
+   - an `impl crate::sdk::FakeResource for Uname` returning `name = "uname"`, the intercept list, an `is_enabled` that reads a `BHF_FAKE_UNAME` environment variable, and a one-line description;
+   - a `#[no_mangle] extern "C" fn uname(...)` that fills a deterministic `utsname` when enabled and forwards to the real symbol otherwise.
 2. Register the new module in `hooks/mod.rs`.
-3. Append a matching `ManifestEntry::gated(...)` to `MANIFEST` in the
-   `runtrace_manifest` crate, and a `&Uname` entry to `registry::REGISTRY`.
-4. Run the cross-check unit test in `registry.rs`, which verifies that the
-   two slices agree.
+3. Append a matching `ManifestEntry::gated(...)` to `MANIFEST` in the `runtrace_manifest` crate, and a `&Uname` entry to `registry::REGISTRY`.
+4. Run the cross-check unit test in `registry.rs`, which verifies that the two slices agree.
 
-The `clock` plugin (`Clock` in `hooks/determinism.rs`, gated by
-`BHF_FAKE_CLOCK`) is a worked example of a hook that libc's own start-up and
-a sanitizer runtime also reach. It resolves the real functions in a
-load-time constructor instead of through `ResolvedFn`, and reads its gate
-from `environ` instead of calling `getenv`, because a lazy lookup inside that
-hook re-entered the dynamic loader.
+The `clock` plugin (`Clock` in `hooks/determinism.rs`, gated by `BHF_FAKE_CLOCK`) is a worked example of a hook that libc's own start-up and a sanitizer runtime also reach. It resolves the real functions in a load-time constructor instead of through `ResolvedFn`, and reads its gate from `environ` instead of calling `getenv`, because a lazy lookup inside that hook re-entered the dynamic loader.
 
 ## Allocation discipline
 
-Every line of hook code runs inside an arbitrary target process on an
-arbitrary call path. Do not:
+Every line of hook code runs inside an arbitrary target process on an arbitrary call path. Do not:
 
 - allocate (`malloc`, `Box::new`, `String`, `Vec::new`, `format!`);
 - acquire locks other than the shim's own `HookGuard`;
-- recurse into the symbol being intercepted (use `HookGuard` to detect
-  re-entry);
+- recurse into the symbol being intercepted (use `HookGuard` to detect re-entry);
 - read configuration from disk.
 
 Do:
 
-- read configuration from environment variables, cached in an `AtomicU8` on
-  first access;
-- emit audit events through `jsonl::Builder`, which writes to a fixed-size
-  stack buffer and calls `libc::write` directly;
+- read configuration from environment variables, cached in an `AtomicU8` on first access;
+- emit audit events through `jsonl::Builder`, which writes to a fixed-size stack buffer and calls `libc::write` directly;
 - forward to the real libc symbol through the `dlsym::ResolvedFn` helper.
 
 ## Diagnostics
@@ -96,8 +68,7 @@ sched               env-gated    BHF_SCHED                   pthread_create pthr
 
 ## Reference plugin: Identity
 
-`hooks/identity.rs` is the reference plugin. With `BHF_FAKE_IDENTITY=1` set,
-the four POSIX identity calls return deterministic constants:
+`hooks/identity.rs` is the reference plugin. With `BHF_FAKE_IDENTITY=1` set, the four POSIX identity calls return deterministic constants:
 
 | Symbol    | Faked value |
 | --------- | ----------- |
@@ -106,8 +77,7 @@ the four POSIX identity calls return deterministic constants:
 | `getgid`  | 1000        |
 | `getppid` | 1           |
 
-Set it when consecutive runs must look like the same process, as in
-differential fuzzing or reproducible replay. bhf does not set it for you.
+Set it when consecutive runs must look like the same process, as in differential fuzzing or reproducible replay. bhf does not set it for you.
 
 ## See also
 

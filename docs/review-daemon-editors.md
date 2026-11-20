@@ -1,11 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Daemon and editor hardening (2026-09-24)
 
-This page records the defects found in `crates/daemon`,
-`crates/continuous_daemon`, `editors/` and `crates/cli/src/capsule.rs` at
-commit `5528a41`, and what bhf does now. [Daemon JSON-RPC](daemon-json-rpc.md),
-[VS Code Thin Client](vscode-thin-client.md) and [GNAT Studio
-Plugin](gnatstudio-plugin.md) describe the current behavior.
+This page records the defects found in `crates/daemon`, `crates/continuous_daemon`, `editors/` and `crates/cli/src/capsule.rs` at commit `5528a41`, and what bhf does now. [Daemon JSON-RPC](daemon-json-rpc.md), [VS Code Thin Client](vscode-thin-client.md) and [GNAT Studio Plugin](gnatstudio-plugin.md) describe the current behavior.
 
 ## Defects and fixes
 
@@ -23,22 +19,14 @@ Plugin](gnatstudio-plugin.md) describe the current behavior.
 
 ## Related changes since
 
-- The daemon bounds a `findings` response: the number of findings and the raw
-  and normalized bytes it loads scale with the daemon's memory budget.
-- On Linux, a tenant's paths are pinned for the call with `openat2`
-  (`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`); see
-  [Daemon: Security Modes](site/daemon.md#security-modes).
-- The GNAT Studio plugin's `daemon-timeout-seconds` preference (default 30)
-  bounds a findings refresh and terminates the daemon process when it passes.
-- Scheduler shutdown signals the workers and waits for them until a deadline
-  (the shutdown timeout within which workers kill and reap their jobs, plus a
-  fixed slack). A thread still running after that is joined in the
-  background, and that thread holds the data directory's lock until it ends.
+- The daemon bounds a `findings` response: the number of findings and the raw and normalized bytes it loads scale with the daemon's memory budget.
+- On Linux, a tenant's paths are pinned for the call with `openat2` (`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`); see [Daemon: Security Modes](site/daemon.md#security-modes).
+- The GNAT Studio plugin's `daemon-timeout-seconds` preference (default 30) bounds a findings refresh and terminates the daemon process when it passes.
+- Scheduler shutdown signals the workers and waits for them until a deadline (the shutdown timeout within which workers kill and reap their jobs, plus a fixed slack). A thread still running after that is joined in the background, and that thread holds the data directory's lock until it ends.
 
 ## Open item
 
-VS Code process tasks have unit tests for the argument vector and API shape;
-they have not been run in a Windows extension host.
+VS Code process tasks have unit tests for the argument vector and API shape; they have not been run in a Windows extension host.
 
 ## Tests
 
@@ -49,5 +37,4 @@ cargo test -p continuous_daemon -p bhf-daemon --lib --offline
 cargo test -p bhf --lib capsule::tests --offline
 ```
 
-The VS Code tests check that metacharacters stay literal arguments and that
-stored replay text is ignored.
+The VS Code tests check that metacharacters stay literal arguments and that stored replay text is ignored.

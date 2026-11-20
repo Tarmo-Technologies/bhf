@@ -1,13 +1,9 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Private-target integration program — design index (#56/#57/#58/#60/#61)
 
-These five issues form one program: fuzzing private, source-unavailable,
-policy-bound targets with bhf. They build on three shipped features: #47
-(runner and target args), #59 (runtime sink oracles in manual and binary
-fuzz), and #55 (user postcondition oracles and fixture hooks).
+These five issues form one program: fuzzing private, source-unavailable, policy-bound targets with bhf. They build on three shipped features: #47 (runner and target args), #59 (runtime sink oracles in manual and binary fuzz), and #55 (user postcondition oracles and fixture hooks).
 
-All five are implemented. Each design's status line names its commits, the
-follow-up issues that completed it, and the user guide:
+All five are implemented. Each design's status line names its commits, the follow-up issues that completed it, and the user guide:
 
 | Design | Initial commit | Follow-ups delivered | User guide |
 |---|---|---|---|
@@ -27,18 +23,10 @@ follow-up issues that completed it, and the user guide:
 
 ## Planned sequencing
 
-1. **#56 external project profiles:** pure, no execution risk, and the
-   composition surface the others plug into. Do it first.
-2. **#58 stateful sessions:** independent of the others (builds on HDF-7); a
-   pure crate plus a TCP vertical slice.
-3. **#60 collector:** land the platform-neutral crate and a Linux adapter
-   first (Linux-only), then the Windows provider on a Windows runner.
-4. **#55-dependent work:** **#61 relational** needs #55 (done) and #60;
-   sequence it after #60's Linux side.
-5. **#57 extension protocol:** the largest; land the host and
-   `oracle.evaluate` slice first, then codec/mutator/scenario.
+1. **#56 external project profiles:** pure, no execution risk, and the composition surface the others plug into. Do it first.
+2. **#58 stateful sessions:** independent of the others (builds on HDF-7); a pure crate plus a TCP vertical slice.
+3. **#60 collector:** land the platform-neutral crate and a Linux adapter first (Linux-only), then the Windows provider on a Windows runner.
+4. **#55-dependent work:** **#61 relational** needs #55 (done) and #60; sequence it after #60's Linux side.
+5. **#57 extension protocol:** the largest; land the host and `oracle.evaluate` slice first, then codec/mutator/scenario.
 
-All five follow one principle: reuse the existing engines and the
-#47/#55/#59 execution surface; add pure, unit-testable crates first; and gate
-anything that spawns an external process or needs a non-Linux runner behind an
-explicit, trusted, separately validated phase.
+All five follow one principle: reuse the existing engines and the #47/#55/#59 execution surface; add pure, unit-testable crates first; and gate anything that spawns an external process or needs a non-Linux runner behind an explicit, trusted, separately validated phase.

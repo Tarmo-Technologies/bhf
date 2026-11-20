@@ -1,10 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # bhf against the usual tool for each job
 
-Measured on twelve projects from the 500-project sweep, cloned once and read
-by every tool. `compare.py` produced the numbers; the raw values are in
-`compare-sloc.json`, `compare-sbom.json` and `compare-static.json` in this
-directory.
+Measured on twelve projects from the 500-project sweep, cloned once and read by every tool. `compare.py` produced the numbers; the raw values are in `compare-sloc.json`, `compare-sbom.json` and `compare-static.json` in this directory.
 
 ## Line counting, against cloc (the reference) and tokei
 
@@ -23,11 +20,7 @@ directory.
 | tmuxinator | 1,342 | 7,123 | 5,174 | 0.01s | 0.35s |
 | fd | 6,779 | 8,570 | 7,525 | 0.01s | 0.37s |
 
-Total wall time: bhf 0.74s, cloc 6.91s, about 9x faster. bhf prunes vendored
-trees, `node_modules`, `.venv` and test directories, so it counts the code it
-would fuzz and its totals are lower than cloc's. This comparison exposed six
-languages the counter did not recognise (PHP, Ruby, Lua, C#, COBOL, Fortran);
-the numbers above are from after that fix.
+Total wall time: bhf 0.74s, cloc 6.91s, about 9x faster. bhf prunes vendored trees, `node_modules`, `.venv` and test directories, so it counts the code it would fuzz and its totals are lower than cloc's. This comparison exposed six languages the counter did not recognise (PHP, Ruby, Lua, C#, COBOL, Fortran); the numbers above are from after that fix.
 
 ## SBOM, against syft
 
@@ -46,11 +39,7 @@ the numbers above are from after that fix.
 | tmuxinator | 0 | 4 | 0.51s | 18.72s |
 | fd | 130 | 137 | 0.9s | 24.51s |
 
-Total wall time: bhf 12.43s, syft 349.26s, about 28x faster. The counts differ
-in both directions: bhf reads declared manifests and grades each component's
-evidence, and syft also fingerprints vendored binaries. This comparison found
-a gemspec parser that required parentheses, so every gemspec-driven Ruby
-project reported zero components; the numbers above are from after that fix.
+Total wall time: bhf 12.43s, syft 349.26s, about 28x faster. The counts differ in both directions: bhf reads declared manifests and grades each component's evidence, and syft also fingerprints vendored binaries. This comparison found a gemspec parser that required parentheses, so every gemspec-driven Ruby project reported zero components; the numbers above are from after that fix.
 
 ## Static analysis, against cppcheck, flawfinder, gosec and bandit
 
@@ -69,13 +58,6 @@ project reported zero components; the numbers above are from after that fix.
 | tmuxinator | ruby | 5 | 0.03s | — | — | — | — |
 | fd | rust | 7 | 0.07s | — | — | — | — |
 
-bhf runs 9x to 265x faster than cppcheck, gosec and bandit (cJSON: 2.8s
-against cppcheck's 740s). flawfinder, a lexical scanner, is faster than bhf on
-three of the four C and C++ projects. bhf reports
-fewer findings than any of them, for example 23 against bandit's 708 on
-requests: its rules favour precision, and an earlier campaign measured their
-false-positive rate ([`docs/site/sast-comparison.md`](../../docs/site/sast-comparison.md)).
-`static-scan` has no rules specific to PHP, Ruby, Lua, C#, COBOL or Fortran.
+bhf runs 9x to 265x faster than cppcheck, gosec and bandit (cJSON: 2.8s against cppcheck's 740s). flawfinder, a lexical scanner, is faster than bhf on three of the four C and C++ projects. bhf reports fewer findings than any of them, for example 23 against bandit's 708 on requests: its rules favour precision, and an earlier campaign measured their false-positive rate ([`docs/site/sast-comparison.md`](../../docs/site/sast-comparison.md)). `static-scan` has no rules specific to PHP, Ruby, Lua, C#, COBOL or Fortran.
 
-`compare.py` runs no other static analyser on the Java, Lua, Perl, PHP, Ruby
-and Rust projects, so those rows show bhf's count only.
+`compare.py` runs no other static analyser on the Java, Lua, Perl, PHP, Ruby and Rust projects, so those rows show bhf's count only.

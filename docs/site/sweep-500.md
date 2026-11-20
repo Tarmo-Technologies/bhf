@@ -1,52 +1,22 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # What 500 real projects say about bhf
 
-This page reports bhf run over 500 open-source projects picked by star rank
-rather than by suitability, across all sixteen languages bhf supports, with
-every failure counted.
+This page reports bhf run over 500 open-source projects picked by star rank rather than by suitability, across all sixteen languages bhf supports, with every failure counted.
 
-The sweep was run to find defects in bhf. It found thirty, listed below
-with the project that exposed each one. The measurements below were taken
-after the fixes, with a single pinned binary over the whole corpus.
+The sweep was run to find defects in bhf. It found thirty, listed below with the project that exposed each one. The measurements below were taken after the fixes, with a single pinned binary over the whole corpus.
 
 ## Method
 
-- **Corpus**: 500 repositories, star-ranked per language, pinned in
-  `benchmarks/campaign-2026-07-25/corpus.tsv`. Excluded: fuzzing corpora and
-  deliberately vulnerable trees (they supply their own bugs), awesome-lists
-  and courses (no code), forks, archived trees, and anything over 400 MB.
-  GitHub's language label is not trusted: each clone is checked against its
-  lane and replaced from a ranked pool if it is not mostly that language.
-- **Budget**: every project gets the same budget. There is no per-project
-  tuning, no hand-written harness, no build fix, and no dependency
-  installation beyond what a developer of that language would already have.
-- **Counting**: a target counts as fuzzed only if it built and the fuzz
-  entry point was reached. A build that links against stubs and executes
-  none of the project's own code is recorded separately
-  (`fuzzed_stub_only`) and is not counted in the headline.
-- **Basis**: the results table and its totals are rolled up over the 500
-  repositories pinned in `corpus.tsv` and nothing else. `results/` holds 534
-  row files, because the lane check replaced repositories from the ranked
-  pool as the campaign ran and the superseded rows were kept; 35 of them
-  name repositories that are no longer in the pinned corpus, and they are
-  excluded here. Of the 500 pinned repositories, 499 produced a row and 438
-  produced a measurable `auto` run; the rest were rejected by the lane check
-  or timed out before reporting. The `--force` comparison below is scored
-  separately, as a pairwise per-repository delta over the 126 projects
-  measured in both arms.
+- **Corpus**: 500 repositories, star-ranked per language, pinned in `benchmarks/campaign-2026-07-25/corpus.tsv`. Excluded: fuzzing corpora and deliberately vulnerable trees (they supply their own bugs), awesome-lists and courses (no code), forks, archived trees, and anything over 400 MB. GitHub's language label is not trusted: each clone is checked against its lane and replaced from a ranked pool if it is not mostly that language.
+- **Budget**: every project gets the same budget. There is no per-project tuning, no hand-written harness, no build fix, and no dependency installation beyond what a developer of that language would already have.
+- **Counting**: a target counts as fuzzed only if it built and the fuzz entry point was reached. A build that links against stubs and executes none of the project's own code is recorded separately (`fuzzed_stub_only`) and is not counted in the headline.
+- **Basis**: the results table and its totals are rolled up over the 500 repositories pinned in `corpus.tsv` and nothing else. `results/` holds 534 row files, because the lane check replaced repositories from the ranked pool as the campaign ran and the superseded rows were kept; 35 of them name repositories that are no longer in the pinned corpus, and they are excluded here. Of the 500 pinned repositories, 499 produced a row and 438 produced a measurable `auto` run; the rest were rejected by the lane check or timed out before reporting. The `--force` comparison below is scored separately, as a pairwise per-repository delta over the 126 projects measured in both arms.
 
-Everything needed to re-run the sweep is in
-[benchmarks/campaign-2026-07-25/](../../benchmarks/campaign-2026-07-25/README.md).
-Score a re-run against the pinned corpus to reproduce the table below; a
-bare `aggregate.py` over `results/` prints the larger all-rows totals.
+Everything needed to re-run the sweep is in [benchmarks/campaign-2026-07-25/](../../benchmarks/campaign-2026-07-25/README.md). Score a re-run against the pinned corpus to reproduce the table below; a bare `aggregate.py` over `results/` prints the larger all-rows totals.
 
 ## What the sweep measures
 
-The sweep measures how much of a large code estate bhf can fuzz without
-anyone writing harnesses first. On one hand-written harness, libFuzzer and
-AFL++ are strong engines; the work that does not get done at scale is
-writing the harnesses. An engineer with a week can write five harnesses, not
-five hundred.
+The sweep measures how much of a large code estate bhf can fuzz without anyone writing harnesses first. On one hand-written harness, libFuzzer and AFL++ are strong engines; the work that does not get done at scale is writing the harnesses. An engineer with a week can write five harnesses, not five hundred.
 
 So the headline is coverage of the estate:
 
@@ -56,8 +26,7 @@ So the headline is coverage of the estate:
 
 ## Defects the sweep found
 
-Each of these was a bug in bhf, not in the project, and each is fixed with a
-regression test:
+Each of these was a bug in bhf, not in the project, and each is fixed with a regression test:
 
 | Language | What was wrong | Effect on the project that exposed it |
 |---|---|---|
@@ -143,45 +112,16 @@ Across the 499 pinned projects and 2,439 surface invocations: **0 panics**, **15
 
 ## Reading the blocker table
 
-The largest single class is uninstalled dependencies. The top TypeScript
-(176) and Python (167) entries are "cannot find module": the corpus was
-cloned and measured without running `npm install` or `pip install` for 500
-projects, so a target whose module graph reaches a package that is not on
-the machine cannot be loaded. Install the dependencies and those targets
-load.
+The largest single class is uninstalled dependencies. The top TypeScript (176) and Python (167) entries are "cannot find module": the corpus was cloned and measured without running `npm install` or `pip install` for 500 projects, so a target whose module graph reaches a package that is not on the machine cannot be loaded. Install the dependencies and those targets load.
 
-The interpreted lanes name the missing package, record it as an acquirable
-requirement (`missing-deps.json`, actionable with `--install-deps`), and
-separate it in the triage from the skips `--force` is for.
+The interpreted lanes name the missing package, record it as an acquirable requirement (`missing-deps.json`, actionable with `--install-deps`), and separate it in the triage from the skips `--force` is for.
 
-The next tier is bhf's own limits: parameters whose types the project never
-defines (78 in C, 37 in C++, 47 in Rust, 58 in Go), C++ headers that cannot
-be included outside their owning translation unit (53), and instance
-methods whose receiver cannot be constructed (31 in C#).
+The next tier is bhf's own limits: parameters whose types the project never defines (78 in C, 37 in C++, 47 in Rust, 58 in Go), C++ headers that cannot be included outside their owning translation unit (53), and instance methods whose receiver cannot be constructed (31 in C#).
 
 ## Limits
 
-- A target whose parameters are types the project does not define (an
-  external SDK's opaque handle, for example) is skipped, and the skip reason
-  names the type. bhf does not invent a definition and report the result as
-  a clean fuzz.
-- A project whose dependencies are not installed is reported as needing
-  them, with the package named, instead of being fuzzed against stubs by
-  default. For a compiled lane, `--force` drives past a missing type or
-  symbol and records the result as stub-only. For an interpreted lane,
-  `--force` cannot get past a missing package, and the skip reason says to
-  install it.
-- Measured over the 126 corpus projects that had at least one undrivable
-  target, applying `--force` from the start of the sweep reached 13 fewer
-  targets than not passing it (214 → 201), for one extra fuzz finding. A
-  forced attempt costs about 36% more, and the campaign budget ran out
-  before the viable targets were reached. `--force` is now a second pass
-  that runs after the normal one, so it can only add reach. In this
-  measurement it turned unbuildable targets into static analysis rather
-  than into fuzzing.
-- Interpreted lanes execute the target's module to load it, which runs the
-  module's top-level code, as fuzzing it does.
-- The per-project budget bounds how many targets are attempted. A project
-  with thousands of candidates has a fraction of them measured here. The
-  rate is reported over attempted targets, with the discovered total beside
-  it, so the difference is visible.
+- A target whose parameters are types the project does not define (an external SDK's opaque handle, for example) is skipped, and the skip reason names the type. bhf does not invent a definition and report the result as a clean fuzz.
+- A project whose dependencies are not installed is reported as needing them, with the package named, instead of being fuzzed against stubs by default. For a compiled lane, `--force` drives past a missing type or symbol and records the result as stub-only. For an interpreted lane, `--force` cannot get past a missing package, and the skip reason says to install it.
+- Measured over the 126 corpus projects that had at least one undrivable target, applying `--force` from the start of the sweep reached 13 fewer targets than not passing it (214 → 201), for one extra fuzz finding. A forced attempt costs about 36% more, and the campaign budget ran out before the viable targets were reached. `--force` is now a second pass that runs after the normal one, so it can only add reach. In this measurement it turned unbuildable targets into static analysis rather than into fuzzing.
+- Interpreted lanes execute the target's module to load it, which runs the module's top-level code, as fuzzing it does.
+- The per-project budget bounds how many targets are attempted. A project with thousands of candidates has a fraction of them measured here. The rate is reported over attempted targets, with the discovered total beside it, so the difference is visible.

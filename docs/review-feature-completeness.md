@@ -1,12 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Feature Completeness Review, 2026-09-24
 
-This review covered the feature promises in the documentation, the documented
-residual gaps and the optional fuzz-engine adapters, at baseline `5528a41`.
-It is part of the [Production readiness review](production-readiness-review.md).
-[`ROADMAP.md`](../ROADMAP.md) §24 lists the continuing work, and
-[Measured gaps](expected-gaps.md) separates bhf's own gaps from missing
-dependencies, environment limits and deliberate refusals.
+This review covered the feature promises in the documentation, the documented residual gaps and the optional fuzz-engine adapters, at baseline `5528a41`. It is part of the [Production readiness review](production-readiness-review.md). [`ROADMAP.md`](../ROADMAP.md) §24 lists the continuing work, and [Measured gaps](expected-gaps.md) separates bhf's own gaps from missing dependencies, environment limits and deliberate refusals.
 
 ## Follow-up items
 
@@ -25,49 +20,27 @@ dependencies, environment limits and deliberate refusals.
 
 These are support boundaries, documented as such:
 
-- the differences between the manual command lanes recorded in `ROADMAP.md`'s
-  implementation snapshot;
+- the differences between the manual command lanes recorded in `ROADMAP.md`'s implementation snapshot;
 - CORBA targets are fuzzed without a real ORB;
 - third-party engine adapters that the CLI does not offer;
 - Ada 83 targets, which are reported and not fuzzed;
 - missing toolchains and dependencies.
 
-A promised behavior counts as missing when an advertised lane cannot run its
-documented workflow, or reports success without the stated result. The
-`nyx-engine` panic was such a defect for anyone who enabled that feature. The
-software replay backend launched a target with a file path, with no snapshot
-restore and no coverage feedback. It captured stdout in a temporary file to
-avoid pipe deadlocks; the in-memory result was capped at 1 MiB, while the
-temporary file could grow until the target exited or timed out.
+A promised behavior counts as missing when an advertised lane cannot run its documented workflow, or reports success without the stated result. The `nyx-engine` panic was such a defect for anyone who enabled that feature. The software replay backend launched a target with a file path, with no snapshot restore and no coverage feedback. It captured stdout in a temporary file to avoid pipe deadlocks; the in-memory result was capped at 1 MiB, while the temporary file could grow until the target exited or timed out.
 
-The largest remaining product gaps are target classes. The residual sweep
-inventory in [Measured gaps](expected-gaps.md) holds both actionable harness
-and build gaps and dependency or environment refusals; keep its verdict labels
-when an item becomes work.
+The largest remaining product gaps are target classes. The residual sweep inventory in [Measured gaps](expected-gaps.md) holds both actionable harness and build gaps and dependency or environment refusals; keep its verdict labels when an item becomes work.
 
 ## Cleanup boundary policy
 
-For `bhf clean` and automatic cache compaction, the work directory you select
-is the trust root, and it may itself be a symlink. No descendant directory is
-followed while bhf locates nested artifacts it owns. A symlink at the artifact
-leaf is unlinked as a leaf, and its target is left alone. Work-root aliases
-therefore keep working, and a nested `auto/` or harness symlink cannot
-redirect a deletion outside the root.
+For `bhf clean` and automatic cache compaction, the work directory you select is the trust root, and it may itself be a symlink. No descendant directory is followed while bhf locates nested artifacts it owns. A symlink at the artifact leaf is unlinked as a leaf, and its target is left alone. Work-root aliases therefore keep working, and a nested `auto/` or harness symlink cannot redirect a deletion outside the root.
 
-These checks cover symlink layouts that exist before the command runs. A
-concurrent process that swaps an ancestor after the metadata check is outside
-them; closing that race needs directory-handle-relative operations.
+These checks cover symlink layouts that exist before the command runs. A concurrent process that swaps an ancestor after the metadata check is outside them; closing that race needs directory-handle-relative operations.
 
 ## Validation
 
-- `cargo test -p fuzz_engine_nyx_adapter --locked` and
-  `cargo test -p fuzz_engine_nyx_adapter --features nyx-engine`: passed (the
-  crate has since been removed).
+- `cargo test -p fuzz_engine_nyx_adapter --locked` and `cargo test -p fuzz_engine_nyx_adapter --features nyx-engine`: passed (the crate has since been removed).
 - `cargo test -p bhf --lib clean::tests`: passed.
 - `cargo test -p bhf --lib auto::storage::tests`: passed.
-- `cargo test -p bhf --lib auto::report::tests::failed_build_records_unresolved_configure_header_with_remediation`:
-  passed.
-- `cargo build -p bhf --locked`: passed; `target/debug/bhf --version` reported
-  `bhf 0.2.32-15-g5528a41-dirty`, matching `git rev-parse --short HEAD`
-  (`5528a41`).
+- `cargo test -p bhf --lib auto::report::tests::failed_build_records_unresolved_configure_header_with_remediation`: passed.
+- `cargo build -p bhf --locked`: passed; `target/debug/bhf --version` reported `bhf 0.2.32-15-g5528a41-dirty`, matching `git rev-parse --short HEAD` (`5528a41`).
 - `git diff --check`: passed.

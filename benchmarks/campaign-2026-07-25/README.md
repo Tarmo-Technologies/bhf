@@ -1,10 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # 500-project sweep (2026-07)
 
-One sweep of bhf over 500 pinned open-source projects in sixteen language
-lanes, run to find bugs and feature gaps in bhf. Every number below is
-reproducible from the files in this directory. The written comparison is
-[`docs/site/sweep-500.md`](../../docs/site/sweep-500.md).
+One sweep of bhf over 500 pinned open-source projects in sixteen language lanes, run to find bugs and feature gaps in bhf. Every number below is reproducible from the files in this directory. The written comparison is [`docs/site/sweep-500.md`](../../docs/site/sweep-500.md).
 
 ## How to reproduce
 
@@ -18,53 +15,27 @@ python3 surfaces.py --project <dir> # 22 command checks against one project
 python3 compare.py sloc|static|sbom|fuzz  # against cloc/tokei, cppcheck/..., syft
 ```
 
-Run the commands from this directory. Every launch script runs the binary in
-`BHF_BIN` and stops if it is missing; the scripts' defaults point at the
-copies under `/home/ubuntu/bhf-sweep-bin/` that produced the checked-in rows.
-Copy the binary once and point `BHF_BIN` at the copy: rebuilding during a
-sweep would mix bhf versions across the corpus. `compare.py` reads its clones
-from `--projects` (default `/home/ubuntu/bhf-corpus-500`); its results on
-twelve projects are in [compare-section.md](compare-section.md).
+Run the commands from this directory. Every launch script runs the binary in `BHF_BIN` and stops if it is missing; the scripts' defaults point at the copies under `/home/ubuntu/bhf-sweep-bin/` that produced the checked-in rows. Copy the binary once and point `BHF_BIN` at the copy: rebuilding during a sweep would mix bhf versions across the corpus. `compare.py` reads its clones from `--projects` (default `/home/ubuntu/bhf-corpus-500`); its results on twelve projects are in [compare-section.md](compare-section.md).
 
 `publish.py` counts only the repositories pinned in `corpus.tsv` and writes the page's reviewed wording, so run over the same rows it leaves `docs/site/sweep-500.md` unchanged. Its blocker table ranks why bhf could not drive a target and leaves out build failures (`failed_build`), which the page's reading of the table does not cover; `aggregate.py --blockers` ranks every category.
 
-`python3 build_corpus.py select` rebuilds the corpus from a fresh GitHub
-search. It needs network access and the `gh` CLI, and it overwrites the
-pinned `corpus.tsv` and `pool.tsv`.
+`python3 build_corpus.py select` rebuilds the corpus from a fresh GitHub search. It needs network access and the `gh` CLI, and it overwrites the pinned `corpus.tsv` and `pool.tsv`.
 
-The corpus is pinned in `corpus.tsv` (lane, repository, clone URL, stars,
-size), with ranked replacements in `pool.tsv`. Each project is cloned,
-measured and deleted in turn, so the sweep keeps only a few working trees on
-disk at once. `results/` holds one JSON row per project: the target-status
-histogram, the residual blockers, the findings, the exit code and wall time
-of each command, and any panic.
+The corpus is pinned in `corpus.tsv` (lane, repository, clone URL, stars, size), with ranked replacements in `pool.tsv`. Each project is cloned, measured and deleted in turn, so the sweep keeps only a few working trees on disk at once. `results/` holds one JSON row per project: the target-status histogram, the residual blockers, the findings, the exit code and wall time of each command, and any panic.
 
 ## Corpus selection
 
-The corpus is the top-starred GitHub repositories per language, without
-fuzzing corpora and deliberately vulnerable trees (they bring their own bugs),
-awesome-lists and courses (no code), forks, archived repositories and
-anything over 400 MB.
+The corpus is the top-starred GitHub repositories per language, without fuzzing corpora and deliberately vulnerable trees (they bring their own bugs), awesome-lists and courses (no code), forks, archived repositories and anything over 400 MB.
 
-GitHub's primary-language label is often wrong: JavaScript wrappers tagged
-COBOL, C projects tagged Perl, editor-config trees tagged Lua. Each clone is
-checked against its lane before it counts, and a clone that is not mostly
-that lane's source is replaced from the pool.
+GitHub's primary-language label is often wrong: JavaScript wrappers tagged COBOL, C projects tagged Perl, editor-config trees tagged Lua. Each clone is checked against its lane before it counts, and a clone that is not mostly that lane's source is replaced from the pool.
 
 ## What the sweep exercises
 
-For every project the sweep runs `sloc`, `list targets`, `static-scan` (report
-and SARIF), `sbom`, `auto` (discover, harness, repair, build, fuzz, report) and
-`report` in all four formats. `surfaces.py` runs 22 command checks against one
-project, including the commands the per-project sweep skips: the triage chain
-(`minimize`, `replay`, `explain`, `capsule`, `verify-poc`, `cartography`),
-`license-audit`, governance (`policy`, `audit`, `export`), `binary scan`,
-`snippet` and `ci`.
+For every project the sweep runs `sloc`, `list targets`, `static-scan` (report and SARIF), `sbom`, `auto` (discover, harness, repair, build, fuzz, report) and `report` in all four formats. `surfaces.py` runs 22 command checks against one project, including the commands the per-project sweep skips: the triage chain (`minimize`, `replay`, `explain`, `capsule`, `verify-poc`, `cartography`), `license-audit`, governance (`policy`, `audit`, `export`), `binary scan`, `snippet` and `ci`.
 
 ## Defects the sweep found
 
-Each defect below was fixed in bhf and the fix was checked against the project
-that exposed it:
+Each defect below was fixed in bhf and the fix was checked against the project that exposed it:
 
 | Defect | Effect | Verified fix |
 |---|---|---|
@@ -91,21 +62,13 @@ that exposed it:
 
 ### Re-measuring one surface, or an A/B
 
-`run_sweep.py --merge` updates only the surfaces named by `--surfaces` and
-keeps the rest of an existing row: a `sloc`-only pass over the corpus takes
-minutes, a full re-run takes hours. `--results-dir` writes rows to another
-directory, so an A/B wave (for example with `--auto-force`) can be compared
-with `aggregate.py --compare` while the baseline stays intact.
+`run_sweep.py --merge` updates only the surfaces named by `--surfaces` and keeps the rest of an existing row: a `sloc`-only pass over the corpus takes minutes, a full re-run takes hours. `--results-dir` writes rows to another directory, so an A/B wave (for example with `--auto-force`) can be compared with `aggregate.py --compare` while the baseline stays intact.
 
 ## The 2026-07-27 and 2026-07-28 re-runs
 
-`sh launch_full_0727.sh` and `sh launch_full_0728.sh` (bhf 0.2.22) re-run the
-same corpus and budgets with newer pinned binaries, writing to `results-0727/`
-and `results-0728/` so that `results/` stays as the baseline. Read a re-run
-with `python3 aggregate.py --results results-0727`.
+`sh launch_full_0727.sh` and `sh launch_full_0728.sh` (bhf 0.2.22) re-run the same corpus and budgets with newer pinned binaries, writing to `results-0727/` and `results-0728/` so that `results/` stays as the baseline. Read a re-run with `python3 aggregate.py --results results-0727`.
 
-Scored over the 500 repositories pinned in `corpus.tsv`, the basis
-`docs/site/sweep-500.md` publishes:
+Scored over the 500 repositories pinned in `corpus.tsv`, the basis `docs/site/sweep-500.md` publishes:
 
 | | 2026-07-26 (`results/`) | 2026-07-27 (`results-0727/`) | 2026-07-28 (`results-0728/`) |
 |---|---:|---:|---:|
@@ -115,28 +78,11 @@ Scored over the 500 repositories pinned in `corpus.tsv`, the basis
 | **built + fuzzed** | **987 (28.3%)** | **983 (28.7%)** | **984 (28.5%)** |
 | findings | 290 | 332 | 329 |
 
-**Score a re-run against the pinned corpus.** A bare `aggregate.py` rolls up
-every row file in the directory, and each directory also holds rows for
-repositories the lane check later replaced from the pool: 35, 26 and 27 of
-them. On that all-rows basis the three runs read 453/463/482 projects and
-28.5%/29.4%/29.4% built and fuzzed. The pinned-corpus rates above stay within
-half a point of each other; the all-rows rise comes from the corpus changing
-between runs. `aggregate.py` prints the all-rows totals, so name the basis
-whenever you quote a number from this directory.
+**Score a re-run against the pinned corpus.** A bare `aggregate.py` rolls up every row file in the directory, and each directory also holds rows for repositories the lane check later replaced from the pool: 35, 26 and 27 of them. On that all-rows basis the three runs read 453/463/482 projects and 28.5%/29.4%/29.4% built and fuzzed. The pinned-corpus rates above stay within half a point of each other; the all-rows rise comes from the corpus changing between runs. `aggregate.py` prints the all-rows totals, so name the basis whenever you quote a number from this directory.
 
-The 2026-07-27 re-run found four defects, each in `CHANGELOG.md`: a cyclic
-C++ construction recipe that used 12 GiB and got 22 projects OOM-killed during
-discovery, POSIX/GLib scalar typedefs misread as opaque handles, a
-`java.io.File` parameter that could not be driven, and the blocker histogram
-corrupting its own grouping key in two ways.
-[`docs/open-defects-discovery-cost.md`](../../docs/open-defects-discovery-cost.md)
-records how the discovery-cost defects were isolated and fixed.
+The 2026-07-27 re-run found four defects, each in `CHANGELOG.md`: a cyclic C++ construction recipe that used 12 GiB and got 22 projects OOM-killed during discovery, POSIX/GLib scalar typedefs misread as opaque handles, a `java.io.File` parameter that could not be driven, and the blocker histogram corrupting its own grouping key in two ways. [`docs/open-defects-discovery-cost.md`](../../docs/open-defects-discovery-cost.md) records how the discovery-cost defects were isolated and fixed.
 
-**Re-run a blocker row before you work on it.** Half of the largest blocker
-rows in `results/` (`Cannot find module "X"); run "X"`, `target module
-"X"torch"X"`, the PHP row that read `  thrown in PATH on line N`) came from a
-binary older than the fix for them. The fastest check is to reproduce the row
-on a five-line fixture with the current binary, which takes about a minute.
+**Re-run a blocker row before you work on it.** Half of the largest blocker rows in `results/` (`Cannot find module "X"); run "X"`, `target module "X"torch"X"`, the PHP row that read `  thrown in PATH on line N`) came from a binary older than the fix for them. The fastest check is to reproduce the row on a five-line fixture with the current binary, which takes about a minute.
 
 ## Result directories
 

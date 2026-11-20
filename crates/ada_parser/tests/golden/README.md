@@ -2,9 +2,7 @@
 
 # Golden Ada Corpus
 
-Synthetic Ada fixtures for the Ada scanner's acceptance test
-(`crates/ada_parser/tests/golden.rs`). Every fixture is written for this
-corpus; third-party Ada source does not belong here.
+Synthetic Ada fixtures for the Ada scanner's acceptance test (`crates/ada_parser/tests/golden.rs`). Every fixture is written for this corpus; third-party Ada source does not belong here.
 
 ## Layout
 
@@ -14,9 +12,7 @@ Each fixture lives at:
 <dialect>/<scenario>/{src.adb|src.ads,manifest.toml}
 ```
 
-The dialect directories are `ada95`, `ada2005`, `ada2012` and `ada2022`. Use
-`src.adb` for bodies and subunits and `src.ads` for specs. If both exist, the
-harness scans `src.adb`.
+The dialect directories are `ada95`, `ada2005`, `ada2012` and `ada2022`. Use `src.adb` for bodies and subunits and `src.ads` for specs. If both exist, the harness scans `src.adb`.
 
 ## Manifest
 
@@ -43,12 +39,9 @@ handler_choices = []
 type_kinds = []
 ```
 
-`dialect_hint` is optional. Leave it out when the fixture exercises dialect
-detection from pragmas or heuristics.
+`dialect_hint` is optional. Leave it out when the fixture exercises dialect detection from pragmas or heuristics.
 
-A non-empty list under `[expected.names]` is an allow-list: every name the
-extractor reports in that category must appear in it. An empty list is not
-checked.
+A non-empty list under `[expected.names]` is an allow-list: every name the extractor reports in that category must appear in it. An empty list is not checked.
 
 ## Adding a fixture
 
@@ -63,15 +56,11 @@ cargo test -p ada_parser --test golden -- --nocapture
 cargo run -p spdx_check -- check
 ```
 
-If a fixture exposes an extractor bug, first write a failing focused test in
-the extractor or reconcile module, then fix the extractor. Keep the manifest
-counts true to the source; lower one only when an open issue documents the
-bug as out of scope.
+If a fixture exposes an extractor bug, first write a failing focused test in the extractor or reconcile module, then fix the extractor. Keep the manifest counts true to the source; lower one only when an open issue documents the bug as out of scope.
 
 ## Acceptance
 
-The golden harness requires at least 50 fixtures and these aggregate
-thresholds:
+The golden harness requires at least 50 fixtures and these aggregate thresholds:
 
 - subprograms: extracted / expected >= 0.95
 - handlers + raises: extracted / expected >= 0.99

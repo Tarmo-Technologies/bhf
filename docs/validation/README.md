@@ -2,14 +2,7 @@
 
 # Validation records
 
-Each page here records a validation campaign or re-run: what was run, on
-which commit or release, and what it found. The pages are dated and describe bhf as it was
-on that date; the [user guides](../site/index.md) describe current
-behaviour. The four `*-2026-09-25.json` files in this directory are
-machine-readable test records from 2026-09-25;
-[Scheduler reliability](../scheduler-reliability.md) and the
-[portability repair record](../portability-hardening-2026-09-25.md) cite
-two of them.
+Each page here records a validation campaign or re-run: what was run, on which commit or release, and what it found. The pages are dated and describe bhf as it was on that date; the [user guides](../site/index.md) describe current behaviour. The four `*-2026-09-25.json` files in this directory are machine-readable test records from 2026-09-25; [Scheduler reliability](../scheduler-reliability.md) and the [portability repair record](../portability-hardening-2026-09-25.md) cite two of them.
 
 ## Real code and legacy builds
 
@@ -61,9 +54,7 @@ two of them.
 
 ## Re-runs of measured gaps
 
-Each of these re-runs, by name, the targets of one class in
-[Measured gaps](../expected-gaps.md) from the 2026-07-28 sweep, except the
-zoxide record, which re-runs one row of the harness-parity audit.
+Each of these re-runs, by name, the targets of one class in [Measured gaps](../expected-gaps.md) from the 2026-07-28 sweep, except the zoxide record, which re-runs one row of the harness-parity audit.
 
 | Record | What it records |
 |---|---|

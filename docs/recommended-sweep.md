@@ -1,9 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # The recommended BHF sweep
 
-Use this command for the usual job: point BHF at a source tree you control,
-fuzz what it can build, and get a static-analysis and supply-chain report for
-the whole tree.
+Use this command for the usual job: point BHF at a source tree you control, fuzz what it can build, and get a static-analysis and supply-chain report for the whole tree.
 
 ```sh
 bhf auto /path/to/source-tree \
@@ -20,10 +18,7 @@ bhf auto /path/to/source-tree \
   --debug
 ```
 
-Read `bhf_work/results/INDEX.md` first. `results/findings.json` and
-`results/findings.csv` are the machine-readable root-cause indexes, and
-`results/findings/` holds the full evidence for each finding. The campaign and
-coverage reports are `auto/run.md`, `auto/run.json`, and `auto/summary.txt`.
+Read `bhf_work/results/INDEX.md` first. `results/findings.json` and `results/findings.csv` are the machine-readable root-cause indexes, and `results/findings/` holds the full evidence for each finding. The campaign and coverage reports are `auto/run.md`, `auto/run.json`, and `auto/summary.txt`.
 
 ## What each flag does, and how to size it
 
@@ -45,46 +40,22 @@ coverage reports are `auto/run.md`, `auto/run.json`, and `auto/summary.txt`.
 
 ## Variations
 
-- **Reclaiming disk.** `bhf clean bhf_work --compact` removes disposable
-  compiler caches and scratch files and keeps findings, reports, corpora,
-  checkpoints, generated harness source, and replay binaries. `--corpus`,
-  `--reports`, `--findings`, and `--all` each delete one named scope.
-- **Untrusted source.** Drop `--unsafe-search-and-run-build-commands`. BHF
-  still recovers what it can from `compile_commands.json` and its own probes.
-- **A quick look instead of a campaign.** Use `--per-target-time 5
-  --max-targets 10` and drop `--sbom`.
-- **Some languages only.** `--languages c,cpp`. All sixteen languages are on
-  by default: Ada, C, C++, Rust, Java, Python, Perl, Go, COBOL, Fortran, C#,
-  JavaScript, TypeScript, Ruby, Lua, PHP.
-- **Resuming.** `--resume` over the same work dir skips targets that already
-  completed and runs the rest. If the target source changed, every target is
-  attempted again.
-  `--resume --force` keeps every target that already fuzzed and forces only
-  the rest.
-- **A second engine.** `--engine builtin,afl++` runs both engines on each C,
-  C++, COBOL, Fortran, Rust and Ada target when AFL++ is installed, splitting
-  `--per-target-time` between them.
-- **Broken or incomplete Ada/C/C++ drops.** The offline auto runbook
-  (`AUTO-OFFLINE-RUNBOOK.md` in a distribution,
-  `docs/site/offline-auto-runbook.md` in the repository) gives the
-  known-build and unknown-build recipes and how the recovery flags combine.
+- **Reclaiming disk.** `bhf clean bhf_work --compact` removes disposable compiler caches and scratch files and keeps findings, reports, corpora, checkpoints, generated harness source, and replay binaries. `--corpus`, `--reports`, `--findings`, and `--all` each delete one named scope.
+- **Untrusted source.** Drop `--unsafe-search-and-run-build-commands`. BHF still recovers what it can from `compile_commands.json` and its own probes.
+- **A quick look instead of a campaign.** Use `--per-target-time 5 --max-targets 10` and drop `--sbom`.
+- **Some languages only.** `--languages c,cpp`. All sixteen languages are on by default: Ada, C, C++, Rust, Java, Python, Perl, Go, COBOL, Fortran, C#, JavaScript, TypeScript, Ruby, Lua, PHP.
+- **Resuming.** `--resume` over the same work dir skips targets that already completed and runs the rest. If the target source changed, every target is attempted again. `--resume --force` keeps every target that already fuzzed and forces only the rest.
+- **A second engine.** `--engine builtin,afl++` runs both engines on each C, C++, COBOL, Fortran, Rust and Ada target when AFL++ is installed, splitting `--per-target-time` between them.
+- **Broken or incomplete Ada/C/C++ drops.** The offline auto runbook (`AUTO-OFFLINE-RUNBOOK.md` in a distribution, `docs/site/offline-auto-runbook.md` in the repository) gives the known-build and unknown-build recipes and how the recovery flags combine.
 
 ## Reading the result
 
-`results/INDEX.md` is the summary to read and share. `auto/summary.txt`
-counts each target under one outcome:
+`results/INDEX.md` is the summary to read and share. `auto/summary.txt` counts each target under one outcome:
 
-- **built+fuzzed**: a harness was built and executed the target.
-  **built+fuzzed (STUB-ONLY)** means the harness exercised only stubs, not the
-  real library.
-- **built, NOT entered**: the harness built and ran, but the target entry was
-  never reached.
-- **static-only**: BHF could not build the target and analyzed it statically
-  instead. The residual-blocker histogram at the end says why.
-- **skipped**: BHF could not synthesize a driver for the parameters, or the
-  lane's toolchain is not installed. `--force` retries the first kind.
-- **failed build**, **link error**, **runtime error**: the build or the first
-  run failed; the per-target line gives the reason.
+- **built+fuzzed**: a harness was built and executed the target. **built+fuzzed (STUB-ONLY)** means the harness exercised only stubs, not the real library.
+- **built, NOT entered**: the harness built and ran, but the target entry was never reached.
+- **static-only**: BHF could not build the target and analyzed it statically instead. The residual-blocker histogram at the end says why.
+- **skipped**: BHF could not synthesize a driver for the parameters, or the lane's toolchain is not installed. `--force` retries the first kind.
+- **failed build**, **link error**, **runtime error**: the build or the first run failed; the per-target line gives the reason.
 
-Findings from a forced build are low confidence and carry a note saying what
-was fabricated. Treat them as leads to confirm by replay.
+Findings from a forced build are low confidence and carry a note saying what was fabricated. Treat them as leads to confirm by replay.

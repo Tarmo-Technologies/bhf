@@ -1,13 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # bhf comparison campaign (2026-07-08)
 
-Measurements of bhf 0.2.14 (the version its SARIF output records) against
-other tools for each feature, on a 14-repository corpus in C, C++, Rust, Go,
-Python, Java, Perl and JavaScript.
-The corpus was cloned locally and is not checked in. The other tools were
-cloc, scc and tokei (SLOC); cppcheck, flawfinder, semgrep, bandit, gosec,
-clippy and perlcritic (static analysis); syft and grype (SBOM); AFL++,
-libFuzzer and cargo-fuzz (fuzzing).
+Measurements of bhf 0.2.14 (the version its SARIF output records) against other tools for each feature, on a 14-repository corpus in C, C++, Rust, Go, Python, Java, Perl and JavaScript. The corpus was cloned locally and is not checked in. The other tools were cloc, scc and tokei (SLOC); cppcheck, flawfinder, semgrep, bandit, gosec, clippy and perlcritic (static analysis); syft and grype (SBOM); AFL++, libFuzzer and cargo-fuzz (fuzzing).
 
 | Path | Contents |
 |---|---|
@@ -23,9 +17,4 @@ libFuzzer and cargo-fuzz (fuzzing).
 
 ## SLOC accuracy against cloc
 
-Mean absolute deviation from cloc over the 13 repositories in
-`results/sloc_final.csv`, counting each repository's primary language: **bhf
-1.3%**, scc 19.7%, tokei 23.6%. scc and tokei classify Mojolicious `.pod` and
-`.t` files as Raku, count Python docstrings as code, and split C++ headers
-from sources differently. `results/measure_sloc.md` repeats the comparison
-with headers summed. See `charts/sloc_accuracy.png`.
+Mean absolute deviation from cloc over the 13 repositories in `results/sloc_final.csv`, counting each repository's primary language: **bhf 1.3%**, scc 19.7%, tokei 23.6%. scc and tokei classify Mojolicious `.pod` and `.t` files as Raku, count Python docstrings as code, and split C++ headers from sources differently. `results/measure_sloc.md` repeats the comparison with headers summed. See `charts/sloc_accuracy.png`.

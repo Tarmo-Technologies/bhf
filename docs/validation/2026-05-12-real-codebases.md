@@ -2,9 +2,7 @@
 
 # Real Codebase Validation - 2026-05-12
 
-Issue: #200 in bhf's earlier tracker. This repository's issue tracker starts
-on 2026-08-31, so the issue numbers in this record (#200 to #217) name issues
-in that earlier tracker; the same numbers on GitHub are different issues.
+Issue: #200 in bhf's earlier tracker. This repository's issue tracker starts on 2026-08-31, so the issue numbers in this record (#200 to #217) name issues in that earlier tracker; the same numbers on GitHub are different issues.
 
 Workspace: `/tmp/bhf-validation-200`
 
@@ -28,22 +26,17 @@ cargo run -p bhf -- list-targets /tmp/bhf-validation-200/repos/ada-util --format
 cargo run -p bhf -- list-targets /tmp/bhf-validation-200/repos/hac --format json --top 20
 ```
 
-`AdaYaml` returned 20 ranked targets in 0.58 seconds. The top target was
-`yaml-presenter.adb` / `put`, score 200.
+`AdaYaml` returned 20 ranked targets in 0.58 seconds. The top target was `yaml-presenter.adb` / `put`, score 200.
 
-`ada-util` returned 20 ranked targets in 1.68 seconds. The top target was
-`util-encoders-base32.adb` / `transform`, score 110.
+`ada-util` returned 20 ranked targets in 1.68 seconds. The top target was `util-encoders-base32.adb` / `transform`, score 110.
 
-`hac` originally exited non-zero before returning targets because the scanner
-attempted to read non-UTF-8 Ada sources as UTF-8. After #211 and #201,
-standalone scan completed successfully:
+`hac` originally exited non-zero before returning targets because the scanner attempted to read non-UTF-8 Ada sources as UTF-8. After #211 and #201, standalone scan completed successfully:
 
 ```sh
 cargo run -p bhf -- scan /tmp/bhf-validation-200/repos/hac --work-dir /tmp/bhf-validation-200/results/hac-scan-work
 ```
 
-The scan wrote `scan_index.json`, parsed 388 Ada files, skipped the 2
-unsupported-encoding files with diagnostics, and found 3709 target candidates.
+The scan wrote `scan_index.json`, parsed 388 Ada files, skipped the 2 unsupported-encoding files with diagnostics, and found 3709 target candidates.
 
 ### Instrumentation
 
@@ -52,8 +45,7 @@ cargo run -p bhf -- instrument /tmp/bhf-validation-200/repos/AdaYaml/src/impleme
 cargo run -p bhf -- instrument /tmp/bhf-validation-200/repos/ada-util/src/sys/encoders/util-encoders-base32.adb --output /tmp/bhf-validation-200/results/ada-util-instrumented
 ```
 
-Both commands exited 0 and wrote an instrumented source file plus
-`breadcrumbs.json`.
+Both commands exited 0 and wrote an instrumented source file plus `breadcrumbs.json`.
 
 ### Harness Generation
 
@@ -62,18 +54,14 @@ cargo run -p bhf -- generate-harness /tmp/bhf-validation-200/repos/ada-util/src/
 gprbuild -P /tmp/bhf-validation-200/results/ada-util-value-harness/H-C34C/H_C34C.gpr
 ```
 
-Harness generation exited 0 for `Util.Dates.ISO8601.Value`, but `gprbuild`
-failed because the generated project only included the target file directory and
-missed parent package source roots:
+Harness generation exited 0 for `Util.Dates.ISO8601.Value`, but `gprbuild` failed because the generated project only included the target file directory and missed parent package source roots:
 
 ```text
 main.adb:10:06: error: file "util.ads" not found
 gprbuild: *** compilation phase failed
 ```
 
-The highest-ranked `AdaYaml` and `ada-util` targets take non-scalar,
-non-string parameters. The direct-call harness of milestone M3 in
-[ROADMAP.md](../../ROADMAP.md) handled scalar and string parameters only.
+The highest-ranked `AdaYaml` and `ada-util` targets take non-scalar, non-string parameters. The direct-call harness of milestone M3 in [ROADMAP.md](../../ROADMAP.md) handled scalar and string parameters only.
 
 ### IDL / Fake CORBA
 
@@ -85,11 +73,9 @@ cargo run -p bhf -- fake-corba /tmp/bhf-validation-200/results/opendds-messenger
 
 `corba-example/echo.idl` generated 4 fake CORBA files and 9 IDL mapping files.
 
-`OpenDDS/dds/CorbaSeq/StringSeq.idl` generated 4 fake CORBA files and 2 IDL
-mapping files.
+`OpenDDS/dds/CorbaSeq/StringSeq.idl` generated 4 fake CORBA files and 2 IDL mapping files.
 
-`OpenDDS/DevGuideExamples/DCPS/Messenger/Messenger.idl` initially failed on DDS
-annotation syntax:
+`OpenDDS/DevGuideExamples/DCPS/Messenger/Messenger.idl` initially failed on DDS annotation syntax:
 
 ```text
 unexpected character '@' at line 8, column 3
@@ -98,30 +84,20 @@ unexpected character '@' at line 8, column 3
 ## Issues Opened
 
 - #211: the scanner should not abort project scans on non-UTF-8 Ada files.
-- #212: generated harness projects need real project source roots and
-  dependencies.
+- #212: generated harness projects need real project source roots and dependencies.
 - #213: the IDL parser should tolerate DDS/OpenDDS annotations.
-- #214: `fake-corba --idl` should not require an existing `src_instrumented`
-  tree.
-- #215: harness source-root support should discover or expand real Ada source
-  trees.
-- #216: the IDL parser needs include-path support for real OpenDDS include
-  trees.
-- #217: IDL partial parsing should recover from missing includes and
-  unsupported preprocessor branches.
+- #214: `fake-corba --idl` should not require an existing `src_instrumented` tree.
+- #215: harness source-root support should discover or expand real Ada source trees.
+- #216: the IDL parser needs include-path support for real OpenDDS include trees.
+- #217: IDL partial parsing should recover from missing includes and unsupported preprocessor branches.
 
 ## Reduced Reproducer
 
-`examples/annotated_idl/` contains a reduced DDS/OpenDDS annotation fixture
-derived from the `OpenDDS` Messenger IDL failure. After #213, the fixture parses
-and fake CORBA generation ignores the unsupported annotations with warnings.
+`examples/annotated_idl/` contains a reduced DDS/OpenDDS annotation fixture derived from the `OpenDDS` Messenger IDL failure. After #213, the fixture parses and fake CORBA generation ignores the unsupported annotations with warnings.
 
 ## Next Validation Slice
 
-The 2026-05-12 rerun covered the #211, #212, and #213 follow-up items. Next,
-address #214 through #216, then expand to repositories with complete GPR
-projects and Alire metadata. Add one IDL validation slice that uses configured
-include roots and nested angle-bracket includes.
+The 2026-05-12 rerun covered the #211, #212, and #213 follow-up items. Next, address #214 through #216, then expand to repositories with complete GPR projects and Alire metadata. Add one IDL validation slice that uses configured include roots and nested angle-bracket includes.
 
 ## Rerun After Fixes
 
@@ -142,8 +118,7 @@ Results:
 - `cargo test --workspace`: passed.
 - `npm test` in `editors/vscode`: passed, 13 tests.
 - `python3 -m pytest editors/gnatstudio/tests`: passed, 11 tests.
-- `python -m pytest ...` failed first: the host has `python3` but no
-  `python`.
+- `python -m pytest ...` failed first: the host has `python3` but no `python`.
 
 ### Target Discovery And Scan
 
@@ -156,17 +131,12 @@ cargo run -p bhf -- scan /tmp/bhf-validation-200/repos/hac --work-dir /tmp/bhf-v
 
 Results:
 
-- `AdaYaml`: returned 20 ranked targets. Top target:
-  `src/implementation/yaml-presenter.adb` / `put`, score 200.
-- `ada-util`: returned 20 ranked targets. Top target:
-  `src/sys/encoders/util-encoders-base32.adb` / `transform`, score 110.
-- `hac`: returned 20 ranked targets. Top target:
-  `src/execute/hac_sys-pcode-interpreter.adb` / `interpret`, score 247.
-- `hac` scan wrote `scan_index.json`, parsed 388 Ada files, skipped 2
-  unsupported-encoding files with diagnostics, and found 3709 target candidates.
+- `AdaYaml`: returned 20 ranked targets. Top target: `src/implementation/yaml-presenter.adb` / `put`, score 200.
+- `ada-util`: returned 20 ranked targets. Top target: `src/sys/encoders/util-encoders-base32.adb` / `transform`, score 110.
+- `hac`: returned 20 ranked targets. Top target: `src/execute/hac_sys-pcode-interpreter.adb` / `interpret`, score 247.
+- `hac` scan wrote `scan_index.json`, parsed 388 Ada files, skipped 2 unsupported-encoding files with diagnostics, and found 3709 target candidates.
 
-This validates the non-UTF-8 source handling from #211 for both `scan` and
-`list-targets`.
+This validates the non-UTF-8 source handling from #211 for both `scan` and `list-targets`.
 
 ### Instrumentation
 
@@ -175,14 +145,11 @@ cargo run -p bhf -- instrument /tmp/bhf-validation-200/repos/AdaYaml/src/impleme
 cargo run -p bhf -- instrument /tmp/bhf-validation-200/repos/ada-util/src/sys/encoders/util-encoders-base32.adb --output /tmp/bhf-validation-200/rerun-2026-05-12/results/ada-util-instrumented
 ```
 
-Both commands exited 0 and wrote an instrumented source file plus
-`breadcrumbs.json`.
+Both commands exited 0 and wrote an instrumented source file plus `breadcrumbs.json`.
 
 ### Harness Generation And Build
 
-`--source-root` is now accepted. Passing the broad repository `src`
-directory still fails GNAT source lookup, because generated GPR `Source_Dirs`
-are non-recursive:
+`--source-root` is now accepted. Passing the broad repository `src` directory still fails GNAT source lookup, because generated GPR `Source_Dirs` are non-recursive:
 
 ```sh
 cargo run -p bhf -- generate-harness /tmp/bhf-validation-200/repos/ada-util/src/base/dates/util-dates-iso8601.adb \
@@ -199,8 +166,7 @@ main.adb:11:06: error: file "util.ads" not found
 gprbuild: *** compilation phase failed
 ```
 
-Passing the actual package source directories builds and the harness runs once
-from stdin:
+Passing the actual package source directories builds and the harness runs once from stdin:
 
 ```sh
 cargo run -p bhf -- generate-harness /tmp/bhf-validation-200/repos/ada-util/src/base/dates/util-dates-iso8601.adb \
@@ -217,15 +183,13 @@ The remaining source-root discovery/ergonomics gap is tracked in #215.
 
 ### IDL / Fake CORBA
 
-Running `fake-corba --idl` against a fresh work directory still fails unless
-`<work-dir>/src_instrumented` exists, even for an IDL-only run:
+Running `fake-corba --idl` against a fresh work directory still fails unless `<work-dir>/src_instrumented` exists, even for an IDL-only run:
 
 ```text
 generate fake CORBA under '/tmp/bhf-validation-200/rerun-2026-05-12/results/corba-example-work/fake_corba': No such file or directory (os error 2)
 ```
 
-After creating an empty `src_instrumented` directory, the prior passing IDL
-cases still pass:
+After creating an empty `src_instrumented` directory, the prior passing IDL cases still pass:
 
 ```sh
 mkdir -p /tmp/bhf-validation-200/rerun-2026-05-12/results/corba-example-work/src_instrumented
@@ -238,19 +202,13 @@ cargo run -p bhf -- fake-corba /tmp/bhf-validation-200/rerun-2026-05-12/results/
 
 Results:
 
-- `corba-example/echo.idl`: generated 4 fake CORBA files and 9 IDL mapping
-  files.
-- `OpenDDS/dds/CorbaSeq/StringSeq.idl`: generated 4 fake CORBA files and 2 IDL
-  mapping files.
-- `OpenDDS/DevGuideExamples/DCPS/Messenger/Messenger.idl`: generated 4 fake
-  CORBA files and 1 IDL mapping file, with warnings for ignored `@topic` and
-  `@key` annotations.
+- `corba-example/echo.idl`: generated 4 fake CORBA files and 9 IDL mapping files.
+- `OpenDDS/dds/CorbaSeq/StringSeq.idl`: generated 4 fake CORBA files and 2 IDL mapping files.
+- `OpenDDS/DevGuideExamples/DCPS/Messenger/Messenger.idl`: generated 4 fake CORBA files and 1 IDL mapping file, with warnings for ignored `@topic` and `@key` annotations.
 
-This validates the annotation handling from #213. The IDL-only source directory
-prerequisite is tracked in #214.
+This validates the annotation handling from #213. The IDL-only source directory prerequisite is tracked in #214.
 
-An include-heavy OpenDDS IDL still fails because includes are resolved only
-relative to the current file:
+An include-heavy OpenDDS IDL still fails because includes are resolved only relative to the current file:
 
 ```sh
 mkdir -p /tmp/bhf-validation-200/rerun-2026-05-12/results/opendds-type-lookup-work/src_instrumented
@@ -264,9 +222,7 @@ Result:
 parse IDL '/tmp/bhf-validation-200/repos/OpenDDS/etc/xtypes/type_lookup.idl': read /tmp/bhf-validation-200/repos/OpenDDS/etc/xtypes/RtpsRpc.idl: No such file or directory (os error 2) at line 1, column 1
 ```
 
-`RtpsRpc.idl` exists elsewhere in the same repository at
-`dds/DCPS/RTPS/RtpsRpc.idl` and includes additional IDL through both quoted and
-angle-bracket include forms. Include-path support is tracked in #216.
+`RtpsRpc.idl` exists elsewhere in the same repository at `dds/DCPS/RTPS/RtpsRpc.idl` and includes additional IDL through both quoted and angle-bracket include forms. Include-path support is tracked in #216.
 
 ## Final Fix Rerun
 
@@ -274,9 +230,7 @@ Date: 2026-05-12
 
 Workspace: `/tmp/bhf-validation-200/final-2026-05-12`
 
-This rerun used the combined branches for #214, #215, #216, and #217, which
-make missing or partial software inputs recoverable for `fake-corba --idl`.
-The branches had not yet merged to `main` when this rerun was recorded.
+This rerun used the combined branches for #214, #215, #216, and #217, which make missing or partial software inputs recoverable for `fake-corba --idl`. The branches had not yet merged to `main` when this rerun was recorded.
 
 ### Verification Gates
 
@@ -306,8 +260,7 @@ Results:
 - `AdaYaml`: returned 20 ranked targets.
 - `ada-util`: returned 20 ranked targets.
 - `hac`: returned 20 ranked targets.
-- `hac` scan completed with 388 parsed files and 3709 targets; 2 non-UTF-8 Ada
-  files were recorded under `skipped` instead of aborting the scan.
+- `hac` scan completed with 388 parsed files and 3709 targets; 2 non-UTF-8 Ada files were recorded under `skipped` instead of aborting the scan.
 
 Instrumentation passed for the same AdaYaml and ada-util targets used earlier.
 
@@ -326,8 +279,7 @@ Generation, `gprbuild`, and the one-input harness run all exited 0.
 
 ### IDL / Fake CORBA Slice
 
-`fake-corba --idl` no longer requires a pre-existing `src_instrumented`
-directory for IDL-only runs.
+`fake-corba --idl` no longer requires a pre-existing `src_instrumented` directory for IDL-only runs.
 
 ```sh
 cargo run -p bhf -- fake-corba /tmp/bhf-validation-200/final-2026-05-12/results/corba-example-work --idl /tmp/bhf-validation-200/repos/corba-example/echo.idl
@@ -341,17 +293,9 @@ cargo run -p bhf -- fake-corba /tmp/bhf-validation-200/final-2026-05-12/results/
 
 Results:
 
-- `corba-example/echo.idl`: generated 4 fake CORBA files and 9 IDL mapping
-  files.
-- `OpenDDS/dds/CorbaSeq/StringSeq.idl`: generated 4 fake CORBA files and 2 IDL
-  mapping files.
-- `OpenDDS/DevGuideExamples/DCPS/Messenger/Messenger.idl`: generated 4 fake
-  CORBA files and 1 IDL mapping file.
-- `OpenDDS/etc/xtypes/type_lookup.idl`: generated 4 fake CORBA files and 128 IDL
-  mapping files with include roots configured.
+- `corba-example/echo.idl`: generated 4 fake CORBA files and 9 IDL mapping files.
+- `OpenDDS/dds/CorbaSeq/StringSeq.idl`: generated 4 fake CORBA files and 2 IDL mapping files.
+- `OpenDDS/DevGuideExamples/DCPS/Messenger/Messenger.idl`: generated 4 fake CORBA files and 1 IDL mapping file.
+- `OpenDDS/etc/xtypes/type_lookup.idl`: generated 4 fake CORBA files and 128 IDL mapping files with include roots configured.
 
-The include-heavy OpenDDS run produced recoverable warnings for missing TAO
-headers, unsupported preprocessor branches, ignored DDS annotations, named
-bounds, arrays, and union declarations, and ran to completion. This validates
-the #217 policy: an incomplete source tree degrades with warnings, and
-generation continues wherever the remaining IDL can still be used.
+The include-heavy OpenDDS run produced recoverable warnings for missing TAO headers, unsupported preprocessor branches, ignored DDS annotations, named bounds, arrays, and union declarations, and ran to completion. This validates the #217 policy: an incomplete source tree degrades with warnings, and generation continues wherever the remaining IDL can still be used.

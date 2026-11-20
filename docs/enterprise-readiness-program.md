@@ -1,41 +1,22 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Enterprise Readiness Program
 
-Goal: bring bhf to production readiness as an enterprise fuzzing tool, with
-evidence that places it against AFL++ and Mayhem.
+Goal: bring bhf to production readiness as an enterprise fuzzing tool, with evidence that places it against AFL++ and Mayhem.
 
-Status: open. The current plan and the latest checkpoint are in
-[DEVELOPMENT_PLAN.md](../DEVELOPMENT_PLAN.md). This page holds the acceptance
-matrix that defines completion.
+Status: open. The current plan and the latest checkpoint are in [DEVELOPMENT_PLAN.md](../DEVELOPMENT_PLAN.md). This page holds the acceptance matrix that defines completion.
 
 ## Evidence and comparison requirements
 
-Competitor capability is broader than a command count. AFL++ documents several
-instrumentation backends, persistent execution, comparison feedback, mutation
-strategies and corpus tools ([overview](https://aflplus.plus/),
-[features](https://aflplus.plus/features/)). Mayhem documents code testing,
-hybrid fuzzing with symbolic execution, target support, coverage and CI
-integrations
-([technology](https://docs.mayhem.security/code-testing/reference/mayhem-technology/),
-[support matrix](https://docs.mayhem.security/code-testing/reference/support-matrix/),
-[documentation](https://docs.mayhem.security/)). The requirements below are
-drawn from these sources.
+Competitor capability is broader than a command count. AFL++ documents several instrumentation backends, persistent execution, comparison feedback, mutation strategies and corpus tools ([overview](https://aflplus.plus/), [features](https://aflplus.plus/features/)). Mayhem documents code testing, hybrid fuzzing with symbolic execution, target support, coverage and CI integrations ([technology](https://docs.mayhem.security/code-testing/reference/mayhem-technology/), [support matrix](https://docs.mayhem.security/code-testing/reference/support-matrix/), [documentation](https://docs.mayhem.security/)). The requirements below are drawn from these sources.
 
 A comparison must:
 
-- identify target versions, engines, compilers, hardware, harness semantics,
-  build and setup effort, seeds, time and resource limits, and independent
-  trials;
-- measure coverage with a common offline replay when the engines' own
-  counters differ;
+- identify target versions, engines, compilers, hardware, harness semantics, build and setup effort, seeds, time and resource limits, and independent trials;
+- measure coverage with a common offline replay when the engines' own counters differ;
 - keep failed trials and censored no-solve trials in the results;
-- move from the small gate fixtures, which serve as regression tests, toward
-  real-code benchmarks and the [FuzzBench](https://github.com/google/fuzzbench)
-  methodology.
+- move from the small gate fixtures, which serve as regression tests, toward real-code benchmarks and the [FuzzBench](https://github.com/google/fuzzbench) methodology.
 
-A Mayhem comparison needs a licensed, identified Mayhem version and
-reproducible results. [Engine Comparison Benchmarks](enterprise-engine-benchmark.md)
-describes the runners and the results so far.
+A Mayhem comparison needs a licensed, identified Mayhem version and reproducible results. [Engine Comparison Benchmarks](enterprise-engine-benchmark.md) describes the runners and the results so far.
 
 ## Acceptance matrix
 
@@ -50,9 +31,7 @@ describes the runners and the results so far.
 | Platform and supply-chain release | Locked reproducible builds, verified minimum Rust version, clean dependency and security policy, Linux ABI and native Windows checks, full final-tree tests, release installation smoke test | Minimum Rust 1.88 (`rust-version`) verified locally; hosted and final-artifact gates are open ([release controls](enterprise-release-controls.md)) |
 | Accurate supported surface | Every public command and feature matched to its implementation, unsupported cases stated, no panicking optional paths, docs and examples validated, migration documented | Ongoing; see [production readiness review](production-readiness-review.md) |
 
-New findings refine the implementation work; the matrix defines success. A
-missing competitor license or hosted runner blocks only its own evidence
-gate. Any missing capability or evidence in the matrix blocks completion.
+New findings refine the implementation work; the matrix defines success. A missing competitor license or hosted runner blocks only its own evidence gate. Any missing capability or evidence in the matrix blocks completion.
 
 ## Workstreams and their records
 
@@ -74,7 +53,5 @@ gate. Any missing capability or evidence in the matrix blocks completion.
 Rules for this program:
 
 - Label evidence from older builds as historical.
-- Local development and testing never publish a release or sign with
-  production credentials.
-- Check [DEVELOPMENT_PLAN.md](../DEVELOPMENT_PLAN.md) before acting on an
-  older task listed here.
+- Local development and testing never publish a release or sign with production credentials.
+- Check [DEVELOPMENT_PLAN.md](../DEVELOPMENT_PLAN.md) before acting on an older task listed here.

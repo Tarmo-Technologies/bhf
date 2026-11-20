@@ -2,10 +2,7 @@
 
 # The docs folder
 
-The user guides are in [`site/`](site/index.md); start at the
-[documentation index](site/index.md). This page lists the other pages under
-`docs/`: reference notes the guides link to, release and CI notes,
-measurements, plans, and dated records.
+The user guides are in [`site/`](site/index.md); start at the [documentation index](site/index.md). This page lists the other pages under `docs/`: reference notes the guides link to, release and CI notes, measurements, plans, and dated records.
 
 ## Reference
 
@@ -57,8 +54,7 @@ measurements, plans, and dated records.
 
 ## Dated records
 
-These pages record one review or repair at the commit they name. The guides
-describe current behaviour.
+These pages record one review or repair at the commit they name. The guides describe current behaviour.
 
 | Page | What it records |
 |---|---|
@@ -70,10 +66,8 @@ describe current behaviour.
 
 Two more indexes list dated files, one per topic:
 
-- [Validation records](validation/README.md): validation runs, named
-  `YYYY-MM-DD-topic.md`.
-- [Design notes](designs/README.md): the designs written before a feature
-  was built, each linked to the guide that now describes it.
+- [Validation records](validation/README.md): validation runs, named `YYYY-MM-DD-topic.md`.
+- [Design notes](designs/README.md): the designs written before a feature was built, each linked to the guide that now describes it.
 
 ## Elsewhere in the repository
 

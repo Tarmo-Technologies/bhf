@@ -86,19 +86,8 @@ The LD_PRELOAD runtrace shim (`bhf_runtrace_shim`) that supplies bhf's behaviora
 
 ## Test fixtures
 
-- **Arm CMSIS-SVD example (`ARM_Example.svd`, version 1.2)** — vendored
-  unmodified under `crates/rehost/tests/fixtures/` (test-only; not
-  redistributed in the bhf binary), to show the rehost crate's SVD reader
-  on a vendor-written file. License: BSD-3-Clause, Copyright (C) 2012-2014
-  ARM Limited (the notice is kept in the file). Upstream:
-  <https://github.com/ARM-software/CMSIS_5>, `CMSIS/Utilities/ARM_Example.svd`
-  at commit `4cbd1fb00fd84a3c8766742f36a32666a73ed120`; sha256
-  `d1a385a7e6792ea99211e17cc507c51a6641ed5356d1e156cf97471f9c030eb8`.
-- **miniz 3.0.2** — vendored under
-  `tests/fixtures/build_recovery/fixtures/miniz/` (test-only;
-  not redistributed in the bhf binary). License: MIT.
-  Upstream: <https://github.com/richgel999/miniz>. Release zip
-  sha256 `ada38db0b703a56d3dd6d57bf84a9c5d664921d870d8fea4db153979fb5332c5`.
+- **Arm CMSIS-SVD example (`ARM_Example.svd`, version 1.2)** — vendored unmodified under `crates/rehost/tests/fixtures/` (test-only; not redistributed in the bhf binary), to show the rehost crate's SVD reader on a vendor-written file. License: BSD-3-Clause, Copyright (C) 2012-2014 ARM Limited (the notice is kept in the file). Upstream: <https://github.com/ARM-software/CMSIS_5>, `CMSIS/Utilities/ARM_Example.svd` at commit `4cbd1fb00fd84a3c8766742f36a32666a73ed120`; sha256 `d1a385a7e6792ea99211e17cc507c51a6641ed5356d1e156cf97471f9c030eb8`.
+- **miniz 3.0.2** — vendored under `tests/fixtures/build_recovery/fixtures/miniz/` (test-only; not redistributed in the bhf binary). License: MIT. Upstream: <https://github.com/richgel999/miniz>. Release zip sha256 `ada38db0b703a56d3dd6d57bf84a9c5d664921d870d8fea4db153979fb5332c5`.
 
 ## GCC RLE boundary
 

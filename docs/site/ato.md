@@ -1,30 +1,16 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # ATO / RMF posture for the bhf container
 
-This page maps the bhf container to NIST controls, for an ISSO or ISSM who
-assembles an RMF package for bhf (NIST SP 800-37). It uses controls from
-SP 800-53 and container guidance from SP 800-190. Each row names the
-evidence bhf provides and the deployment condition you verify. Your SSP and
-STIG work stays with your accreditation team (see the last section).
+This page maps the bhf container to NIST controls, for an ISSO or ISSM who assembles an RMF package for bhf (NIST SP 800-37). It uses controls from SP 800-53 and container guidance from SP 800-190. Each row names the evidence bhf provides and the deployment condition you verify. Your SSP and STIG work stays with your accreditation team (see the last section).
 
 ## Distribution and operating model
 
-- **Controlled builds.** Build the container from reviewed source and record
-  the Dockerfile, source revision, base image digest and dependency inputs.
-  The container image and the CLI release packages
-  ([Release Packaging](release-packaging.md)) are separate artifacts with
-  separate build workflows.
-- **Offline operation.** Stage the tools, target dependencies and advisory
-  databases you need before you disconnect. Run the container with
-  `--network none` and apply equivalent controls on the host. Target build
-  scripts and any network or model integration you enable can open
-  connections, so review them separately. See
-  [offline / air-gapped use](./docker.md#air-gapped-and-offline-use).
+- **Controlled builds.** Build the container from reviewed source and record the Dockerfile, source revision, base image digest and dependency inputs. The container image and the CLI release packages ([Release Packaging](release-packaging.md)) are separate artifacts with separate build workflows.
+- **Offline operation.** Stage the tools, target dependencies and advisory databases you need before you disconnect. Run the container with `--network none` and apply equivalent controls on the host. Target build scripts and any network or model integration you enable can open connections, so review them separately. See [offline / air-gapped use](./docker.md#air-gapped-and-offline-use).
 
 ## Control crosswalk (selected)
 
-Each row lists evidence sources and deployment controls to verify for your
-deployment.
+Each row lists evidence sources and deployment controls to verify for your deployment.
 
 | Area | Control(s) | Evidence or deployment condition to verify |
 |---|---|---|
@@ -49,26 +35,13 @@ docker run --rm --network none --shm-size=2g --cap-add=SYS_PTRACE \
   bhf:local auto /src --work-dir /work/run
 ```
 
-The image already contains bhf's own instrumentation dependencies. To stage
-your project's dependencies (`.m2`, NuGet, `cargo vendor`, Go modules) for an
-air-gapped run, see [docker.md](./docker.md#air-gapped-and-offline-use).
+The image already contains bhf's own instrumentation dependencies. To stage your project's dependencies (`.m2`, NuGet, `cargo vendor`, Go modules) for an air-gapped run, see [docker.md](./docker.md#air-gapped-and-offline-use).
 
 ## Vulnerability posture (RA-5, SI-2)
 
-Retain the whole-image inventory, the scan database identity, the raw
-matches and a reviewed disposition for the exact image you ship. The baked
-OS inventory lists dpkg packages. Container acceptance reconciles a
-filesystem scan, which includes the build-toolchain caches, with the
-compiled Cargo dependency graph, and verifies the hashes of the shipped
-binaries.
+Retain the whole-image inventory, the scan database identity, the raw matches and a reviewed disposition for the exact image you ship. The baked OS inventory lists dpkg packages. Container acceptance reconciles a filesystem scan, which includes the build-toolchain caches, with the compiled Cargo dependency graph, and verifies the hashes of the shipped binaries.
 
-The local scans of October 4, 2026 are recorded in
-[the validation report](../validation/2026-10-04-rtos-container-local.md).
-They describe that working tree; each release needs its own scan. A match
-can need distro backport analysis. An installed vulnerable component counts
-even when it sits outside the runtime path. A match stays under
-investigation until evidence supports a reviewed disposition. See
-[inventory assurance and review gates](./inventory-assurance.md).
+The local scans of October 4, 2026 are recorded in [the validation report](../validation/2026-10-04-rtos-container-local.md). They describe that working tree; each release needs its own scan. A match can need distro backport analysis. An installed vulnerable component counts even when it sits outside the runtime path. A match stays under investigation until evidence supports a reviewed disposition. See [inventory assurance and review gates](./inventory-assurance.md).
 
 ## Minimal image for deployment (CM-7 least functionality)
 
@@ -78,18 +51,8 @@ investigation until evidence supports a reviewed disposition. See
 | `ada` | `core` plus GNAT and GPRbuild |
 | `runtime` | the full-language toolchains, all sixteen languages |
 
-The default Docker build (`production`) builds on `runtime`; a smaller image
-needs an explicit `--target`. None of the three includes the optional `llm`
-feature. Use the hardened Compose override (`docker/compose.hardened.yaml`)
-and stage project dependencies before you disconnect. Keep execution
-evidence for each language and each source and cache mount your deployment
-uses; a smoke test of one lane covers that lane.
+The default Docker build (`production`) builds on `runtime`; a smaller image needs an explicit `--target`. None of the three includes the optional `llm` feature. Use the hardened Compose override (`docker/compose.hardened.yaml`) and stage project dependencies before you disconnect. Keep execution evidence for each language and each source and cache mount your deployment uses; a smoke test of one lane covers that lane.
 
 ## What remains with the accreditation team
 
-bhf provides the tooling and the evidence listed above. Your accreditation
-team makes the authorization decision. The team validates the exact
-deployment artifact and operating boundary, retains provenance and review
-records, and completes the SSP, the applicable STIG and SRG checklists,
-continuous monitoring and the cryptographic requirements. Offline operation
-and generated VEX files are inputs to that work.
+bhf provides the tooling and the evidence listed above. Your accreditation team makes the authorization decision. The team validates the exact deployment artifact and operating boundary, retains provenance and review records, and completes the SSP, the applicable STIG and SRG checklists, continuous monitoring and the cryptographic requirements. Offline operation and generated VEX files are inputs to that work.

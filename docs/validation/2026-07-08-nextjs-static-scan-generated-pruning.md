@@ -1,24 +1,18 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Next.js Static-Scan Generated-Bundle Pruning - 2026-07-08
 
-This memo records the follow-up validation for the `next` timeout found during
-the 50-project
-[`BHF-512` framework raw-HTML sweep](2026-07-07-bhf512-framework-html-sweep.md).
+This memo records the follow-up validation for the `next` timeout found during the 50-project [`BHF-512` framework raw-HTML sweep](2026-07-07-bhf512-framework-html-sweep.md).
 
 ## Scope
 
 - Worktree: `static-scan-generated-skip-2026-07-08`
-- Repo under test:
-  `/tmp/bhf-sast-bhf512-framework-sweep-2026-07-07/repos/next`
+- Repo under test: `/tmp/bhf-sast-bhf512-framework-sweep-2026-07-07/repos/next`
 - Scanner: `target/debug/bhf static-scan <path> --debug --enable-rule BHF-512`
-- Original symptom: full-tree Next.js scan timed out under a 600 second cap with
-  no report.
+- Original symptom: full-tree Next.js scan timed out under a 600 second cap with no report.
 
 ## Root Cause Evidence
 
-The Next.js tree contains many generated and vendored JavaScript bundles under
-`packages/next/src/compiled`. Scanning that subtree produced zero `BHF-512`
-findings but consumed most of the `packages/next/src` budget:
+The Next.js tree contains many generated and vendored JavaScript bundles under `packages/next/src/compiled`. Scanning that subtree produced zero `BHF-512` findings but consumed most of the `packages/next/src` budget:
 
 | Path | Pre-fix time | Findings |
 |---|---:|---:|
@@ -30,15 +24,11 @@ findings but consumed most of the `packages/next/src` budget:
 | `.github/actions` | 0.55 s | 0 |
 | `examples` | 7.48 s | 0 |
 
-This fits the scanner's existing SAST/SCA split: source SAST scans the
-project's own code, and SBOM/SCA inventory covers dependency and generated
-payloads.
+This fits the scanner's existing SAST/SCA split: source SAST scans the project's own code, and SBOM/SCA inventory covers dependency and generated payloads.
 
 ## Fix
 
-The static scanner now prunes directory components named `compiled` during the
-tree walk, alongside `node_modules`, `dist`, `vendor`, `third_party`,
-virtualenvs, caches, and other dependency/build outputs.
+The static scanner now prunes directory components named `compiled` during the tree walk, alongside `node_modules`, `dist`, `vendor`, `third_party`, virtualenvs, caches, and other dependency/build outputs.
 
 ## Focused Rescan
 
@@ -49,8 +39,7 @@ After pruning `compiled/` child directories:
 | `packages/next/src` | 20.23 s | 0 |
 | full Next.js tree | 253.79 s | 0 |
 
-The full Next.js `BHF-512` scan now exits successfully under the same 600 second
-cap that previously timed out.
+The full Next.js `BHF-512` scan now exits successfully under the same 600 second cap that previously timed out.
 
 ## Verification Commands
 

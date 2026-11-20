@@ -2,12 +2,7 @@
 
 # Hardware-in-the-Loop Bring-Up: Fuzzing an ARM Board over gdb-remote
 
-This runbook connects bhf's on-target transport (`crates/target_transport`) to
-a physical ARM board: the parts list, the toolchain, the bring-up steps and
-the contract the firmware must meet. The flag-driven workflow, without a board
-profile, is in [On-Target Fuzzing](site/on-target-fuzzing.md)
-(`bhf fuzz --target-transport gdb:HOST:PORT --transport-coverage-map ...`),
-over the same gdb remote serial protocol (RSP) path.
+This runbook connects bhf's on-target transport (`crates/target_transport`) to a physical ARM board: the parts list, the toolchain, the bring-up steps and the contract the firmware must meet. The flag-driven workflow, without a board profile, is in [On-Target Fuzzing](site/on-target-fuzzing.md) (`bhf fuzz --target-transport gdb:HOST:PORT --transport-coverage-map ...`), over the same gdb remote serial protocol (RSP) path.
 
 The same lane runs against emulators, which stand in for the board:
 
@@ -19,20 +14,13 @@ The same lane runs against emulators, which stand in for the board:
 | Agent stand-in | the reference agent on a pseudo-terminal, from a board profile's serial lane | CI or locally | `crates/cli/tests/transport_agent_serial_cli.rs` |
 | **HIL** | **real board through the OpenOCD gdbstub** | **your bench** | `crates/target_transport/tests/hil_board.rs` |
 
-The same `GdbClient` / `GdbRemoteTransport` code drives all of them. A board
-is described once, in a **board profile**
-([`docs/hil-boards/nucleo-f411re.toml`](hil-boards/nucleo-f411re.toml) is the
-template). The profile holds:
+The same `GdbClient` / `GdbRemoteTransport` code drives all of them. A board is described once, in a **board profile** ([`docs/hil-boards/nucleo-f411re.toml`](hil-boards/nucleo-f411re.toml) is the template). The profile holds:
 
-- the `gdb:` spec of the board's probe, with the completion breakpoint, the
-  fault-status word and the reset;
+- the `gdb:` spec of the board's probe, with the completion breakpoint, the fault-status word and the reset;
 - the coverage map of its firmware;
 - the `agent:serial:` spec of its UART.
 
-`tests/hil_board.rs` and `bhf fuzz --board-profile` both read it. The
-stand-ins run the same profile format against QEMU and a pseudo-terminal, so
-every step below except the hardware steps runs without a board. The run on a
-physical board is tracked as #357.
+`tests/hil_board.rs` and `bhf fuzz --board-profile` both read it. The stand-ins run the same profile format against QEMU and a pseudo-terminal, so every step below except the hardware steps runs without a board. The run on a physical board is tracked as #357.
 
 ## BOM
 
@@ -42,9 +30,7 @@ physical board is tracked as #357.
 | USB-A → mini-B cable | ~$3 | Powers + debugs the Nucleo via the ST-Link. |
 | *(optional)* **Segger J-Link EDU Mini** | ~$20 | For **RTT** (SEGGER Real-Time Transfer) as the coverage channel in place of memory-mapped ring readback, or for faster hardware breakpoints. The on-board ST-Link with memory readback covers the ring path. |
 
-The Nucleo-F411RE is the recommended first board: it is the cheapest way to a
-real Cortex-M HardFault vector, real SWD halting debug, and an on-chip SRAM
-ring that `MemoryBufferReader` reads back byte for byte.
+The Nucleo-F411RE is the recommended first board: it is the cheapest way to a real Cortex-M HardFault vector, real SWD halting debug, and an on-chip SRAM ring that `MemoryBufferReader` reads back byte for byte.
 
 ## Toolchain
 
@@ -56,9 +42,7 @@ sudo apt-get install -y gcc-arm-none-eabi gdb-multiarch openocd
 
 ## Bring-up
 
-Each step gives the command and what it prints when it works. Steps 1 to 3 need
-the board; the rest are the same against the stand-ins (see
-[Without a board](#without-a-board-the-stand-ins)).
+Each step gives the command and what it prints when it works. Steps 1 to 3 need the board; the rest are the same against the stand-ins (see [Without a board](#without-a-board-the-stand-ins)).
 
 1. **Plug in the board and find its probe.**
 
@@ -66,31 +50,24 @@ the board; the rest are the same against the stand-ins (see
    lsusb | grep -i st-link
    ```
 
-   Expected: a line like `ID 0483:374b STMicroelectronics ST-LINK/V2.1`. On
-   Linux a non-root user needs the udev rules from the `openocd` package.
+   Expected: a line like `ID 0483:374b STMicroelectronics ST-LINK/V2.1`. On Linux a non-root user needs the udev rules from the `openocd` package.
 
-2. **Start OpenOCD.** It serves the gdb remote serial protocol on `:3333` and
-   its command line on `:4444`.
+2. **Start OpenOCD.** It serves the gdb remote serial protocol on `:3333` and its command line on `:4444`.
 
    ```bash
    openocd -f board/st_nucleo_f4.cfg
    ```
 
-   Expected, among its startup lines:
-   `Info : Listening on port 3333 for gdb connections`. For a J-Link instead:
-   `openocd -f interface/jlink.cfg -f target/stm32f4x.cfg`.
+   Expected, among its startup lines: `Info : Listening on port 3333 for gdb connections`. For a J-Link instead: `openocd -f interface/jlink.cfg -f target/stm32f4x.cfg`.
 
-3. **Flash the harness** (your instrumented firmware; see
-   [Firmware contract](#firmware-contract-what-the-harness-on-the-board-must-expose)).
+3. **Flash the harness** (your instrumented firmware; see [Firmware contract](#firmware-contract-what-the-harness-on-the-board-must-expose)).
 
    ```bash
    gdb-multiarch harness.elf -batch -ex 'target extended-remote :3333' \
      -ex 'monitor reset halt' -ex load -ex 'monitor reset halt'
    ```
 
-   Expected: `Loading section .text, size ...`, then
-   `Transfer rate: ...` and no error. From OpenOCD's command line,
-   `flash write_image erase harness.elf` prints `wrote N bytes`.
+   Expected: `Loading section .text, size ...`, then `Transfer rate: ...` and no error. From OpenOCD's command line, `flash write_image erase harness.elf` prints `wrote N bytes`.
 
 4. **Read the firmware's contract addresses.**
 
@@ -99,23 +76,9 @@ the board; the rest are the same against the stand-ins (see
      'bhf_input|harness_done|bhf_fault_flag|adafuzz_probe_memory_buffer'
    ```
 
-   Expected: one line per symbol, for example
-   `08000200 T harness_done`, `20000000 B adafuzz_probe_memory_buffer`,
-   `20000200 B adafuzz_probe_memory_buffer_write`,
-   `20000204 B adafuzz_probe_memory_buffer_wrapped`,
-   `20000208 B bhf_fault_flag` and `2000020c B bhf_input`. `bhf_input` must be
-   in a section the startup code leaves alone (`.noinit` in the linker
-   script; `arm-none-eabi-objdump -t harness.elf | grep bhf_input` names it):
-   bhf writes it after the reset, before the firmware runs.
+   Expected: one line per symbol, for example `08000200 T harness_done`, `20000000 B adafuzz_probe_memory_buffer`, `20000200 B adafuzz_probe_memory_buffer_write`, `20000204 B adafuzz_probe_memory_buffer_wrapped`, `20000208 B bhf_fault_flag` and `2000020c B bhf_input`. `bhf_input` must be in a section the startup code leaves alone (`.noinit` in the linker script; `arm-none-eabi-objdump -t harness.elf | grep bhf_input` names it): bhf writes it after the reset, before the firmware runs.
 
-5. **Write the board profile.** Copy `docs/hil-boards/nucleo-f411re.toml` and
-   put the addresses of step 4 in it: `done=` is `harness_done`, `fault=` is
-   `bhf_fault_flag`, and the coverage map's `input=`, `ring=`, `write=` and
-   `wrapped=` are the input buffer and the ring. `input_cap` is the input
-   buffer's size and `cap` the ring's. `reset=monitor:reset halt` resets the
-   chip through OpenOCD before each input. bhf checks every spec in the profile
-   when it reads it, so a mistyped one is refused before anything connects,
-   with the spec error and the file's path.
+5. **Write the board profile.** Copy `docs/hil-boards/nucleo-f411re.toml` and put the addresses of step 4 in it: `done=` is `harness_done`, `fault=` is `bhf_fault_flag`, and the coverage map's `input=`, `ring=`, `write=` and `wrapped=` are the input buffer and the ring. `input_cap` is the input buffer's size and `cap` the ring's. `reset=monitor:reset halt` resets the chip through OpenOCD before each input. bhf checks every spec in the profile when it reads it, so a mistyped one is refused before anything connects, with the spec error and the file's path.
 
 6. **Check the lane with the test.**
 
@@ -124,12 +87,7 @@ the board; the rest are the same against the stand-ins (see
      cargo test -p target_transport --test hil_board -- --nocapture
    ```
 
-   Expected, in order: `hil_board: attached, initial stop = Signal(5)`,
-   `hil_board: read N register bytes`, a
-   `hil_board: run_input([41]) -> exit=Ok, fault=None, edges [...]` line with
-   at least one edge, and `hil_board: PASSED against gdbstub 127.0.0.1:3333`.
-   No edges means the ring map is wrong or the firmware emitted no crumbs; a
-   run that never stops means `done=` is not where the run ends.
+   Expected, in order: `hil_board: attached, initial stop = Signal(5)`, `hil_board: read N register bytes`, a `hil_board: run_input([41]) -> exit=Ok, fault=None, edges [...]` line with at least one edge, and `hil_board: PASSED against gdbstub 127.0.0.1:3333`. No edges means the ring map is wrong or the firmware emitted no crumbs; a run that never stops means `done=` is not where the run ends.
 
 7. **Fuzz the board.**
 
@@ -138,24 +96,16 @@ the board; the rest are the same against the stand-ins (see
      --seed-input A --time 10m
    ```
 
-   Expected: a JSON summary on stdout with `"executions"` and
-   `"coverage_edges"` above zero, `"incomplete_observations": 0` and
-   `"halted": null`. A fault the HardFault handler records through `fault=`
-   is a finding under `work/results/findings/`, its detail
-   `firmware fault-status 0x... at 0x...`.
+   Expected: a JSON summary on stdout with `"executions"` and `"coverage_edges"` above zero, `"incomplete_observations": 0` and `"halted": null`. A fault the HardFault handler records through `fault=` is a finding under `work/results/findings/`, its detail `firmware fault-status 0x... at 0x...`.
 
-8. **Fuzz over the UART instead** (the reference agent in the firmware,
-   `c_runtime/bhf_agent.c`, with the board's UART as its read and write
-   callbacks).
+8. **Fuzz over the UART instead** (the reference agent in the firmware, `c_runtime/bhf_agent.c`, with the board's UART as its read and write callbacks).
 
    ```bash
    bhf fuzz work --harness H-BOARD --board-profile board.toml \
      --board-lane serial --seed-input A --time 10m
    ```
 
-   Expected: `bhf fuzz: board "nucleo-f411re" over agent:serial:/dev/ttyACM0,baud=115200`
-   on stderr, then a summary as in step 7. A silent UART ends the run with
-   `"halted": "... the serial device sent nothing within ..."`.
+   Expected: `bhf fuzz: board "nucleo-f411re" over agent:serial:/dev/ttyACM0,baud=115200` on stderr, then a summary as in step 7. A silent UART ends the run with `"halted": "... the serial device sent nothing within ..."`.
 
 ## Without a board: the stand-ins
 
@@ -165,60 +115,27 @@ Both lanes run against stand-ins that use the same profile format:
 cargo test -p target_transport --test hil_board -- --nocapture
 ```
 
-builds a Cortex-M firmware that starts as a board's does (it zeroes `.bss` and
-keeps its input in `.noinit`), boots it under `qemu-system-arm` with only a
-gdbstub, writes its profile (`reset=monitor:system_reset`, because QEMU's
-system gdbstub refuses `R`) and runs four inputs. It needs
-`arm-none-eabi-gcc` and `qemu-system-arm`, and skips without them (it fails
-instead when `BHF_HIL_REQUIRE=1`). Expected:
-`hil_board: run_input([41]) -> exit=Ok, fault=None, edges [100, 300]`,
-`run_input([f7]) -> exit=Crash, fault=Some("firmware fault-status 0xdeadfa11 at ..."), edges [100, 1fa, fa17]`,
-`run_input([42]) -> exit=Ok, ... edges [100, 200, 201]` and `[41]` again with
-the edges of the first, since each input runs from reset.
+builds a Cortex-M firmware that starts as a board's does (it zeroes `.bss` and keeps its input in `.noinit`), boots it under `qemu-system-arm` with only a gdbstub, writes its profile (`reset=monitor:system_reset`, because QEMU's system gdbstub refuses `R`) and runs four inputs. It needs `arm-none-eabi-gcc` and `qemu-system-arm`, and skips without them (it fails instead when `BHF_HIL_REQUIRE=1`). Expected: `hil_board: run_input([41]) -> exit=Ok, fault=None, edges [100, 300]`, `run_input([f7]) -> exit=Crash, fault=Some("firmware fault-status 0xdeadfa11 at ..."), edges [100, 1fa, fa17]`, `run_input([42]) -> exit=Ok, ... edges [100, 200, 201]` and `[41]` again with the edges of the first, since each input runs from reset.
 
 ```bash
 cargo test -p bhf --test transport_agent_serial_cli -- --nocapture
 ```
 
-builds the reference agent with `c_runtime/examples/agent_posix.c --pty`, which
-serves a pseudo-terminal and prints its path, writes a profile whose `serial`
-lane names it, and runs two 300-input campaigns over it. Expected: the test
-`the_reference_agent_on_a_pty_runs_a_board_profiles_serial_lane ... ok`; the
-second campaign's seeds reach deeper code and record the agent's fault once.
+builds the reference agent with `c_runtime/examples/agent_posix.c --pty`, which serves a pseudo-terminal and prints its path, writes a profile whose `serial` lane names it, and runs two 300-input campaigns over it. Expected: the test `the_reference_agent_on_a_pty_runs_a_board_profiles_serial_lane ... ok`; the second campaign's seeds reach deeper code and record the agent's fault once.
 
 ## Firmware contract (what the harness on the board must expose)
 
-The board lane uses the memory-buffer coverage channel that the Ada runtime
-emits (`ada_runtime/adafuzz-probe-memory_buffer.adb`, see
-[Probe backends](cross-compilation.md#probe-backends)) and that
-`target_transport::coverage::MemoryBufferReader` reconstructs. Your firmware
-harness must, in a fixed SRAM layout:
+The board lane uses the memory-buffer coverage channel that the Ada runtime emits (`ada_runtime/adafuzz-probe-memory_buffer.adb`, see [Probe backends](cross-compilation.md#probe-backends)) and that `target_transport::coverage::MemoryBufferReader` reconstructs. Your firmware harness must, in a fixed SRAM layout:
 
-* accept an input at a fixed **input** address (the fuzzer writes the testcase
-  there over SWD before each run),
-* fill the **coverage ring** in the `MemoryBufferReader` format — a base buffer
-  plus a `_write` cursor (`u32`, little-endian) and a `_wrapped` flag (`u8`),
-  written byte-for-byte like the Ada `Write_Byte` (`BHF_EVENTS` `Crumb` records:
-  tag byte `3` then the `u32` breadcrumb id, little-endian), and
-* end each run at a known **`harness_done`** symbol (a tight loop) where the host
-  plants a breakpoint.
+* accept an input at a fixed **input** address (the fuzzer writes the testcase there over SWD before each run),
+* fill the **coverage ring** in the `MemoryBufferReader` format — a base buffer plus a `_write` cursor (`u32`, little-endian) and a `_wrapped` flag (`u8`), written byte-for-byte like the Ada `Write_Byte` (`BHF_EVENTS` `Crumb` records: tag byte `3` then the `u32` breadcrumb id, little-endian), and
+* end each run at a known **`harness_done`** symbol (a tight loop) where the host plants a breakpoint.
 
-A real **HardFault vector** works with this contract: a planted fault path
-(an illegal access or `udf`) traps to the chip's `HardFault_Handler`, which
-records a distinct fault breadcrumb before reaching `harness_done`, as
-`tests/live_fullsystem.rs` shows on the emulated core.
+A real **HardFault vector** works with this contract: a planted fault path (an illegal access or `udf`) traps to the chip's `HardFault_Handler`, which records a distinct fault breadcrumb before reaching `harness_done`, as `tests/live_fullsystem.rs` shows on the emulated core.
 
 ### Run control: real boards and the emulated core
 
-Under the QEMU gdbstub, halting debug is off by default, so a guest `BKPT`
-**escalates to a HardFault** and does not halt to the debugger. The emulator
-harness therefore stops at `harness_done` through a **gdbstub software
-breakpoint** (`Z0`) that the host plants there
-(`FullSystemTransport::with_harness_breakpoint`). On a **real board over
-SWD**, OpenOCD enables halting debug (`C_DEBUGEN`), so both a hardware
-breakpoint (`Z1`, FPB unit) and a literal `BKPT` instruction halt to the
-debugger. Either works; the `GdbClient::insert_sw_breakpoint(addr, kind)`
-path is the same.
+Under the QEMU gdbstub, halting debug is off by default, so a guest `BKPT` **escalates to a HardFault** and does not halt to the debugger. The emulator harness therefore stops at `harness_done` through a **gdbstub software breakpoint** (`Z0`) that the host plants there (`FullSystemTransport::with_harness_breakpoint`). On a **real board over SWD**, OpenOCD enables halting debug (`C_DEBUGEN`), so both a hardware breakpoint (`Z1`, FPB unit) and a literal `BKPT` instruction halt to the debugger. Either works; the `GdbClient::insert_sw_breakpoint(addr, kind)` path is the same.
 
 ## Environment variables (`tests/hil_board.rs`)
 
@@ -236,27 +153,12 @@ path is the same.
 | `BHF_HIL_INPUT=deadbeef` | Optional hex input delivered before the run. |
 | `BHF_HIL_REQUIRE=1` | Makes the QEMU stand-in test fail, instead of skip, when its tools are missing. |
 
-Set the four `..._ADDR` variables (and, if not the default, `RING_CAP`) to drive
-a full `GdbRemoteTransport::run_input`: it writes the input, continues, and reads
-the on-board ring back into coverage edges. Discover the addresses from your
-firmware's map file (`arm-none-eabi-nm harness.elf`), mask the Thumb bit (bit 0)
-off any function symbol used as a breakpoint address.
+Set the four `..._ADDR` variables (and, if not the default, `RING_CAP`) to drive a full `GdbRemoteTransport::run_input`: it writes the input, continues, and reads the on-board ring back into coverage edges. Discover the addresses from your firmware's map file (`arm-none-eabi-nm harness.elf`), mask the Thumb bit (bit 0) off any function symbol used as a breakpoint address.
 
 ## RTT (optional, J-Link)
 
-The SEGGER RTT control block is another in-RAM buffer, which `openocd`'s
-`rtt` commands or `JLinkRTTLogger` stream out. bhf's
-`coverage::SemihostingReader` and `MemoryBufferReader` decode the
-`BHF_EVENTS` stream whatever byte channel carries it, so RTT needs a channel
-adapter and no new decoder. bhf has no RTT adapter yet; the memory ring above
-is the supported path and needs no extra hardware.
+The SEGGER RTT control block is another in-RAM buffer, which `openocd`'s `rtt` commands or `JLinkRTTLogger` stream out. bhf's `coverage::SemihostingReader` and `MemoryBufferReader` decode the `BHF_EVENTS` stream whatever byte channel carries it, so RTT needs a channel adapter and no new decoder. bhf has no RTT adapter yet; the memory ring above is the supported path and needs no extra hardware.
 
 ## Semihosting (alternative coverage channel)
 
-With `--probe-backend semihosting` firmware and OpenOCD's `arm semihosting
-enable` and `arm semihosting_fileio enable`, each semihosting write reaches bhf's
-gdb connection as a File-I/O request, and `coverage=semihosting` in the coverage
-map decodes the `BHF_EVENTS` stream the probe writes to fd 2 (see
-[Semihosting coverage](site/on-target-fuzzing.md#semihosting-coverage)). Use
-this when the board has no spare SRAM for a ring; otherwise prefer the memory
-ring, which costs no host round trip per write.
+With `--probe-backend semihosting` firmware and OpenOCD's `arm semihosting enable` and `arm semihosting_fileio enable`, each semihosting write reaches bhf's gdb connection as a File-I/O request, and `coverage=semihosting` in the coverage map decodes the `BHF_EVENTS` stream the probe writes to fd 2 (see [Semihosting coverage](site/on-target-fuzzing.md#semihosting-coverage)). Use this when the board has no spare SRAM for a ring; otherwise prefer the memory ring, which costs no host round trip per write.

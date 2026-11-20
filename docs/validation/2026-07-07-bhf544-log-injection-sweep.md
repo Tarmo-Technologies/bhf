@@ -1,16 +1,14 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # BHF-544 Log-Injection Sweep - 2026-07-07
 
-This memo records the validation for `BHF-544` (CWE-117 log injection / log
-forging), added to the static taint engine.
+This memo records the validation for `BHF-544` (CWE-117 log injection / log forging), added to the static taint engine.
 
 ## Scope
 
 - Worktree: `sast-loop-log-injection-2026-07-07`
 - Sweep root: `/tmp/bhf-sast-bhf544-sweep-2026-07-07`
 - Scanner: `target/debug/bhf static-scan <repo> --debug`
-- Corpus: 50 shallow-cloned GitHub projects across Ada, C, C++, Rust, Go, Java,
-  and Python source trees.
+- Corpus: 50 shallow-cloned GitHub projects across Ada, C, C++, Rust, Go, Java, and Python source trees.
 
 ## Results
 
@@ -20,21 +18,14 @@ forging), added to the static taint engine.
 - `BHF-544` findings after FP fixes: 9
 - Precision benchmark: 97 TP, 0 FP, 0 FN
 
-The first sweep produced 20 `BHF-544` findings. Manual triage found four
-false-positive shapes, all fixed:
+The first sweep produced 20 `BHF-544` findings. Manual triage found four false-positive shapes, all fixed:
 
-- Plain string literals containing source words such as "Request" were parsed as
-  tainted log message arguments.
-- C++ benchmark logs of numeric CLI values such as `queue_size` and `iters` were
-  treated as forgeable strings.
+- Plain string literals containing source words such as "Request" were parsed as tainted log message arguments.
+- C++ benchmark logs of numeric CLI values such as `queue_size` and `iters` were treated as forgeable strings.
 - Usage logs of `argv[0]` were reported.
-- Log calls that pass a returned error object, and logs of parsed client/socket
-  address scalars, were over-reported.
+- Log calls that pass a returned error object, and logs of parsed client/socket address scalars, were over-reported.
 
-The final rescan removed those false positives. The remaining `BHF-544`
-reports were in Log4j examples/core text rendering, pip CacheControl URL
-logging, and a mitmproxy XSS scanner example that logs reflected URL data;
-each is a source-to-log flow the static rule targets.
+The final rescan removed those false positives. The remaining `BHF-544` reports were in Log4j examples/core text rendering, pip CacheControl URL logging, and a mitmproxy XSS scanner example that logs reflected URL data; each is a source-to-log flow the static rule targets.
 
 ## Commands
 

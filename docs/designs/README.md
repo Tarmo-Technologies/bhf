@@ -2,10 +2,7 @@
 
 # Design notes
 
-Each page here is the design written before a feature was built: the
-problem, the goals, the design and the phased plan. A note's status line
-names the commits that built it and the user guide that now describes it.
-For how a feature behaves today, read that guide.
+Each page here is the design written before a feature was built: the problem, the goals, the design and the phased plan. A note's status line names the commits that built it and the user guide that now describes it. For how a feature behaves today, read that guide.
 
 | Design | What it designs | User guide |
 |---|---|---|
