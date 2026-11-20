@@ -357,7 +357,8 @@ pub struct AutoArgs {
     /// candidate list of the run before, which saves most of the start-up time
     /// on a large tree. Each load checks a fingerprint of the sources and of
     /// `--exclude-dir`/`--include-dir`, so a change to either makes bhf
-    /// discover again.
+    /// discover again. Each source file's hash is still recorded for
+    /// `--resume`.
     #[arg(long = "no-discovery-cache")]
     pub no_discovery_cache: bool,
 
@@ -372,9 +373,8 @@ pub struct AutoArgs {
     /// writes `harnesses/<id>/result.json` when its attempt finishes, so an
     /// interrupted run can be resumed. Results are reused while the build
     /// context (compile database, `.gpr`, IDL and harness options) is
-    /// unchanged; a target whose own source file changed runs again. With
-    /// `--no-discovery-cache` bhf records no source files, so a target whose
-    /// file changed is reused too. Skipped targets keep their files
+    /// unchanged; a target whose own source file changed runs again, with or
+    /// without `--no-discovery-cache`. Skipped targets keep their files
     /// (`harnesses/<id>/`, `results/findings/`, `fuzz_runs/`), and the new
     /// run's report counts them as `resumed`.
     #[arg(long = "resume")]
@@ -3931,13 +3931,13 @@ fn emit_campaign_sbom(root: &Path, work: &Path) {
     }
 }
 
-/// Discover candidates. Without `--reuse-discovery` this is exactly the prior
-/// behavior: a fresh `discover_with_dir_filter` with no cache I/O, no fingerprint
-/// walk, and no extra logging (byte-identical default). With `reuse` set, the
-/// discovery cache is consulted: on a fingerprint match the ranked list is loaded
-/// from `<work>/discovery-cache.json` (skipping the tree-sitter re-parse); on a
-/// miss (absent cache, changed tree, or changed dir-filter) discovery runs fresh
-/// and the cache is rewritten so the NEXT `--reuse-discovery` run hits. The
+/// Discover candidates. Every run records the source identity (the tree
+/// fingerprint and each file's hash) that `--resume` judges targets by. With
+/// `--no-discovery-cache` discovery then runs fresh with no cache I/O.
+/// Otherwise the discovery cache is consulted: on a fingerprint match the ranked
+/// list is loaded from `<work>/discovery-cache.json` (skipping the tree-sitter
+/// re-parse); on a miss (absent cache, changed tree, or changed dir-filter)
+/// discovery runs fresh and the cache is rewritten so the next run hits. The
 /// fingerprint guards correctness — a stale cache is never used silently — and
 /// which path was taken is always logged.
 /// The discovery-cache identity: a cached candidate list is reused only when the
@@ -3963,24 +3963,12 @@ fn discover_or_reuse(
     cache_override: Option<&Path>,
     preprocess: crate::auto::discovery::PreprocessMode,
 ) -> Result<(Vec<crate::auto::candidate::Candidate>, bool, bool)> {
-    // `--no-discovery-cache`: never read or write a cache. (Second tuple element
-    // is `cache_hit` — whether the candidate list came from a validated cache, ie
-    // the source tree is unchanged; `--resume` only skips completed targets then.)
-    if !cache_enabled {
-        return Ok((
-            crate::auto::discovery::discover_with_fuzz_drivers(path, dir_filter, preprocess)?,
-            false,
-            // `--no-discovery-cache` keeps no source identity, so `--resume`
-            // stays conservative and re-attempts, exactly as before.
-            false,
-        ));
-    }
-
+    // (Second tuple element is `cache_hit` — whether the candidate list came
+    // from a validated cache, ie the source tree is unchanged; the third is
+    // whether the source fingerprint matches the previous run's.)
     use crate::auto::discovery::discover_with_fuzz_drivers;
     use crate::auto::discovery_cache::{self, DiscoveryCache};
 
-    // `--discovery-cache <path>` overrides the default `<work>/discovery-cache.json`.
-    let cache_file = discovery_cache::resolve_cache_path(work, cache_override);
     // Fold the preprocess mode into the fingerprint: it changes WHICH functions are
     // discovered (and their lines), so a cache built under a different mode must not
     // be reused (§27.6). The base fingerprint stays the content+dir-filter digest.
@@ -4024,6 +4012,18 @@ fn discover_or_reuse(
         let _ = writeln!(serialized, "{hash:016x}\t{rel}");
     }
     let _ = crate::auto::report::atomic_write(&files_record, serialized.as_bytes());
+    // `--no-discovery-cache`: never read or write the discovery cache. The source
+    // identity above is kept all the same, so `--resume` re-attempts exactly the
+    // targets whose own file changed, as it does with the cache.
+    if !cache_enabled {
+        return Ok((
+            discover_with_fuzz_drivers(path, dir_filter, preprocess)?,
+            false,
+            source_unchanged,
+        ));
+    }
+    // `--discovery-cache <path>` overrides the default `<work>/discovery-cache.json`.
+    let cache_file = discovery_cache::resolve_cache_path(work, cache_override);
     if fresh {
         bhfeprintln!(
             "bhf auto: --fresh-discovery: ignoring any cache at {} and recomputing discovery (fingerprint {fingerprint})",

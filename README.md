@@ -419,17 +419,7 @@ bhf auto path/to/src \
   --resume
 ```
 
-Completed targets are skipped and included in the new report; findings and
-corpora are kept, and interrupted targets start again. bhf reuses a
-completed result while the build context is unchanged:
-`compile_commands.json`, GNAT projects (`.gpr`), IDL files, Visual Studio
-solutions and projects, and the harness options, including project
-selection, decoder limits, stubbing, engines, passes and sanitizers. A change
-to the build context retries every target. A changed source file retries
-only the targets in that file, so edits to documentation or other files keep
-the results. With `--no-discovery-cache` bhf records no source files, so a
-changed source file retries nothing. In a work directory written by a
-different bhf build, the targets that fuzzed are kept and the rest run again.
+Completed targets are skipped and included in the new report; findings and corpora are kept, and interrupted targets start again. bhf reuses a completed result while the build context is unchanged: `compile_commands.json`, GNAT projects (`.gpr`), IDL files, Visual Studio solutions and projects, and the harness options, including project selection, decoder limits, stubbing, engines, passes and sanitizers. A change to the build context retries every target. A changed source file retries only the targets in that file, with or without `--no-discovery-cache`, so edits to documentation or other files keep the results. In a work directory written by a different bhf build, the targets that fuzzed are kept and the rest run again.
 
 ## Resource Requirements
 
