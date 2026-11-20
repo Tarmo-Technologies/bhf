@@ -533,8 +533,11 @@ reset vector, and basic-block edge coverage steers the mutation. Addresses are
 hex, `0x` optional, as `nm` prints them. An invalid memory access, a bad PC
 or a HardFault is a `kind: rehost_fault` finding, which `bhf replay`
 reproduces through the recorded machine setup and MMIO models. Interrupts
-are not modelled; see [On-target fuzzing §9](on-target-fuzzing.md) for the
-flags and the fidelity.
+the firmware enables are raised on a schedule the input chooses: each tick
+(`--interrupt-interval`, default 1000 instructions) takes one input byte
+that picks the interrupt and the wait to the next tick, and a sleeping core
+runs on to the next tick (`--no-interrupts` raises none); see
+[On-target fuzzing §9](on-target-fuzzing.md) for the flags and the fidelity.
 
 `--runtime-oracles auto|on|off` (on `bhf fuzz` and `bhf binary fuzz`) loads the
 runtrace sink oracles via the `LD_PRELOAD` shim so a **clean-exit** semantic

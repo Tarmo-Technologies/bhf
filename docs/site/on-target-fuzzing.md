@@ -61,7 +61,7 @@ binary release.
 | An on-device agent (TCP/serial) | **On-target agent** | Real device; coverage over the agent protocol | ⛔ unproven: the host side ships; no target-side agent does yet ([#289](https://github.com/Tarmo-Technologies/bhf/issues/289)), so you write one to the frame format in §3c |
 | A physical board | **HIL** (hardware-in-the-loop) | Silicon | ⛔ unproven (`BHF_HIL_GDB`) |
 | A Linux driver's source, and syzkaller | **syzkaller descriptions and crash import** (`bhf kernel syzlang`, `bhf kernel import`, §10) | syzkaller runs the kernel and its KCOV coverage; bhf describes the driver's ioctls and triages the crashes | ✅ snapshot of the widget fixture's description, and the import of a crash directory in syz-manager's layout; ⛔ syz-sysgen acceptance and a fresh syz-manager workdir gated (need syzkaller) |
-| Only a firmware image (ELF or flash dump), no source | **Rehosting** (`bhf binary rehost`, §9) | bhf's own Cortex-M interpreter: the real instructions; peripheral reads from per-register models (input-fed, constant, or bit-extract inferred from polling loops), no interrupts | ✅ fixture images in `crates/rehost/tests/fixtures/`: edge coverage that grows with the input, invalid-access, bad-PC and HardFault findings, a parser fed through a peripheral data register, a polled UART's parser bug reached through inferred models, `bhf replay` MATCH |
+| Only a firmware image (ELF or flash dump), no source | **Rehosting** (`bhf binary rehost`, §9) | bhf's own Cortex-M interpreter: the real instructions; peripheral reads from per-register models (input-fed, constant, or bit-extract inferred from polling loops); interrupts the firmware enables, raised on a schedule the input chooses | ✅ fixture images in `crates/rehost/tests/fixtures/`: edge coverage that grows with the input, invalid-access, bad-PC and HardFault findings, a parser fed through a peripheral data register, a polled UART's parser bug reached through inferred models, an RX-interrupt handler's bug reached through the interrupt schedule, `bhf replay` MATCH |
 
 ---
 
@@ -936,7 +936,8 @@ stack pointer and the reset vector come from the vector table. The input
 reaches the firmware in a fixed buffer in its memory (the receive buffer its
 parser reads, with an optional length word), through its peripheral reads
 (MMIO models, below), or both. Execution runs until the core goes idle
-(`WFI`, `WFE`, a branch to itself), reaches an `--exit-at` address, exits
+(`WFI`, `WFE`, a branch to itself) with no interrupt to wake it, reaches an
+`--exit-at` address, exits
 through semihosting, requests a system reset, runs out of input at a
 peripheral read, faults, or uses `--max-instructions`. Every basic block the core enters is counted in a
 64 KiB edge map that steers the builtin engine's mutator and power schedule.
@@ -956,6 +957,11 @@ bhf binary rehost firmware.bin --base 0x08000000 --work-dir bhf_work \
 # register, after checking an ID register that must read a fixed value:
 bhf binary rehost firmware.elf --work-dir bhf_work \
   --mmio 0x40013000=constant:0x4c31a5c3 --seed-file seed.bin
+
+# Firmware that sleeps until its UART interrupts it: interrupts are raised
+# on the input's schedule by default, here a tick every 500 instructions:
+bhf binary rehost firmware.elf --work-dir bhf_work \
+  --interrupt-interval 500 --seed-file seed.bin
 ```
 
 - Addresses are hex, `0x` optional, so a value copied from `nm` or `objdump`
@@ -1044,6 +1050,49 @@ bhf binary rehost firmware.elf --work-dir bhf_work \
   inferred. `--no-mmio-inference` turns it off. Loops that alternate
   between two registers, or whose exit depends on more than the bits of
   one read, are not inferred; name those with `--mmio`.
+- **Interrupts (an input-chosen schedule).** Firmware that sleeps until its
+  peripherals interrupt it (a UART's receive interrupt, a timer tick) never
+  progresses when nothing raises one. bhf models the NVIC (its enable,
+  pending, active and priority registers, `AIRCR.PRIGROUP`, and `ICSR`'s
+  PendSV and SysTick bits) and raises interrupts on a schedule that is part
+  of the testcase, as Fuzzware's fuzzer-chosen interrupt triggers do. Every
+  tick, `--interrupt-interval` instructions apart (default 1000), takes one
+  byte of the input, from the same stream the peripheral reads take, in
+  order with them, and pends one of the interrupts the firmware has enabled:
+  its NVIC IRQs, and SysTick when its counter and its interrupt are on. The
+  byte modulo how many are enabled picks which, lowest exception number
+  first, and its top three bits pick the wait until the next tick: the
+  interval, a half, a quarter, one instruction, 4, 8 or 16 times it, or
+  twice it (`000` to `111`). A tick with nothing enabled takes no byte, and a
+  tick the input has no byte left for raises nothing. A core that sleeps
+  (`WFI`, `WFE`, a branch to itself) runs on to the next tick at once, and
+  ends the run idle only when nothing enabled could wake it or the input is
+  used up. A pending interrupt is taken between two instructions when its
+  group priority preempts the core's execution priority (the active
+  exceptions, `BASEPRI`, `PRIMASK`, `FAULTMASK`); the frame is stacked and
+  the handler entered as the hardware does, and the pending bits the
+  firmware sets itself (`NVIC_ISPR`, `PENDSVSET`, `PENDSTSET`) are taken the
+  same way. An `SVC` in a handler is taken when SVCall's priority preempts
+  the handler's, and escalates otherwise; an exception return clears
+  `FAULTMASK`. A handler counts its own edges: the edge into it is from the
+  interrupt, not from where it landed, and its return counts none, so an
+  interrupt's timing alone makes no new coverage. An input buffer setup
+  gets room for the schedule too: the buffer then takes at most the input's
+  first 4096 bytes, as with peripheral input. With an input fed through
+  peripheral reads, a status register that every interrupt's handler reads
+  once is a loop to inference like a status poll, and gets a bit-extract
+  model for the bit the handler tests. A finding records the interrupts its
+  run took (`rehost.interrupts`: how many, the schedule's input bytes, and
+  the first 64 with the instruction count, exception and IRQ number and the
+  instruction each interrupted), the exception whose handler faulted
+  (`rehost.fault.exception`, 16 + n for IRQ n), and the schedule in its
+  setup (`rehost.setup.interrupts`), which `bhf replay` runs; a finding
+  recorded before the schedule existed replays without one.
+  `--no-interrupts` raises none: the NVIC's registers then hold what is
+  written to them and a core that sleeps ends the run. No peripheral raises
+  an interrupt of its own accord; NMI and the fault exceptions are never
+  raised (a fault ends the run), and tail-chaining runs as a return and a
+  fresh entry.
 - `--ram BASE:SIZE` (repeatable) maps RAM; the default is
   `0x20000000:0x100000`, and an ELF's `.data` and `.bss` RAM is mapped as
   well. An initial stack pointer outside RAM is refused before anything
@@ -1076,14 +1125,16 @@ bhf binary rehost firmware.elf --work-dir bhf_work \
 
 **Fidelity.** The run JSON and every finding carry a `fidelity` block. The
 CPU runs the real instructions: the Cortex-M3/M4 integer set with the M4's
-halfword multiplies and saturation, the banked stack pointers, `SVC`
-exception entry and return, and the System Control Block registers start-up
-code writes. Peripherals are modelled only as far as their reads go: each
-read returns what its model says (the input's bytes or a constant), writes
-are dropped, and nothing a peripheral does on its own (a FIFO filling, a
-timer counting) happens. With no models and the `zero` default the block
-says peripherals are not modelled. Interrupts, the FPU, the M4's SIMD
-instructions, the MPU and privilege are not modelled. An instruction outside the model
+halfword multiplies and saturation, the banked stack pointers, `SVC` and
+interrupt exception entry and return, the NVIC, and the System Control
+Block registers start-up code writes. Peripherals are modelled only as far
+as their reads go: each read returns what its model says (the input's bytes
+or a constant), writes are dropped, and nothing a peripheral does on its
+own (a FIFO filling, a timer counting) happens; its interrupts come from
+the schedule (`interrupts` says so, or `not modelled` under
+`--no-interrupts`). With no models and the `zero` default the block says
+peripherals are not modelled. The FPU, the M4's SIMD instructions, the MPU
+and privilege are not modelled. An instruction outside the model
 ends the run as `unsupported` in the run JSON's `stops` and `unsupported`
 fields, never as a finding. An UNPREDICTABLE encoding (one that sets a bit
 the architecture says should be clear, say) runs as the instruction it

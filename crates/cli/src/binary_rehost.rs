@@ -17,6 +17,12 @@
 //! that records the machine setup, its MMIO models included; `bhf replay`
 //! runs its testcase through the same machine again and matches the fault
 //! signature.
+//!
+//! Interrupts come from a schedule in the input: every tick takes one input
+//! byte and pends one of the interrupts the firmware has enabled (the byte
+//! picks which, and how long until the next tick), so firmware that sleeps
+//! until its UART or timer interrupts it progresses, and the schedule that
+//! reached a fault is in its testcase.
 
 use anyhow::{anyhow, Context};
 use fuzz_engine_builtin::{
@@ -24,8 +30,9 @@ use fuzz_engine_builtin::{
     ScheduleFeedback,
 };
 use rehost::{
-    CoverageMap, Execution, Fault, Image, InputBuffer, Machine, MachineConfig, MemoryRange,
-    MmioConfig, MmioDefault, MmioModel, MmioModelKind, NotAPoll, Stop, DEFAULT_MAX_INSTRUCTIONS,
+    CoverageMap, Execution, Fault, Image, InputBuffer, InterruptConfig, InterruptEvent, Machine,
+    MachineConfig, MemoryRange, MmioConfig, MmioDefault, MmioModel, MmioModelKind, NotAPoll, Stop,
+    DEFAULT_INTERRUPT_INTERVAL, DEFAULT_MAX_INSTRUCTIONS,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -81,10 +88,13 @@ pub struct BinaryRehostArgs {
     #[arg(long = "input-buffer", value_name = "ADDR|SYMBOL")]
     pub input_buffer: Option<String>,
 
-    /// Bytes the input buffer holds; a longer input is cut to this, and
-    /// peripheral reads that take input take the bytes after it (the buffer
-    /// then takes at most the input's first 4096 bytes). Default: the
-    /// symbol's size.
+    /// Bytes the input buffer holds: it takes up to this many of an input's
+    /// first bytes. The bytes after them go to peripheral reads that take
+    /// input and to the interrupt schedule (on unless `--no-interrupts`);
+    /// while either is on, the buffer takes at most the first 4096 bytes, so
+    /// an input the mutator makes reaches them. With `--no-interrupts` and
+    /// no peripheral read taking input, it takes up to its whole capacity.
+    /// Default: the symbol's size.
     #[arg(long = "input-size", value_name = "BYTES", requires = "input_buffer")]
     pub input_size: Option<u32>,
 
@@ -158,6 +168,29 @@ pub struct BinaryRehostArgs {
     /// lists the loops.
     #[arg(long = "no-mmio-inference")]
     pub no_mmio_inference: bool,
+
+    /// Instructions between two ticks of the interrupt schedule. Each tick
+    /// takes one byte of the input (after the bytes `--input-buffer` holds,
+    /// in order with the peripheral reads) and pends one of the interrupts
+    /// the firmware has enabled in the NVIC, or SysTick: the byte modulo how
+    /// many are enabled picks which, and its top three bits the wait until
+    /// the next tick (this interval, a half, a quarter, one instruction, or
+    /// 2, 4, 8 or 16 times it). A tick with nothing enabled takes no byte; a
+    /// core that sleeps (WFI, WFE, a branch to itself) runs on to the next
+    /// tick, or ends the run when nothing enabled could wake it or the
+    /// input has no byte left.
+    #[arg(
+        long = "interrupt-interval",
+        value_name = "INSTRUCTIONS",
+        default_value_t = DEFAULT_INTERRUPT_INTERVAL,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub interrupt_interval: u64,
+
+    /// Raise no interrupts: the NVIC's registers hold what is written to
+    /// them, nothing is ever taken, and a core that sleeps ends the run.
+    #[arg(long = "no-interrupts")]
+    pub no_interrupts: bool,
 
     /// Runs in the campaign: the seeds, then mutations of the inputs that
     /// reached new edges.
@@ -498,6 +531,9 @@ struct Setup {
     mmio: MmioConfig,
     /// The sites of the models inference added.
     inferred: BTreeSet<Site>,
+    /// The interrupt schedule; `None` raises no interrupts, as a setup
+    /// recorded before there was one does.
+    interrupts: Option<InterruptConfig>,
 }
 
 impl Setup {
@@ -556,6 +592,9 @@ impl Setup {
             max_instructions: args.max_instructions,
             mmio,
             inferred,
+            interrupts: (!args.no_interrupts).then_some(InterruptConfig {
+                interval: args.interrupt_interval,
+            }),
         })
     }
 
@@ -570,6 +609,7 @@ impl Setup {
             exit_at: self.exit_at.clone(),
             max_instructions: self.max_instructions,
             mmio: self.mmio.clone(),
+            interrupts: self.interrupts,
         }
     }
 
@@ -578,13 +618,19 @@ impl Setup {
             .map_err(|error| anyhow!("{}: {error}", self.image.display()))
     }
 
+    /// Whether anything takes the bytes of an input after the buffer's:
+    /// peripheral reads that take input, or the interrupt schedule.
+    fn stream_takes_input(&self) -> bool {
+        self.mmio.takes_input() || self.interrupts.is_some()
+    }
+
     /// The bytes of each input the buffer takes: its capacity, or, when
-    /// peripheral reads take input as well, at most [`MAX_INPUT_LEN`], so
-    /// that the bytes after it reach the peripheral reads in an input the
-    /// mutator can make.
+    /// peripheral reads or the interrupt schedule take input as well, at
+    /// most [`MAX_INPUT_LEN`], so that the bytes after it reach them in an
+    /// input the mutator can make.
     fn buffer_share(&self) -> u32 {
         self.input.map_or(0, |input| {
-            if self.mmio.takes_input() {
+            if self.stream_takes_input() {
                 input.capacity.min(MAX_INPUT_LEN)
             } else {
                 input.capacity
@@ -593,15 +639,15 @@ impl Setup {
     }
 
     /// The longest input a run can use: the buffer's bytes, then what the
-    /// peripheral reads take.
+    /// peripheral reads and the interrupt schedule take.
     fn max_input_len(&self) -> usize {
         let buffer = self.buffer_share().min(MAX_INPUT_LEN);
-        let peripherals = if self.mmio.takes_input() {
+        let stream = if self.stream_takes_input() {
             MAX_INPUT_LEN
         } else {
             0
         };
-        (buffer + peripherals).max(1) as usize
+        (buffer + stream).max(1) as usize
     }
 
     /// How the input reaches the firmware, as a finding's `input.mode`.
@@ -631,6 +677,9 @@ impl Setup {
             "exit_at": self.exit_at.iter().copied().map(hex).collect::<Vec<_>>(),
             "max_instructions": self.max_instructions,
             "mmio": mmio_to_json(&self.mmio, &self.inferred),
+            "interrupts": self.interrupts.map(|interrupts| json!({
+                "interval": interrupts.interval,
+            })),
         })
     }
 
@@ -698,7 +747,24 @@ impl Setup {
                 .ok_or("rehost.setup.max_instructions is missing")?,
             mmio: mmio_from_json(&value["mmio"], "rehost.setup.mmio")?,
             inferred: inferred_from_json(&value["mmio"]),
+            interrupts: interrupts_from_json(&value["interrupts"])?,
         })
+    }
+}
+
+/// The interrupt schedule a setup records; a setup recorded before there was
+/// one (no `interrupts` field) raises none, as its campaign did.
+fn interrupts_from_json(value: &Value) -> Result<Option<InterruptConfig>, String> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Object(_) => match value["interval"].as_u64() {
+            Some(interval) if interval > 0 => Ok(Some(InterruptConfig { interval })),
+            _ => Err(format!(
+                "rehost.setup.interrupts.interval {} is not a number of instructions above zero",
+                value["interval"]
+            )),
+        },
+        other => Err(format!("rehost.setup.interrupts is {other}, not an object")),
     }
 }
 
@@ -792,8 +858,36 @@ fn fidelity(setup: &Setup) -> Value {
         "execution": "rehosted",
         "cpu": "ARMv7-M Thumb-2 integer core (Cortex-M3/M4), interpreted",
         "peripherals": describe_peripherals(&setup.mmio, setup.inferred.len()),
-        "interrupts": "not modelled",
+        "interrupts": describe_interrupts(setup.interrupts),
         "floating_point": "not modelled",
+    })
+}
+
+fn describe_interrupts(interrupts: Option<InterruptConfig>) -> String {
+    match interrupts {
+        None => "not modelled: nothing raises an interrupt, and a core that sleeps ends the run"
+            .to_owned(),
+        Some(InterruptConfig { interval }) => format!(
+            "injected on a schedule the input chooses: each tick (every {interval} instructions, \
+             stretched or shortened by its byte, and whenever the core sleeps) takes one input \
+             byte and pends one of the interrupts the firmware has enabled (NVIC IRQs, SysTick); \
+             taken by priority as the NVIC does, as are the firmware's own pending bits; no \
+             peripheral raises one of its own accord"
+        ),
+    }
+}
+
+/// The interrupts a run took, as far as its log holds them.
+fn interrupts_json(run: &Execution, log: &[InterruptEvent]) -> Value {
+    json!({
+        "taken": run.interrupts,
+        "schedule_bytes": run.interrupt_input,
+        "first": log.iter().map(|event| json!({
+            "at": event.instructions,
+            "exception": event.exception,
+            "irq": event.irq(),
+            "pc": hex(event.pc),
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -846,6 +940,8 @@ fn fault_json(fault: &Fault) -> Value {
         "site": hex(fault.site()),
         "registers": registers,
         "xpsr": hex(fault.xpsr),
+        // The exception whose handler faulted (16 + n for IRQ n), from IPSR.
+        "exception": Some(fault.xpsr & 0x1ff).filter(|&number| number != 0),
     })
 }
 
@@ -882,7 +978,7 @@ fn render_finding(
     dir: &Path,
     target: &Target<'_>,
     input: &[u8],
-    run: &Execution,
+    (run, interrupts): (&Execution, &[InterruptEvent]),
     fault: &Fault,
 ) -> Value {
     json!({
@@ -904,6 +1000,7 @@ fn render_finding(
             "delivered": run.input_delivered,
             "mmio_reads": run.mmio_reads,
             "mmio_bytes": run.mmio_input,
+            "schedule_bytes": run.interrupt_input,
             "testcase": "testcase.bin",
         },
         "crash": {
@@ -917,6 +1014,7 @@ fn render_finding(
             "fault": fault_json(fault),
             "instructions": run.instructions,
             "blocks": run.blocks,
+            "interrupts": interrupts_json(run, interrupts),
             "fidelity": fidelity(target.setup),
         },
         "paths": {
@@ -962,6 +1060,8 @@ struct Campaign<'a> {
     input_not_delivered: usize,
     /// Peripheral registers the runs read.
     mmio_reads: u64,
+    /// Interrupts the runs took.
+    interrupts_taken: u64,
     /// How the first of them ended.
     first_undelivered: Option<String>,
 }
@@ -973,6 +1073,7 @@ impl Campaign<'_> {
         let run = self.machine.run(input);
         self.executions += 1;
         self.mmio_reads += run.mmio_reads;
+        self.interrupts_taken += run.interrupts;
         *self.stops.entry(run.stop.as_str()).or_default() += 1;
         if self.target.setup.input.is_some() && run.input_delivered.is_none() {
             self.input_not_delivered += 1;
@@ -1027,7 +1128,14 @@ impl Campaign<'_> {
             .context("create a finding directory")?;
         fs::write(dir.join("testcase.bin"), input)
             .with_context(|| format!("write {}", dir.join("testcase.bin").display()))?;
-        let mut finding = render_finding(&id, &dir, &self.target, input, run, fault);
+        let mut finding = render_finding(
+            &id,
+            &dir,
+            &self.target,
+            input,
+            (run, self.machine.interrupt_log()),
+            fault,
+        );
         corpus::finding::stamp_v1(&mut finding, corpus::finding::finding_kind::BINARY);
         fs::write(
             dir.join("finding.json"),
@@ -1106,6 +1214,7 @@ fn run_inner(args: &BinaryRehostArgs) -> anyhow::Result<Value> {
         repeated_faults: 0,
         input_not_delivered: 0,
         mmio_reads: 0,
+        interrupts_taken: 0,
         first_undelivered: None,
     };
     let started = Instant::now();
@@ -1174,6 +1283,7 @@ fn run_inner(args: &BinaryRehostArgs) -> anyhow::Result<Value> {
         "repeated_faults": campaign.repeated_faults,
         "input_not_delivered": campaign.input_not_delivered,
         "mmio_reads": campaign.mmio_reads,
+        "interrupts_taken": campaign.interrupts_taken,
         "elapsed_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
     }))
 }
@@ -1259,6 +1369,15 @@ pub(crate) fn replay_rehost_outcome(
             ),
         ));
     }
+    if run.interrupts > 0 {
+        details.push(crate::replay::Detail::new(
+            "interrupts",
+            format!(
+                "{} taken on the testcase's schedule ({} input bytes)",
+                run.interrupts, run.interrupt_input
+            ),
+        ));
+    }
     Ok(crate::replay::LaneReplay {
         lane: "rehost",
         matched,
@@ -1312,6 +1431,8 @@ mod tests {
             mmio_models: None,
             mmio_default: None,
             no_mmio_inference: false,
+            interrupt_interval: DEFAULT_INTERRUPT_INTERVAL,
+            no_interrupts: false,
             iterations: 1,
             time: None,
             seed_inputs: Vec::new(),
@@ -1553,6 +1674,40 @@ mod tests {
     }
 
     #[test]
+    fn the_interrupt_schedule_is_recorded_and_a_setup_without_one_raises_none() {
+        let work = TestDir::new("rehost-setup-interrupts");
+        let (image, _) = load_image(&fixture("irq.elf"), None).unwrap();
+        let mut args = irq_args(&work);
+        args.interrupt_interval = 250;
+        let setup = Setup::from_args(&args, &image).unwrap();
+        assert_eq!(setup.interrupts, Some(InterruptConfig { interval: 250 }));
+        assert_eq!(setup.to_json()["interrupts"], json!({"interval": 250}));
+        assert_eq!(Setup::from_json(&setup.to_json()), Ok(setup.clone()));
+        // A setup recorded before the schedule existed replays without one.
+        let mut old = setup.to_json();
+        old.as_object_mut().unwrap().remove("interrupts");
+        assert_eq!(Setup::from_json(&old).unwrap().interrupts, None);
+        args.no_interrupts = true;
+        let off = Setup::from_args(&args, &image).unwrap();
+        assert_eq!(off.interrupts, None);
+        assert_eq!(off.to_json()["interrupts"], Value::Null);
+        let fidelity = fidelity(&off);
+        assert!(
+            fidelity["interrupts"]
+                .as_str()
+                .unwrap()
+                .starts_with("not modelled"),
+            "{fidelity:#}"
+        );
+        for bad in [json!({"interval": 0}), json!({}), json!(1000)] {
+            let mut broken = setup.to_json();
+            broken["interrupts"] = bad;
+            let error = Setup::from_json(&broken).unwrap_err();
+            assert!(error.contains("rehost.setup.interrupts"), "{error}");
+        }
+    }
+
+    #[test]
     fn mmio_models_parse_from_their_flags_and_bad_ones_are_named() {
         let (image, _) = load_image(&fixture("mmio.elf"), None).unwrap();
         let main = image.symbol("main").unwrap().address;
@@ -1738,8 +1893,14 @@ mod tests {
         let dir = corpus::layout::findings_dir(&work).join(&id);
         let replay = replay_rehost_outcome(&dir, None).unwrap();
         assert!(replay.matched, "{:?}", replay.differences);
-        // With no peripheral input the buffer keeps its whole capacity.
+        // With no peripheral input the interrupt schedule still takes the
+        // bytes after the buffer's share.
         args.mmio_default = Some(MmioDefaultArg::Zero);
+        let setup = Setup::from_args(&args, &image).unwrap();
+        assert_eq!(setup.config().input.unwrap().capacity, 4096);
+        assert_eq!(setup.max_input_len(), 8192);
+        // With neither, the buffer keeps its whole capacity.
+        args.no_interrupts = true;
         let setup = Setup::from_args(&args, &image).unwrap();
         assert_eq!(setup.config().input.unwrap().capacity, 8192);
         assert_eq!(setup.max_input_len(), 4096);
@@ -1961,6 +2122,126 @@ mod tests {
             Setup::from_json(&summary["setup"]).unwrap().inferred,
             BTreeSet::from([(USART_SR, Some(TXE_POLL)), (USART_SR, Some(RXNE_POLL))])
         );
+    }
+
+    /// The interrupt-driven UART fixture (`irq.c`): only its receive
+    /// interrupt's handler reads the UART and calls the frame parser.
+    fn irq_args(work: &Path) -> BinaryRehostArgs {
+        let mut args = args(fixture("irq.elf"), work);
+        args.input_buffer = None;
+        args.input_length = None;
+        args.inject_at = None;
+        args.max_instructions = 200_000;
+        args
+    }
+
+    /// The handler's status read (`ldr r2, [r3, #0]`), which inference
+    /// gives a bit-extract model for RXNE: each tick's interrupt reads it
+    /// once, so over the ticks it is a loop like a status poll's.
+    const IRQ_STATUS_READ: u32 = 0x0800_011a;
+
+    /// `bytes` as the interrupt-driven fixture receives them under the
+    /// model inference gives its status read: the tick's byte (the receive
+    /// interrupt, the plain wait), a byte for RXNE, and the data register.
+    fn received(bytes: &[u8]) -> Vec<u8> {
+        bytes
+            .iter()
+            .flat_map(|&byte| [0x00, 0x01, byte, 0, 0, 0])
+            .collect()
+    }
+
+    /// A received "FUZZW" frame that stores at `offset` in the table: clean
+    /// for an offset inside it.
+    fn received_store(dir: &Path, offset: u32) -> PathBuf {
+        let mut frame = b"FUZZW".to_vec();
+        frame.extend_from_slice(&offset.to_le_bytes());
+        frame.extend_from_slice(b"Z\n");
+        let path = dir.join(format!("seed-irq-{offset:08x}"));
+        fs::write(&path, received(&frame)).unwrap();
+        path
+    }
+
+    #[test]
+    fn an_interrupt_driven_uart_bug_is_found_by_mutation_and_replays_with_its_schedule() {
+        let work = TestDir::new("rehost-irq");
+        let mut args = irq_args(&work);
+        args.seed_files = vec![received_store(&work, 1)];
+        args.iterations = 3000;
+        let summary = run_inner(&args).unwrap();
+        assert_eq!(summary["setup"]["interrupts"], json!({"interval": 1000}));
+        assert_eq!(
+            summary["setup"]["mmio"]["models"],
+            json!([{"address": "0x40011000", "pc": hex(IRQ_STATUS_READ), "model": "bitextract",
+                    "mask": "0x00000020", "inferred": true}]),
+            "{summary:#}"
+        );
+        assert!(
+            summary["interrupts_taken"].as_u64().unwrap() >= 11,
+            "{summary:#}"
+        );
+        let findings = summary["findings"].as_array().unwrap();
+        assert!(!findings.is_empty(), "{summary:#}");
+        let dir = corpus::layout::findings_dir(&work).join(findings[0].as_str().unwrap());
+        let finding: Value =
+            serde_json::from_slice(&fs::read(dir.join("finding.json")).unwrap()).unwrap();
+        let fault = &finding["rehost"]["fault"];
+        assert_eq!(fault["kind"], "write_unmapped", "{finding:#}");
+        assert_eq!(fault["pc"], "0x08000110", "the parser's table store");
+        assert_eq!(fault["exception"], 53, "in USART1's handler (IRQ 37)");
+        let interrupts = &finding["rehost"]["interrupts"];
+        assert!(
+            interrupts["taken"].as_u64().unwrap() >= 11,
+            "{interrupts:#}"
+        );
+        assert_eq!(interrupts["first"][0]["irq"], 37);
+        assert_eq!(interrupts["first"][0]["exception"], 53);
+        assert!(finding["input"]["schedule_bytes"].as_u64().unwrap() >= 11);
+        let described = finding["rehost"]["fidelity"]["interrupts"]
+            .as_str()
+            .unwrap();
+        assert!(described.starts_with("injected"), "{described}");
+        let replay = replay_rehost_outcome(&dir, None).unwrap();
+        assert!(replay.matched, "{:?}", replay.differences);
+        assert!(
+            replay
+                .details
+                .iter()
+                .any(|detail| detail.label == "interrupts"),
+            "{:?}",
+            replay.details
+        );
+        // The recorded schedule is what the replay runs: without it the
+        // firmware sleeps before the handler reads a byte.
+        let mut stripped = finding.clone();
+        stripped["rehost"]["setup"]["interrupts"] = Value::Null;
+        fs::write(dir.join("finding.json"), stripped.to_string()).unwrap();
+        let replay = replay_rehost_outcome(&dir, None).unwrap();
+        assert!(!replay.matched);
+        assert!(
+            replay.differences[0].contains("went idle (wfi)"),
+            "{:?}",
+            replay.differences
+        );
+    }
+
+    #[test]
+    fn with_no_interrupts_the_interrupt_driven_uart_never_reads_its_input() {
+        let work = TestDir::new("rehost-irq-off");
+        let mut args = irq_args(&work);
+        args.seed_files = vec![received_store(&work, 0x0100_0001)];
+        args.iterations = 200;
+        args.no_interrupts = true;
+        let summary = run_inner(&args).unwrap();
+        assert_eq!(summary["findings"], json!([]), "{summary:#}");
+        assert_eq!(summary["setup"]["interrupts"], Value::Null);
+        assert_eq!(summary["interrupts_taken"], 0);
+        assert_eq!(summary["mmio_reads"], 0, "{summary:#}");
+        assert_eq!(summary["stops"]["idle"], summary["executions"]);
+        // The same seed with the schedule faults at once.
+        args.no_interrupts = false;
+        args.iterations = 1;
+        let summary = run_inner(&args).unwrap();
+        assert_eq!(summary["stops"]["fault"], 1, "{summary:#}");
     }
 
     #[test]

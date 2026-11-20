@@ -60,6 +60,24 @@ impl EdgeMap {
         self.previous = id >> 1;
     }
 
+    /// The edge context: the previous block's id, shifted.
+    pub(crate) fn previous(&self) -> u32 {
+        self.previous
+    }
+
+    /// Count the edge into the handler at `address` of exception `number`
+    /// from the exception itself, not from the block it interrupted.
+    pub(crate) fn enter_handler(&mut self, number: u32, address: u32) {
+        self.previous = block_id(0xffff_ff00 | number) >> 1;
+        self.enter(address);
+    }
+
+    /// Go back to an edge context [`EdgeMap::previous`] gave, counting no
+    /// edge.
+    pub(crate) fn resume(&mut self, previous: u32) {
+        self.previous = previous;
+    }
+
     /// The hit count of every slot.
     pub fn counts(&self) -> &[u8] {
         &self.counts

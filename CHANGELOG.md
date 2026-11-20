@@ -5,6 +5,19 @@
 ## Unreleased
 
 ### Added
+- `bhf binary rehost` raises the interrupts the firmware enables on a
+  schedule stored in the testcase (#353): every tick
+  (`--interrupt-interval`, default 1000 instructions) takes one input byte
+  that pends one of the enabled NVIC IRQs or SysTick and sets the wait to
+  the next tick, a sleeping core runs on to the next tick, and the rehost
+  crate models the NVIC's enable, pending, active and priority registers,
+  priority grouping and preemption, and PendSV and SysTick pending bits. A
+  finding records the interrupts taken and the faulting handler's exception
+  (`rehost.interrupts`, `rehost.fault.exception`), the setup records the
+  schedule (`rehost.setup.interrupts`; older findings replay without one),
+  and the run JSON gains `interrupts_taken`. `--no-interrupts` keeps the
+  old behaviour. With interrupts on, an input buffer takes at most the
+  input's first 4096 bytes, as with peripheral input.
 - `bhf kernel import CRASHES... --work-dir DIR [--source-root DIR]` turns
   syzkaller crash directories (or a syz-manager workdir) into findings
   under `results/findings/F-KERNEL-*` (#349): the crash class, rule and CWE

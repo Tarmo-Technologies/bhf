@@ -513,3 +513,83 @@ fn a_data_register_dispatch_loop_keeps_its_input_and_reaches_its_bug_with_infere
         assert_eq!(replay.status.code(), Some(0), "{}", text(&replay));
     }
 }
+
+/// A received "FUZZW" frame for the interrupt-driven UART fixture
+/// (`irq.c`) that stores at `offset` in its table, laid out as the firmware
+/// reads it once inference models its handler's status read: for each byte
+/// of the frame, the interrupt schedule's byte, a byte for RXNE, and the
+/// four bytes of the data register.
+fn received_store(dir: &Path, offset: u32) -> PathBuf {
+    let mut frame = b"FUZZW".to_vec();
+    frame.extend_from_slice(&offset.to_le_bytes());
+    frame.extend_from_slice(b"Z\n");
+    let input: Vec<u8> = frame
+        .iter()
+        .flat_map(|&byte| [0x00, 0x01, byte, 0, 0, 0])
+        .collect();
+    let path = dir.join(format!("seed-irq-{offset:08x}"));
+    fs::write(&path, input).unwrap();
+    path
+}
+
+#[test]
+fn an_rx_interrupt_handler_bug_is_found_and_replays_as_a_match() {
+    let root = TestDir::new("binary-rehost-irq");
+    let work = root.join("work");
+    // An offset inside the table: the seed runs clean, a byte from the bug.
+    let seed = received_store(&root, 1);
+    let campaign = |work: &Path, extra: &[&str]| {
+        bhf()
+            .args(["binary", "rehost"])
+            .arg(fixture("irq.elf"))
+            .arg("--work-dir")
+            .arg(work)
+            .args([
+                "--seed-file",
+                seed.to_str().unwrap(),
+                "--max-instructions",
+                "200000",
+            ])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let run = summary(&campaign(&work, &["--iterations", "3000"]));
+    assert_eq!(run["setup"]["interrupts"]["interval"], 1000, "{run:#}");
+    assert!(run["interrupts_taken"].as_u64().unwrap() > 0, "{run:#}");
+    let findings = run["findings"].as_array().unwrap();
+    assert!(!findings.is_empty(), "{run:#}");
+    for id in findings {
+        let dir = work.join("results/findings").join(id.as_str().unwrap());
+        let finding: Value =
+            serde_json::from_slice(&fs::read(dir.join("finding.json")).unwrap()).unwrap();
+        assert_eq!(
+            finding["rehost"]["fault"]["kind"], "write_unmapped",
+            "{finding:#}"
+        );
+        assert_eq!(finding["rehost"]["fault"]["exception"], 53, "{finding:#}");
+        assert_eq!(finding["rehost"]["interrupts"]["first"][0]["irq"], 37);
+        let replay = bhf().arg("replay").arg(&dir).output().unwrap();
+        assert_eq!(replay.status.code(), Some(0), "{}", text(&replay));
+        let stdout = String::from_utf8_lossy(&replay.stdout);
+        assert!(stdout.starts_with("MATCH"), "{}", text(&replay));
+    }
+    // With no interrupts the handler never runs and nothing is found.
+    let off = summary(&campaign(
+        &root.join("off"),
+        &["--no-interrupts", "--iterations", "300"],
+    ));
+    assert_eq!(off["findings"], serde_json::json!([]), "{off:#}");
+    assert_eq!(off["setup"]["interrupts"], Value::Null);
+    assert_eq!(
+        off["fidelity"]["interrupts"]
+            .as_str()
+            .unwrap()
+            .split(':')
+            .next(),
+        Some("not modelled")
+    );
+    // A zero interval is refused before anything runs.
+    let refused = campaign(&root.join("zero"), &["--interrupt-interval", "0"]);
+    assert_eq!(refused.status.code(), Some(2), "{}", text(&refused));
+}

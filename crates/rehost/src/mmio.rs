@@ -275,6 +275,11 @@ impl Mmio {
         Ok(value)
     }
 
+    /// The next byte of the stream, for the interrupt schedule.
+    pub(crate) fn take_byte(&mut self) -> Option<u8> {
+        self.take(1).ok().map(|value| value as u8)
+    }
+
     /// A read of `size` (1, 2 or 4) bytes at `address` by the instruction at
     /// `pc`, after `instructions` instructions.
     pub(crate) fn read(

@@ -53,9 +53,19 @@
 //! bytes left for ends the run as [`Stop::InputExhausted`]. Peripheral
 //! writes are dropped.
 //!
+//! Interrupts come from a schedule in the input ([`InterruptConfig`]): every
+//! tick takes one byte of the same stream and pends one of the interrupts
+//! the firmware has enabled in the NVIC (or SysTick), the byte choosing
+//! which and how long until the next tick, and a core that waits for an
+//! interrupt runs on to the next tick. The NVIC takes a pending interrupt
+//! when its priority preempts the core's, stacking the frame and entering
+//! the handler as the hardware does; the firmware's own pending bits are
+//! taken the same way. Without a schedule nothing is ever taken.
+//!
 //! What a rehosted run does not model: peripheral behaviour beyond those
-//! reads, interrupts, the floating-point unit, the M4's SIMD instructions,
-//! the MPU and privilege. An instruction outside the model stops the run as
+//! reads (a peripheral never raises an interrupt of its own accord: the
+//! schedule does), the floating-point unit, the M4's SIMD instructions, the
+//! MPU and privilege. An instruction outside the model stops the run as
 //! [`Stop::Unsupported`], a limit of the emulator rather than a fault of the
 //! firmware.
 
@@ -67,9 +77,12 @@ mod cpu;
 mod fault;
 mod image;
 mod infer;
+#[cfg(test)]
+mod irq_tests;
 mod machine;
 mod memory;
 mod mmio;
+mod nvic;
 mod thumb16;
 mod thumb32;
 
@@ -85,3 +98,6 @@ pub use machine::{
     DEFAULT_MAX_INSTRUCTIONS, DEFAULT_RAM_BASE, DEFAULT_RAM_SIZE,
 };
 pub use mmio::{MmioAccess, MmioConfig, MmioDefault, MmioModel, MmioModelKind};
+pub use nvic::{
+    schedule_wait, InterruptConfig, InterruptEvent, DEFAULT_INTERRUPT_INTERVAL, INTERRUPT_LOG_LIMIT,
+};
