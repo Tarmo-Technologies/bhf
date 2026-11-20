@@ -126,7 +126,7 @@
   again.
 - bhf builds and fuzzes natively on Apple Silicon Macs from source (#344): a
   new `macos-build` CI job, which CI acceptance requires, builds the
-  workspace for `aarch64-apple-darwin` on `macos-14` and runs a `bhf auto` C
+  workspace for `aarch64-apple-darwin` on `macos-15` and runs a `bhf auto` C
   smoke. The builtin engine's coverage and CmpLog maps now work on macOS, and
   the C driver and generated C/C++ harnesses leave out the weak references
   Mach-O cannot link there: those to the runtrace shim's hooks, and the one

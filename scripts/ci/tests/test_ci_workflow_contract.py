@@ -72,12 +72,12 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn('"Linux aarch64")', installer)
 
     def test_macos_job_builds_natively_without_the_shim_and_finds_a_bug(self):
-        # A macos-14 runner builds the workspace for aarch64-apple-darwin, runs
+        # A macos-15 runner builds the workspace for aarch64-apple-darwin, runs
         # the shim-gating and shared-map unit tests there, and the auto smoke,
         # which finds the planted bug with the shim-unavailable fidelity, on
         # every heavy change; CI acceptance requires it.
         job = self.jobs["macos-build"]
-        self.assertIn("runs-on: macos-14", job)
+        self.assertIn("runs-on: macos-15", job)
         self.assertIn("if: needs.changes.outputs.heavy == 'true'", job)
         steps = [
             "cargo build --locked --workspace",

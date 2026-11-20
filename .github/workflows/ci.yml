@@ -301,7 +301,7 @@ jobs:
     name: macOS build, shim gating and auto smoke
     needs: changes
     if: needs.changes.outputs.heavy == 'true'
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 75
     steps:
       - name: Checkout

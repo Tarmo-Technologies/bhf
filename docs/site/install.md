@@ -362,7 +362,7 @@ including Visual Studio solutions (`.sln`/`.vcxproj`) via `--probe-build`. See
 
 No macOS release binaries are published yet, but bhf builds and fuzzes
 natively on Apple Silicon (`aarch64-apple-darwin`); CI builds it on a
-`macos-14` runner and checks that `bhf auto` finds a planted C overflow
+`macos-15` runner and checks that `bhf auto` finds a planted C overflow
 there. You need Rust and the Xcode Command Line Tools (`xcode-select
 --install`), whose `clang` and `make` build the C/C++ harnesses with
 AddressSanitizer, UBSan and SanitizerCoverage:

@@ -189,7 +189,7 @@ installers. The runtime and
 compiler-interception preload shims remain Linux-only assets. macOS and
 Windows-on-Arm artifacts are not currently published. CI's `macos-build` job,
 which CI acceptance requires, builds the workspace natively for
-`aarch64-apple-darwin` on a `macos-14` runner (the preload shim crates build
+`aarch64-apple-darwin` on a `macos-15` runner (the preload shim crates build
 empty libraries there and no shim is staged beside `bhf`), runs the shim-gating
 and shared-map unit tests, and runs `scripts/ci/macos-auto-smoke.sh`: `bhf
 auto` finds a planted C overflow, and the target, the campaign rollup and the
