@@ -281,6 +281,10 @@
   (`lint_adhoc_tmp_dirs`) rejects test code that builds one by hand.
 
 ### Fixed
+- The all-language container image ships OpenJDK 21.0.13.1+2 (#445). Its
+  Ubuntu archive snapshot moves to 20261120T000000Z, which carries the fixed
+  `openjdk-21-jdk-headless` and `openjdk-21-jre-headless` for CVE-2026-114938
+  through CVE-2026-114946, so the image scan reports no blockers.
 - A SEGV on a fixed address is taken for a missing device register only when
   the target reads that address as a register: a volatile access that is no
   poison or sentinel value (#437). A fault on a plain pointer constant, such

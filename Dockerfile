@@ -40,7 +40,7 @@ FROM ubuntu:24.04@sha256:ac3a3d13e90c660a1cb3e89ec695533399f7378dc1ae5fbdc28eb57
 COPY --from=certificates /certificates/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 ARG TARGETARCH
 COPY docker/toolchain-platform.sh /usr/local/share/bhf/toolchain-platform.sh
-ARG UBUNTU_SNAPSHOT=20261114T000000Z
+ARG UBUNTU_SNAPSHOT=20261120T000000Z
 # The snapshot service answers 503 under load; retry each fetch with backoff
 # instead of failing the whole build on one busy response.
 RUN printf 'APT::Snapshot "%s";\nAPT::Update::Error-Mode "any";\n' "${UBUNTU_SNAPSHOT}" > /etc/apt/apt.conf.d/50snapshot \
