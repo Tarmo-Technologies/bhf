@@ -105,7 +105,6 @@ jobs:
     timeout-minutes: 15
     runs-on: "ubuntu-22.04"
     outputs:
-      val: ${{ steps.plan.outputs.manifest }}
       tag: ${{ !github.event.pull_request && github.ref_name || '' }}
       tag-flag: ${{ !github.event.pull_request && format('--tag={0}', github.ref_name) || '' }}
       publishing: ${{ !github.event.pull_request }}
@@ -134,7 +133,6 @@ jobs:
           dist host --steps=create --tag="$RELEASE_TAG" --output-format=json > plan-dist-manifest.json
           echo "dist ran successfully"
           cat plan-dist-manifest.json
-          echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
       - name: "Upload dist-manifest.json"
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -150,7 +148,6 @@ jobs:
     timeout-minutes: 15
     runs-on: "ubuntu-22.04"
     outputs:
-      val: ${{ steps.plan.outputs.manifest }}
       tag: ${{ !github.event.pull_request && github.ref_name || '' }}
       tag-flag: ${{ !github.event.pull_request && format('--tag={0}', github.ref_name) || '' }}
       publishing: ${{ !github.event.pull_request }}
@@ -178,7 +175,6 @@ jobs:
           dist plan --output-format=json > plan-dist-manifest.json
           echo "dist ran successfully"
           cat plan-dist-manifest.json
-          echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
       - name: "Upload dist-manifest.json"
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -200,11 +196,11 @@ jobs:
       # needs-based `if` on that matrix job skips it even when the condition is
       # true (a matrix-job evaluation quirk confirmed in release history: an
       # identical `if: always()` probe with this same matrix expanded, while the
-      # gated job skipped). `has_artifacts`/`val` are kept for compatibility.
+      # gated job skipped). The full manifest remains an artifact rather than a
+      # job output because GitHub limits total job outputs to 1 MB.
       artifacts_matrix: ${{ steps.plan.outputs.artifacts_matrix }}
       has_artifacts: ${{ steps.plan.outputs.has_artifacts }}
       pr_run_mode: ${{ steps.plan.outputs.pr_run_mode }}
-      val: ${{ steps.plan.outputs.manifest }}
       tag: ${{ needs.release-plan.outputs.tag }}
       tag-flag: ${{ needs.release-plan.outputs.tag-flag }}
       publishing: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
@@ -216,7 +212,6 @@ jobs:
       - id: plan
         run: |
           set -euo pipefail
-          echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
           pr_run_mode="$(jq -r '.ci.github.pr_run_mode // ""' plan-dist-manifest.json)"
           echo "pr_run_mode=${pr_run_mode}" >> "$GITHUB_OUTPUT"
           if jq -e '(.ci.github.artifacts_matrix.include // []) | length > 0' plan-dist-manifest.json >/dev/null; then
@@ -791,8 +786,6 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       RELEASE_TAG: ${{ needs.plan.outputs.tag }}
     runs-on: "ubuntu-22.04"
-    outputs:
-      val: ${{ steps.host.outputs.manifest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -820,7 +813,6 @@ jobs:
           dist host "--tag=$RELEASE_TAG" --steps=upload --steps=release --output-format=json > dist-manifest.json
           echo "artifacts uploaded and released successfully"
           cat dist-manifest.json
-          echo "manifest=$(jq -c "." dist-manifest.json)" >> "$GITHUB_OUTPUT"
       - name: "Upload dist-manifest.json"
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -841,15 +833,16 @@ jobs:
           rm -f artifacts/*-dist-manifest.json
       - name: Create GitHub Release
         env:
-          PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
-          ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
-          ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
           RELEASE_COMMIT: "${{ github.sha }}"
         run: |
-          # Write and read notes from a file to avoid quoting breaking things
-          echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
-
-          gh release create "$RELEASE_TAG" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+          set -euo pipefail
+          prerelease_flag=()
+          if jq -e '.announcement_is_prerelease == true' dist-manifest.json >/dev/null; then
+            prerelease_flag+=(--prerelease)
+          fi
+          announcement_title="$(jq -er '.announcement_title | strings' dist-manifest.json)"
+          jq -er '.announcement_github_body | strings' dist-manifest.json > "$RUNNER_TEMP/notes.txt"
+          gh release create "$RELEASE_TAG" --target "$RELEASE_COMMIT" "${prerelease_flag[@]}" --title "$announcement_title" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
   announce:
     timeout-minutes: 5
