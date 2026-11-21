@@ -863,6 +863,7 @@ fn afl_workers_are_synced_main_and_secondary_instances() {
 }
 
 /// A heap overflow behind a one-byte check, which AFL++ finds in seconds.
+#[cfg(target_os = "linux")]
 const EASY_OVERFLOW: &str = "#include <stdlib.h>\n\
      int easy_crash(const unsigned char *d, size_t n) {\n\
      \x20   char *slot;\n\
@@ -912,6 +913,7 @@ fn afl_binds_cores_here() -> bool {
 }
 
 /// The run summary of the one AFL++ pass under `work`.
+#[cfg(target_os = "linux")]
 fn afl_run_summary(work: &Path) -> serde_json::Value {
     let summaries: Vec<serde_json::Value> = std::fs::read_dir(work.join("fuzz_runs"))
         .into_iter()
@@ -1128,6 +1130,7 @@ fn kill_targets_left_under(work: &Path) -> Vec<String> {
 }
 
 /// The branches a fuzzer finds one by one, with a CmpLog build.
+#[cfg(target_os = "linux")]
 const BRANCHES: &str = "#include <stddef.h>\n\
      int branches(const unsigned char *d, size_t n) {\n\
      \x20   int r = 0;\n\
