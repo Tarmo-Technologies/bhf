@@ -11132,6 +11132,17 @@ fn runtrace_log_dir(extra_env: &[(String, String)]) -> Option<PathBuf> {
         .and_then(|(_, value)| Path::new(value).parent().map(Path::to_path_buf))
 }
 
+/// Loader environment a setuid Firejail removes before launching the target.
+/// The runner carries it through Firejail's explicit `--env=` channel; direct
+/// and bubblewrap runs continue to inherit the ordinary `Command` environment.
+fn sandbox_loader_env(extra_env: &[(String, String)]) -> Vec<(String, String)> {
+    extra_env
+        .iter()
+        .filter(|(key, _)| key == "LD_PRELOAD" || key == "LD_LIBRARY_PATH")
+        .cloned()
+        .collect()
+}
+
 /// #416: inputs already recorded as crash findings, read from
 /// `<work>/findings/*/testcase.bin`. A crashing input is a finding, not a clean
 /// coverage seed, so it must be kept out of the persisted corpus — even when a
@@ -11370,14 +11381,13 @@ fn run_harness_with_protocol(
     // When a runtrace log is configured (the executable oracles read it), bind
     // its directory read-write into the sandbox so the harness can write events
     // from inside it. No-op when not sandboxed or when it is the events dir.
-    let runner_owned;
-    let runner = match runtrace_log_dir(extra_env) {
-        Some(dir) => {
-            runner_owned = runner.clone().with_rw_binds([dir]);
-            &runner_owned
-        }
-        None => runner,
-    };
+    let mut runner_owned = runner
+        .clone()
+        .with_sandbox_env(sandbox_loader_env(extra_env));
+    if let Some(dir) = runtrace_log_dir(extra_env) {
+        runner_owned = runner_owned.with_rw_binds([dir]);
+    }
+    let runner = &runner_owned;
     let mut command = runner
         .command_for_events(&events_path)
         .map_err(|error| error.to_string())?;
@@ -13578,14 +13588,13 @@ impl ForkServer {
         fs::File::create(&events_path)
             .map_err(|error| format!("create fork-server event log: {error}"))?;
         let scratch = ensure_harness_scratch(work_dir)?;
-        let runner_owned;
-        let runner = match runtrace_log_dir(extra_env) {
-            Some(dir) => {
-                runner_owned = runner.clone().with_rw_binds([dir]);
-                &runner_owned
-            }
-            None => runner,
-        };
+        let mut runner_owned = runner
+            .clone()
+            .with_sandbox_env(sandbox_loader_env(extra_env));
+        if let Some(dir) = runtrace_log_dir(extra_env) {
+            runner_owned = runner_owned.with_rw_binds([dir]);
+        }
+        let runner = &runner_owned;
         let mut command = runner
             .command_for_events(&events_path)
             .map_err(|error| error.to_string())?;
