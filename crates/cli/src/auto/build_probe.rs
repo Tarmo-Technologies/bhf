@@ -4201,6 +4201,15 @@ fn build_command(
             if let Some(home) = writable_probe_home(cwd) {
                 c.arg(format!("--whitelist={}", home.display()));
             }
+            // A setuid Firejail launcher strips LD_PRELOAD before it starts the
+            // sandboxed command. Reintroduce the probe's preload value after
+            // Firejail has dropped privilege so absolute-path and posix_spawn
+            // compiler invocations remain observable inside the sandbox.
+            for (key, value) in env {
+                if key == "LD_PRELOAD" {
+                    c.arg(format!("--env=LD_PRELOAD={value}"));
+                }
+            }
             c.arg("--");
             c.args(args);
             c.current_dir(cwd);
@@ -5384,6 +5393,36 @@ mod tests {
         assert!(env
             .iter()
             .any(|(k, v)| k == "CXX" && v == "/p/intercept/c++"));
+    }
+
+    #[test]
+    fn firejail_reintroduces_the_build_interposer_after_setuid_sanitization() {
+        let env = vec![
+            ("BHF_CC_LOG".to_owned(), "/probe/cc.log".to_owned()),
+            (
+                "LD_PRELOAD".to_owned(),
+                "/probe/libbhf_cc_intercept.so".to_owned(),
+            ),
+        ];
+        let command = build_command(
+            Path::new("/probe/build"),
+            &["sh".to_owned(), "build.sh".to_owned()],
+            &env,
+            Some(Path::new("/usr/bin/firejail")),
+        );
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.contains(&"--env=LD_PRELOAD=/probe/libbhf_cc_intercept.so".to_owned()),
+            "{args:?}"
+        );
+        assert_eq!(
+            args.iter().filter(|arg| arg.starts_with("--env=")).count(),
+            1,
+            "ordinary build environment remains inherited: {args:?}"
+        );
     }
 
     #[test]
