@@ -5,6 +5,8 @@ use clap::ValueEnum;
 use replay_min::{HarnessRunner, SandboxConfig};
 use std::path::{Path, PathBuf};
 
+mod wine_prefix;
+
 /// How a foreign-platform/arch harness is launched. Both variants prefix the
 /// harness argv with an emulator executable (`qemu-aarch64 <harness>` /
 /// `wine <harness>`), so both reuse `HarnessRunner::qemu_user` — wine takes no
@@ -14,6 +16,30 @@ use std::path::{Path, PathBuf};
 pub(crate) enum HarnessWrapper {
     QemuUser { exe: PathBuf, args: Vec<String> },
     Wine { exe: PathBuf },
+}
+
+/// Get the emulator ready before the first harness runs under it: a Wine
+/// runner's prefix is created when it does not exist yet (#394), since Wine
+/// creating it on the first harness start outlasts the fork server's wait and
+/// every input's timeout. Other emulators need nothing. The error is a
+/// toolchain problem on this host, naming what to do.
+pub(crate) fn prepare_wrapper(wrapper: &HarnessWrapper) -> Result<(), String> {
+    match wrapper {
+        HarnessWrapper::Wine { exe } => wine_prefix::ensure_prefix(exe),
+        // An operator's `runner = "wine64"`, a recorded runner or
+        // `--qemu-user wine` runs the harness the same way.
+        HarnessWrapper::QemuUser { exe, .. } => prepare_runner_program(exe),
+    }
+}
+
+/// [`prepare_wrapper`] for a runner given as a program (`bhf binary fuzz
+/// --runner wine`): a Wine loader's prefix is created when it is missing.
+pub(crate) fn prepare_runner_program(program: &Path) -> Result<(), String> {
+    if wine_prefix::is_wine_program(program) {
+        wine_prefix::ensure_prefix(program)
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -29,6 +55,8 @@ pub(crate) enum SandboxModeArg {
 /// beside the harness ([`recorded_runner_for`]) runs it, with a note saying
 /// so; otherwise it runs directly, and a harness built for an architecture
 /// this host cannot run is refused before it runs, naming the flag to pass.
+/// The emulator is made ready first ([`prepare_wrapper`]): a replay on a
+/// machine with no Wine prefix yet creates one before the harness starts.
 pub(crate) fn harness_runner_for(
     harness: PathBuf,
     qemu_user: Option<PathBuf>,
@@ -68,6 +96,9 @@ pub(crate) fn harness_runner_for(
             }
         },
     };
+    if let Some(wrapper) = &wrapper {
+        prepare_wrapper(wrapper)?;
+    }
     Ok(harness_runner_with_wrapper(
         harness,
         wrapper,

@@ -41,7 +41,7 @@ WD="$SCRATCH/gw"; mkdir -p "$SCRATCH/src"; cp "$LIB" "$SCRATCH/src/"
 s=$(date +%s.%N)
 "$BHF" auto --per-target-time "$BUDGET" --reuse-discovery --work-dir "$WD" "$SCRATCH/src" >"$SCRATCH/bhf1.log" 2>&1
 R1=$(echo "$(date +%s.%N) - $s"|bc -l)
-BHF_CWES="$(bhf_cwes "$WD/findings")"
+BHF_CWES="$(bhf_cwes "$WD/results/findings")"
 echo "   bhf run1 wall=${R1}s  CWEs=[$BHF_CWES]"
 echo ">> bhf: run 2 (warm, reuse harnesses)"
 s=$(date +%s.%N)

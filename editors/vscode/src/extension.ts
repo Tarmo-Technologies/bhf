@@ -6,6 +6,7 @@ import path from "node:path";
 import * as vscode from "vscode";
 
 import {
+  DEFAULT_FINDINGS_DIR,
   buildMinimizeProcess,
   buildReplayProcess,
   resolveReproducerPath,
@@ -222,7 +223,7 @@ function readConfig(notifyNoWorkspace: boolean): ExtensionConfig | undefined {
   }
 
   const config = vscode.workspace.getConfiguration("bhf");
-  const findingsDir = config.get<string>("findingsDir", "findings");
+  const findingsDir = config.get<string>("findingsDir", DEFAULT_FINDINGS_DIR);
   return {
     daemonPath: config.get<string>("daemonPath", "bhf-daemon"),
     cliPath: config.get<string>("cliPath", "bhf"),

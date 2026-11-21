@@ -2,30 +2,59 @@
 
 # Installing a BHF Release
 
-Linux releases provide two complete installation choices. Use the all-in-one
-bundle when you want `install.sh` to install the CLI, daemon, both Linux shims,
-harness runtimes, and the checksum-verified content pack together. The pack's
-SHA-256 digests detect accidental changes but do not authenticate its publisher.
-Use the component
-archives when you want to choose and place the files yourself.
+This guide installs the published release files: the full Linux bundle with its `install.sh`, the Linux component archives, and the Windows CLI. To build bhf from source, or for the toolchain each language needs, see [Installing bhf](docs/site/install.md). For the Docker image, see [Running bhf in Docker](docs/site/docker.md).
 
-Every all-in-one bundle also carries `INSTALL.md`, `LICENSE`, `README.md`, and
-`RELEASE_NOTES.md` at its root. These are required release payloads, not optional
-source-tree documentation.
+Use files of one version and one target triple together. The commands below use the x86_64 GNU/Linux files. On 64-bit ARM Linux, use the component archives with `aarch64-unknown-linux-gnu` in place of `x86_64-unknown-linux-gnu`; the full bundle is built for x86_64 only.
 
-Do not mix versions or target triples. The commands below use the published
-x86_64 GNU/Linux artifacts. On 64-bit ARM Linux, use the component archives
-with `aarch64-unknown-linux-gnu` in place of `x86_64-unknown-linux-gnu`; the
-all-in-one bundle is published for x86_64 only.
+## What each package contains
+
+The full bundle, `bhf-dist-<version>-x86_64-unknown-linux-gnu.tar.gz`, extracts to a directory of the same name:
+
+| Path | Contents |
+|---|---|
+| `install.sh` | The installer |
+| `tool/` | `bhf`, `bhf-daemon`, both Linux shims, `bhf-bug-report` and the harness runtimes |
+| `content/packs/current/` | The signed content pack: the static-analysis rule catalog, an SBOM CVE database, a binary CVE database and a seed archive. The release workflow builds the bundle without CVE data or seeds, so those three are empty; [Offline deployment](docs/site/offline-deployment.md) shows how to add them |
+| `README.md`, `RUN-BHF.md` | What bhf does, and how to run it after installing |
+| `docs/` | The user documentation; start at `docs/site/index.md` |
+| `examples/`, `schemas/` | Example projects, and the JSON schemas of bhf's output files |
+| `INSTALL.md`, `README-DIST.md` | This guide, and a summary of the bundle and installer options |
+| `RELEASE_NOTES.md`, `CHANGELOG.md` | The current release, and every change release by release |
+| `LICENSE`, `NOTICE`, `THIRD_PARTY.md` | License and third-party notices |
+| `benchmarks/` | The benchmark write-ups and their results |
+| `smoke/c/` | The C fixture the installer's smoke test fuzzes |
+| `VERSION` | Package name, version, target triple, build time and commit |
+
+Each component archive (`bhf-*.tar.xz`, `bhf-daemon-*`, `bhf_runtrace_shim-*`, `bhf_cc_intercept-*`, and the Windows `.zip` files) holds one component with `README.md`, `INSTALL.md`, `LICENSE` and `CHANGELOG.md`. Each one also holds the documentation, laid out as in the repository: `docs/`, `examples/`, `schemas/`, `benchmarks/`, `RELEASE_NOTES.md`, the license notices (`NOTICE`, `THIRD_PARTY.md`) and the project pages `README.md` links. The `bhf` archive also holds the harness runtimes and `bhf-bug-report.sh`.
 
 ## Choice 1: all-in-one `install.sh` bundle
 
-Download `bhf-dist-<version>-x86_64-unknown-linux-gnu.tar.gz`, its `.sha256`
-sidecar, and its detached `.sig` from the same release. Obtain the verifier,
-publisher key, and operator policy through a separately trusted channel.
-Verification needs Python 3 and an Ed25519-capable OpenSSL; EL7 needs an
-approved newer OpenSSL or a separate verification host. Set `ARCHIVE` to the
-file you received (replace `<version>` below), then:
+### What you need before you start
+
+The bundle is signed with the publisher's Ed25519 key. Before you run anything from it, check the signature with a verifier and key that did not come with the download. Get these three files through a separate trusted channel, such as a contact at the publisher or your organization's software administrator, and keep them outside the extracted bundle:
+
+- **The verifier**: [`scripts/verify-offline-dist.py`](https://github.com/Tarmo-Technologies/bhf/blob/main/scripts/verify-offline-dist.py) from the bhf repository. It needs Python 3.8 or newer and OpenSSL with Ed25519 support. RHEL 7's OpenSSL lacks Ed25519, so verify on a newer host or with a newer OpenSSL there.
+- **The publisher's public key**: 64 hexadecimal characters, and its key ID. Save the key as `publisher.pub`.
+- **A trust policy**: `operator-policy.json`, naming that key. Replace both placeholders with the key ID and the public key:
+
+```json
+{
+  "schema_version": "bhf.policy.v1",
+  "policy_id": "local-install",
+  "update_packs": {
+    "require_signature": true,
+    "trusted_public_keys": {
+      "REPLACE_WITH_KEY_ID": "REPLACE_WITH_64_CHARACTER_PUBLIC_KEY"
+    }
+  }
+}
+```
+
+The `.sha256` file published beside the archive detects a damaged download. The signature, checked against a key you obtained separately, identifies the publisher. `install.sh` checks the content pack's signature against the policy before it changes anything on the host.
+
+### Verify and install
+
+Download the archive, its `.sha256` file and its `.sig` file from the same release. Set `ARCHIVE` to the file name, with the version in place of `<version>`, then run from the download directory:
 
 ```sh
 ARCHIVE='bhf-dist-<version>-x86_64-unknown-linux-gnu.tar.gz'
@@ -39,13 +68,11 @@ cd "${ARCHIVE%.tar.gz}"
 ./install.sh --trust-policy /trusted/operator-policy.json
 ```
 
-The interactive installer selects language toolchains, targets, fuzzers, and
-optional extras. Its default install prefix is `/opt/bhf`, with `bhf`
-and `bhf-daemon` plus the `bhf-bug-report` scrubbed diagnostic collector
-symlinked in `/usr/local/bin`.
+`--verified-copy` writes the exact bytes the verifier checked to a new file, so you extract what was verified.
 
-For automation or an offline host whose system dependencies were staged
-separately:
+The interactive installer asks which language toolchains, targets, fuzzers and extras to set up, installs the system packages they need, and runs the bundled C smoke test before it activates the new install. By default it installs to `/opt/bhf` and links `bhf`, `bhf-daemon` and `bhf-bug-report` into `/usr/local/bin`.
+
+For automation, or for an offline host whose system packages you staged separately:
 
 ```sh
 ./install.sh --non-interactive --trust-policy /trusted/operator-policy.json \
@@ -54,21 +81,31 @@ separately:
   --fuzzers builtin \
   --extras build-recovery,archives
 
-# Add these when the offline host must not contact package or Rust servers:
+# On a host that must not contact package or Rust servers, also pass:
 #   --no-system-packages --no-rustup
 ```
 
-Run `./install.sh --help` for custom prefixes, dependency controls, seed
-installation, smoke-test controls, and every available language profile.
-The policy must independently pin a publisher public key under
-`update_packs.trusted_public_keys` and set `require_signature: true`.
-Checksum-only legacy content requires explicit `--allow-legacy-integrity-only`
-instead; neither it nor a same-channel `.sha256` sidecar authenticates the
-publisher or the unverified installer.
+`./install.sh --help` lists every option: the prefix, the symlink directory, package-manager control, seed installation and the smoke test. A content pack built in the older checksum-only format installs only with `--allow-legacy-integrity-only` in place of `--trust-policy`; that format carries no publisher signature.
+
+### After installing
+
+The install prefix (`/opt/bhf` by default) holds:
+
+| Path | Contents |
+|---|---|
+| `bhf`, `bhf-daemon` | The CLI and the JSON-RPC/MCP daemon |
+| `libbhf_runtrace.so`, `libbhf_runtrace_shim.so`, `libbhf_cc_intercept.so` | The runtime shim (under both names) and the compiler-interception shim |
+| `bhf-bug-report` | The scrubbed support-report collector |
+| `packs/` | Installed content packs |
+| `README.md`, `RUN-BHF.md`, `docs/` | The documentation; start at `docs/site/index.md` |
+
+Run `bhf --help`, then follow `RUN-BHF.md` in the bundle or [First run](README.md#first-run) in the README.
+
+To update, run `install.sh` from the newer bundle. It replaces the binaries, runtimes and documentation, keeps `<prefix>/packs/` and `<prefix>/corpora/`, and moves the previous install to `<prefix>.backup.<timestamp>`. Work directories live outside the prefix and are left alone.
 
 ## Choice 2: manually co-locate component archives
 
-Download the CLI plus the two Linux shims and their checksum sidecars:
+Download the CLI and the two Linux shims with their `.sha256` files:
 
 ```text
 bhf-x86_64-unknown-linux-gnu.tar.xz
@@ -76,8 +113,7 @@ bhf_runtrace_shim-x86_64-unknown-linux-gnu.tar.xz
 bhf_cc_intercept-x86_64-unknown-linux-gnu.tar.xz
 ```
 
-The daemon archive is optional and is needed only for IDE, JSON-RPC, or MCP
-use. Verify and extract the selected archives from their download directory:
+The daemon archive is needed only for an IDE, JSON-RPC or MCP. Verify and extract the archives in their download directory:
 
 ```sh
 sha256sum -c bhf-x86_64-unknown-linux-gnu.tar.xz.sha256
@@ -89,8 +125,7 @@ tar xf bhf_runtrace_shim-x86_64-unknown-linux-gnu.tar.xz
 tar xf bhf_cc_intercept-x86_64-unknown-linux-gnu.tar.xz
 ```
 
-Copy the two libraries into the CLI directory. This gives both components one
-reliable automatic-discovery layout:
+Copy both libraries into the CLI directory, where bhf finds them:
 
 ```sh
 CLI_DIR=bhf-x86_64-unknown-linux-gnu
@@ -105,7 +140,7 @@ install -m 0755 \
 "./$CLI_DIR/bhf" --version
 ```
 
-You can run in place or copy the co-located directory to a permanent prefix:
+Run bhf from that directory, or copy the directory to a permanent prefix:
 
 ```sh
 PREFIX="${BHF_PREFIX:-$HOME/.local/share/bhf}"
@@ -118,27 +153,7 @@ install -m 0755 "$CLI_DIR/bhf-bug-report.sh" "$PREFIX/bhf-bug-report"
 ln -sfn "$PREFIX/bhf-bug-report" "$BIN_DIR/bhf-bug-report"
 ```
 
-The wrapper runs the CLI's built-in collector. Either form works:
-
-```sh
-bhf-bug-report /path/to/bhf_work
-bhf bug-report /path/to/bhf_work --stdout
-
-# Bundle the scrubbed diagnostics into an offline archive to share with a
-# maintainer. `--preview` first shows exactly what would be included:
-bhf bug-report /path/to/bhf_work --preview
-bhf bug-report /path/to/bhf_work --bundle bhf-bug-report.tar.gz
-```
-
-The bundle works entirely offline. It carries only scrubbed, bounded
-diagnostics — the compact support report, bhf's own internal-issue log if
-any, and a manifest describing every field — and never source, corpus, findings
-inputs, environment values, usernames, hostnames, or absolute paths. A built-in
-self-test scans every field for the work-dir path, username, and hostname and
-refuses to write an archive that leaks any.
-
-To add the optional daemon, extract its archive, copy `bhf-daemon` into the
-same prefix, and create a matching symlink:
+To add the daemon, extract its archive, copy `bhf-daemon` into the same prefix, and link it:
 
 ```sh
 tar xf bhf-daemon-x86_64-unknown-linux-gnu.tar.xz
@@ -147,35 +162,49 @@ install -m 0755 \
 ln -sfn "$PREFIX/bhf-daemon" "$BIN_DIR/bhf-daemon"
 ```
 
-If policy requires the libraries to remain elsewhere, set absolute paths
-instead of copying them:
+If the libraries must stay somewhere else, set their absolute paths instead of copying them:
 
 ```sh
 export BHF_RUNTRACE_SHIM=/absolute/path/libbhf_runtrace_shim.so
 export BHF_CC_INTERCEPT=/absolute/path/libbhf_cc_intercept.so
 ```
 
-The runtrace shim provides runtime auditing, behavioral/taint oracles, and fake
-resources. The compiler-interception shim enables complex C/C++ build recovery
-for compiler processes launched by absolute path or `posix_spawn`.
+The runtrace shim provides the runtime audit, the sink and behavioural oracles, and fake resources. The compiler-interception shim records the compiler commands of a C/C++ build, including compilers started by absolute path or through `posix_spawn`, for `--probe-build` and `--build-command`. bhf also finds the runtrace shim in its extracted archive directory beside the CLI directory. The compiler-interception shim must sit beside `bhf`, or `BHF_CC_INTERCEPT` must name it.
 
-The runtrace shim can also be found in its sibling extracted archive directory.
-The compiler-interception shim cannot: keep it directly beside `bhf` or set
-`BHF_CC_INTERCEPT` to its absolute path.
+Every component archive carries `README.md`, this guide and the complete documentation in `docs/`, as the full bundle does; start at `docs/site/index.md`. [Installing bhf](docs/site/install.md) lists the supported operating systems and each language's prerequisites.
 
-See `README.md` in the same archive and the
-[online installation guide](https://github.com/Tarmo-Technologies/bhf/blob/main/docs/site/install.md)
-for supported operating systems and per-language toolchain prerequisites.
+## Windows
 
-### Selected language installations
+`bhf-installer.ps1` and `bhf-daemon-installer.ps1` install the native x64 CLI and daemon. For an offline host, verify `bhf-x86_64-pc-windows-msvc.zip` against its `.sha256` file and extract it. The [Windows guide](docs/site/windows.md) covers the Visual Studio Build Tools, LLVM and make that C and C++ fuzzing needs, and how each language lane runs on Windows.
 
-All sixteen languages remain the default; AI/LLM features remain opt-in at build
-and invocation time. Container `--languages` controls installed toolchains,
-while `bhf auto --languages` controls only the current run. For example:
+## Support reports
+
+When bhf itself fails on a tree, `bhf-bug-report` collects a scrubbed support report from the work directory. Both forms run the CLI's built-in collector:
+
+```sh
+bhf-bug-report /path/to/bhf_work
+bhf bug-report /path/to/bhf_work --stdout
+
+# Bundle the scrubbed diagnostics into an archive to share with a
+# maintainer. `--preview` first shows exactly what the archive would hold:
+bhf bug-report /path/to/bhf_work --preview
+bhf bug-report /path/to/bhf_work --bundle bhf-bug-report.tar.gz
+```
+
+The bundle is built offline. It holds the compact support report, bhf's own internal-issue log when there is one, and a manifest describing every field. Source, corpus, finding inputs, environment values, user names, host names and absolute paths are left out, and a self-test scans the archive for the work-directory path, user name and host name and refuses to write it if any appears.
+
+## Selected language installations
+
+All sixteen languages are installed by default; LLM features are a separate build option. Choosing languages at install time decides which toolchains are installed, while `bhf auto --languages` limits one run. In a source checkout, build a container image with only the Java and Python toolchains:
 
 ```sh
 scripts/build-container-release.sh bhf:java-python --languages java,python
 ```
 
-For an extracted native bundle: `./install.sh --non-interactive --no-content --languages java,python` (one shell command). See [selection and dependency details](docs/site/docker.md#installation-selection-versus-run-selection) for aliases, conflicts,
-shared dependencies, engine opt-outs, and current executed evidence.
+From the extracted full bundle:
+
+```sh
+./install.sh --non-interactive --no-content --languages java,python
+```
+
+[Installation selection versus run selection](docs/site/docker.md#installation-selection-versus-run-selection) lists the aliases, conflicts, shared dependencies and engine opt-outs.

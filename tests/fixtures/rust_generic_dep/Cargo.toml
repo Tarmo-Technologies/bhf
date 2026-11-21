@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# #409 fixture: a target crate (`app`) whose dependency (`shapes`) sorts its
+# own types through a generic method of another crate (`keysort`), so the
+# instances of core's stable sort live in `shapes`, spread over its codegen
+# units. Its own workspace detaches it from bhf's.
+
+[workspace]
+resolver = "2"
+members = ["app", "shapes", "keysort"]

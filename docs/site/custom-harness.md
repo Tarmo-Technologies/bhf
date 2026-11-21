@@ -2,30 +2,19 @@
 
 # Custom C and C++ Harnesses
 
-`bhf auto` writes harnesses for you. When an API needs setup that a generated
-harness cannot guess, or you already have a libFuzzer-style entry point, you
-can write the harness yourself and still use bhf's build, fuzzing engine and
-triage tools. This page describes three routes:
+`bhf auto` writes harnesses for you. When an API needs setup that a generated harness cannot guess, or you already have a libFuzzer-style entry point, you can write the harness yourself and still use bhf's build, fuzzing engine and triage tools. This page describes three routes:
 
-1. Write an `LLVMFuzzerTestOneInput` entry point and let `generate-harness`
-   wrap it.
-2. Let bhf generate a harness for the function or method closest to what you
-   need, then edit its `bhf_run_one` body.
+1. Write an `LLVMFuzzerTestOneInput` entry point and let `generate-harness` wrap it.
+2. Let bhf generate a harness for the function or method closest to what you need, then edit its `bhf_run_one` body.
 3. Fuzz an executable you cannot rebuild as a binary-only target.
 
-A project with an OSS-Fuzz or ClusterFuzzLite integration needs none of
-them: see [Import an OSS-Fuzz build](#import-an-oss-fuzz-build).
+A project with an OSS-Fuzz or ClusterFuzzLite integration needs none of them: see [Import an OSS-Fuzz build](#import-an-oss-fuzz-build).
 
-All commands below use one work directory, `bhf_work`. Generate harnesses
-into `bhf_work/harnesses/<id>/`, the layout `bhf auto` uses. `bhf build`,
-`bhf fuzz`, `bhf explain` and `bhf capsule` find a harness there from the work
-directory and its id, and `bhf replay` and `bhf minimize` from the finding (see
-[Triage](#triage)).
+All commands below use one work directory, `bhf_work`. Generate harnesses into `bhf_work/harnesses/<id>/`, the layout `bhf auto` uses. `bhf build`, `bhf fuzz`, `bhf explain` and `bhf capsule` find a harness there from the work directory and its id, and `bhf replay` and `bhf minimize` from the finding (see [Triage](#triage)).
 
 ## 1. Write an `LLVMFuzzerTestOneInput` entry point
 
-Write the entry point the way you would for libFuzzer. It receives one input
-per call and drives the code under test:
+Write the entry point the way you would for libFuzzer. It receives one input per call and drives the code under test:
 
 ```cpp
 // harness/drive_codec.cpp
@@ -43,11 +32,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 - In C++, declare it `extern "C"`.
 - Return 0 and do not call `exit()`: the same process runs many inputs.
 - Do not define `main`. bhf supplies the driver.
-- Keep it deterministic, and reset any global state the code under test keeps
-  between calls.
+- Keep it deterministic, and reset any global state the code under test keeps between calls.
 
-Wrap it with `generate-harness`. List the library sources it calls with
-`--extra-source` and their header directories with `--extra-include`:
+Wrap it with `generate-harness`. List the library sources it calls with `--extra-source` and their header directories with `--extra-include`:
 
 ```sh
 bhf generate-harness harness/drive_codec.cpp \
@@ -57,30 +44,13 @@ bhf generate-harness harness/drive_codec.cpp \
   --extra-include lib/include --extra-include lib/src
 ```
 
-The generated `main.cpp` (or `main.c`) is a passthrough: bhf's own `main`,
-framed fork-server driver and SanitizerCoverage runtime (edge coverage,
-cmplog, value profile), forwarding each input to your entry point. It is not
-built with `-fsanitize=fuzzer`.
+The generated `main.cpp` (or `main.c`) is a passthrough: bhf's own `main`, framed fork-server driver and SanitizerCoverage runtime (edge coverage, cmplog, value profile), forwarding each input to your entry point. It is not built with `-fsanitize=fuzzer`.
 
-`bhf auto` finds the same entry point. When the tree has other targets, a
-driver is skipped unless you select it with `--target LLVMFuzzerTestOneInput`,
-`--target-file harness/drive_codec.cpp` or its `--harness-id`; auto prints a
-note naming the drivers it skipped. Pointing `bhf auto` at a directory that
-holds only your driver works too:
-`bhf auto harness/ --extra-source lib/src/codec.cpp --extra-include lib/include`.
-Discovery skips the usual homes of a driver. It never looks in
-`harnesses`, `generated_harnesses`, `bhf_work` or `build`. By default it also
-skips any directory whose name contains `fuzz` or `test` (`fuzz/`, `fuzzers/`,
-`my_fuzz/`, `tests/`), and directories such as `tools`, `bin`, `examples`,
-`samples` and `contrib`. `--include-dir <name>` restores one of the default
-skips (`--include-dir fuzzers`), or run `bhf auto` on the driver's directory
-itself as above.
+`bhf auto` finds the same entry point. When the tree has other targets, a driver is skipped unless you select it with `--target LLVMFuzzerTestOneInput`, `--target-file harness/drive_codec.cpp` or its `--harness-id`; auto prints a note naming the drivers it skipped. Pointing `bhf auto` at a directory that holds only your driver works too: `bhf auto harness/ --extra-source lib/src/codec.cpp --extra-include lib/include`. Discovery skips the usual homes of a driver. It never looks in `harnesses`, `generated_harnesses`, `bhf_work` or `build`. By default it also skips any directory whose name contains `fuzz` or `test` (`fuzz/`, `fuzzers/`, `my_fuzz/`, `tests/`), and directories such as `tools`, `bin`, `examples`, `samples` and `contrib`. `--include-dir <name>` restores one of the default skips (`--include-dir fuzzers`), or run `bhf auto` on the driver's directory itself as above.
 
 ## 2. Generate a harness for a function or method
 
-To call one function or method directly, name it with `--target`. For C and
-C++ sources `--target` is required. These C++ spellings all select
-`widgets::Codec::decode`:
+To call one function or method directly, name it with `--target`. For C and C++ sources `--target` is required. These C++ spellings all select `widgets::Codec::decode`:
 
 | Spelling | Example |
 |---|---|
@@ -89,14 +59,7 @@ C++ sources `--target` is required. These C++ spellings all select
 | Fully qualified, as `bhf list targets` prints it | `widgets::Codec::decode` |
 | Any of those with a parameter list | `Codec::decode(const unsigned char *, size_t)` |
 
-An exact spelling wins over a suffix: with a global `Codec` and a
-`widgets::Codec` in the same file, `Codec::decode` names the global one and
-only a spelling no definition has exactly falls back to the suffix match. A
-leading `::` (`::Codec::decode`) names the global namespace only. When a
-spelling matches several definitions (overloads, or two classes named `Codec`
-in different namespaces), bhf picks the first, prints all of them, and
-`--target-line N` picks one. A name that matches nothing fails with the
-closest definitions in the file.
+An exact spelling wins over a suffix: with a global `Codec` and a `widgets::Codec` in the same file, `Codec::decode` names the global one and only a spelling no definition has exactly falls back to the suffix match. A leading `::` (`::Codec::decode`) names the global namespace only. When a spelling matches several definitions (overloads, or two classes named `Codec` in different namespaces), bhf picks the first, prints all of them, and `--target-line N` picks one. A name that matches nothing fails with the closest definitions in the file.
 
 ```sh
 bhf list targets lib/src --top 20
@@ -105,10 +68,7 @@ bhf generate-harness lib/src/codec.cpp --target Codec::decode \
   --extra-source lib/src/table.cpp --extra-include lib/include
 ```
 
-The harness default-constructs the receiver (or uses a supported constructor
-or factory) and decodes each parameter from the input. To change how
-arguments are built, edit the body of `bhf_run_one` in the generated
-`main.cpp`:
+The harness default-constructs the receiver (or uses a supported constructor or factory) and decodes each parameter from the input. To change how arguments are built, edit the body of `bhf_run_one` in the generated `main.cpp`:
 
 ```cpp
 extern "C" int bhf_run_one(const uint8_t *Data, size_t Size) {
@@ -122,9 +82,7 @@ extern "C" int bhf_run_one(const uint8_t *Data, size_t Size) {
 }
 ```
 
-Leave the rest of the file alone: it is the driver `bhf fuzz` talks to. The
-`bhf_cursor` helpers in `c_runtime/bhf_decode.h` take typed values from the
-input. Running `generate-harness` again overwrites your edits, so keep a copy.
+Leave the rest of the file alone: it is the driver `bhf fuzz` talks to. The `bhf_cursor` helpers in `c_runtime/bhf_decode.h` take typed values from the input. Running `generate-harness` again overwrites your edits, so keep a copy.
 
 ## Build
 
@@ -132,36 +90,18 @@ input. Running `generate-harness` again overwrites your edits, so keep a copy.
 bhf build bhf_work --harness H-XCODEC
 ```
 
-`bhf build` runs `make main` in `bhf_work/harnesses/H-XCODEC/` and stages the
-binary at `bhf_work/build/H-XCODEC/main`. It also accepts the harness
-directory itself (`bhf build bhf_work/harnesses/H-XCODEC`) and prints the
-equivalent command. With more than one harness and no `--harness`, or an
-unknown id, it lists the ids it found.
+`bhf build` runs `make main` in `bhf_work/harnesses/H-XCODEC/` and stages the binary at `bhf_work/build/H-XCODEC/main`. It also accepts the harness directory itself (`bhf build bhf_work/harnesses/H-XCODEC`) and prints the equivalent command. With more than one harness and no `--harness`, or an unknown id, it lists the ids it found.
 
-`bhf build` has no repair loop; `bhf auto` does. When a build fails, it
-prints what was missing and the exact fix:
+`bhf build` has no repair loop; `bhf auto` does. When a build fails, it prints what was missing and the exact fix:
 
-- Undefined symbols: the in-tree source files that define them, with the
-  `--extra-source` flags to add when regenerating and an `AUTO_EXTRA_SOURCES`
-  command that builds without regenerating. They are looked for around the
-  target and in the directories of the harness's other sources and include
-  dirs (the `--extra-source`/`--extra-include` paths it was generated with),
-  so the `harness/` + `lib/` layout above works outside a git checkout too.
-- Standard streams used without their header (`cerr`, `cout`, `endl`,
-  `std::istream`): an `AUTO_EXTRA_INCLUDES='-include iostream'` command.
-- Standard-library names used without `std::` (`string`, `map`, `vector`,
-  `list`, `pair`, the other containers, `shared_ptr`, `runtime_error`): a
-  prelude header and the command that force-includes it. See
-  [Headers that rely on `using namespace std;`](#headers-that-rely-on-using-namespace-std).
-- A member declared with an extra class qualification, which only MSVC
-  accepts by default: `-fms-extensions` for clang++ (`-fpermissive` for g++).
+- Undefined symbols: the in-tree source files that define them, with the `--extra-source` flags to add when regenerating and an `AUTO_EXTRA_SOURCES` command that builds without regenerating. They are looked for around the target and in the directories of the harness's other sources and include dirs (the `--extra-source`/`--extra-include` paths it was generated with), so the `harness/` + `lib/` layout above works outside a git checkout too.
+- Standard streams used without their header (`cerr`, `cout`, `endl`, `std::istream`): an `AUTO_EXTRA_INCLUDES='-include iostream'` command.
+- Standard-library names used without `std::` (`string`, `map`, `vector`, `list`, `pair`, the other containers, `shared_ptr`, `runtime_error`): a prelude header and the command that force-includes it. See [Headers that rely on using namespace std](#headers-that-rely-on-using-namespace-std).
+- A member declared with an extra class qualification, which only MSVC accepts by default: `-fms-extensions` for clang++ (`-fpermissive` for g++).
 
-Each suggested command keeps the `AUTO_EXTRA_*`, `CXX_STD` and `C_STD` values
-the build ran with. When several fixes apply, the last hint line combines them
-into one command.
+Each suggested command keeps the `AUTO_EXTRA_*`, `CXX_STD` and `C_STD` values the build ran with. When several fixes apply, the last hint line combines them into one command.
 
-Add compiler and linker input through these environment variables. The
-Makefile appends them to its own flags:
+Add compiler and linker input through these environment variables. The Makefile appends them to its own flags:
 
 | Variable | Adds |
 |---|---|
@@ -177,17 +117,9 @@ CXX_STD=gnu++14 AUTO_EXTRA_INCLUDES="-DWIDGETS_LEGACY=1 -include iostream" \
 
 ### Headers that rely on `using namespace std;`
 
-Pre-standard C++ headers often write `string`, `map<string, int>` or
-`list<T>` without `std::`, because every source of the project puts
-`using namespace std;` before including them. The generated `main.cpp` does
-not, so the build fails with `unknown type name 'string'` or `no template
-named 'map'` (clang++), or `'map' does not name a type` (g++).
-`-include string` alone does not fix that: the names stay unqualified.
+Pre-standard C++ headers often write `string`, `map<string, int>` or `list<T>` without `std::`, because every source of the project puts `using namespace std;` before including them. The generated `main.cpp` does not, so the build fails with `unknown type name 'string'` or `no template named 'map'` (clang++), or `'map' does not name a type` (g++). `-include string` alone does not fix that: the names stay unqualified.
 
-`bhf build` names the standard types it saw, writes a prelude header with
-their headers and a `using` declaration for each into the harness directory
-(`bhf_work/harnesses/<id>/std_prelude.h`), and prints the command that
-force-includes it into every translation unit:
+`bhf build` names the standard types it saw, writes a prelude header with their headers and a `using` declaration for each into the harness directory (`bhf_work/harnesses/<id>/std_prelude.h`), and prints the command that force-includes it into every translation unit:
 
 ```cpp
 #pragma once
@@ -210,36 +142,11 @@ AUTO_EXTRA_INCLUDES="-include $PWD/bhf_work/harnesses/H-XRECORD/std_prelude.h" \
   bhf build bhf_work --harness H-XRECORD
 ```
 
-The project's own sources build with the prelude too: next to their
-`using namespace std;`, `using std::string;` names the same type. When the
-next build reports more names, `bhf build` adds their `#include` and `using`
-lines to the same file and leaves every other line as it is, including lines
-you added, so run the same command again. Errors in C code (`.c` sources and
-the headers they include) get no prelude: a C source's `list` or `stack` is
-its own type, which needs the project header that declares it. An
-unqualified stream object such as `cerr` gets the `-include iostream` hint
-while that is enough. It goes into the prelude when other names need one or
-the build already force-includes the prelude, when the compiler shows that
-`std::cerr` is already declared, or when `-include iostream` is already set.
-Delete a `using` line whose name a project source declares itself.
+The project's own sources build with the prelude too: next to their `using namespace std;`, `using std::string;` names the same type. When the next build reports more names, `bhf build` adds their `#include` and `using` lines to the same file and leaves every other line as it is, including lines you added, so run the same command again. Errors in C code (`.c` sources and the headers they include) get no prelude: a C source's `list` or `stack` is its own type, which needs the project header that declares it. An unqualified stream object such as `cerr` gets the `-include iostream` hint while that is enough. It goes into the prelude when other names need one or the build already force-includes the prelude, when the compiler shows that `std::cerr` is already declared, or when `-include iostream` is already set. Delete a `using` line whose name a project source declares itself.
 
-To write a prelude by hand, list the headers and names your sources use
-(`<algorithm>` with `using std::min;`, `<iostream>` with `using std::cerr;`),
-save it anywhere, and force-include it the same way, by its absolute path as
-the hint does.
+To write a prelude by hand, list the headers and names your sources use (`<algorithm>` with `using std::min;`, `<iostream>` with `using std::cerr;`), save it anywhere, and force-include it the same way, by its absolute path as the hint does.
 
-`bhf auto` applies the prelude itself. When one of its C++ harness builds
-fails on such names, it writes (or extends) that harness's
-`std_prelude.h` by the same rules, force-includes it into every translation
-unit of the harness's builds, and builds again, adding names while a rebuild
-reports more (clang++ stops after 20 errors), then prints one note naming
-the types. A name the scanned tree declares as a C++ type of its own is left
-out; for a use written as a template (`list<string>`) only its own template
-of that name counts, and a C struct in C code never does. `run.json` records
-the repair as `std_prelude`, and if the build still fails, `missing-deps.txt`
-says the names are standard ones used without `std::` and names the prelude
-instead of asking for a header. A prelude you wrote by hand reaches
-`bhf auto` through `AUTO_EXTRA_INCLUDES` as well:
+`bhf auto` applies the prelude itself. When one of its C++ harness builds fails on such names, it writes (or extends) that harness's `std_prelude.h` by the same rules, force-includes it into every translation unit of the harness's builds, and builds again, adding names while a rebuild reports more (clang++ stops after 20 errors), then prints one note naming the types. A name the scanned tree declares as a C++ type of its own is left out; for a use written as a template (`list<string>`) only its own template of that name counts, and a C struct in C code never does. `run.json` records the repair as `std_prelude`, and if the build still fails, `missing-deps.txt` says the names are standard ones used without `std::` and names the prelude instead of asking for a header. A prelude you wrote by hand reaches `bhf auto` through `AUTO_EXTRA_INCLUDES` as well:
 
 ```sh
 AUTO_EXTRA_INCLUDES="-include $PWD/my_prelude.h" bhf auto lib --work-dir bhf_auto
@@ -251,19 +158,13 @@ AUTO_EXTRA_INCLUDES="-include $PWD/my_prelude.h" bhf auto lib --work-dir bhf_aut
 bhf fuzz bhf_work --harness H-XCODEC --time 60s --seed-file samples/record.bin
 ```
 
-`--seed-file` passes the file's bytes unchanged, so binary samples are safe.
-Repeat it for several seeds. `--seed-input` takes a literal text seed.
+`--seed-file` passes the file's bytes unchanged, so binary samples are safe. Repeat it for several seeds. `--seed-input` takes a literal text seed.
 
-`generate-harness` writes `dictionary.txt` next to `main.cpp`, mined from the
-target file and its headers: one quoted token per line, used for token
-insertion. For a passthrough harness it is mined from your driver and can
-contain noise such as `"C"` from `extern "C"`. Edit it and add the magic
-values your format uses.
+`generate-harness` writes `dictionary.txt` next to `main.cpp`, mined from the target file and its headers: one quoted token per line, used for token insertion. For a passthrough harness it is mined from your driver and can contain noise such as `"C"` from `extern "C"`. Edit it and add the magic values your format uses.
 
 ## Triage
 
-Findings are written under `bhf_work/results/findings/<finding-id>/` with
-`finding.json`, the input (`testcase.bin`) and a standalone `replay.py`.
+Findings are written under `bhf_work/results/findings/<finding-id>/` with `finding.json`, the input (`testcase.bin`) and a standalone `replay.py`.
 
 ```sh
 bhf replay --finding bhf_work/results/findings/<finding-id> \
@@ -274,19 +175,7 @@ bhf explain --work-dir bhf_work --finding-id <finding-id>
 python3 bhf_work/results/findings/<finding-id>/replay.py
 ```
 
-`--harness` is optional for `bhf replay` and `bhf minimize`: without it, each
-runs the finding's own harness, resolved in the work directory from its
-`fixture_path` and `harness_id`. The binary `bhf build`
-stages at `bhf_work/build/<id>/main` works as well as the one next to
-`main.c` / `main.cpp`. `bhf capsule` and `bhf verify-poc` package C and C++
-findings whatever the harness id; the language comes from the harness's
-`generation-metadata.json`. A capsule rebuilds the harness from what the
-harness directory records: `bhf build` writes the build recipe
-(`coverage-build-recipe.json`) after a successful build, with the
-`AUTO_EXTRA_SOURCES`, `AUTO_EXTRA_INCLUDES` and `AUTO_EXTRA_LDFLAGS` values,
-the `CXX_STD`/`C_STD` standard and the `[toolchain]` flags it was built with,
-as `bhf auto` does for its builds, so the capsule rebuilds with them without
-them set:
+`--harness` is optional for `bhf replay` and `bhf minimize`: without it, each runs the finding's own harness, resolved in the work directory from its `fixture_path` and `harness_id`. The binary `bhf build` stages at `bhf_work/build/<id>/main` works as well as the one next to `main.c` / `main.cpp`. `bhf capsule` and `bhf verify-poc` package C and C++ findings whatever the harness id; the language comes from the harness's `generation-metadata.json`. A capsule rebuilds the harness from what the harness directory records: `bhf build` writes the build recipe (`coverage-build-recipe.json`) after a successful build, with the `AUTO_EXTRA_SOURCES`, `AUTO_EXTRA_INCLUDES` and `AUTO_EXTRA_LDFLAGS` values, the `CXX_STD`/`C_STD` standard and the `[toolchain]` flags it was built with, as `bhf auto` does for its builds, so the capsule rebuilds with them without them set:
 
 ```sh
 bhf capsule --work-dir bhf_work --finding-id <finding-id>
@@ -295,38 +184,22 @@ bhf verify-poc bhf_work/capsules/capsule_<finding-id>
 
 ## 3. Binary-only targets
 
-An executable you cannot rebuild does not speak bhf's driver protocol, so fuzz
-it as a binary-only target. It receives each input as a file or on stdin.
+An executable you cannot rebuild does not speak bhf's driver protocol, so fuzz it as a binary-only target. It receives each input as a file or on stdin.
 
-Coverage-guided mutation needs AFL++ with QEMU mode (`afl-fuzz -Q`), which
-the container image ships (`afl-qemu-trace`, with Frida mode's
-`afl-frida-trace.so` for `--engine afl-frida`). With it installed, the
-default engine (`auto`) runs a coverage-guided campaign for the `--time`
-budget, with CmpLog, and `--persistent-addr` runs a function that reads one
-input in a loop (see the CLI reference):
+Coverage-guided mutation needs AFL++ with QEMU mode (`afl-fuzz -Q`), which the container image ships (`afl-qemu-trace`, with Frida mode's `afl-frida-trace.so` for `--engine afl-frida`). With it installed, the default engine (`auto`) runs a coverage-guided campaign for the `--time` budget, with CmpLog, and `--persistent-addr` runs a function that reads one input in a loop (see the CLI reference):
 
 ```sh
 bhf binary fuzz path/to/tool --work-dir bhf_work --input-mode file \
   --seed-file samples/record.bin --time 60s
 ```
 
-Without AFL++ QEMU mode, `auto` falls back to the builtin engine: it runs the
-seeds, then a blind havoc loop of stacked byte mutations with no coverage
-feedback, until `--iterations`, `--time` or the first crash. The run JSON
-marks it `degraded`. Pass `--engine afl-qemu` to fail instead of falling
-back.
+Without AFL++ QEMU mode, `auto` falls back to the builtin engine: it runs the seeds, then a blind havoc loop of stacked byte mutations with no coverage feedback, until `--iterations`, `--time` or the first crash. The run JSON marks it `degraded`. Pass `--engine afl-qemu` to fail instead of falling back.
 
-In a `bhf project` manifest, such an executable uses `engine = "binary"`.
-`engine = "builtin"` and `engine = "afl++"` expect a bhf harness binary, built
-from a harness directory bhf generated.
+In a `bhf project` manifest, such an executable uses `engine = "binary"`. `engine = "builtin"` and `engine = "afl++"` expect a bhf harness binary, built from a harness directory bhf generated.
 
 ## Import an OSS-Fuzz build
 
-A project with an OSS-Fuzz or ClusterFuzzLite integration already has
-`LLVMFuzzerTestOneInput` fuzz targets and a `build.sh` that builds them.
-`bhf project import-ossfuzz` runs that `build.sh` with `$LIB_FUZZING_ENGINE`
-set to bhf's driver, so every fuzz target it links is a bhf harness, with no
-`--extra-source` wiring and nothing regenerated:
+A project with an OSS-Fuzz or ClusterFuzzLite integration already has `LLVMFuzzerTestOneInput` fuzz targets and a `build.sh` that builds them. `bhf project import-ossfuzz` runs that `build.sh` with `$LIB_FUZZING_ENGINE` set to bhf's driver, so every fuzz target it links is a bhf harness, with no `--extra-source` wiring and nothing regenerated:
 
 ```sh
 bhf project import-ossfuzz path/to/libfoo --work-dir bhf_work
@@ -335,39 +208,12 @@ bhf fuzz bhf_work --harness parse_record_fuzzer --time 60s
 bhf auto path/to/libfoo --work-dir bhf_work
 ```
 
-`build.sh` runs in bubblewrap or firejail, without network and with writes
-confined to `$SRC`, `$WORK` and `$OUT`, and the import refuses to run it when
-neither works (`--sandbox none` runs it directly). Each fuzzer it builds is
-registered under its own name at `bhf_work/build/<name>/main`, so
-`bhf fuzz`, `bhf replay` and `bhf minimize` take it like a harness you built,
-and as a target of `bhf_work/ossfuzz/bhf.project.toml` for
-`bhf project run`; the import lists them. Its `<name>_seed_corpus.zip`
-(unpacked with the system `unzip`), `<name>.dict` and the `[libfuzzer]`
-options of `<name>.options` come with it: `bhf project run` applies them
-all, and `bhf fuzz` loads the dictionary. The variables `build.sh` gets, the
-sandbox, and which options apply are described in the
-[CLI reference](cli.md#importing-an-oss-fuzz-build).
+`build.sh` runs in bubblewrap or firejail, without network and with writes confined to `$SRC`, `$WORK` and `$OUT`, and the import refuses to run it when neither works (`--sandbox none` runs it directly). Each fuzzer it builds is registered under its own name at `bhf_work/build/<name>/main`, so `bhf fuzz`, `bhf replay` and `bhf minimize` take it like a harness you built, and as a target of `bhf_work/ossfuzz/bhf.project.toml` for `bhf project run`; the import lists them. Its `<name>_seed_corpus.zip` (unpacked with the system `unzip`), `<name>.dict` and the `[libfuzzer]` options of `<name>.options` come with it: `bhf project run` applies them all, and `bhf fuzz` loads the dictionary. The variables `build.sh` gets, the sandbox, and which options apply are described in the [CLI reference](cli.md#importing-an-oss-fuzz-build).
 
 ## Pitfalls
 
-- Do not link your harness with `-fsanitize=fuzzer` and give it to
-  `bhf fuzz`. bhf runs such a binary on one input file per process, without
-  coverage guidance; the coverage-guided driver is the generated `main`.
-  A `bhf.project.v1` target with `engine = "builtin"` refuses such a binary;
-  give it `engine = "binary"` and `input-mode = "file"` instead.
-  `make libfuzzer` in the harness directory builds a separate libFuzzer binary
-  for other fuzzers; see the harness's `PORTABILITY.md`.
-- `CXXFLAGS` and `CFLAGS` add flags to the `main` build, after the
-  Makefile's own sanitizer and coverage flags (`BHF_CXXFLAGS`/`BHF_CFLAGS`,
-  which a `make BHF_CFLAGS=...` replaces). `AUTO_EXTRA_INCLUDES` adds them to
-  every lane.
-- `CC`/`CXX` choose the compiler. clang is the default; gcc and a
-  cross-prefixed gcc work too, because the Makefile picks its flags from the
-  compiler that runs (see the compiler contract in [C and C++](c-cpp.md)).
-  With gcc the harness gets `trace-pc,trace-cmp` coverage and statically
-  linked sanitizer runtimes. Every sanitized build turns glibc's
-  `_FORTIFY_SOURCE` off after your flags (see [auto](auto.md)), so a fortify
-  check in a distribution gcc cannot stop an overflow before
-  AddressSanitizer reports it.
+- Do not link your harness with `-fsanitize=fuzzer` and give it to `bhf fuzz`. bhf runs such a binary on one input file per process, without coverage guidance; the coverage-guided driver is the generated `main`. A `bhf.project.v1` target with `engine = "builtin"` refuses such a binary; give it `engine = "binary"` and `input-mode = "file"` instead. `make libfuzzer` in the harness directory builds a separate libFuzzer binary for other fuzzers; see the harness's `PORTABILITY.md`.
+- `CXXFLAGS` and `CFLAGS` add flags to the `main` build, after the Makefile's own sanitizer and coverage flags (`BHF_CXXFLAGS`/`BHF_CFLAGS`, which a `make BHF_CFLAGS=...` replaces). `AUTO_EXTRA_INCLUDES` adds them to every lane.
+- `CC`/`CXX` choose the compiler. clang is the default; gcc and a cross-prefixed gcc work too, because the Makefile picks its flags from the compiler that runs (see the compiler contract in [C and C++](c-cpp.md)). With gcc the harness gets `trace-pc,trace-cmp` coverage and statically linked sanitizer runtimes. Every sanitized build turns glibc's `_FORTIFY_SOURCE` off after your flags (see [auto](auto.md)), so a fortify check in a distribution gcc cannot stop an overflow before AddressSanitizer reports it.
 - `bhf build` takes the work directory, not the `--output` directory.
 - Regenerating a harness overwrites edits to `main.cpp` and `dictionary.txt`.

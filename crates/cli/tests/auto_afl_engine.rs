@@ -607,6 +607,17 @@ fn afl_fuzz_runs_its_budget_past_the_first_crash() {
 
 /// `bhf auto --engine afl++` over `src` into `work`, for `secs` per target.
 fn auto_afl(src: &Path, work: &Path, secs: &str, extra: &[&str]) -> String {
+    auto_afl_with(src, work, secs, extra, &[])
+}
+
+/// [`auto_afl`] with `env` set.
+fn auto_afl_with(
+    src: &Path,
+    work: &Path,
+    secs: &str,
+    extra: &[&str],
+    env: &[(&str, &str)],
+) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_bhf"))
         .arg("auto")
         .arg(src)
@@ -615,6 +626,7 @@ fn auto_afl(src: &Path, work: &Path, secs: &str, extra: &[&str]) -> String {
         .args(["--engine", "afl++", "--per-target-time", secs])
         .args(["--max-targets", "1", "--jobs", "1", "--no-discovery-cache"])
         .args(extra)
+        .envs(env.iter().copied())
         .env_remove("CC")
         .env_remove("CXX")
         .output()
@@ -848,4 +860,335 @@ fn afl_workers_are_synced_main_and_secondary_instances() {
     );
     let corpus = files_in(&work.join("corpus").join(&id).join("queue"));
     assert!(!corpus.is_empty(), "both queues are in the corpus");
+}
+
+/// A heap overflow behind a one-byte check, which AFL++ finds in seconds.
+#[cfg(target_os = "linux")]
+const EASY_OVERFLOW: &str = "#include <stdlib.h>\n\
+     int easy_crash(const unsigned char *d, size_t n) {\n\
+     \x20   char *slot;\n\
+     \x20   if (n < 2 || d[0] != 'A') return 0;\n\
+     \x20   slot = malloc(4);\n\
+     \x20   if (!slot) return 0;\n\
+     \x20   slot[4 + (n & 3)] = 1;\n\
+     \x20   free(slot);\n\
+     \x20   return 1;\n\
+     }\n";
+
+/// The CPUs a kernel CPU list (`0-3,6`) names.
+#[cfg(target_os = "linux")]
+fn cpu_list(list: &str) -> Vec<u32> {
+    list.trim()
+        .split(',')
+        .filter(|part| !part.is_empty())
+        .flat_map(|part| match part.split_once('-') {
+            Some((first, last)) => first.parse().unwrap()..=last.parse().unwrap(),
+            None => part.parse().unwrap()..=part.parse().unwrap(),
+        })
+        .collect()
+}
+
+/// The host's online CPUs.
+#[cfg(target_os = "linux")]
+fn online_cpus() -> Vec<u32> {
+    cpu_list(&std::fs::read_to_string("/sys/devices/system/cpu/online").unwrap())
+}
+
+/// The `Cpus_allowed_list` of process `pid`, while it runs.
+#[cfg(target_os = "linux")]
+fn cpus_allowed(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+        .map(|list| list.trim().to_owned())
+}
+
+/// Whether this test runs on every online CPU with no `AFL_NO_AFFINITY`:
+/// afl-fuzz then binds itself to a core unless bhf says otherwise.
+#[cfg(target_os = "linux")]
+fn afl_binds_cores_here() -> bool {
+    std::env::var_os("AFL_NO_AFFINITY").is_none()
+        && cpus_allowed(std::process::id()).is_some_and(|list| cpu_list(&list) == online_cpus())
+}
+
+/// The run summary of the one AFL++ pass under `work`.
+#[cfg(target_os = "linux")]
+fn afl_run_summary(work: &Path) -> serde_json::Value {
+    let summaries: Vec<serde_json::Value> = std::fs::read_dir(work.join("fuzz_runs"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let text = std::fs::read_to_string(entry.path()).ok()?;
+            serde_json::from_str::<serde_json::Value>(&text).ok()
+        })
+        .filter(|summary| summary["engine"] == "afl++")
+        .collect();
+    assert_eq!(summaries.len(), 1, "{summaries:#?}");
+    summaries[0].clone()
+}
+
+/// Sleeping processes, each bound to one CPU, as a busy fuzzing host's
+/// other fuzzers are. Killed when dropped.
+#[cfg(target_os = "linux")]
+struct CpuLockedStandIns(Vec<std::process::Child>);
+
+#[cfg(target_os = "linux")]
+impl CpuLockedStandIns {
+    fn on_every_cpu() -> Self {
+        let mut stand_ins = Self(Vec::new());
+        for cpu in online_cpus() {
+            let child = Command::new("taskset")
+                .args(["-c", &cpu.to_string(), "sleep", "600"])
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            stand_ins.0.push(child);
+            // Bound once taskset has set the mask and started sleep.
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while cpus_allowed(pid).as_deref() != Some(cpu.to_string().as_str()) {
+                assert!(std::time::Instant::now() < until, "stand-in on CPU {cpu}");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        stand_ins
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for CpuLockedStandIns {
+    fn drop(&mut self) {
+        for child in &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// #444: with every core bound to another CPU-locked process, afl-fuzz
+/// refuses to start (`No more free CPU cores`). The pass runs again,
+/// unbound, finds the bug, and its summary says it ran without affinity.
+/// It had ended with no AFL pass and no finding. AFL++ is required under
+/// `BHF_REQUIRE_TOOLS=1`.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_afl_pass_runs_unbound_when_every_core_is_bound_to_another_fuzzer() {
+    if !afl_present() || !which("make") || !which("taskset") {
+        eprintln!("skipping: afl-fuzz/afl-clang-fast, make or taskset not on PATH");
+        return;
+    }
+    if !afl_binds_cores_here() {
+        eprintln!("skipping: this test runs pinned or with AFL_NO_AFFINITY set");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("tree/src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("easy.c"), EASY_OVERFLOW).unwrap();
+    let work = tmp.path().join("work");
+
+    let stand_ins = CpuLockedStandIns::on_every_cpu();
+    let log = auto_afl(&src, &work, "10", &[]);
+    drop(stand_ins);
+
+    assert!(
+        log.contains("running it again without binding a core"),
+        "{log}"
+    );
+    let summary = afl_run_summary(&work);
+    assert_eq!(summary["afl"]["no_affinity"], "no_free_core", "{summary:#}");
+    let findings = findings_under(&work);
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.to_string().contains("heap-buffer-overflow")),
+        "the unbound pass finds the overflow: {findings:#?}\n{log}"
+    );
+}
+
+/// #444: afl-fuzz binds itself to a free core of its own choosing, so a
+/// `bhf auto` pinned to one core (`taskset`) ran its AFL pass on another.
+/// bhf tells it not to bind (`AFL_NO_AFFINITY=1`): it stays on the core it
+/// was pinned to, and the summary says why. AFL++ is required under
+/// `BHF_REQUIRE_TOOLS=1`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_pinned_afl_run_stays_on_the_core_it_was_pinned_to() {
+    if !afl_present() || !which("make") || !which("taskset") {
+        eprintln!("skipping: afl-fuzz/afl-clang-fast, make or taskset not on PATH");
+        return;
+    }
+    let cpus = online_cpus();
+    if cpus.len() < 2 || !afl_binds_cores_here() {
+        eprintln!("skipping: needs two CPUs, unpinned, without AFL_NO_AFFINITY");
+        return;
+    }
+    // The last CPU: afl-fuzz, left to choose, takes the first free one.
+    let pinned = cpus.last().unwrap().to_string();
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("tree/src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("easy.c"), EASY_OVERFLOW).unwrap();
+    let work = tmp.path().join("work");
+    let out = std::fs::File::create(tmp.path().join("bhf.log")).unwrap();
+    let mut bhf = Command::new("taskset")
+        .args(["-c", &pinned])
+        .arg(env!("CARGO_BIN_EXE_bhf"))
+        .arg("auto")
+        .arg(&src)
+        .arg("--work-dir")
+        .arg(&work)
+        .args(["--engine", "afl++", "--per-target-time", "6"])
+        .args(["--max-targets", "1", "--jobs", "1", "--no-discovery-cache"])
+        .env_remove("CC")
+        .env_remove("CXX")
+        .stdin(std::process::Stdio::null())
+        .stdout(out.try_clone().unwrap())
+        .stderr(out)
+        .spawn()
+        .unwrap();
+    // taskset execs bhf, so bhf is this child and afl-fuzz is its child.
+    let bhf_pid = bhf.id().to_string();
+    let mut seen = std::collections::BTreeSet::new();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(900);
+    let status = loop {
+        if let Some(status) = bhf.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > until {
+            let _ = bhf.kill();
+            let _ = bhf.wait();
+            panic!("bhf auto did not finish");
+        }
+        for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+                continue;
+            };
+            let field = |key: &str| {
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix(key))
+                    .map(str::trim)
+            };
+            if field("Name:") == Some("afl-fuzz") && field("PPid:") == Some(bhf_pid.as_str()) {
+                if let Some(allowed) = field("Cpus_allowed_list:") {
+                    seen.insert(allowed.to_owned());
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let log = std::fs::read_to_string(tmp.path().join("bhf.log")).unwrap();
+    assert!(status.success(), "{log}");
+    assert!(!seen.is_empty(), "afl-fuzz ran: {log}");
+    assert_eq!(
+        seen.into_iter().collect::<Vec<_>>(),
+        [pinned],
+        "afl-fuzz stays on the core bhf was pinned to: {log}"
+    );
+    let summary = afl_run_summary(&work);
+    assert_eq!(summary["afl"]["no_affinity"], "pinned", "{summary:#}");
+}
+
+/// The processes running a program under `work` (an AFL++ target a run left
+/// behind), as `<pid> <program>`. Each is killed as it is found, so a failing
+/// test leaves none.
+#[cfg(target_os = "linux")]
+fn kill_targets_left_under(work: &Path) -> Vec<String> {
+    let work = work.canonicalize().unwrap();
+    let mut left = Vec::new();
+    for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let Ok(exe) = std::fs::read_link(entry.path().join("exe")) else {
+            continue;
+        };
+        if exe.starts_with(&work) {
+            left.push(format!("{pid} {}", exe.display()));
+            // SAFETY: signalling a process this test's bhf run started.
+            unsafe {
+                libc::kill(pid, libc::SIGCONT);
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+    left
+}
+
+/// The branches a fuzzer finds one by one, with a CmpLog build.
+#[cfg(target_os = "linux")]
+const BRANCHES: &str = "#include <stddef.h>\n\
+     int branches(const unsigned char *d, size_t n) {\n\
+     \x20   int r = 0;\n\
+     \x20   if (n > 0 && d[0] == 'a') r += 1;\n\
+     \x20   if (n > 1 && d[1] == 'b') r += 2;\n\
+     \x20   if (n > 2 && d[2] == 'c') r += 4;\n\
+     \x20   if (n > 3 && d[3] == 'd') r += 8;\n\
+     \x20   return r;\n\
+     }\n";
+
+/// #444, #275: afl-fuzz exits leaving the persistent child of its CmpLog fork
+/// server (`main_afl_cmplog`) stopped. That child held the session's lock, so
+/// the next run could not resume the session ("is in use") and started it
+/// over, and it kept its core bound, which on a host running bhf often left
+/// no free core for the next afl-fuzz. bhf kills what a pass left running.
+/// The runs are unbound (`AFL_NO_AFFINITY=1`), as on a host with no free core.
+/// AFL++ is required under `BHF_REQUIRE_TOOLS=1`.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_afl_pass_leaves_no_target_running_and_the_next_run_resumes() {
+    if !afl_present() || !which("make") {
+        eprintln!("skipping: afl-fuzz/afl-clang-fast or make not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("tree/src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("branches.c"), BRANCHES).unwrap();
+    let work = tmp.path().join("work");
+    let unbound = [("AFL_NO_AFFINITY", "1")];
+
+    let first = auto_afl_with(&src, &work, "6", &[], &unbound);
+    let left = kill_targets_left_under(&work);
+    assert!(
+        walk_for(&work, "main_afl_cmplog"),
+        "a CmpLog build: {first}"
+    );
+    let summary = afl_run_summary(&work);
+    assert!(
+        summary["afl"]["cmplog_binary"].is_string(),
+        "afl-fuzz ran with -c: {summary:#}"
+    );
+    assert_eq!(
+        left,
+        Vec::<String>::new(),
+        "the first pass left its target running: {first}"
+    );
+
+    let second = auto_afl_with(&src, &work, "4", &[], &unbound);
+    let left = kill_targets_left_under(&work);
+    let log = std::fs::read_to_string(afl_harness_dir(&work).join("afl-fuzz.log")).unwrap();
+    assert!(
+        log.contains("Resuming") && !second.contains("could not resume"),
+        "the second run resumes the session: {log}\n{second}"
+    );
+    assert_eq!(
+        left,
+        Vec::<String>::new(),
+        "the second pass left its target running: {second}"
+    );
 }

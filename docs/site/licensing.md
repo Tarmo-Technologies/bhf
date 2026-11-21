@@ -2,53 +2,46 @@
 
 # Licensing
 
-BHF treats license policy as a release gate. The license audit checks
-workspace dependency metadata, SPDX headers, third-party notices, and vendored
-source checksums before code reaches `main`.
+bhf treats license policy as a release gate. The license audit checks workspace dependency metadata, SPDX headers, third-party notices and vendored source checksums before code reaches `main`.
 
 ## Audit Command
 
+Run it in a bhf source checkout:
+
 ```sh
-bhf license-audit --profile strict-permissive   # default; links only permissive code
-bhf license-audit --profile external-tools      # also allows external tools (GNAT, GPRbuild, AFL++, analyzers) as subprocesses
-bhf license-audit --profile research-lab        # unrestricted; allows all tool probes
+bhf license-audit --profile strict-permissive   # default
+bhf license-audit --profile external-tools
+bhf license-audit --profile research-lab
 ```
 
-The command validates every reachable dependency against a fixed allowed-license
-list — Apache-2.0, MIT, BSD-2-Clause, BSD-3-Clause, Unicode (DFS-2016/3.0), ISC,
-Zlib, CC0-1.0, and CDLA-Permissive-2.0 for certificate trust-anchor data (a
-`WITH LLVM-exception` suffix is accepted) — and rejects unknown, copyleft-only,
-or missing license metadata.
+`bhf license-audit` checks the crates a bhf build links, from the `Cargo.lock` and `THIRD_PARTY.md` of the checkout (`--root`, default `.`) and for one workspace package (`--package`, default `bhf`). It checks bhf's own dependencies, not a scanned project's; `bhf sbom` reports a tree's dependencies and their licenses.
 
-The `--profile` flag does not change that dependency-license list; it gates which
-external tools may run as subprocesses (they are never linked). `strict-permissive`
-(the default) permits none. `external-tools` permits twelve: the GPL Ada toolchain
-(FSF GNAT, GPRbuild) and GNATcheck, plus AFL++ (Apache-2.0), the binary-analysis
-tools Rizin, Ghidra, and angr, the external static analyzers gosec, Bandit,
-and semgrep, SymCC (GPL-3.0), the concolic lane of `bhf auto --symcc`, and
-bhf's QEMU dirty-page plugin (`qemu_plugin`), which the `qemu-system:` lane's
-`reset=fast` has QEMU (GPL-2.0) load: bhf builds it from its own Apache-2.0
-source with the host C compiler and never links QEMU. `research-lab` allows
-all probes. `bhf auto --symcc` and `reset=fast` honor an explicit
-`BHF_PROFILE`; without one each opts into `external-tools`, as
-`--external-tools` does.
+The command validates every reachable dependency against a fixed list of allowed licenses: Apache-2.0, MIT, BSD-2-Clause, BSD-3-Clause, Unicode (DFS-2016 and 3.0), ISC, Zlib, CC0-1.0, and CDLA-Permissive-2.0 for certificate trust-anchor data. A `WITH LLVM-exception` suffix is accepted. Unknown, copyleft-only or missing license metadata fails the audit.
 
-Optional LLM support adds no proprietary model SDK to the linked core. BHF
-either speaks documented HTTP protocols, launches an operator-installed
-Codex/Claude executable, or exposes read-only MCP tools to a separate host.
-Provider service terms, model licenses, retention, and data-handling policy are
-operational concerns outside the workspace dependency audit; review them before
-transmitting source, logs, or findings.
+## License profiles
+
+A license profile does not change the dependency-license list. It decides which external tools bhf may run as subprocesses and which capability probes (`--probe`) a run may ask for; bhf never links those tools.
+
+| Profile | External tools permitted |
+|---|---|
+| `strict-permissive` (default) | none of the gated tools, and no probe |
+| `external-tools` | the binary-analysis tools Rizin, Ghidra and angr; the static analyzers gosec, Bandit, semgrep and GNATcheck; SymCC (GPL-3.0), the concolic lane of `bhf auto --symcc`; bhf's QEMU dirty-page plugin (`qemu_plugin`); and the `gnat_actions` probe |
+| `research-lab` | all tools and capability probes |
+
+bhf runs FSF GNAT, GPRbuild and AFL++ (Apache-2.0) under every profile.
+
+The global `--profile` option picks the profile for every gate of the run, and bhf passes it to the fuzz workers the run starts. Without it, the `--probe` checks and the `bhf binary adapter` tools use `strict-permissive`, and the tools a run asks for by flag (the `--external-tools` analyzers of `bhf static-scan` and `bhf auto`, `bhf auto --symcc` and the `qemu-system:` lane's `reset=fast`) use the profile the `BHF_PROFILE` environment variable names, else `external-tools`, which asking for them opts into. Pass `--profile strict-permissive` to have bhf refuse them.
+
+The QEMU plugin is the one the `qemu-system:` lane's `reset=fast` has QEMU (GPL-2.0) load; bhf builds it from its own Apache-2.0 source with the host C compiler and never links QEMU.
+
+## Optional LLM support
+
+The optional LLM support (the `llm` Cargo feature) adds no proprietary model SDK to the linked core. It speaks documented HTTP protocols, launches an operator-installed session CLI (`codex` or `claude`), or exposes read-only MCP tools to a separate host. Provider service terms, model licenses, retention and data-handling policy are outside the dependency audit; review them before you send source, logs or findings to a provider. See [LLM Assistance](llm.md).
 
 ## Repository Policy
 
-- Source, workflow, and docs files carry SPDX identifiers.
-- `SPDX/manifest.json` records auditable files and is generated by
-  `cargo run -p spdx_check -- generate`.
-- `THIRD_PARTY.md` documents non-workspace dependencies and license sources;
-  the audit fails if any direct third-party dependency is undocumented there.
-- `vendor/tree-sitter-ada/VENDORED.md` pins the vendored grammar license
-  checksum.
-- The `License Audit` workflow runs cargo-deny, the BHF license audit, SPDX
-  header/manifest checks, vendored checksum verification, and the `license_policy`
-  profile/probe-gating unit tests.
+- Source, workflow and docs files carry SPDX identifiers.
+- `SPDX/manifest.json` records the auditable files and is generated by `cargo run -p spdx_check -- generate`.
+- `THIRD_PARTY.md` documents non-workspace dependencies and license sources; the audit fails if a direct third-party dependency is not documented there.
+- `vendor/tree-sitter-ada/VENDORED.md` pins the vendored grammar's license checksum.
+- The `License Audit` workflow runs cargo-deny, the bhf license audit, the SPDX header and manifest checks, vendored checksum verification, and the `license_policy` profile and probe-gating unit tests.

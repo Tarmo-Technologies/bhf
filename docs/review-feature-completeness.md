@@ -1,70 +1,46 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
-# Feature completeness review
+# Feature Completeness Review, 2026-09-24
 
-This is a scoped review of the current feature promises, the documented residual
-gaps, and optional fuzz-engine adapters. It is not a claim that every roadmap
-item or every target in the supported languages is complete. The roadmap itself
-marks §24 as continuing work, while `docs/expected-gaps.md` distinguishes BHF
-gaps from absent dependencies, environment limits, and intentional refusals.
+This review covered the feature promises in the documentation, the documented residual gaps and the optional fuzz-engine adapters, at baseline `5528a41`. It is part of the [Production readiness review](production-readiness-review.md). [`ROADMAP.md`](../ROADMAP.md) §24 lists the continuing work, and [Measured gaps](expected-gaps.md) separates bhf's own gaps from missing dependencies, environment limits and deliberate refusals.
 
-## Prioritized follow-up handoff
+## Follow-up items
 
-| Priority | Work item | Evidence | Acceptance | Economical assignment | Status |
-|---|---|---|---|---|---|
-| P1 | Complete real Nyx execution or keep it explicitly unsupported. The `nyx-engine` feature previously reached `unreachable!()` even though `NyxError::NotImplemented` exists. | `crates/fuzz_engine/nyx_adapter/src/lib.rs`; `crates/fuzz_engine/nyx_adapter/Cargo.toml`; `docs/site/cli.md` says Nyx is not CLI-reachable. | Feature-enabled call returns typed `NotImplemented`; later real backend needs integration coverage against Nyx/QEMU and documented host prerequisites. | Small fix: fast coding model. Real backend: specialist Rust/virtualization engineer; estimate separately. | Panic fixed; backend remains open. |
-| P1 | Prevent the software replay adapter from deadlocking on verbose children and guarantee temporary input cleanup. | Pipe buffering could report a false hang; timestamp-derived input names were predictable. | Large-stdout fixture passes; secure temporary input is removed; in-memory capture is capped at 1 MiB. | Fast coding model; small isolated Rust change. | Fixed and tested. |
-| P1 | Prevent cleanup and compaction from traversing symlinked workdir descendants. | `crates/cli/src/auto/storage.rs` and `crates/cli/src/clean.rs` previously followed symlinked ancestors while finding nested caches or `auto/findings.csv`. | Temporary-directory tests preserve sentinels behind symlinked ancestors. Cache compaction, explicit work-root aliases, and leaf-symlink unlinking remain covered. | Fast coding model; isolated filesystem boundary fix. | Fixed and tested. |
-| P1 | Isolate filesystem-sensitive tests from global `/tmp` state. | `crates/cli/src/auto/report.rs::failed_build_records_unresolved_configure_header_with_remediation` used `/tmp` as a project root, allowing unrelated fixtures to change output. | The test owns a temporary project root for the whole assertion. | Fast coding model; small test-only change. | Fixed and tested. |
-| P1 | Refresh `bhf --version` when the current branch ref moves and support Git worktrees. | `crates/cli/build.rs` watched hardcoded `.git/HEAD`, tags, and packed refs but not the loose branch ref; `.git` can also be a file in worktrees. | Build script watches HEAD, active symbolic ref, packed refs, and tags using `git rev-parse --git-path`; rebuilt `bhf --version` reports the current commit. | Fast coding model; small build-script change. | Fixed and rebuilt: version reports `g5528a41-dirty`. |
-| P2 | Preserve the deliberate engine boundary in user-facing docs and expose adapter maturity clearly to library consumers. | `docs/site/cli.md` documents that only builtin/AFL++ are accepted; Nyx, LibAFL, and libFuzzer adapters are not integrated into `bhf fuzz`. Nyx software replay has no coverage feedback (`coverage_edges` is empty). | Adapter docs identify software replay as process replay, not snapshot restore or coverage-guided fuzzing; CLI lists only implemented engines. | Fast coding model; doc-only. | CLI boundary documented; review records adapter limit. |
-| P2 | Continue resolving high-count, confirmed target-driving gaps rather than treating language count as parity. | `docs/expected-gaps.md`: C opaque types (86), C++ non-self-contained headers (49 report-only), Go undrivable types (58), Rust no native byte decoder (42). | Each fix has representative fixtures and moves the correct outcomes to built-and-fuzzed while preserving dependency/environment/design classifications. | Assign to lane owners; fast model for bounded cases, specialist Rust/C++ model for semantic/codegen changes. | Open; separate lane work. |
-| P3 | Keep roadmap completion claims scoped to dated milestones and documented behavior. | `ROADMAP.md` says §0/M0–M19/§25 are delivered while explicitly leaving §24 continuous improvement. | Claims reference implemented workflows and residual gaps; no blanket all-features-complete wording. | Maintainer/editor; small review. | Open review recommendation. |
+| Priority | Work item | Evidence | Acceptance | Status |
+|---|---|---|---|---|
+| P1 | Real Nyx execution, or Nyx kept explicitly unsupported. The `nyx-engine` feature reached `unreachable!()` although `NyxError::NotImplemented` existed. | `crates/fuzz_engine/nyx_adapter/` (since removed) | A feature-enabled call returns the typed `NotImplemented`; a real backend would need integration tests against Nyx/QEMU and documented host prerequisites | The panic was fixed. Nyx was later retired in favor of the full-system transport, and the crate removed |
+| P1 | The software replay adapter deadlocked on verbose children and used predictable input names | Pipe buffering could report a false hang; input names derived from timestamps | A large-stdout fixture passes; the secure temporary input is removed; in-memory capture is capped at 1 MiB | Fixed and tested (adapter since removed with the Nyx crate) |
+| P1 | Cleanup and compaction followed symlinked work-directory descendants | `crates/cli/src/auto/storage.rs` and `crates/cli/src/clean.rs` followed symlinked ancestors while finding nested caches or `auto/findings.csv` | Temporary-directory tests keep sentinels behind symlinked ancestors; cache compaction, explicit work-root aliases and leaf-symlink unlinking stay covered | Fixed and tested |
+| P1 | A filesystem-sensitive test depended on global `/tmp` state | `crates/cli/src/auto/report.rs::failed_build_records_unresolved_configure_header_with_remediation` used `/tmp` as a project root | The test owns a temporary project root for the whole assertion | Fixed and tested |
+| P1 | `bhf --version` did not refresh when the branch ref moved, and Git worktrees were not handled | `crates/cli/build.rs` watched `.git/HEAD`, tags and packed refs but not the loose branch ref; in a worktree `.git` is a file | The build script watches HEAD, the active symbolic ref, packed refs and tags through `git rev-parse --git-path`; a rebuilt `bhf --version` reports the current commit | Fixed; the rebuilt binary reported `g5528a41-dirty` |
+| P2 | State the engine boundary in the user documentation and the maturity of each adapter for library users | At the time, `bhf fuzz` accepted the builtin engine and AFL++ only, and the Nyx software replay had no coverage feedback (`coverage_edges` empty) | Adapter docs describe software replay as process replay without snapshot restore or coverage guidance; the CLI lists only implemented engines | Done. `bhf fuzz --engine` now also takes `libfuzzer`, `honggfuzz`, `winafl` (native Windows) and `libafl` (a build with the `libafl-engine` feature); see [libFuzzer adapter](libfuzzer-adapter.md) |
+| P2 | Keep closing the confirmed high-count target-driving gaps | [Measured gaps](expected-gaps.md): C opaque types (86), C++ non-self-contained headers (49 report-only), Go undrivable types (58), Rust without a native byte decoder (42) | Each fix has representative fixtures and moves the right outcomes to built-and-fuzzed, keeping the dependency, environment and by-design classifications | Ongoing lane work; the C++ headers class is fixed since |
+| P3 | Keep roadmap completion claims tied to dated milestones and documented behavior | `ROADMAP.md` lists §0, M0–M19 and §25 as delivered and §24 as continuing | Claims reference implemented workflows and residual gaps | Open |
 
 ## Scope classification
 
-Intentional limits include: the manual command lane differences recorded in
-`ROADMAP.md`'s implementation snapshot; no real ORB requirement; unavailable
-third-party engine adapters through the CLI; Ada 83 report-only behavior; and
-toolchain/dependency absence. These are support boundaries, not missing promised
-behavior, as long as current docs remain explicit.
+These are support boundaries, documented as such:
 
-Promised behavior should be considered missing when an advertised lane cannot
-execute its documented workflow or reports success without the stated result.
-The `nyx-engine` panic was a defect for consumers who enabled that exposed
-feature and now returns `NotImplemented`. The software replay backend is a
-limited adapter scaffold: it launches
-a target with a file path, has no snapshot restore and no coverage feedback, so
-it must not be represented as production Nyx fuzzing. Its stdout is captured in
-a temporary file to avoid pipe deadlocks; the in-memory result is capped at 1 MiB,
-while the temporary file can still grow until the target exits or times out.
+- the differences between the manual command lanes recorded in `ROADMAP.md`'s implementation snapshot;
+- CORBA targets are fuzzed without a real ORB;
+- third-party engine adapters that the CLI does not offer;
+- Ada 83 targets, which are reported and not fuzzed;
+- missing toolchains and dependencies.
 
-The largest remaining product gaps are target-class limitations, not the count
-of language labels: the residual sweep inventory in `docs/expected-gaps.md`
-contains both actionable harness/build gaps and honest dependency/environment
-refusals. Its verdict labels should be preserved when promoting items into work.
+A promised behavior counts as missing when an advertised lane cannot run its documented workflow, or reports success without the stated result. The `nyx-engine` panic was such a defect for anyone who enabled that feature. The software replay backend launched a target with a file path, with no snapshot restore and no coverage feedback. It captured stdout in a temporary file to avoid pipe deadlocks; the in-memory result was capped at 1 MiB, while the temporary file could grow until the target exited or timed out.
+
+The largest remaining product gaps are target classes. The residual sweep inventory in [Measured gaps](expected-gaps.md) holds both actionable harness and build gaps and dependency or environment refusals; keep its verdict labels when an item becomes work.
 
 ## Cleanup boundary policy
 
-For `bhf clean` and automatic cache compaction, the user-selected work directory
-is the explicit trust root and may itself be a symlink alias. No descendant
-directory is followed while locating nested owned artifacts. A symlink at the
-artifact leaf is unlinked as a leaf; its target is left untouched. This keeps
-explicit work-root aliases usable while preventing a nested `auto/` or harness
-symlink from redirecting deletion outside that root.
+For `bhf clean` and automatic cache compaction, the work directory you select is the trust root, and it may itself be a symlink. No descendant directory is followed while bhf locates nested artifacts it owns. A symlink at the artifact leaf is unlinked as a leaf, and its target is left alone. Work-root aliases therefore keep working, and a nested `auto/` or harness symlink cannot redirect a deletion outside the root.
 
-These checks cover static symlink layouts. They do not make path-based deletion
-race-free against a concurrent process swapping an ancestor after metadata
-validation; that stronger guarantee would require directory-handle-relative
-operations.
+These checks cover symlink layouts that exist before the command runs. A concurrent process that swaps an ancestor after the metadata check is outside them; closing that race needs directory-handle-relative operations.
 
-## Validation completed
+## Validation
 
-- `cargo test -p fuzz_engine_nyx_adapter --locked` — 6 passed (the crate has
-  since been removed: nothing used it).
-- `cargo test -p fuzz_engine_nyx_adapter --features nyx-engine` — 3 passed.
-- `cargo test -p bhf --lib clean::tests` — 7 passed.
-- `cargo test -p bhf --lib auto::storage::tests` — 4 passed.
-- `cargo test -p bhf --lib auto::report::tests::failed_build_records_unresolved_configure_header_with_remediation` — 1 passed.
-- `cargo build -p bhf --locked` — passed; `target/debug/bhf --version` reported
-  `bhf 0.2.32-15-g5528a41-dirty`, matching `git rev-parse --short HEAD` (`5528a41`).
-- `git diff --check` — passed.
+- `cargo test -p fuzz_engine_nyx_adapter --locked` and `cargo test -p fuzz_engine_nyx_adapter --features nyx-engine`: passed (the crate has since been removed).
+- `cargo test -p bhf --lib clean::tests`: passed.
+- `cargo test -p bhf --lib auto::storage::tests`: passed.
+- `cargo test -p bhf --lib auto::report::tests::failed_build_records_unresolved_configure_header_with_remediation`: passed.
+- `cargo build -p bhf --locked`: passed; `target/debug/bhf --version` reported `bhf 0.2.32-15-g5528a41-dirty`, matching `git rev-parse --short HEAD` (`5528a41`).
+- `git diff --check`: passed.

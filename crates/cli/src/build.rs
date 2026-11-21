@@ -205,8 +205,8 @@ pub struct BuildArgs {
     /// is also accepted and mapped onto its work directory.
     pub work_dir: PathBuf,
 
-    /// Governing Ada project whose evaluated build semantics the generated
-    /// instrumented overlay should inherit.
+    /// The Ada project (`.gpr`) whose build settings the generated harness
+    /// project inherits.
     #[arg(long)]
     pub source_project: Option<PathBuf>,
 
@@ -245,12 +245,13 @@ pub struct BuildArgs {
     #[command(flatten)]
     pub(crate) toolchain_args: BuildToolchainArgs,
 
-    /// For C/C++ harnesses: which Makefile target to build.
-    /// `libfuzzer` (default) runs `make` which produces a libFuzzer binary
-    /// driven by sanitizers; `afl++` runs `make afl` which produces a
-    /// persistent-mode AFL++ binary suitable for `bhf fuzz --engine afl++`;
-    /// `winafl` runs `make winafl` which produces `main_winafl`, the build
-    /// without sanitizers `bhf fuzz --engine winafl` runs beside `main`.
+    /// For C/C++ harnesses: which Makefile target to build. `libfuzzer`
+    /// (default) runs `make`, which builds `main`: the harness linked with
+    /// bhf's own driver, sanitizers and coverage (`make libfuzzer` builds a
+    /// libFuzzer binary, `main_libfuzzer`); `afl++` runs `make afl`, which
+    /// builds a persistent-mode AFL++ binary for `bhf fuzz --engine afl++`;
+    /// `winafl` runs `make winafl`, which builds `main_winafl`, the build
+    /// without sanitizers that `bhf fuzz --engine winafl` runs beside `main`.
     #[arg(long, value_enum, default_value = "libfuzzer")]
     pub c_engine: CEngine,
 }
@@ -309,13 +310,14 @@ pub(crate) struct BuildToolchainArgs {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum CEngine {
-    /// `make` target - libFuzzer entrypoint (default).
+    /// `make`: `main`, the harness with bhf's driver, sanitizers and coverage
+    /// (default).
     Libfuzzer,
-    /// `make afl` target - AFL++ persistent-mode entrypoint.
+    /// `make afl`: the AFL++ persistent-mode harness.
     #[value(name = "afl++")]
     AflPlusPlus,
-    /// `make winafl` target - the uninstrumented WinAFL build (`main_winafl`,
-    /// native Windows), which `bhf fuzz --engine winafl` runs beside `main`.
+    /// `make winafl`: `main_winafl`, built without sanitizers for WinAFL
+    /// (native Windows), which `bhf fuzz --engine winafl` runs beside `main`.
     Winafl,
 }
 

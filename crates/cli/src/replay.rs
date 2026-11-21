@@ -40,10 +40,11 @@ pub struct ReplayArgs {
     #[arg(long, value_name = "ID_OR_DIR")]
     pub finding: Option<PathBuf>,
 
-    /// Harness binary path. Optional: when omitted it is auto-resolved from the
+    /// Harness binary path. Without it, bhf finds the harness from the
     /// finding's recorded `fixture_path` (relative to the work dir holding the
-    /// finding first) or `harness_id` (`<work>/{harnesses,auto,generated_harnesses,build}/<harness_id>/main`).
-    /// Pass this to override the auto-resolved path. Every replay writes its
+    /// finding first) or `harness_id`
+    /// (`<work>/{harnesses,auto,generated_harnesses,build}/<harness_id>/main`).
+    /// Every replay writes its
     /// raw output to `<finding>/replay.log`; a replay of another harness than
     /// the finding's own (another build's sha256, or another file when no
     /// build is recorded) that does not MATCH writes
@@ -69,21 +70,23 @@ pub struct ReplayArgs {
     )]
     pub qemu_args: Vec<String>,
 
-    /// Sandbox wrapper for harness execution.
+    /// Sandbox the harness runs in. `auto` uses bubblewrap, else firejail, and
+    /// runs without one when neither works on this host.
     #[arg(long, value_enum, default_value_t = SandboxModeArg::Auto)]
     pub sandbox: SandboxModeArg,
 
-    /// Override sandbox wrapper executable.
+    /// The firejail or bubblewrap executable to use.
     #[arg(long, value_name = "PATH", requires = "sandbox")]
     pub sandbox_tool: Option<PathBuf>,
 
-    /// Fail if the requested sandbox tool is unavailable.
+    /// Fail when the requested sandbox is unavailable, in place of running
+    /// without it.
     #[arg(long)]
     pub sandbox_strict: bool,
 
-    /// Relocate an on-target transport finding's endpoint to `HOST:PORT` for
-    /// replay (the recorded endpoint is often gone/unreachable). Applies to
-    /// agent:tcp / gdb transport findings; ignored for host harness findings.
+    /// Replay an on-target transport finding against `HOST:PORT` in place of
+    /// the endpoint it records. Applies to agent:tcp and gdb transport
+    /// findings; ignored for host harness findings.
     #[arg(long = "transport-endpoint", value_name = "HOST:PORT")]
     pub transport_endpoint: Option<String>,
 

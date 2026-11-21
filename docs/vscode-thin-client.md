@@ -2,9 +2,7 @@
 
 # VS Code Thin Client
 
-The BHF VS Code extension lives in `editors/vscode`. It starts the M18
-daemon over stdio, loads normalized findings through the `findings` JSON-RPC
-method, and shows findings inline as diagnostics with CodeLens actions.
+The BHF VS Code extension lives in `editors/vscode`. It starts `bhf-daemon` over stdio, loads findings through the daemon's `findings` JSON-RPC method (see [Daemon JSON-RPC](daemon-json-rpc.md)), and shows each finding as a diagnostic with CodeLens actions.
 
 ## Development
 
@@ -15,31 +13,24 @@ npm ci --prefix editors/vscode
 npm test --prefix editors/vscode
 ```
 
-The extension contributes Ada file associations for `.adb`, `.ads`, and `.ada`
-files. It activates after startup and refreshes findings when the configured
-findings directory exists.
+The extension contributes Ada file associations for `.adb`, `.ads`, and `.ada` files. It activates after VS Code starts and loads findings when the configured findings directory exists.
 
 ## Settings
 
-- `bhf.daemonPath`: daemon executable path. Defaults to `bhf-daemon`.
-- `bhf.cliPath`: BHF CLI executable path for terminal actions. Defaults
-  to `bhf`.
-- `bhf.findingsDir`: findings directory loaded through the daemon. Defaults
-  to `findings`.
-- `bhf.harnessPath`: optional harness path added to replay/minimize actions.
-- `bhf.minimizeStrategy`: `bytes` or `typed`. Defaults to `bytes`.
+| Setting | Default | Meaning |
+|---|---|---|
+| `bhf.daemonPath` | `bhf-daemon` | Daemon executable. |
+| `bhf.cliPath` | `bhf` | BHF CLI executable for the replay and minimize tasks. |
+| `bhf.findingsDir` | `results/findings` | Findings directory loaded through the daemon, relative to the workspace root unless absolute. `bhf auto` writes findings to `<work-dir>/results/findings`, so the default fits a workspace opened on the work directory; otherwise set it to that path (for example `bhf_work/results/findings`). |
+| `bhf.harnessPath` | empty | Harness path passed as `--harness` to replay and minimize. |
+| `bhf.minimizeStrategy` | `bytes` | `bytes` or `typed`, passed as `--strategy` to minimize. |
 
 ## Actions
 
-Each finding with a source location gets CodeLens actions:
+A finding gets a diagnostic and CodeLens actions at its location: the `actionability.fix_location` when the finding has one, otherwise the Ada exception's handler, last breadcrumb or explicit raise site. The actions are:
 
-- `Replay this finding`
-- `Minimize`
-- `Open repro.adb`
+- `Replay this finding` runs `bhf replay --finding <findings-dir>/<id>`.
+- `Minimize` runs `bhf minimize --finding <findings-dir>/<id> --strategy <strategy>`.
+- `Open repro.adb` opens the finding's `generated_repro_ada` file, resolved under the findings directory unless the finding stores an absolute path. It appears only when the finding has that field.
 
-Replay and minimize run as process tasks with visible `BHF` task terminals
-and exit status. They use the configured CLI, workspace root, and finding
-under the configured findings directory; the extension does not execute
-command text stored in finding JSON. `Open
-repro.adb` resolves `generated_repro_ada` under the configured findings root
-unless the finding already stores an absolute path.
+Replay and minimize run as process tasks in a `BHF` task terminal that shows their exit status. The extension builds each command line from these settings and the finding's ID; it ignores any command text stored in the finding JSON.

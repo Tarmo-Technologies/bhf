@@ -1,103 +1,75 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
-# Enterprise container validation
+# Container Validation Sweep
 
-Status: strict Linux image gate passed on the corrected current-code image;
-broader enterprise qualification remains open.
+The container sweep runs `bhf auto` inside the Docker image over a pinned corpus of 32 public projects, two per language across 16 languages, and writes a pass/fail report. It checks that each language lane builds, harnesses and fuzzes real code in the image. The scripts and the manifest are in [`docker/`](../docker/README.md): `sweep-manifest.tsv` (the corpus), `fetch-corpus.sh` (`bhf-fetch-corpus`), `bhf-sweep.sh` (`bhf-sweep`) and `sweep_contract.py` (the checks below).
 
-Confirmed defects in the baseline validation infrastructure:
+Status: the strict Linux image gate passed on the image built from the current code (evidence below). The qualification gates listed under [Open gates](#open-gates) are tracked separately.
 
-1. Docker build chains ended in `|| true`, masking compilation, package installation
-   and dependency-cache failures. Required setup must fail the image build.
-2. The sweep exited successfully for empty selections, stub-only execution and
-   projects without fuzzable targets. A successful matrix must include at least
-   one selected project and real target-entry evidence for every project.
-3. Human-readable summary parsing could mistake a zero stub counter for a stub
-   outcome. The versioned JSON report is the validation contract instead.
-4. Reruns deleted prior project results, and unchecked manifest identifiers could
-   escape the result directory. Validate the manifest before mutation, and refuse
-   nonempty result directories instead of deleting evidence.
-5. Fetching skipped existing clones without checking their revision. Existing
-   clones must match the full pinned commit and have no modified/extra inputs;
-   failed/new downloads must not remove preexisting paths.
+## What the gate checks
 
-Acceptance: fixture-based negative tests, current-source image build, all 32 pinned
-projects across 16 languages attempted, source/image/toolchain identity recorded,
-and every missing/partial/unentered/stub-only/timeout result fails the gate. A PASS
-means observed execution of at least one non-stub target, not complete API coverage,
-meaningful feedback in every language, or proof of competitive fuzzing quality.
-Zero-feedback campaigns remain visible and require separate coverage evaluation.
+- **Image build.** Every required setup step, including compilation, package installation and the dependency caches, fails the image build when it fails. No step ends in `|| true`.
+- **Selection.** A sweep with no selected project fails. `BHF_LANGS` with an unknown language fails.
+- **Per-project result.** Each project's status comes from its versioned `auto/run.json`, not from the human-readable summary. A row is `PASS` only when bhf built, harnessed and fuzzed at least one non-stub target of that project. `STUB-ONLY`, `NO-TARGETS`, `NOT-ENTERED`, missing, error and timeout rows fail the gate. The sweep exits `0` only when every selected project passes.
+- **Manifest.** The manifest is validated before anything is written: six TSV columns, safe project identifiers and source subpaths, no duplicates, a full 40-character commit SHA and a valid repository URL per row.
+- **Results directory.** The sweep refuses a nonempty results directory, so a rerun never deletes earlier evidence. Pick a fresh directory or volume for each run.
+- **Fetch.** An existing clone must be at the full pinned commit, with no modified, untracked or ignored files. A failed or new download leaves existing paths in place.
 
-Do not overwrite historical `bhf:local` image or sweep volumes. Keep new evidence
-in a unique directory/volume. Build recovery executes target-controlled code;
-only run these public pinned fixtures inside the disposable container.
+The report records the edge count of every row, so a `PASS` campaign that reached zero edges is visible in it and needs its own coverage review.
 
-## Current-code evidence — 2026-09-25 UTC
+Build recovery executes code from the target project. Run the sweep only on these public pinned projects, inside the disposable container. Keep earlier `bhf:local` images and sweep volumes; write new evidence to a new directory or volume.
 
-The source archive
-`/tmp/bhf-enterprise-container.CRwioX/source-wave4-pugixml-lifetime.tar` hashes
-to `f6048b57c11bd611d941d1f75972cc29eeaa4d30bde353199fdd7bf318677838`.
-It built `bhf:enterprise-20260924-wave4-pugixml-lifetime`, image ID
-`sha256:140318d01e3b52fd82ea1cf00fff99a2c1b3895c76d900b528574c5cf275247c`.
-Labels record the source archive hash, baseline revision
-`5528a41df1968e7ec7efb843b9dac12cbe377c8c`, and creation time
-`2026-09-25T03:30:57Z`. Build log:
-`/tmp/bhf-enterprise-wave4-pugixml-lifetime-build.log`. Tool versions are in
-`/tmp/bhf-enterprise-wave4-tool-versions.log` (among them Clang 18.1.3, Go
-1.27.1, .NET 8.0.131, JDK 21, Python 3.12.3, and runtime Rust nightly
-1.100.0). Later edits to this evidence document are not included in the build
-archive; the image identifies its actual build input, not the whole later
-documentation worktree.
+## Evidence: current-code image, 2026-09-25 UTC
 
-The original public corpus was copied into the fresh volume
-`bhf_enterprise_20260924_wave4_full32_clean`. `bhf-fetch-corpus` verified all
-32 pinned checkouts with zero failures before the sweep. The run used
-`--network none`, one target per project, five seconds per target, a
-120-second campaign cap per project, `CARGO_NET_OFFLINE=true`, a staged Cargo
-cache, `NUGET_PACKAGES` pointing to a staged NuGet cache, and a `NuGet.Config`
-whose only package source was that local cache. No source checkout or package
-download occurred during the run. The single uninterrupted strict report is
-`/work/results/sweep-report.tsv` in that volume; stdout is
-`/tmp/bhf-enterprise-wave4-full32-sweep.log`. It returned **32 PASS, zero
-stub-only, no-target, missing, error, or timeout rows** across 16 languages.
+| Item | Value |
+|---|---|
+| Source archive | `/tmp/bhf-enterprise-container.CRwioX/source-wave4-pugixml-lifetime.tar` |
+| Archive SHA-256 | `f6048b57c11bd611d941d1f75972cc29eeaa4d30bde353199fdd7bf318677838` |
+| Image tag | `bhf:enterprise-20260924-wave4-pugixml-lifetime` |
+| Image ID | `sha256:140318d01e3b52fd82ea1cf00fff99a2c1b3895c76d900b528574c5cf275247c` |
+| Baseline revision (label) | `5528a41df1968e7ec7efb843b9dac12cbe377c8c` |
+| Created (label) | `2026-09-25T03:30:57Z` |
+| Build log | `/tmp/bhf-enterprise-wave4-pugixml-lifetime-build.log` |
+| Tool versions | `/tmp/bhf-enterprise-wave4-tool-versions.log`: Clang 18.1.3, Go 1.27.1, .NET 8.0.131, JDK 21, Python 3.12.3, Rust nightly 1.100.0 |
 
-An earlier current-code image without staged target packages returned 29/32
-in bounded split runs: Rust CSV could not obtain `memchr`/`itoa`, while C#
-Sprache and Superpower could not restore their NuGet graphs. Staged dependency
-retries made all three pass on that image. The separate full run above is the
-stronger image-level evidence, but its dependency cache is part of the stated
-offline test setup. BHF's bundled instrumentation packages alone are not a
-claim that arbitrary third-party applications build in an air gap.
+The image labels record the source archive hash, so the image identifies the exact input it was built from. Edits made to this page after the build are not part of that archive.
 
-The first image also found three ASan double frees in one generated Pugixml
-sequence harness. `load_buffer_inplace_own` owns its buffer, but the harness
-freed it after the call. The generator now leaves that allocation to Pugixml
-and defers cleanup for the borrowed `load_buffer_inplace` variant until after
-document reset. The corrected full sweep reported 562 Pugixml edges and zero
-findings; each of the three old testcase files exited 0 when replayed against
-the corrected harness (`/tmp/bhf-enterprise-wave4-pugixml-replay.log`).
+### Sweep setup
 
-The strict PASS means at least one non-stub target was entered and fuzzed. It
-does not prove coverage quality or complete API breadth. The wave4 sweep showed
-three zero-edge lanes — Lua lunajson and both PHP projects — each a distinct
-target-selection/discovery defect, **all fixed (2026-09-24)** and re-verified on
-the pinned corpora with the release binary + PHP 8.3.6 / lua5.4: symfony-yaml
-`0 → 1230` edges (exception-setter demotion), php-parser `0 → 174` (string-input
-first-parameter affinity), lunajson `0 → 162` (module `return {…}` factory-field
-discovery). See `DEVELOPMENT_PLAN.md` for per-lane root causes and regressions.
-Go fastjson saved one
-`MustParse` panic on empty input with a `lab_only` actionability verdict; it
-is not a confirmed target security defect. Each COBOL campaign reported one
-pass-level finding ID, while its top-level `findings/` directory and CSV were
-empty. **This count/evidence mismatch is fixed (2026-09-24):** COBOL crash
-attribution deletes a finding it proves a harness artifact (an empty-input
-dynamic `CALL` to an unlinked sibling program), but that removal did not reach
-the in-memory pass records feeding the headline count. `report::
-reconcile_pass_findings_with_disk` now drops any pass finding id whose
-`finding.json` a post-pass removed, so `summary.findings`, `run.json`, `run.md`,
-`findings.csv` and `FINDINGS.md` all agree. Re-verified on the pinned carddemo
-corpus with the release binary: `CSUTLDTC` reports `summary.findings = 0` and an
-empty `findings/`. The wave4 volumes above predate the fix. Native Windows/RHEL
-qualification,
-long-running service soaks, and a representative multi-trial AFL++/libFuzzer
-comparison are separate gates; a Mayhem comparison is unavailable without a
-licensed environment.
+- Fresh volume `bhf_enterprise_20260924_wave4_full32_clean`, with the public corpus copied in. `bhf-fetch-corpus` verified all 32 pinned checkouts before the sweep.
+- `--network none`.
+- One target per project, five seconds per target, a 120-second cap per project.
+- `CARGO_NET_OFFLINE=true` with a staged Cargo cache.
+- `NUGET_PACKAGES` set to a staged NuGet cache, and a `NuGet.Config` whose only package source was that cache.
+
+No source checkout or package download happened during the run.
+
+### Result
+
+The strict report is `/work/results/sweep-report.tsv` in that volume; stdout is in `/tmp/bhf-enterprise-wave4-full32-sweep.log`. It returned **32 PASS** across 16 languages, with no stub-only, no-target, missing, error or timeout rows.
+
+An earlier current-code image without staged target packages passed 29 of 32 projects in bounded split runs: Rust CSV could not fetch `memchr` and `itoa`, and the C# projects Sprache and Superpower could not restore their NuGet graphs. With staged dependencies, all three passed on that image. For an offline build, stage each target's own third-party dependencies in a local cache; bhf's bundled packages cover its instrumentation.
+
+### Defects the sweep found and how they were fixed
+
+- **Pugixml double free in a generated harness.** The first image found three ASan double frees in one generated Pugixml sequence harness. `load_buffer_inplace_own` takes ownership of its buffer, and the harness freed it again after the call. The generator now leaves that allocation to Pugixml, and for the borrowing `load_buffer_inplace` variant it frees the buffer after the document reset. The corrected sweep reported 562 Pugixml edges and no findings. Each of the three old testcases exited `0` against the corrected harness (`/tmp/bhf-enterprise-wave4-pugixml-replay.log`).
+- **Zero-edge lanes (fixed 2026-09-24).** Lua lunajson and both PHP projects reached zero edges, each from a target-selection or discovery defect. Re-verified on the pinned corpora with the release binary, PHP 8.3.6 and Lua 5.4:
+
+  | Project | Edges before → after | Fix |
+  |---|---|---|
+  | symfony-yaml | 0 → 1230 | exception-setter demotion |
+  | php-parser | 0 → 174 | string-input first-parameter affinity |
+  | lunajson | 0 → 162 | discovery of factory fields in a module's `return {…}` |
+
+  [`DEVELOPMENT_PLAN.md`](../DEVELOPMENT_PLAN.md) has the per-lane root causes and regression tests.
+- **COBOL finding count (fixed 2026-09-24).** Each COBOL campaign reported one pass-level finding ID while its `findings/` directory and CSV were empty. COBOL crash attribution deletes a finding it proves to be a harness artifact (an empty-input dynamic `CALL` to an unlinked sibling program), but the deletion did not reach the in-memory pass records behind the headline count. `report::reconcile_pass_findings_with_disk` now drops every pass finding ID whose `finding.json` a later step removed, so `summary.findings`, `run.json`, `run.md`, `findings.csv` and `FINDINGS.md` agree. Re-verified on the pinned carddemo corpus with the release binary: `CSUTLDTC` reports `summary.findings = 0` and an empty `findings/`. The sweep volumes above were produced before this fix.
+
+Go fastjson recorded one `MustParse` panic on empty input, with the `lab_only` actionability verdict (see [`docs/finding-report-fields.md`](finding-report-fields.md)).
+
+## Open gates
+
+These are separate qualification gates:
+
+- native Windows and RHEL qualification;
+- long-running service soak tests;
+- a representative multi-trial comparison against AFL++ and libFuzzer (see [Engine benchmark](enterprise-engine-benchmark.md));
+- a Mayhem comparison, which needs a licensed Mayhem environment.

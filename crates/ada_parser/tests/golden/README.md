@@ -2,7 +2,7 @@
 
 # Golden Ada Corpus
 
-This directory contains synthetic Ada fixtures for the M1 scanner acceptance gate. Do not vendor third-party Ada source here.
+Synthetic Ada fixtures for the Ada scanner's acceptance test (`crates/ada_parser/tests/golden.rs`). Every fixture is written for this corpus; third-party Ada source does not belong here.
 
 ## Layout
 
@@ -12,11 +12,11 @@ Each fixture lives at:
 <dialect>/<scenario>/{src.adb|src.ads,manifest.toml}
 ```
 
-Use `src.adb` for bodies and subunits, `src.ads` for specs. If both exist, the harness scans `src.adb`.
+The dialect directories are `ada95`, `ada2005`, `ada2012` and `ada2022`. Use `src.adb` for bodies and subunits and `src.ads` for specs. If both exist, the harness scans `src.adb`.
 
 ## Manifest
 
-`manifest.toml` is the ground truth from human inspection of the Ada source:
+`manifest.toml` holds the ground truth, counted by reading the Ada source:
 
 ```toml
 description = "Short fixture purpose"
@@ -39,16 +39,16 @@ handler_choices = []
 type_kinds = []
 ```
 
-`dialect_hint` is optional. Omit it when the fixture is meant to exercise pragma or heuristic dialect detection.
+`dialect_hint` is optional. Leave it out when the fixture exercises dialect detection from pragmas or heuristics.
 
-The optional name lists are allow-lists for extracted names. If a list is present, every extracted item in that category must appear in the manifest.
+A non-empty list under `[expected.names]` is an allow-list: every name the extractor reports in that category must appear in it. An empty list is not checked.
 
-## Adding A Fixture
+## Adding a fixture
 
-1. Create a new scenario directory under the lowest applicable dialect.
+1. Create a scenario directory under the oldest dialect the fixture needs.
 2. Add a small synthetic Ada source file with an Apache-2.0 SPDX header.
 3. Add `manifest.toml` with an Apache-2.0 SPDX header.
-4. Set expected counts from the source, not from extractor output.
+4. Set the expected counts from the source, not from the extractor's output.
 5. Run:
 
 ```bash
@@ -56,13 +56,13 @@ cargo test -p ada_parser --test golden -- --nocapture
 cargo run -p spdx_check -- check
 ```
 
-If a fixture exposes an extractor bug, write a failing focused test in the extractor or reconcile module first, then fix the extractor. Do not lower manifest counts to match current behavior unless a follow-up issue documents an out-of-scope known bug.
+If a fixture exposes an extractor bug, first write a failing focused test in the extractor or reconcile module, then fix the extractor. Keep the manifest counts true to the source; lower one only when an open issue documents the bug as out of scope.
 
 ## Acceptance
 
-The golden harness requires at least 50 fixtures and enforces aggregate M1 thresholds:
+The golden harness requires at least 50 fixtures and these aggregate thresholds:
 
 - subprograms: extracted / expected >= 0.95
 - handlers + raises: extracted / expected >= 0.99
 
-It also rejects false-positive names through manifest allow-lists.
+It also fails on any extracted name missing from a manifest allow-list.

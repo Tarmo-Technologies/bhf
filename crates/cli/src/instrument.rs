@@ -9,7 +9,7 @@ pub struct InstrumentArgs {
     /// `pkg.adb`) is copied to the output directory with it.
     pub source: PathBuf,
 
-    /// Output directory. Default: bhf_work/src_instrumented/.
+    /// Output directory for the instrumented source and breadcrumbs.json.
     #[arg(long, default_value = "bhf_work/src_instrumented")]
     pub output: PathBuf,
 }

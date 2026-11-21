@@ -16,11 +16,13 @@
 //!
 //! Go is compiled + statically typed, so the harness decodes by the parameter's
 //! declared type. A Go panic (nil deref, index OOB, divide-by-zero, ...) is
-//! `recover`ed and reported as a finding; an unrecoverable `fatal error` crashes
-//! the process and the engine catches the death. A missing `go` toolchain, a
-//! method (needs a receiver), or an unsupported parameter type skips cleanly
-//! (the GNAT-less rule). A target outside every module is copied into a module
-//! of its own ([`loose_package_module`]).
+//! `recover`ed and reported as a finding, except a `Must` function's
+//! documented panic when the target is a `Must` function, and
+//! `template.Must`'s (`GO_CONTRACT_PANIC_RUNTIME`); an unrecoverable
+//! `fatal error` crashes the process and the engine catches the death. A missing `go` toolchain, a method (needs a receiver), or an
+//! unsupported parameter type skips cleanly (the GNAT-less rule). A target
+//! outside every module is copied into a module of its own
+//! ([`loose_package_module`]).
 
 use crate::auto::candidate::Candidate;
 use go_parser::{parse_go_data_types, parse_go_functions, parse_go_package, GoDataType, GoFunc};
@@ -42,7 +44,18 @@ pub enum GoBuildResult {
         reason: String,
         skip: bool,
     },
+    /// The harness built, but it fails before it reads an input: a package
+    /// `init` panicked, or the process exited, as it loaded. Every input would
+    /// hit it, so it is the target's environment (often the Go release), not a
+    /// finding. `reason` names the package and the panic.
+    NotEntered {
+        reason: String,
+    },
 }
+
+/// Set in a Go harness's environment, it makes `main` return before it reads
+/// an input, once every package's `init` has run: the build's load gate.
+const GO_LOAD_ONLY_ENV: &str = "BHF_GO_LOAD_ONLY";
 
 fn probe_go() -> Option<PathBuf> {
     which::which("go").ok()
@@ -133,7 +146,8 @@ pub fn build_go_harness(
         },
     };
 
-    let main_go = generate_main_go(&import_path, &body);
+    let must_target = target_rank::go_rank::is_must_function_name(&func.name);
+    let main_go = generate_main_go(&import_path, &body, must_target);
     let harness_files = std::iter::once(("bhf_harness.go", main_go.as_str())).chain(GO_OS_FILES);
     for (name, text) in harness_files {
         if let Err(e) = std::fs::write(auto_dir.join(name), text) {
@@ -274,7 +288,10 @@ pub fn build_go_harness(
         }
     }
     match build {
-        Ok(out) if out.status.success() && bin.is_file() => GoBuildResult::Built { forced },
+        Ok(out) if out.status.success() && bin.is_file() => match load_failure(&bin, &auto_dir) {
+            Some(reason) => GoBuildResult::NotEntered { reason },
+            None => GoBuildResult::Built { forced },
+        },
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
             // A target needing external modules we can't fetch offline, or a newer Go
@@ -297,6 +314,121 @@ pub fn build_go_harness(
             skip: false,
         },
     }
+}
+
+/// The build's load gate (#398): run the built harness with
+/// [`GO_LOAD_ONLY_ENV`] set, so every package's `init` runs and `main` returns
+/// before it reads an input. A run that fails failed before the target could
+/// be called, on whatever input: a dependency's `init` that refuses this Go
+/// release, a `log.Fatal` as a package loads. Returns why, naming the package
+/// whose `init` panicked when the stack shows one; `None` when the harness
+/// loads, or when the run could not be started or was cut off (a hang as it
+/// loads is the fuzz pass's to report).
+fn load_failure(bin: &Path, dir: &Path) -> Option<String> {
+    let mut command = Command::new(bin);
+    command
+        .env(GO_LOAD_ONLY_ENV, "1")
+        .env_remove("BHF_FRAMED")
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null());
+    let (out, timed_out) = crate::command_output::output_with_timeout_flagged(
+        &mut command,
+        std::time::Duration::from_secs(60),
+    )
+    .ok()?;
+    if out.status.success() || timed_out {
+        return None;
+    }
+    Some(load_failure_reason(
+        &String::from_utf8_lossy(&out.stderr),
+        &out.status.to_string(),
+    ))
+}
+
+/// Why a harness that ran no input failed, from its stderr: the panic and the
+/// package whose `init` raised it, or else the last thing it printed.
+fn load_failure_reason(stderr: &str, status: &str) -> String {
+    let panic = stderr.lines().find_map(|line| {
+        let line = line.trim();
+        line.strip_prefix("panic: ")
+            .or_else(|| line.strip_prefix("fatal error: "))
+    });
+    let tail = "before it read an input, so every input fails the same way. That is the \
+                target's environment (often the Go release: try the one the project \
+                supports), not a finding";
+    match (panic, init_frame_package(stderr)) {
+        (Some(message), Some(package)) => format!(
+            "the harness never reached the target: package `{package}` panicked in its \
+             init (`{message}`) {tail}"
+        ),
+        (Some(message), None) => format!(
+            "the harness never reached the target: it panicked as its packages loaded \
+             (`{message}`) {tail}"
+        ),
+        (None, _) => {
+            let last = stderr
+                .lines()
+                .map(str::trim)
+                .rfind(|line| !line.is_empty() && !line.starts_with("warning: GOCOVERDIR"))
+                .unwrap_or("no output");
+            format!(
+                "the harness never reached the target: it exited ({status}) as its \
+                 packages loaded (`{last}`) {tail}"
+            )
+        }
+    }
+}
+
+/// The package of the outermost package-`init` frame in a Go traceback:
+/// `example.com/lib.init.0()` or `example.com/lib.init()` (a package-level
+/// variable's initializer), and the closures inside them
+/// (`example.com/lib.init.0.func1(...)`). The outermost, because the runtime
+/// calls a package's `init` itself, below anything it calls.
+fn init_frame_package(stderr: &str) -> Option<String> {
+    stderr.lines().rev().find_map(|line| {
+        if line.starts_with(char::is_whitespace) {
+            return None;
+        }
+        // A frame's function has no spaces (`panic: …` and `created by …` do).
+        let function = line.trim_end().split_once('(').map(|(name, _)| name)?;
+        if function.is_empty() || function.contains(char::is_whitespace) {
+            return None;
+        }
+        // Past the import path, the package name and the function are
+        // dot-separated.
+        let slash = function.rfind('/').map_or(0, |at| at + 1);
+        let (dir, last) = function.split_at(slash);
+        let mut parts = last.split('.');
+        let package = parts.next()?;
+        let rest: Vec<&str> = parts.collect();
+        // A package path element may itself hold dots (`yaml.v3`): the `init`
+        // is the first element that reads so. A method's receiver
+        // (`lib.(*T).init`) is not part of a path.
+        let init = rest.iter().position(|part| *part == "init")?;
+        if rest[..init]
+            .iter()
+            .any(|part| part.is_empty() || part.contains(['(', ')', '*', '[']))
+        {
+            return None;
+        }
+        let after = &rest[init + 1..];
+        let numbered = after
+            .first()
+            .is_some_and(|part| part.parse::<u32>().is_ok());
+        let closures = &after[usize::from(numbered)..];
+        if !closures.iter().all(|part| {
+            part.strip_prefix("func")
+                .is_some_and(|n| n.parse::<u32>().is_ok())
+                || part.parse::<u32>().is_ok()
+        }) {
+            return None;
+        }
+        let path = std::iter::once(package)
+            .chain(rest[..init].iter().copied())
+            .collect::<Vec<_>>()
+            .join(".");
+        Some(format!("{dir}{path}"))
+    })
 }
 
 /// The target plus every function parsed from its file — the siblings a receiver
@@ -1473,11 +1605,14 @@ func bhfControlPipe() *os.File {
 
 /// The full harness `main.go`. All imports are referenced inside cursor methods so
 /// none is "unused" regardless of which decode paths a given target uses.
-fn generate_main_go(import_path: &str, body: &str) -> String {
+/// `must_target`: the fuzz target is itself a `Must` function, so a panic a
+/// `Must` function raises is its contract (`GO_CONTRACT_PANIC_RUNTIME`).
+fn generate_main_go(import_path: &str, body: &str, must_target: bool) -> String {
     format!(
         r#"// SPDX-License-Identifier: Apache-2.0
 // Generated by bhf (native Go lane). Decodes fuzz bytes into typed args and
-// calls the target; a recovered panic is a finding. Do not edit. BHF_FRAMED
+// calls the target; a recovered panic is a finding, unless a Must function
+// raised it as its contract. Do not edit. BHF_FRAMED
 package main
 
 import (
@@ -1488,6 +1623,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"runtime"
 	"runtime/coverage"
 	"runtime/debug"
 	"strings"
@@ -1555,9 +1691,15 @@ var _ = json.Unmarshal
 // can be qualified with); every platform has Getpid.
 var _ = syscall.Getpid
 
-{entry}func runOne(data []byte) {{
+{entry}{contract}// The fuzz target is itself a Must function (#399).
+const bhfMustTarget = {must_target}
+
+func runOne(data []byte) {{
 	defer func() {{
 		if r := recover(); r != nil {{
+			if bhfContractPanic(r) {{
+				return // the Must function rejected this input, as documented
+			}}
 			os.Stderr.WriteString("== bhf go finding: " + fmt.Sprint(r) + "\n")
 			os.Stderr.Write(debug.Stack()) // stack frames so findings cluster by site
 			_ = os.Stderr.Sync()
@@ -1578,6 +1720,10 @@ func readU32(f *os.File) (int, bool) {{
 }}
 
 func main() {{
+	// The build's load gate: every package's init has run, stop before an input.
+	if os.Getenv("{load_only}") != "" {{
+		return
+	}}
 	// Keep the control pipe (stdout) and point stdout at the null device, so
 	// the target's prints can't corrupt the sync stream (#427).
 	control := bhfControlPipe()
@@ -1617,8 +1763,91 @@ func main() {{
         body = body,
         coverage = GO_COVERAGE_RUNTIME,
         entry = GO_TARGET_ENTRY_RUNTIME,
+        contract = GO_CONTRACT_PANIC_RUNTIME,
+        must_target = must_target,
+        load_only = GO_LOAD_ONLY_ENV,
     )
 }
+
+/// The harness runtime's test for a `Must` function's documented panic
+/// (#399). `MustX` panics on whatever `X` rejects, by contract. When the fuzz
+/// target is itself a `Must` function (`bhfMustTarget`, set by
+/// [`generate_main_go`]), a panic that a `Must` function raises rejects the
+/// input rather than reporting a defect. A target that is no `Must` function
+/// and passes its input to one (`regexp.MustCompile(filter)`) breaks that
+/// contract, and the panic stays a finding. `template.Must` panics on a
+/// template error, and the templates it checks are part of the program, so its
+/// panic rejects the input under any target. A runtime fault (an index, nil,
+/// conversion or divide error), even in a `Must` function's own body, is never
+/// a contract, nor is a panic raised deeper, in code the `Must` function
+/// calls. `log.Panic*` is seen through to its caller. The program defines
+/// `bhfMustTarget`.
+const GO_CONTRACT_PANIC_RUNTIME: &str = r#"// bhfContractPanic reports whether the panic being recovered (r) is a Must
+// function's documented contract rather than a fault: one template.Must
+// raised, or, when the fuzz target is a Must function, one a Must function
+// raised. A runtime fault never is.
+func bhfContractPanic(r any) bool {
+	if _, fault := r.(runtime.Error); fault {
+		return false
+	}
+	pcs := make([]uintptr, 64)
+	frames := runtime.CallersFrames(pcs[:runtime.Callers(1, pcs)])
+	panicking := false
+	for {
+		frame, more := frames.Next()
+		fn := frame.Function
+		if panicking && !strings.HasPrefix(fn, "runtime.") && !bhfPanicHelper(fn) {
+			return bhfTemplateMust(fn) || (bhfMustTarget && bhfMustName(fn))
+		}
+		if fn == "runtime.gopanic" {
+			panicking = true
+		}
+		if !more {
+			return false
+		}
+	}
+}
+
+// bhfTemplateMust: html/template.Must and text/template.Must.
+func bhfTemplateMust(fn string) bool {
+	return fn == "html/template.Must" || fn == "text/template.Must"
+}
+
+// bhfPanicHelper: log.Panic, log.Panicf, log.Panicln and the *log.Logger ones.
+func bhfPanicHelper(fn string) bool {
+	return strings.HasPrefix(fn, "log.Panic") || strings.HasPrefix(fn, "log.(*Logger).Panic")
+}
+
+// bhfMustName reports whether a frame's function (pkg/path.MustParse,
+// pkg.(*T).MustDo, pkg.MustOf[...], or a closure in one) is named Must, or
+// Must and then an upper-case letter.
+func bhfMustName(fn string) bool {
+	fn = strings.ReplaceAll(fn, "[...]", "")
+	if i := strings.LastIndexByte(fn, '/'); i >= 0 {
+		fn = fn[i+1:]
+	}
+	parts := strings.Split(fn, ".")
+	for i := len(parts) - 1; i >= 1; i-- {
+		if bhfGeneratedName(parts[i]) {
+			continue // a closure or go/defer wrapper inside the function
+		}
+		rest, ok := strings.CutPrefix(parts[i], "Must")
+		return ok && (rest == "" || (rest[0] >= 'A' && rest[0] <= 'Z'))
+	}
+	return false
+}
+
+func bhfGeneratedName(name string) bool {
+	for _, prefix := range []string{"func", "gowrap", "deferwrap", ""} {
+		digits, ok := strings.CutPrefix(name, prefix)
+		if ok && digits != "" && strings.Trim(digits, "0123456789") == "" {
+			return true
+		}
+	}
+	return false
+}
+
+"#;
 
 /// The harness runtime's edge coverage: per input, the set of Go `-cover`
 /// blocks the input executed, folded into the engine's `BHF_COV_SHM` map.
@@ -1803,7 +2032,8 @@ fn build_go_fuzz_test(
     harness_id: &str,
 ) -> GoBuildResult {
     match build_go_fuzz_test_inner(go, candidate, work_dir, harness_id) {
-        Ok(()) => GoBuildResult::Built { forced: None },
+        Ok(None) => GoBuildResult::Built { forced: None },
+        Ok(Some(reason)) => GoBuildResult::NotEntered { reason },
         Err((reason, skip)) => GoBuildResult::Failed { reason, skip },
     }
 }
@@ -1814,12 +2044,14 @@ struct GoTestFile {
     text: String,
 }
 
+/// `Ok(Some(why))` when the fuzz test built but fails before it reads an
+/// input ([`load_failure`]).
 fn build_go_fuzz_test_inner(
     go: &Path,
     candidate: &Candidate,
     work_dir: &Path,
     harness_id: &str,
-) -> Result<(), (String, bool)> {
+) -> Result<Option<String>, (String, bool)> {
     let source = crate::source_text::read_source_text(&candidate.source_path).map_err(|e| {
         (
             format!("read {}: {e}", candidate.source_path.display()),
@@ -1923,7 +2155,11 @@ fn build_go_fuzz_test_inner(
     if let Some(error) = last {
         return Err(error);
     }
-    probe_fuzz_test(&auto_dir, candidate, &test, &pkg_dir)
+    let bin = auto_dir.join(crate::auto::layout::harness_exe_name("main"));
+    if let Some(reason) = load_failure(&bin, &auto_dir) {
+        return Ok(Some(reason));
+    }
+    probe_fuzz_test(&auto_dir, candidate, &test, &pkg_dir).map(|()| None)
 }
 
 /// The other `_test.go` files of `pkg_dir` in `package`.
@@ -2547,6 +2783,10 @@ func readU32(f *os.File) (int, bool) {{
 }}
 
 func main() {{
+	// The build's load gate: every package's init has run, stop before an input.
+	if os.Getenv("{load_only}") != "" {{
+		return
+	}}
 	// The fuzz test runs in its package's directory, as under go test, so a
 	// replayed input named relative to where bhf started the harness is
 	// resolved first.
@@ -2595,6 +2835,7 @@ func main() {{
 "#,
         coverage = GO_COVERAGE_RUNTIME,
         entry = GO_TARGET_ENTRY_RUNTIME,
+        load_only = GO_LOAD_ONLY_ENV,
         dir = quote(package_dir),
         corpus = quote(corpus),
     )
@@ -3787,9 +4028,256 @@ func ParseRequest(req *Request) {}
         assert!(out.contains("require golang.org/x/text v0.3.0"));
     }
 
+    /// #399: the generated harness asks whether a recovered panic is a
+    /// `Must` function's contract before it reports a finding, and says
+    /// whether the target is a `Must` function.
+    #[test]
+    fn the_harness_checks_for_a_must_contract_before_reporting_a_panic() {
+        let main_go = generate_main_go("x/y", "\ttgt.F()\n", false);
+        let recover = main_go.find("if r := recover(); r != nil {").unwrap();
+        let contract = main_go.find("if bhfContractPanic(r) {").unwrap();
+        let finding = main_go.find("== bhf go finding: ").unwrap();
+        assert!(recover < contract && contract < finding, "{main_go}");
+        assert!(main_go.contains("func bhfContractPanic(r any) bool {"));
+        assert!(
+            main_go.contains("\t\"runtime\"\n"),
+            "imports runtime: {main_go}"
+        );
+        assert!(main_go.contains("\nconst bhfMustTarget = false\n"));
+        let must = generate_main_go("x/y", "\ttgt.MustF()\n", true);
+        assert!(must.contains("\nconst bhfMustTarget = true\n"), "{must}");
+    }
+
+    /// #399: run the harness runtime's `Must` test in Go on the panics it must
+    /// tell apart. When the target is a `Must` function, a `Must` function's
+    /// own `panic`, through `log.Panicf`, of a method, of a generic function
+    /// and of `regexp.MustCompile` is its contract. When it is not, only
+    /// `template.Must`'s is: a target that passes its input to a `Must`
+    /// function breaks that function's contract. A runtime fault in a `Must`
+    /// body, a panic in code a `Must` function calls, and an ordinary
+    /// function's panic never are.
+    #[test]
+    fn the_must_contract_test_tells_a_documented_panic_from_a_fault() {
+        let Some(go) = probe_go() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("go.mod"),
+            "module example.test/must\n\ngo 1.21\n",
+        )
+        .unwrap();
+        let program = format!(
+            r#"package main
+
+import (
+	"errors"
+	"fmt"
+	"log"
+	"regexp"
+	"runtime"
+	"strings"
+	"text/template"
+)
+
+{GO_CONTRACT_PANIC_RUNTIME}
+var bhfMustTarget bool
+
+type Widget struct{{}}
+
+func ParseWidget(s string) (int, error) {{
+	if s == "" {{
+		return 0, errors.New("empty widget")
+	}}
+	return len(s), nil
+}}
+
+func MustParseWidget(s string) int {{
+	n, err := ParseWidget(s)
+	if err != nil {{
+		panic(err)
+	}}
+	return n
+}}
+
+func MustLogged(s string) {{ log.Panicf("bad widget %q", s) }}
+
+func (Widget) MustCopyAt(s string) {{ panic("widget: bad offset") }}
+
+func MustOf[V any](v V, err error) V {{
+	if err != nil {{
+		panic(err)
+	}}
+	return v
+}}
+
+func MustIndex(s string) byte {{ return s[5] }}
+
+func decodeDeep(s string) {{ panic("unreachable state") }}
+
+func MustDecode(s string) {{ decodeDeep(s) }}
+
+func ParseRecord(s string) {{ panic("record: truncated") }}
+
+func classify(name string, call func()) {{
+	defer func() {{
+		fmt.Printf("%s %s=%v\n", map[bool]string{{true: "must", false: "plain"}}[bhfMustTarget],
+			name, bhfContractPanic(recover()))
+	}}()
+	call()
+}}
+
+func main() {{
+	_ = runtime.Version
+	_ = strings.Cut
+	for _, must := range []bool{{true, false}} {{
+		bhfMustTarget = must
+		classify("must", func() {{ MustParseWidget("") }})
+		classify("logged", func() {{ MustLogged("") }})
+		classify("method", func() {{ Widget{{}}.MustCopyAt("") }})
+		classify("generic", func() {{ MustOf(ParseWidget("")) }})
+		classify("regexp", func() {{ regexp.MustCompile("(") }})
+		classify("template", func() {{ template.Must(template.New("p").Delims("<", ">").Parse("<")) }})
+		classify("fault", func() {{ MustIndex("a") }})
+		classify("deeper", func() {{ MustDecode("") }})
+		classify("plain", func() {{ ParseRecord("") }})
+	}}
+}}
+"#
+        );
+        std::fs::write(dir.path().join("main.go"), program).unwrap();
+        let mut run = Command::new(go);
+        run.args(["run", "."])
+            .current_dir(dir.path())
+            .env("GOTOOLCHAIN", "local")
+            .env("GOFLAGS", "-mod=mod");
+        let out = crate::command_output::output_with_timeout(
+            &mut run,
+            std::time::Duration::from_secs(600),
+        )
+        .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let verdicts: Vec<&str> = stdout.lines().collect();
+        assert_eq!(
+            verdicts,
+            [
+                "must must=true",
+                "must logged=true",
+                "must method=true",
+                "must generic=true",
+                "must regexp=true",
+                "must template=true",
+                "must fault=false",
+                "must deeper=false",
+                "must plain=false",
+                "plain must=false",
+                "plain logged=false",
+                "plain method=false",
+                "plain generic=false",
+                "plain regexp=false",
+                "plain template=true",
+                "plain fault=false",
+                "plain deeper=false",
+                "plain plain=false",
+            ],
+            "{stdout}"
+        );
+    }
+
+    /// #398: the load gate's harness stops after every package's `init` and
+    /// before it touches the control pipe or reads an input, in the generated
+    /// harness and in a native fuzz test's.
+    #[test]
+    fn both_harness_mains_stop_after_init_when_asked_to_load_only() {
+        let fuzz_test = generate_fuzz_test_main_go(
+            "x/y",
+            "x/y/bhftesting",
+            "FuzzParse",
+            Path::new("/src/y"),
+            Path::new("/src/y/testdata/fuzz/FuzzParse"),
+        );
+        for main_go in [generate_main_go("x/y", "\ttgt.F()\n", false), fuzz_test] {
+            let main = &main_go[main_go.find("func main() {").expect("a main")..];
+            let gate = main
+                .find("if os.Getenv(\"BHF_GO_LOAD_ONLY\") != \"\" {\n\t\treturn\n\t}")
+                .unwrap_or_else(|| panic!("no load-only return in main: {main}"));
+            let control = main.find("bhfControlPipe()").expect("a control pipe");
+            assert!(gate < control, "{main}");
+            assert!(gate < main.find("os.Args").expect("argv"), "{main}");
+        }
+    }
+
+    /// #398: a package `init` that panics names its package and its message;
+    /// the frame shapes are those `go1.22` prints for an `init` function, a
+    /// closure in one, and a package-level variable's initializer.
+    #[test]
+    fn a_failed_load_names_the_package_whose_init_panicked() {
+        let init_func = "panic: qtls.ClientSessionState doesn't match\n\n\
+            goroutine 1 [running]:\n\
+            github.com/marten-seemann/qtls-go1-15.init.0()\n\
+            \t/go/pkg/mod/github.com/marten-seemann/qtls-go1-15@v0.1.1/unsafe.go:20 +0x132\n";
+        assert_eq!(
+            init_frame_package(init_func).as_deref(),
+            Some("github.com/marten-seemann/qtls-go1-15")
+        );
+        let reason = load_failure_reason(init_func, "exit status: 2");
+        assert!(
+            reason.contains("package `github.com/marten-seemann/qtls-go1-15` panicked in its init")
+                && reason.contains("`qtls.ClientSessionState doesn't match`")
+                && reason.contains("not a finding"),
+            "{reason}"
+        );
+        let closure = "panic: codec: state doesn't match\n\ngoroutine 1 [running]:\n\
+            example.test/exp/codec.init.0.func1(...)\n\t/src/codec/codec.go:4\n\
+            example.test/exp/codec.init.0()\n\t/src/codec/codec.go:4 +0x6a\n";
+        assert_eq!(
+            init_frame_package(closure).as_deref(),
+            Some("example.test/exp/codec")
+        );
+        let initializer = "panic: bad table\n\ngoroutine 1 [running]:\n\
+            gopkg.in/legacy.v3.Table.init(...)\n\t/src/legacy/table.go:12\n\
+            gopkg.in/legacy.v3.build(...)\n\t/src/legacy/table.go:9\n\
+            gopkg.in/legacy.v3.init()\n\t/src/legacy/table.go:5 +0x8c\n";
+        assert_eq!(
+            init_frame_package(initializer).as_deref(),
+            Some("gopkg.in/legacy.v3")
+        );
+    }
+
+    /// Only a package's `init` names a package: a method called `init`, a
+    /// function whose name merely contains it, or a panic message does not.
+    #[test]
+    fn only_a_package_init_frame_names_a_package() {
+        for stderr in [
+            "panic: x\n\ngoroutine 1 [running]:\nexample.com/p.(*Codec).init(...)\n\t/p.go:3\n",
+            "panic: x\n\ngoroutine 1 [running]:\nexample.com/p.initTable()\n\t/p.go:3 +0x1\n",
+            "panic: x\n\ngoroutine 1 [running]:\nexample.com/p.(*Codec).init(...)\n\t/p.go:3\n\
+             example.com/p.Load()\n\t/p.go:9 +0x1\n",
+            "panic: a.init.0() failed\n",
+            "created by example.com/p.init.0 in goroutine 1\n",
+        ] {
+            assert_eq!(init_frame_package(stderr), None, "{stderr}");
+        }
+        // A load that failed without a panic names what it printed last.
+        let fatal = load_failure_reason(
+            "2026/11/20 10:00:00 config: no profile directory\n",
+            "exit status: 1",
+        );
+        assert!(
+            fatal.contains("exited (exit status: 1) as its packages loaded")
+                && fatal.contains("`2026/11/20 10:00:00 config: no profile directory`"),
+            "{fatal}"
+        );
+    }
+
     #[test]
     fn main_go_carries_framed_marker() {
-        let m = generate_main_go("x/y", "\ttgt.F()\n");
+        let m = generate_main_go("x/y", "\ttgt.F()\n", false);
         assert!(m.contains("BHF_FRAMED"));
         assert!(m.contains("tgt \"x/y\""));
     }
@@ -3799,7 +4287,7 @@ func ParseRequest(req *Request) {}
         // The Go lane is no longer black-box: the harness reads Go's -cover atomic
         // counters and folds executed blocks into the shared BHF_COV_SHM map,
         // clearing+recording around each framed input.
-        let m = generate_main_go("x/y", "\ttgt.F()\n");
+        let m = generate_main_go("x/y", "\ttgt.F()\n", false);
         assert!(m.contains("runtime/coverage"), "imports runtime/coverage");
         assert!(m.contains("BHF_COV_SHM"), "maps the shared edge map");
         assert!(m.contains("WriteCounters"), "reads per-input counters");
@@ -3830,7 +4318,7 @@ func ParseRequest(req *Request) {}
         );
         // The helper it calls exists, returns the non-nil background context,
         // and keeps the import referenced so an unrelated harness still compiles.
-        let main_go = generate_main_go("x/y", "\ttgt.F()\n");
+        let main_go = generate_main_go("x/y", "\ttgt.F()\n", false);
         assert!(
             main_go.contains("func (c *cur) ctx() context.Context"),
             "{main_go}"

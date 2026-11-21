@@ -204,6 +204,41 @@ fn extension_validate_refuses_without_explicit_manifest() {
     assert_eq!(output.status.code(), Some(2), "clap usage error");
 }
 
+/// #450: a manifest named by a bare relative path, run from its directory,
+/// starts the executable beside it. `PATH` holds no copy, so a lookup there
+/// fails.
+#[test]
+fn extension_validate_runs_the_executable_beside_a_bare_relative_manifest() {
+    let dir = temp_dir("validate-bare-manifest");
+    fs::copy(mock_extension(), dir.join("bhf-ext-beside")).unwrap();
+    fs::write(
+        dir.join("extension.toml"),
+        "schema = \"bhf.extension-manifest.v1\"\n\
+         id = \"mock-extension\"\n\
+         executable = \"bhf-ext-beside\"\n\
+         args = [\"--mode\", \"well-behaved\"]\n\
+         required-capabilities = [\"oracle.evaluate\"]\n",
+    )
+    .unwrap();
+    let empty_path = dir.join("empty-path");
+    fs::create_dir(&empty_path).unwrap();
+
+    let output = Command::new(bhf_bin())
+        .current_dir(&dir)
+        .env("PATH", &empty_path)
+        .args(["extension", "validate", "--manifest", "extension.toml"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "validate failed: {:?}\n{stdout}\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("oracle.evaluate"), "capability: {stdout}");
+}
+
 // ── evaluate ─────────────────────────────────────────────────────────────
 
 /// Drive `bhf extension evaluate` on `input_bytes` through the mock in `mode`,

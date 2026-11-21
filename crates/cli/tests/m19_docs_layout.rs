@@ -71,7 +71,13 @@ fn the_docs_name_no_legacy_result_paths() {
                 continue;
             }
             for spelling in &spellings {
-                if line.contains(spelling.as_str()) {
+                // A bare `FINDINGS.md` is the legacy index; one at the end of
+                // another directory's path (a benchmark's `FINDINGS.md`) is
+                // that file.
+                let named = line
+                    .match_indices(spelling.as_str())
+                    .any(|(at, _)| spelling != "FINDINGS.md" || !line[..at].ends_with('/'));
+                if named {
                     stale.push(format!(
                         "{}:{}: {spelling}",
                         path.strip_prefix(repo_root()).unwrap_or(&path).display(),
@@ -103,6 +109,23 @@ fn tree_entries(block: &str, indent: &str) -> Vec<(String, bool)> {
             Some((name, comment.contains("(when")))
         })
         .collect()
+}
+
+#[cfg(unix)]
+/// The lines of `block` under its top-level entry `name/`, up to the next
+/// top-level entry, so a subdirectory's children are not read as another's.
+fn subtree(block: &str, name: &str) -> String {
+    let mut lines = block.lines().skip_while(|line| {
+        let entry = line
+            .strip_prefix("├── ")
+            .or_else(|| line.strip_prefix("└── "));
+        entry.is_none_or(|entry| entry.split('/').next() != Some(name))
+    });
+    lines.next();
+    lines
+        .take_while(|line| !line.starts_with("├── ") && !line.starts_with("└── "))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(unix)]
@@ -178,12 +201,13 @@ fn the_auto_output_tree_matches_a_real_run() {
     );
 
     let tree = documented_tree();
-    for (indent, dir) in [
-        ("", work.clone()),
-        ("│   ", work.join("auto")),
-        ("    ", work.join("results")),
+    for (indent, scope, dir) in [
+        ("", None, work.clone()),
+        ("│   ", Some("auto"), work.join("auto")),
+        ("    ", Some("results"), work.join("results")),
     ] {
-        let documented = tree_entries(&tree, indent);
+        let block = scope.map_or_else(|| tree.clone(), |name| subtree(&tree, name));
+        let documented = tree_entries(&block, indent);
         let real = listing(&dir);
         // Each entry the tree shows is there, unless it is marked `(when ...)`.
         for (name, optional) in &documented {

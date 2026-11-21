@@ -24,6 +24,7 @@ fn words(text: &str) -> String {
 fn fuzz_help_describes_grammar_generation_plus_tree_mutation() {
     let out = Command::new(env!("CARGO_BIN_EXE_bhf"))
         .args(["fuzz", "--help"])
+        .env("COLUMNS", "100")
         .output()
         .unwrap();
     assert!(

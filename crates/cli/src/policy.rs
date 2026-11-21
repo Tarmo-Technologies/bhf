@@ -11,26 +11,37 @@ pub struct PolicyArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum PolicyCommand {
-    /// Explain effective policy decisions and policy hash.
+    /// Print a policy's decisions and its SHA-256 hash
+    ///
+    /// The decisions are its disabled rules, denied external tools, allowed
+    /// runners, sandbox requirement and CI gates.
     Explain(ExplainArgs),
-    /// Evaluate policy decisions against a finding record without running scans.
+    /// Apply a policy to one finding record and print the decision
+    ///
+    /// The decision includes any waiver that matches the finding. No scan
+    /// runs.
     DryRun(DryRunArgs),
-    /// Validate a BHF policy-as-code document.
+    /// Check a policy-as-code JSON file and print a validation summary.
     Validate(ValidateArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct ExplainArgs {
+    /// Policy JSON file.
     pub path: PathBuf,
+    /// Write the JSON summary to this path instead of stdout.
     #[arg(long)]
     pub out: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 pub struct DryRunArgs {
+    /// Policy JSON file.
     pub path: PathBuf,
+    /// The finding record (JSON) to judge.
     #[arg(long)]
     pub finding: PathBuf,
+    /// Write the JSON decision to this path instead of stdout.
     #[arg(long)]
     pub out: Option<PathBuf>,
 }
@@ -40,7 +51,7 @@ pub struct ValidateArgs {
     /// Policy JSON file.
     pub path: PathBuf,
 
-    /// Write validation summary JSON to this path.
+    /// Write the JSON validation summary to this path instead of stdout.
     #[arg(long)]
     pub out: Option<PathBuf>,
 }

@@ -34,17 +34,12 @@ use std::time::Duration;
 /// `qemu-system:...,reset=fast` reads (#347).
 pub(crate) const QEMU_PLUGIN_SUBPROCESS_ID: &str = "qemu_plugin";
 
-/// The license profile the dirty-page plugin runs under: the one
-/// `BHF_PROFILE` names, else `external-tools`, which asking for `reset=fast`
-/// opts into (as `--symcc` and `--external-tools` do).
+/// The license profile the dirty-page plugin runs under: the global
+/// `--profile`, else the one `BHF_PROFILE` names, else `external-tools`,
+/// which asking for `reset=fast` opts into (as `--symcc` and
+/// `--external-tools` do).
 pub(crate) fn qemu_plugin_profile() -> Profile {
-    qemu_plugin_profile_from(std::env::var("BHF_PROFILE").ok().as_deref())
-}
-
-fn qemu_plugin_profile_from(value: Option<&str>) -> Profile {
-    value
-        .and_then(|value| value.trim().parse().ok())
-        .unwrap_or(Profile::ExternalTools)
+    Profile::for_requested_tools()
 }
 
 /// Whether `profile` lets bhf build and use its plugin inside QEMU; `Err`
@@ -55,7 +50,7 @@ pub(crate) fn qemu_plugin_gate(profile: Profile) -> Result<(), String> {
     }
     Err(format!(
         "reset=fast runs bhf's dirty-page plugin inside QEMU (GPL-2.0), which the `{}` \
-         license profile does not allow; set BHF_PROFILE=external-tools or research-lab, or \
+         license profile does not allow; pass --profile external-tools or research-lab, or \
          use reset=loadvm",
         profile.as_str()
     ))
@@ -610,23 +605,34 @@ mod tests {
         ));
     }
 
+    /// Every subprocess id a license profile lists is one a gate checks
+    /// before its tool runs, and every gate's id is listed.
+    #[test]
+    fn every_listed_subprocess_id_is_checked_where_its_tool_runs() {
+        let mut checked: Vec<&str> = ADAPTERS
+            .iter()
+            .map(|adapter| adapter.subprocess_id)
+            .collect();
+        checked.extend(crate::binary_adapter::gated_subprocess_ids());
+        checked.push(crate::symcc::SUBPROCESS_ID);
+        checked.push(QEMU_PLUGIN_SUBPROCESS_ID);
+        checked.sort_unstable();
+        let mut listed = Profile::ExternalTools.allowed_subprocesses().to_vec();
+        listed.sort_unstable();
+        assert_eq!(listed, checked);
+    }
+
     /// #347: bhf's plugin runs inside QEMU (GPL-2.0), so strict-permissive
-    /// refuses `reset=fast`; external-tools and research-lab allow it, and
-    /// asking for it without BHF_PROFILE opts into external-tools.
+    /// refuses `reset=fast`; external-tools and research-lab allow it.
     #[test]
     fn only_the_external_tool_profiles_allow_the_qemu_plugin() {
         let refused = qemu_plugin_gate(Profile::StrictPermissive).unwrap_err();
         assert!(
-            refused.contains("strict-permissive") && refused.contains("BHF_PROFILE=external-tools"),
+            refused.contains("strict-permissive") && refused.contains("--profile external-tools"),
             "{refused}"
         );
         assert_eq!(qemu_plugin_gate(Profile::ExternalTools), Ok(()));
         assert_eq!(qemu_plugin_gate(Profile::ResearchLab), Ok(()));
-        assert_eq!(qemu_plugin_profile_from(None), Profile::ExternalTools);
-        assert_eq!(
-            qemu_plugin_profile_from(Some("strict-permissive")),
-            Profile::StrictPermissive
-        );
     }
 
     /// #347: off Unix the plugin is not built: it maps its log with POSIX mmap.

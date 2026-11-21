@@ -75,11 +75,12 @@ const STATE_NOVELTY_CAP: usize = 8;
 /// fidelity so a finding states exactly how its session state was re-established.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum SessionResetMode {
-    /// A fresh connection per testcase: new per-session target state (a new
-    /// handle / id / nonce is captured each run). The default.
+    /// A fresh connection per testcase, so the target starts a fresh session
+    /// (a new handle, id or nonce is captured each run). The default.
     #[default]
     Reconnect,
-    /// Keep one connection across testcases: per-session target state persists.
+    /// Keep one connection across testcases, so the session's state carries
+    /// over from one testcase to the next.
     None,
 }
 

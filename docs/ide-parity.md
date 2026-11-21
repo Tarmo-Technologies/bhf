@@ -2,24 +2,22 @@
 
 # IDE Parity
 
-This matrix tracks the VS Code extension and GNAT Studio plugin workflows that
-use `bhf-daemon` and the `bhf` CLI.
+The VS Code extension (`editors/vscode/`) and the GNAT Studio plugin (`editors/gnatstudio/`) offer the same finding workflows. Both use `bhf-daemon` (see [Daemon](site/daemon.md)) and the `bhf` CLI.
 
 | Workflow | VS Code | GNAT Studio | Notes |
 | --- | --- | --- | --- |
-| Configure daemon path | `bhf.daemonPath` | `BHF/daemon-path` | Defaults to `bhf-daemon`. |
-| Configure CLI path | `bhf.cliPath` | `BHF/cli-path` | Defaults to `bhf`. |
-| Configure findings directory | `bhf.findingsDir` | `BHF/findings-dir` | Relative paths resolve from the workspace/project root. |
-| Configure harness override | `bhf.harnessPath` | `BHF/harness-path` | Optional; both editors build replay arguments from the configured CLI and finding ID, ignoring command text stored in a finding. |
-| Configure minimize strategy | `bhf.minimizeStrategy` | `BHF/minimize-strategy` | Supports `bytes` and `typed`. |
-| Refresh findings | Command palette action | `/Tools/BHF/Refresh Findings` | Both call daemon `findings`. |
-| Finding source display | Diagnostics | Locations/messages | Both use handler, then last breadcrumb, then explicit raise. |
-| Replay finding | CodeLens and command | Message action and menu action | VS Code uses a process task; GNAT Studio uses `GPS.Process`. Both pass arguments to `bhf replay`. |
-| Minimize finding | CodeLens and command | Menu action | GNAT Studio exposes replay as the single inline message action; minimize is under the finding menu. |
-| Open `repro.adb` | CodeLens and command when generated | Menu action when generated | Both hide the action when `generated_repro_ada` is absent. |
-| Daemon lifecycle | Long-lived stdio client restarted on config change | One daemon subprocess per refresh | GNAT Studio's Python integration keeps the lifecycle simpler and avoids background process state. |
-| Findings grouping | Per-file diagnostics and CodeLens | Per-message Locations entries and per-finding menus | This follows each IDE's native UI model. |
+| Daemon path | `bhf.daemonPath` | `BHF/daemon-path` | Default `bhf-daemon` |
+| CLI path | `bhf.cliPath` | `BHF/cli-path` | Default `bhf` |
+| Findings directory | `bhf.findingsDir` | `BHF/findings-dir` | Default `results/findings`, where `bhf auto` writes findings in its work directory; a relative path resolves from the workspace or project root |
+| Harness override | `bhf.harnessPath` | `BHF/harness-path` | Optional. Both editors build the replay arguments from the configured CLI and the finding ID, and ignore any command text stored in a finding |
+| Minimize strategy | `bhf.minimizeStrategy` | `BHF/minimize-strategy` | `bytes` (default) or `typed` |
+| Request deadline | none | `BHF/daemon-timeout-seconds` | GNAT Studio default 30 seconds; see [Daemon reliability](enterprise-daemon-reliability.md) |
+| Refresh findings | Command palette action | `/Tools/BHF/Refresh Findings` | Both call the daemon's `findings` method |
+| Finding location | Diagnostics | Locations window messages | Both use the handler, then the last breadcrumb, then the explicit raise |
+| Replay a finding | CodeLens and command | Message action and menu action | VS Code runs a process task, GNAT Studio `GPS.Process`; both pass the arguments to `bhf replay` |
+| Minimize a finding | CodeLens and command | Menu action | In GNAT Studio, replay is the one inline message action and minimize is in the finding's menu |
+| Open `repro.adb` | CodeLens and command | Menu action | Shown only when the finding has `generated_repro_ada` |
+| Daemon lifecycle | One long-lived stdio client, restarted when the configuration changes | One daemon subprocess per refresh | GNAT Studio keeps no background process between refreshes |
+| Grouping | Per-file diagnostics and CodeLens | Per-message Locations entries and per-finding menus | Each follows its IDE's own UI model |
 
-The feature surfaces are intentionally equivalent for core finding workflows.
-The remaining differences are presentation details caused by IDE APIs, not
-missing BHF workflows.
+The differences in the table are in presentation and process lifecycle; both editors cover the same finding workflows.

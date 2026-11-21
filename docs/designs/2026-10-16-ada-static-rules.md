@@ -1,52 +1,29 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Design: Ada static rules
 
-> Status: implemented (`crates/static_analysis/src/ada_rules.rs`).
+> Status: implemented (bf57c71, `crates/static_analysis/src/ada_rules.rs`).
 
 ## Problem
 
-The Ada lane of `bhf static-scan` had six line-matching rules. Four of them
-reported the use of a language feature rather than a defect: every
-`Unchecked_Conversion` or `Unchecked_Deallocation` instantiation (BHF-409,
-BHF-410), every task, protected object, `accept` or `select` (BHF-411), and every
-`Spawn` call (BHF-412). BHF-405 matched any line containing `open (` and
-`path`. On the 18 permissive Ada projects listed below, main reports 979 Ada
-findings, and almost none of them point at a weakness. This pack reports 131. Findings from this
-pass are used as review and training data, so a finding that teaches nothing
-costs reviewer time and teaches the wrong lesson.
+The Ada lane of `bhf static-scan` had six line-matching rules. Four of them reported the use of a language feature rather than a defect: every `Unchecked_Conversion` or `Unchecked_Deallocation` instantiation (BHF-409, BHF-410), every task, protected object, `accept` or `select` (BHF-411), and every `Spawn` call (BHF-412). BHF-405 matched any line containing `open (` and `path`. On the 18 permissive Ada projects listed below, those rules reported 979 Ada findings, almost none of them pointing at a weakness. The rules in this design report 131. Static findings are reviewed and used as labelled training data, so a finding that points at no weakness costs reviewer time and teaches the wrong label.
 
 ## Approach
 
-`ada_rules.rs` lexes Ada (string literals with `""` escapes, character literals
-versus the attribute tick, comments) and splits the token stream into
-statements. It tracks frames: package, subprogram, task body, protected body,
-declare/begin block, and control constructs. Each frame records its declarations,
-formal parameters, phase (declarative part, statements, handler) and the
-exception choices of its handlers. Rules then ask structural questions, such as
-"is this object declared in the enclosing subprogram", "is this argument a
-constant", or "does this frame have a `when others` handler", instead of
-matching text.
+`ada_rules.rs` lexes Ada (string literals with `""` escapes, character literals versus the attribute tick, comments) and splits the token stream into statements. It tracks frames: package, subprogram, task body, protected body, declare/begin block, and control constructs. Each frame records its declarations, formal parameters, phase (declarative part, statements, handler) and the exception choices of its handlers. Rules then ask structural questions, such as "is this object declared in the enclosing subprogram", "is this argument a constant", or "does this frame have a `when others` handler", instead of matching text.
 
-`ada_parser` was not used. It wraps a tree-sitter C grammar, which would add a C
-build dependency to `static_analysis`, and the rules need declarations and
-scopes more than a full syntax tree.
+The rules do not use `ada_parser`. It wraps a tree-sitter C grammar, which would add a C build dependency to `static_analysis`, and the rules need declarations and scopes more than a full syntax tree.
 
-Findings go through the existing `static_finding` path, so JSON and SARIF output
-(rule id, CWE, file, line, message, snippet, triage) is unchanged.
+Findings go through the existing `static_finding` path, so JSON and SARIF output (rule id, CWE, file, line, message, snippet, triage) is unchanged.
 
-Scope exclusions that apply to every rule in the pack:
+Every rule in the pack skips:
 
-- test trees below the scan root (`test`, `tests`, `regtests`, `testsuite`,
-  `testing`, `unit_tests`, `*-tests.adb`, `*_test.adb`);
+- test trees below the scan root (`test`, `tests`, `regtests`, `testsuite`, `testing`, `unit_tests`, `*-tests.adb`, `*_test.adb`);
 - GNAT binder output (`b__*.adb`, `b~*.adb`);
-- compilation units of the predefined or GNAT hierarchy (`Ada.*`, `System.*`,
-  `Interfaces.*`, `GNAT.*`, including `separate` subunits of them). A runtime
-  implementation has to suppress checks and forge pointers to provide them.
+- compilation units of the predefined or GNAT hierarchy (`Ada.*`, `System.*`, `Interfaces.*`, `GNAT.*`, including `separate` subunits of them). A runtime implementation has to suppress checks and forge pointers to provide them.
 
 ## Rules
 
-Sources: ISO/IEC TR 24772-2 (Ada vulnerabilities, codes in brackets), the
-GNATcheck predefined rules, and CWE.
+Sources: ISO/IEC TR 24772-2 (Ada vulnerabilities, codes in brackets), the GNATcheck predefined rules, and CWE.
 
 | Rule | CWE | Reports | Source | Known false-positive patterns |
 |---|---|---|---|---|
@@ -70,21 +47,13 @@ GNATcheck predefined rules, and CWE.
 | BHF-570 | CWE-248 | A subprogram exported with C convention whose body has no `when others` handler. | TR [DJS] [OYB]; GNATcheck Exception_Propagation_From_Export | Bodies that cannot raise. Not reported: `null` bodies and units with `No_Exception_Propagation`. |
 | BHF-571 | CWE-460 | A `raise` (or re-raise) that can leave a controlled `Finalize (Obj : in out T)`. | TR [OYB] | None found in measurement. |
 
-BHF-405 (path traversal) is now reported for Ada only by the taint engine's
-Ada.*_IO Open/Create sinks. The line heuristic is removed. Hardcoded credentials
-are already covered for Ada by the generic BHF-429 assignment detector, which
-handles `:=`.
+For Ada, the taint engine's Ada.*_IO Open/Create sinks now report BHF-405 (path traversal); the line heuristic is removed. The generic BHF-429 assignment detector, which handles `:=`, reports hardcoded credentials in Ada.
 
-Not implemented, because they cannot be decided from source with useful
-precision: modular wrap-around in size/index computations (needs type
-resolution across units), unprotected shared variables accessed through
-subprogram calls from several tasks (needs a call graph per task), and missing
-`'Valid` after Unchecked_Conversion of input bytes.
+Three candidate rules are left out because source alone cannot decide them with useful precision: modular wrap-around in size/index computations (needs type resolution across units), unprotected shared variables accessed through subprogram calls from several tasks (needs a call graph per task), and missing `'Valid` after Unchecked_Conversion of input bytes.
 
 ## Measurement
 
-Tuning and precision projects (shallow clones at the commit shown). All are
-permissively licensed, and all are excluded from the evaluation panels:
+Tuning and precision projects (shallow clones at the commit shown). All are permissively licensed, and none is in the project sets used to evaluate bhf:
 
 - https://github.com/stcarrez/ada-util (897d197)
 - https://github.com/stcarrez/ada-ado (0f35d42)
@@ -105,24 +74,19 @@ permissively licensed, and all are excluded from the evaluation panels:
 - https://github.com/wookey-project/ewok-kernel (ca8e2a0)
 - https://github.com/vivianjia123/Password-Manager (c61523b)
 
-Four more projects were scanned during tuning before the evaluation project
-list reached this work:
+Four more projects were scanned during tuning, before the list of evaluation projects was available to this work:
 
 - https://github.com/jrcarter/Ada_GUI
 - https://github.com/ytomino/drake
 - https://github.com/persan/zeromq-Ada
 - https://github.com/jrmarino/libsodium-ada
 
-drake prompted the runtime-unit skip and the `'Size`-check overlay exemption;
-the other three only had their hits reviewed. All four have been dropped from
-the evaluation panels, and none of them is counted below.
+drake prompted the runtime-unit skip and the `'Size`-check overlay exemption; for the other three, only the hits were reviewed. All four have been removed from the project sets used to evaluate bhf, and none of them is counted below.
 
-Every hit was read in context when a rule had 18 or fewer hits. For BHF-409
-and BHF-567, 25 hits were sampled with a fixed seed. Verdicts:
+Every hit was read in context when a rule had 18 or fewer hits. For BHF-409 and BHF-567, 25 hits were sampled with a fixed seed. Verdicts:
 
 - **real**: a weakness, or a high-risk instance.
-- **review**: the pattern is genuine and needs a non-trivial check, but is
-  probably intended.
+- **review**: the pattern is genuine and needs a non-trivial check, but is probably intended.
 - **noise**: misdetected or trivially safe.
 
 Precision is (real + review) / reviewed.
@@ -137,23 +101,13 @@ Precision is (real + review) / reviewed.
 | BHF-564 | 18 | 18 | 1 | 17 | 0 | 100% |
 | BHF-567 | 53 | 25 | 6 | 16 | 3 | 88% |
 
-For BHF-409, the 25-hit sample was drawn before the four projects were dropped;
-the 18 sampled hits from allowed projects are reported.
+For BHF-409, the 25-hit sample was drawn before the four projects were dropped; the 18 sampled hits from allowed projects are reported.
 
-BHF-410, 419, 422, 436, 437, 550, 565, 566, 568, 569, 570 and 571 have no hits
-on these projects. BHF-550, 565 and 566 had false positives that tuning
-removed. The precision of these rules rests on the unit fixtures and the
-labelled corpus in `benchmarks/static/corpus/ada/`. Matreshka contributes most
-BHF-564/567 hits: near-duplicate string-handler kernels in portable, 32-bit,
-64-bit and SSE2 variants.
+BHF-410, 419, 422, 436, 437, 550, 565, 566, 568, 569, 570 and 571 have no hits on these projects. BHF-550, 565 and 566 had false positives that tuning removed. The precision of these rules rests on the unit fixtures and the labelled corpus in `benchmarks/static/corpus/ada/`. Matreshka contributes most BHF-564/567 hits: near-duplicate string-handler kernels in portable, 32-bit, 64-bit and SSE2 variants.
 
 Examples of real findings:
 
-- session identifiers and WS-Security nonces generated with `Discrete_Random`
-  (matreshka);
-- an editor command and GPG command templates run through `/bin/sh -c`
-  (ada-keystore);
-- FastCGI records decoded from raw network buffers with no validity check
-  (matreshka);
-- kernel enum and record objects overlaid on user syscall parameters with no
-  validity check (ewok-kernel).
+- session identifiers and WS-Security nonces generated with `Discrete_Random` (matreshka);
+- an editor command and GPG command templates run through `/bin/sh -c` (ada-keystore);
+- FastCGI records decoded from raw network buffers with no validity check (matreshka);
+- kernel enum and record objects overlaid on user syscall parameters with no validity check (ewok-kernel).

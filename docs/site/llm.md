@@ -2,50 +2,41 @@
 
 # LLM Assistance
 
-BHF keeps scanning, target ranking, harness validation, building, fuzzing,
-replay, and minimization deterministic. An LLM is useful around those steps: it
-can plan a run, draft a candidate harness, interpret evidence, explain code, and
-rank diagnostic hypotheses. It must not become the source of truth for whether
-a harness compiles, links, reaches its target, gains coverage, or reproduces a
-finding.
+bhf's scanning, target ranking, harness validation, building, fuzzing, replay and minimization are deterministic and use no model. A language model can help around those steps: plan a run, draft a candidate harness, interpret evidence, explain code, and rank diagnostic hypotheses. bhf's own checks decide whether a harness compiles, links, reaches its target, gains coverage or reproduces a finding.
 
-The LLM surface is an opt-in build feature. Build `bhf` and `bhf-daemon` with
-`cargo build --locked -p bhf -p bhf-daemon --features bhf/llm,bhf-daemon/llm`
-to enable the assistance commands and MCP prompt/preflight tools. Default
-release binaries omit the LLM crate; their MCP mode exposes only deterministic
-scan, target-list, and finding-load tools.
+The LLM commands are an opt-in build feature. Build `bhf` and `bhf-daemon` with the `llm` feature to get the `bhf llm` commands and the two extra MCP tools:
 
-The LLM surface is optional and is not part of `bhf auto`. BHF does not
-silently call a model, apply a completion to the repository, execute a
-model-generated command, or promote model prose into a finding. `llm prompt`
-renders a prompt, `llm assist` makes one bounded provider request, and the MCP
-LLM-enabled MCP server (a build with `--features llm`) exposes five read-only tools. The operator or host agent decides what to
-do next, under the same command-review and sandbox policy used for any other
-change.
+```sh
+cargo build --release --locked -p bhf -p bhf-daemon --features bhf/llm,bhf-daemon/llm
+```
 
-## Current capability boundary
+Release binaries and Docker images are built without it. Their `bhf-daemon --mcp` exposes the three deterministic tools: scan, target list and finding load.
 
-| Capability | Current scope |
+`bhf auto` never calls a model. bhf does not apply a completion to the repository, execute a model-generated command, or turn model prose into a finding. `bhf llm prompt` renders a prompt, `bhf llm assist` makes one bounded provider request, and the MCP server exposes read-only tools. You, or the host agent, decide what to do next, under the same command-review and sandbox policy used for any other change.
+
+## What each part covers
+
+| Capability | Scope |
 |---|---|
-| BHF fuzzing lanes | Sixteen: Ada, C, C++, Rust, Java, Python, Perl, Go, COBOL, Fortran, C#, JavaScript, TypeScript, Ruby, Lua, PHP |
+| bhf fuzzing lanes | Sixteen: Ada, C, C++, Rust, Java, Python, Perl, Go, COBOL, Fortran, C#, JavaScript, TypeScript, Ruby, Lua, PHP |
 | `bhf llm` task kinds | Run planning, harness drafting, finding analysis, code explanation, error diagnosis |
-| Structured LLM harness language option | Ada, C, C++ |
+| `--language` option of `bhf llm` | Ada, C, C++ |
 | MCP deterministic scan | Ada |
 | MCP ranked targets and harness preflight | Ada, C, C++ |
-| MCP finding loading and prompt preparation | Language-neutral normalized artifacts/evidence |
-| Build, fuzz, replay, minimization through MCP | Not exposed; run the explicit CLI commands |
+| MCP finding loading and prompt preparation | Any language (normalized findings and evidence) |
+| Build, fuzz, replay, minimization | CLI commands only; not exposed through MCP |
 
 ## Pick an integration mode
 
-| Mode | Credentials seen by BHF | Best use | Important distinction |
+| Mode | Credentials bhf sees | Best use | Note |
 |---|---|---|---|
-| No LLM | None | Deterministic scanning, building, fuzzing, replay, minimization, and reporting | Fully supported; every core workflow remains offline and model-free |
-| MCP (`bhf-daemon --mcp`) | None | Interactive work in the Codex/Claude session already open | Recommended for agentic assistance: the host session reasons and calls read-only BHF tools directly |
-| `--provider codex` / `claude` | None; the installed CLI uses its cached login | Automation that may use an existing subscription instead of an API key | Starts a new ephemeral child session; it is not the caller's current conversation |
-| `--provider openai` / `anthropic` | Key read from an environment variable | CI, services, controlled model/version evaluation | Data is sent to the configured remote API |
-| `--provider local` | None by default | Air-gapped or data-residency-sensitive work | Requires an OpenAI-compatible Ollama, llama.cpp, LM Studio, or gateway endpoint |
+| No model | None | Scanning, building, fuzzing, replay, minimization and reporting | Every core workflow runs offline without a model |
+| MCP (`bhf-daemon --mcp`) | None | Interactive work in an MCP client session you already have open | The host session reasons and calls bhf's read-only tools |
+| `--provider codex` / `claude` | None; the installed CLI uses its cached login | Automation that uses an existing subscription instead of an API key | Starts a new child session, separate from the caller's conversation |
+| `--provider openai` / `anthropic` | Key read from an environment variable | CI, services, controlled model and version evaluation | Data goes to the configured remote API |
+| `--provider local` | None by default | Air-gapped or data-residency-sensitive work | Needs an OpenAI-compatible endpoint (Ollama, llama.cpp, LM Studio or a gateway) |
 
-Start with a non-secret status check, then make an actual request:
+`--provider` defaults to `codex`. Start with a status check, which prints no secrets, then make a live request:
 
 ```sh
 bhf llm status --json
@@ -53,23 +44,26 @@ bhf llm test --provider codex
 bhf llm test --provider claude
 ```
 
-BHF never accepts an API key as a command-line value, where it would leak
-into shell history or process listings. Have the shell, CI secret store, or
-credential broker populate the environment; do not paste a real key into the
-example below. API providers require an explicit model instead of silently
-pinning a model name that will age:
+bhf never accepts an API key as a command-line value, where it would leak into shell history or process listings. Have the shell, the CI secret store or a credential broker set the environment variable; do not paste a real key into the example below. API providers need an explicit `--model`, because bhf does not pin a model name that will age:
 
 ```sh
-# OPENAI_API_KEY is already injected into this process environment
+# OPENAI_API_KEY is already set in this process environment
 bhf llm test --provider openai --model '<openai-model-id>'
 
-# ANTHROPIC_API_KEY is already injected into this process environment
+# ANTHROPIC_API_KEY is already set in this process environment
 bhf llm test --provider anthropic --model '<anthropic-model-id>'
 ```
 
-OpenAI uses the Responses API; Anthropic uses the Messages API. `--base-url`
-supports an organization gateway. Use `--api-key-env NAME` when the credential
-is stored under a different environment variable.
+OpenAI uses the Responses API and Anthropic the Messages API. `--base-url` points either at an organization gateway. Use `--api-key-env NAME` when the key is in a different environment variable.
+
+| Provider option | Default | Meaning |
+|---|---|---|
+| `--model` | none (session CLIs use their configured default) | Model identifier; required for `openai`, `anthropic` and `local` |
+| `--base-url` | provider default | Gateway or local server URL |
+| `--api-key-env` | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | Environment variable holding the key |
+| `--timeout-secs` | `180` | Provider wall-clock timeout |
+| `--max-output-tokens` | `4096` | Output-token cap for HTTP providers |
+| `--bin` | `codex` / `claude` on `PATH` | Session CLI executable |
 
 For a local server:
 
@@ -82,18 +76,14 @@ bhf llm test --provider local --model '<served-model>' \
   --base-url http://127.0.0.1:8080/v1
 ```
 
-Choose the strongest coding/reasoning model you have measured for harness and
-root-cause work. A smaller model is usually sufficient for report summarization
-and first-pass clustering. Model choice is deliberately operator-controlled:
-evaluate it on representative targets and compare deterministic build,
-reachability, coverage, and triage outcomes rather than prose quality.
+For harness and root-cause work, use the strongest coding and reasoning model you have measured; a smaller model is usually enough for report summarization and first-pass clustering. You choose the model: evaluate it on representative targets, and compare the deterministic build, reachability, coverage and triage outcomes rather than the quality of its prose.
 
 ## Recommended: use the current session through MCP
 
-Build the daemon and register its absolute path with the client:
+Build the daemon and register its absolute path with your MCP client. A default build serves the three deterministic tools; add `--features llm` for `bhf_prepare_assistance` and `bhf_preflight_harness`:
 
 ```sh
-cargo build --release -p bhf-daemon --bin bhf-daemon
+cargo build --release --locked -p bhf-daemon --features llm
 
 codex mcp add bhf -- \
   /absolute/path/to/bhf/target/release/bhf-daemon --mcp
@@ -102,80 +92,56 @@ claude mcp add --scope user bhf -- \
   /absolute/path/to/bhf/target/release/bhf-daemon --mcp
 ```
 
-Restart or open a new client session after registration. The server uses MCP
-stdio framing and exposes exactly these tools:
+Restart the client, or open a new session, after registration. The server uses MCP stdio framing and exposes these tools:
 
-| MCP tool | Input | Result and boundary |
-|---|---|---|
-| `bhf_scan` | repository `path` | Deterministic Ada structure summary |
-| `bhf_list_targets` | `path`, optional positive `top` | Ranked Ada/C/C++ targets; reports total/truncation metadata |
-| `bhf_load_findings` | findings directory, optional positive `top` | Bounded normalized finding records for triage |
-| `bhf_prepare_assistance` | `kind`, optional question/target/language/evidence | Injection-aware task prompt; MCP kinds use underscores (`plan_run`, `generate_harness`, `analyze_findings`, `explain_code`, `diagnose_error`) |
-| `bhf_preflight_harness` | target symbol, Ada/C/C++ language, candidate source | Structural checks only; never claims compile, link, reachability, or coverage |
+| MCP tool | Build | Input | Result |
+|---|---|---|---|
+| `bhf_scan` | default | repository `path` | Deterministic Ada structure summary |
+| `bhf_list_targets` | default | `path`, optional positive `top` | Ranked Ada/C/C++ targets, with total and truncation metadata |
+| `bhf_load_findings` | default | findings directory, optional positive `top` | Bounded normalized finding records for triage |
+| `bhf_prepare_assistance` | `llm` | `kind`, optional question, target, language and evidence | Injection-aware task prompt; MCP kinds use underscores (`plan_run`, `generate_harness`, `analyze_findings`, `explain_code`, `diagnose_error`) |
+| `bhf_preflight_harness` | `llm` | target symbol, Ada/C/C++ language, candidate source | Structural checks only; it does not compile, link or run the harness |
 
-All five tools advertise read-only, non-destructive, idempotent, closed-world
-annotations. Verify registration from a shell before restarting the host:
+All tools advertise read-only, non-destructive, idempotent, closed-world annotations. Check the registration from a shell before restarting the host:
 
 ```sh
 codex mcp get bhf
 claude mcp get bhf
 ```
 
-The MCP structured scan currently covers Ada. Ranked-target inventory and
-harness preflight cover Ada, C, and C++. If `top` is omitted, target and finding
-output use defaults derived from the current MCP message budget. Target
-discovery retains only the best candidates as it proceeds, and both responses
-report total and truncation metadata; set an explicit positive `top` when a
-different breadth is useful. For the other language lanes, use the normal
-explicit BHF CLI commands and pass their bounded artifacts to the session
-for explanation or diagnosis.
+The MCP structured scan covers Ada. The ranked-target inventory and harness preflight cover Ada, C and C++. If `top` is omitted, the target and finding tools use a default derived from the MCP message budget. Target discovery keeps only the best candidates as it goes, and both responses report total and truncation metadata; set a positive `top` for a different breadth. For the other language lanes, run the bhf CLI commands and pass their bounded artifacts to the session for explanation or diagnosis.
 
-This is how the current session is used without an API token: the MCP host model
-performs the reasoning. The BHF server does not call a hidden model and does
-not receive the host's credential. Long-running or mutating operations such as
-`auto`, `build`, `fuzz`, replay, and minimization remain explicit CLI actions,
-which keeps approval, logs, and resource budgets visible.
+In this mode the MCP host's model does the reasoning, so no API token is needed. The bhf server calls no model and never receives the host's credential. Long-running or mutating operations (`auto`, `build`, `fuzz`, replay, minimization) stay explicit CLI actions, so approval, logs and resource budgets stay visible.
 
-That is the current agentic boundary: an agent may read bounded evidence and
-propose the next step, but BHF itself does not implement an autonomous loop.
-If a host agent is allowed to run CLI commands, its own approval policy—not MCP
-tool metadata—governs those separate shell actions. In particular,
-`--probe-build`, `--build-command`, `--run-untrusted`, and
-`--unsafe-search-and-run-build-commands` can execute repository-controlled build
-logic and require the same explicit trust decision whether a human or model
-suggested them.
+An agent may read bounded evidence and propose the next step; bhf itself runs no autonomous loop. If a host agent may run CLI commands, its own approval policy governs those shell actions, not the MCP tool metadata. In particular, `--probe-build`, `--build-command`, `--run-untrusted` and `--unsafe-search-and-run-build-commands` can execute repository-controlled build logic, and need the same explicit trust decision whether a person or a model suggested them.
 
 ## Workflow audit
 
-| Stage | Give the LLM | Ask it to do | Deterministic check that decides |
+| Stage | Give the model | Ask it to | Deterministic check that decides |
 |---|---|---|---|
-| Run planning | language/build inventory, SLOC, ranked targets, machine RAM/CPU, time budget | propose the cheapest useful sequence, concurrency, limits, stop conditions | inspect `--help`; run `scan`/`list targets`, then a bounded pilot before a whole-tree campaign |
-| Harness generation | exact declaration/signature, callers, headers/specs, build command, target metadata | draft a candidate and list required compile/link inputs; identify missing facts | `generate-harness`, `build`, then a short fuzz run with observed target coverage |
-| Build/link failure | exact command, stdout/stderr, generated source, symbols and libraries | quote the decisive diagnostic, rank hypotheses, propose one discriminator at a time | rerun the exact command; inspect symbols/link order; accept only a clean deterministic build |
-| Harness/fuzz failure | run manifest, harness, crash/hang output, coverage progression, resource settings | distinguish harness defects, target behavior, environment gaps, and budget exhaustion | replay, coverage counters, sanitizer output, timeout/RSS evidence, and a controlled rerun |
-| Finding analysis | normalized `finding.json`, minimized input, replay output, nearby code | cluster likely duplicates, explain input-to-sink flow, label uncertainty, prioritize follow-up | replay/minimize/differential results and BHF reachability/actionability fields |
-| Code-specific explanation | focused source around the target and its callers, not a 10M-SLOC dump | explain state, guards, dataflow, dangerous sinks, and candidate seeds/dictionaries with citations | source review plus instrumented observations; never accept invented paths or line numbers |
-| Reporting | validated findings and their reproducer evidence | write audience-specific explanations and remediation context | generated report fields and reproducer artifacts remain authoritative |
+| Run planning | language and build inventory, SLOC, ranked targets, machine RAM and CPU, time budget | propose the cheapest useful sequence, concurrency, limits and stop conditions | read `--help`; run `scan` / `list targets`, then a bounded pilot before a whole-tree campaign |
+| Harness generation | exact declaration or signature, callers, headers or specs, build command, target metadata | draft a candidate and list the compile and link inputs it needs; name missing facts | `generate-harness`, `build`, then a short fuzz run with observed target coverage |
+| Build or link failure | exact command, stdout and stderr, generated source, symbols and libraries | quote the decisive diagnostic, rank hypotheses, propose one discriminating test at a time | rerun the exact command; inspect symbols and link order; accept only a clean, repeatable build |
+| Harness or fuzz failure | run manifest, harness, crash or hang output, coverage progression, resource settings | separate harness defects, target behaviour, environment gaps and budget exhaustion | replay, coverage counters, sanitizer output, timeout and RSS evidence, and a controlled rerun |
+| Finding analysis | normalized `finding.json`, minimized input, replay output, nearby code | cluster likely duplicates, explain the input-to-sink flow, label uncertainty, prioritize follow-up | replay, minimize and differential results, and bhf's reachability and actionability fields |
+| Code explanation | focused source around the target and its callers, not a 10M-SLOC dump | explain state, guards, dataflow, dangerous sinks and candidate seeds or dictionaries, with citations | source review plus instrumented observations; reject invented paths or line numbers |
+| Reporting | validated findings and their reproducer evidence | write explanations and remediation context for the audience | the generated report fields and reproducer artifacts stay authoritative |
 
-The highest-yield loop is evidence-driven and iterative:
+The loop that works best is driven by evidence:
 
-1. Let BHF discover/rank or reproduce the problem.
-2. Give the LLM the smallest relevant source and exact artifacts, not the whole
-   repository.
+1. Let bhf discover and rank targets, or reproduce the problem.
+2. Give the model the smallest relevant source and the exact artifacts, not the whole repository.
 3. Ask for hypotheses and a verification checklist.
-4. Run one deterministic discriminator.
+4. Run one deterministic discriminating test.
 5. Feed the new result back, and stop when the evidence settles the question.
 
-This reduces context cost and hallucination risk, and works on large trees where
-sending the repository to a model would be slow, expensive, and potentially a
-data-handling violation.
+This keeps context cost and the risk of invented answers down, and works on large trees where sending the repository to a model would be slow, expensive and possibly a data-handling violation.
 
 ## Practical agent workflows
 
 ### Plan a large or memory-constrained run
 
-Start with deterministic inventory and a no-build plan. Save compact artifacts
-instead of sending a whole 10M+ SLOC tree to a model:
+Start with a deterministic inventory and a no-build plan. Save compact artifacts instead of sending a whole 10M+ SLOC tree to a model:
 
 ```sh
 bhf sloc path/to/tree --out bhf-sloc.json
@@ -186,15 +152,11 @@ bhf llm prompt --task plan-run \
   --input bhf-sloc.json --input bhf-dry-run.txt
 ```
 
-The model should select explicit budgets and stop conditions from documented
-flags. Confirm them with `bhf auto --help`, then run a bounded pilot. Do not
-ask a model to infer peak memory from SLOC alone: target RSS, sanitizer cost,
-compiler concurrency, and report cardinality matter.
+Have the model choose explicit budgets and stop conditions from documented flags. Confirm them with `bhf auto --help`, then run a bounded pilot. Peak memory depends on target RSS, sanitizer cost, compiler concurrency and report size, so do not ask a model to infer it from SLOC alone.
 
 ### Generate or repair a harness
 
-Use deterministic generation first. An LLM is most useful for a wrapper, an
-unusual lifecycle, or a diagnostic the repair loop could not resolve:
+Use bhf's deterministic generation first. A model helps most with a wrapper, an unusual lifecycle, or a diagnostic the repair loop could not resolve:
 
 ```sh
 bhf list targets path/to/source.cpp --format json --top 20 > targets.json
@@ -206,11 +168,7 @@ bhf llm prompt --task generate-harness --language cpp \
   --input bhf_work/auto/run.json
 ```
 
-`llm assist` and MCP preflight return advice; they do not write the proposed
-harness into the work tree. Review and integrate any candidate deliberately,
-run `bhf_preflight_harness` when using MCP, then use the real compiler/linker
-and a short fuzz run. A target reference in source is not proof that the call
-survived optimization or was reached; require observed target/coverage evidence.
+`bhf llm assist` and the MCP preflight return advice; neither writes the proposed harness into the work tree. Review and integrate a candidate deliberately, run `bhf_preflight_harness` when you use MCP, then use the real compiler and linker and a short fuzz run. A reference to the target in source does not show that the call survived optimization or was reached; require observed target or coverage evidence.
 
 ### Analyze findings and write code-specific explanations
 
@@ -227,33 +185,27 @@ bhf llm assist --provider local --model '<served-model>' \
   --input bhf_work/auto/run.json
 ```
 
-For `explain-code`, provide the target, its callers, relevant type declarations,
-and the smallest source window that contains the observed path. Ask for citations
-to evidence labels and line numbers. Treat invented symbols, paths, flags, and
-line numbers as a failed answer, not as facts to repair silently.
+For `explain-code`, provide the target, its callers, the relevant type declarations, and the smallest source window that contains the observed path. Ask for citations to evidence labels and line numbers. Treat invented symbols, paths, flags and line numbers as a failed answer.
 
-### Root-cause BHF failures
+### Root-cause bhf failures
 
-Classify the failing stage before requesting a fix:
+Classify the failing stage before asking for a fix:
 
-| Stage | Evidence to capture | Useful deterministic discriminator |
+| Stage | Evidence to capture | Useful deterministic test |
 |---|---|---|
-| Discovery | source path/encoding, `--list-targets` output, exclusion/config flags | rerun with `--fresh-discovery`; inspect `--include-dir`/`--exclude-dir` and language filter |
-| Harness generation | target signature, declarations, callers, generated source | compare the selected file/line/symbol with `list targets`; run MCP structural preflight for Ada/C/C++ |
-| Compile | complete compiler command and first decisive diagnostic | rerun the exact command; check dialect, include paths, generated headers, and type completeness |
-| Link | complete linker command, undefined/duplicate symbols, library order | inspect symbols and translation-unit/library inputs; add one real input at a time |
-| Fuzz startup | run manifest, child stderr, exit status, timeout/RSS settings | replay the seed directly; distinguish loader/toolchain failure from target failure |
-| Fuzz effectiveness | executions, coverage progression, target-reachability and stub metadata | short controlled reruns with one changed seed/dictionary/pass; reject stub-only false cleans |
-| BHF internal error | stderr plus generated `bug-report.json` from `--debug` | reproduce with the smallest tree/command without discarding the original report |
+| Discovery | source path and encoding, `--list-targets` output, exclusion and config flags | rerun with `--fresh-discovery`; check `--include-dir`/`--exclude-dir` and the language filter |
+| Harness generation | target signature, declarations, callers, generated source | compare the selected file, line and symbol with `list targets`; run the MCP structural preflight for Ada/C/C++ |
+| Compile | the complete compiler command and the first decisive diagnostic | rerun the exact command; check the dialect, include paths, generated headers and type completeness |
+| Link | the complete linker command, undefined or duplicate symbols, library order | inspect symbols and translation-unit and library inputs; add one real input at a time |
+| Fuzz startup | run manifest, child stderr, exit status, timeout and RSS settings | replay the seed directly; separate a loader or toolchain failure from a target failure |
+| Fuzz effectiveness | executions, coverage progression, target-reachability and stub metadata | short controlled reruns that change one seed, dictionary or pass; reject stub-only clean results |
+| bhf internal error | stderr plus the `bug-report.json` that `--debug` enriches | reproduce with the smallest tree and command, and keep the original report |
 
-Ask `diagnose-error` to quote the decisive diagnostic, rank hypotheses, and
-propose one discriminator at a time. If the proposed edit changes several
-variables, it is poor root-cause analysis even when it happens to build.
+Ask `diagnose-error` to quote the decisive diagnostic, rank hypotheses and propose one discriminating test at a time. An edit that changes several variables at once does not identify the root cause, even when it builds.
 
 ## CLI assistance workflows
 
-`prompt` only renders the bounded task prompt. It is useful for manual review or
-copying into an existing session:
+`bhf llm prompt` only renders the bounded task prompt, for manual review or for pasting into a session you already have:
 
 ```sh
 bhf llm prompt --task diagnose-error \
@@ -262,12 +214,9 @@ bhf llm prompt --task diagnose-error \
   --input bhf_work/harnesses/<harness-id>/main.cpp
 ```
 
-Capture the exact diagnostic first with `bhf auto ... --verbose 2>
-bhf-auto.stderr`. Persisted build/link outcomes live in `auto/run.json` and
-per-target `harnesses/<id>/result.json`; BHF does not promise a synthetic
-`build/link.log` file.
+Capture the exact diagnostic first with `bhf auto ... --verbose 2> bhf-auto.stderr`. Build and link outcomes are kept in `auto/run.json` and in each target's `harnesses/<id>/result.json`; bhf writes no separate `build/link.log`.
 
-`assist` renders the same prompt and sends it to a provider:
+`bhf llm assist` renders the same prompt and sends it to a provider:
 
 ```sh
 bhf llm assist --provider claude --task analyze-findings \
@@ -280,47 +229,23 @@ bhf llm assist --provider local --model '<served-model>' \
   --input include/parser.hpp --input src/parser.cpp
 ```
 
-Supported task names are `plan-run`, `generate-harness`, `analyze-findings`,
-`explain-code`, and `diagnose-error`.
+The task names are `plan-run`, `generate-harness`, `analyze-findings`, `explain-code` and `diagnose-error`.
 
-The structured `--language` option and MCP harness preflight currently recognize
-Ada, C, and C++. For other BHF language lanes, use focused evidence with
-`explain-code` or `diagnose-error`, and keep the lane's normal deterministic
-harness/build/fuzz path authoritative.
+The `--language` option and the MCP harness preflight recognize Ada, C and C++. For the other lanes, use focused evidence with `explain-code` or `diagnose-error`, and keep the lane's own harness, build and fuzz path authoritative.
 
 ## Memory, privacy, and failure boundaries
 
-Provider stdout/stderr, HTTP responses, CLI evidence, MCP messages, and legacy
-daemon frames are bounded. Defaults scale to 1/512 of currently available
-host/cgroup RAM and are clamped to 1–64 MiB; this is an input-safety budget, not
-a model context-window claim. Exact positive byte overrides are available:
+Provider stdout and stderr, HTTP responses, CLI evidence, MCP messages and legacy daemon frames are bounded. The default bound is 1/512 of the host or cgroup RAM available at the time, clamped to 1–64 MiB. It is an input-safety budget, not the model's context window. These variables set an exact positive byte limit:
 
 - `BHF_LLM_MAX_RESPONSE_BYTES`
 - `BHF_LLM_MAX_EVIDENCE_BYTES`
 - `BHF_MCP_MAX_MESSAGE_BYTES`
 - `BHF_DAEMON_MAX_MESSAGE_BYTES`
 
-Provider subprocesses have configurable wall-clock timeouts and timed-out
-process trees are terminated. HTTP output tokens are controlled by
-`--max-output-tokens`.
+Provider subprocesses stop at `--timeout-secs`, and a timed-out process tree is terminated. `--max-output-tokens` sets the HTTP providers' output-token cap.
 
-Cloud API and authenticated CLI modes can transmit prompts, code, logs, and
-findings to their provider. Check the target repository's classification and
-provider retention policy first. Use a local model or no LLM for air-gapped or
-restricted data. Treat repository text, logs, and finding content as prompt-
-injection-capable untrusted data, and never let a model-generated command bypass
-the same review and sandboxing applied to a human-written command.
+Cloud API and authenticated-CLI modes can send prompts, code, logs and findings to their provider. Check the target repository's classification and the provider's retention policy first. Use a local model, or none, for air-gapped or restricted data. Treat repository text, logs and finding content as untrusted data that can carry prompt injection, and give a model-generated command the same review and sandboxing as a command a person wrote.
 
-Evidence can also contain credentials that belong to the target under test.
-Run the source and binary secret checks (including BHF-429 verified-format
-findings), review build logs and environment dumps, and redact secrets before a
-cloud or authenticated-CLI request. `bhf llm status --json` reports only
-credential presence booleans, executable paths, and limits; it does not print
-credential values. Clear provider variables from the environment when the call
-is complete, and never commit prompts, provider output, or MCP transcripts
-without reviewing them as carefully as source artifacts.
+Evidence can also contain credentials that belong to the target under test. Run the source and binary secret checks (including BHF-429 verified-format findings), review build logs and environment dumps, and redact secrets before a cloud or authenticated-CLI request. `bhf llm status --json` reports only whether credentials are present, the executable paths and the limits; it never prints credential values. Clear provider variables from the environment when the call is complete, and review prompts, provider output and MCP transcripts as carefully as source before you commit them.
 
-The dated [LLM and MCP validation record](https://github.com/Tarmo-Technologies/bhf/blob/main/docs/validation/2026-07-20-llm-mcp-validation.md)
-documents the tested Codex/Claude session paths, raw MCP protocol, local mock
-HTTP transports, resource measurements, and the live-provider limitations of
-that validation host.
+The dated [LLM and MCP validation record](../validation/2026-07-20-llm-mcp-validation.md) documents the tested session paths, the raw MCP protocol, the local mock HTTP transports, the resource measurements, and the live-provider limits of the validation host.

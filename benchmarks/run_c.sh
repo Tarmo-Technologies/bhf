@@ -75,7 +75,7 @@ run_bhf() {
   # Record end-to-end TTFC (source -> first crash, incl. auto-build) when the
   # first finding appears, but let bhf finish so run.json finalizes (execs).
   while kill -0 "$pid" 2>/dev/null; do
-    if [ "$crash" = 0 ] && compgen -G "$dir/gw/findings/*" >/dev/null 2>&1; then ttfc=$(elapsed "$s"); crash=1; fi
+    if [ "$crash" = 0 ] && compgen -G "$dir/gw/results/findings/*" >/dev/null 2>&1; then ttfc=$(elapsed "$s"); crash=1; fi
     sleep 0.2
   done
   wait "$pid" 2>/dev/null

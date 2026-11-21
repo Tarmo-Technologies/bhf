@@ -11,7 +11,7 @@ RES="$ROOT/results/java_cwe.tsv"; echo -e "metric\tbhf\tJazzer" > "$RES"
 
 cp -r "$ROOT/targets/java" "$SCRATCH/bhf"
 "$BHF" auto --per-target-time "$BUDGET" --seed-dir "$ROOT/seeds_java" --work-dir "$SCRATCH/gw" "$SCRATCH/bhf" >"$SCRATCH/bhf.log" 2>&1
-bhf_fns=$(python3 - "$SCRATCH/gw/findings" <<'PY'
+bhf_fns=$(python3 - "$SCRATCH/gw/results/findings" <<'PY'
 import json,os,sys
 root=sys.argv[1]; ids=set()
 if os.path.isdir(root):

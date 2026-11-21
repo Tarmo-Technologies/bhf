@@ -156,6 +156,11 @@ pub struct HarnessRunner {
     /// runtrace log the harness writes from inside the sandbox). No effect when
     /// the sandbox is `None`.
     extra_rw_binds: Vec<PathBuf>,
+    /// Environment values that a setuid sandbox launcher must restore for the
+    /// sandboxed child. Firejail strips loader variables such as `LD_PRELOAD`
+    /// from its own environment before it starts the target, so those values
+    /// also have to be carried as explicit `--env=` arguments.
+    sandbox_env: Vec<(String, String)>,
     /// How long one run of the harness may take ([`HARNESS_TIMEOUT`]).
     timeout: Duration,
     /// The program a launched harness runs as, in place of the harness file
@@ -211,6 +216,7 @@ impl HarnessRunner {
             sandbox: SandboxConfig::none(),
             extra_ro_binds: Vec::new(),
             extra_rw_binds: Vec::new(),
+            sandbox_env: Vec::new(),
             timeout: HARNESS_TIMEOUT,
             launch: None,
         }
@@ -246,6 +252,7 @@ impl HarnessRunner {
             sandbox: SandboxConfig::none(),
             extra_ro_binds: Vec::new(),
             extra_rw_binds: Vec::new(),
+            sandbox_env: Vec::new(),
             timeout: HARNESS_TIMEOUT,
             launch: None,
         }
@@ -267,6 +274,14 @@ impl HarnessRunner {
     /// of a runtrace log the harness writes). Ignored when not sandboxed.
     pub fn with_rw_binds(mut self, binds: impl IntoIterator<Item = PathBuf>) -> Self {
         self.extra_rw_binds.extend(binds);
+        self
+    }
+
+    /// Restore environment values after a setuid Firejail launcher sanitizes
+    /// its own environment. Other sandbox modes inherit the caller's normal
+    /// `Command` environment and ignore this extra argv channel.
+    pub fn with_sandbox_env(mut self, env: impl IntoIterator<Item = (String, String)>) -> Self {
+        self.sandbox_env.extend(env);
         self
     }
 
@@ -339,6 +354,7 @@ impl HarnessRunner {
                 io_file,
                 &self.extra_ro_binds,
                 &self.extra_rw_binds,
+                &self.sandbox_env,
             );
             // A crash under the emulator must not make it dump its own
             // address space.
@@ -353,6 +369,7 @@ impl HarnessRunner {
                 io_file,
                 &self.extra_ro_binds,
                 &self.extra_rw_binds,
+                &self.sandbox_env,
             ))
         }
     }
@@ -630,6 +647,7 @@ fn run_bwrap_probe(program: &Path, unshare_net: bool) -> bool {
     matches!(command.status(), Ok(status) if status.success())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn wrap_command<'a>(
     sandbox: Option<ResolvedSandbox>,
     program: &Path,
@@ -638,12 +656,17 @@ fn wrap_command<'a>(
     events_path: &Path,
     extra_ro_binds: &[PathBuf],
     extra_rw_binds: &[PathBuf],
+    sandbox_env: &[(String, String)],
 ) -> Command {
     let args = args.into_iter().collect::<Vec<_>>();
     match sandbox {
         Some(ResolvedSandbox::Firejail(firejail)) => {
             let mut command = Command::new(firejail);
-            command.args(["--quiet", "--net=none", "--"]);
+            command.args(["--quiet", "--net=none"]);
+            for (key, value) in sandbox_env {
+                command.arg(format!("--env={key}={value}"));
+            }
+            command.arg("--");
             command.arg(program);
             command.args(args);
             if program != harness_path {
@@ -1140,7 +1163,11 @@ mod tests {
         let harness_path = compile_stdin_capture_harness(&root, &capture_path);
         let firejail_path = compile_fake_sandbox_wrapper(&root, &sandbox_log_path);
         let runner = HarnessRunner::direct(harness_path.clone())
-            .with_sandbox(SandboxConfig::firejail(firejail_path));
+            .with_sandbox(SandboxConfig::firejail(firejail_path))
+            .with_sandbox_env([(
+                "LD_PRELOAD".to_owned(),
+                "/opt/bhf/libbhf_runtrace.so".to_owned(),
+            )]);
         let testcase = b"bhf-sandbox-stdin-marker\n".to_vec();
 
         let signatures = signatures_for_input_with_runner(&runner, &testcase).unwrap();
@@ -1149,6 +1176,7 @@ mod tests {
         assert_eq!(fs::read(capture_path).unwrap(), testcase);
         let sandbox_argv = fs::read_to_string(sandbox_log_path).unwrap();
         assert!(sandbox_argv.contains("--net=none\n"));
+        assert!(sandbox_argv.contains("--env=LD_PRELOAD=/opt/bhf/libbhf_runtrace.so\n"));
         assert!(sandbox_argv.contains("--\n"));
         assert!(sandbox_argv.contains(&format!("{}\n", harness_path.display())));
     }

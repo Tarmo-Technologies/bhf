@@ -77,7 +77,7 @@ struct AssistanceArgs {
 
 #[derive(Debug, Clone, Args)]
 struct ProviderArgs {
-    /// Backend: cached Codex/Claude login, OpenAI/Anthropic API, or local OpenAI-compatible server.
+    /// Backend: `codex` or `claude` (the installed CLI and its cached login), `openai` or `anthropic` (hosted API), or `local` (an OpenAI-compatible server).
     #[arg(long, value_enum, default_value = "codex")]
     provider: ProviderName,
     /// Model identifier. API/local providers require this; session CLIs use their configured default when omitted.
@@ -95,7 +95,7 @@ struct ProviderArgs {
     /// Maximum output tokens requested from HTTP providers.
     #[arg(long, default_value_t = 4096)]
     max_output_tokens: u32,
-    /// Override the Codex or Claude executable path.
+    /// Path of the `codex` or `claude` executable, when it is not the one on PATH.
     #[arg(long)]
     bin: Option<PathBuf>,
 }

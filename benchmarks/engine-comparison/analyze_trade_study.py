@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Render a trade-study JSON (from trade_study.py) into a Markdown report.
 
-Reads the raw rows + aggregated summary and emits per-target comparison tables
-with repeated-trial distributions (median, IQR, range) and confidence intervals,
-a cross-target rollup, an all-targets-pooled per-engine aggregate, an explicit
-outcome-visibility table (how many trials failed/were censored/were unsupported),
-and the honest caveats. Pure rendering — no measurement — so it can be re-run on
-any completed or in-progress evidence file.
+Reads the raw rows and the aggregated summary and writes per-target tables with
+repeated-trial distributions (median, interquartile range) and confidence
+intervals, an all-targets-pooled table per engine, and each table's outcome
+breakdown (how many trials failed, were censored or were unsupported). It only
+renders, so it can be re-run on a completed or an in-progress evidence file.
+
+A new report gets the methodology and scope prose below. The results go
+between two markers, and re-rendering into an existing report replaces only
+what is between them, so prose edited after the first render stays. A report
+without the markers was written or rewritten by hand; it is left as it is.
 
 Supports the v2 summary shape (``{per_target, aggregate_by_engine, ...}``) with
 distribution/CI fields; a v1 file predates this script's rewrite and should be
@@ -25,6 +29,28 @@ ENGINE_LABEL = {
     "libfuzzer": "libFuzzer",
     "honggfuzz": "honggfuzz",
 }
+ENGINE_NAME = {"bhf": "BHF", "aflpp": "AFL++", "libfuzzer": "libFuzzer", "honggfuzz": "honggfuzz"}
+# The generated results sit between these markers; a re-render replaces only them.
+BEGIN = "<!-- analyze_trade_study.py: generated results begin -->"
+END = "<!-- analyze_trade_study.py: generated results end -->"
+
+METHODOLOGY = """## Methodology
+
+- **Targets:** each target has one fixed harness, and every engine drives the same source.
+- **Independent crash oracle:** each engine's saved crash artifacts and its final corpus are replayed through one ASan+UBSan binary the engines never see; only oracle-confirmed crashes count.
+- **Engine-neutral coverage:** every engine's final corpus is merged through one shared libFuzzer-sancov binary, so `edges` use identical instrumentation and are directly comparable across engines.
+- **Crash-find rate:** a Wilson 95% interval over valid campaigns only. Build failures, supervisor timeouts, incomplete and unsupported trials are counted in each table's outcome breakdown, so every rate shows the sample behind it.
+- **Distributions:** the median, the interquartile range `[q1–q3]` and a percentile-bootstrap confidence interval, which is left out when every trial measured the same value.
+- **Setup and build time are separate from campaign time.** Native exec/s uses each engine's own definition of an execution, so compare it within one engine only.
+"""
+
+SCOPE = """## Scope
+
+- A crash-find interval is only as narrow as the trial count allows; a wide Wilson interval is not evidence of parity.
+- Controlled micro-fixtures measure mutator reach and magic-value solving, not throughput on production code. Real-code targets need a pinned manifest, and a target that needs a full project build shows as `unsupported` until it has a build recipe.
+- Native exec/s uses each engine's own definition and is reported for context.
+- No licensed engine, Mayhem for example, was run.
+"""
 
 
 def dist(d: dict | None, suffix: str = "") -> str:
@@ -57,8 +83,8 @@ def outcome_cell(outcomes: dict) -> str:
 def render_engine_rows(block: dict, engines: list[str]) -> list[str]:
     out = [
         "| Engine | In-budget crash-find (Wilson 95%) | Normalized diagnostic "
-        "variants (grouping aid, NOT a defect count) | Median in-budget TTFC (s) "
-        "| Common cov edges | Native exec/s (not comparable) |",
+        "variants (a grouping aid, not a defect count) | Median in-budget TTFC (s) "
+        "| Common cov edges | Native exec/s (per engine) |",
         "|---|---|---|---|---|---|",
     ]
     for e in engines:
@@ -77,7 +103,7 @@ def render_engine_rows(block: dict, engines: list[str]) -> list[str]:
 def render_outcomes(block: dict, engines: list[str]) -> list[str]:
     out = [
         "",
-        "Outcome visibility (every trial accounted for):",
+        "Every trial's outcome:",
         "",
         "| Engine | Trials | Valid campaigns | Outcome breakdown |",
         "|---|---|---|---|",
@@ -93,32 +119,18 @@ def render_outcomes(block: dict, engines: list[str]) -> list[str]:
     return out
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", type=Path, required=True)
-    ap.add_argument("--output", type=Path, required=True)
-    args = ap.parse_args()
-    d = json.loads(args.input.read_text())
+def render_results(d: dict) -> list[str]:
+    """The generated part of a report: the run's metadata and every table."""
     rows = d["rows"]
     summary = d["summary"]
-    if "per_target" not in summary:
-        raise SystemExit(
-            "input is a pre-v2 summary without distribution fields; re-run "
-            "trade_study.py to regenerate it"
-        )
     cfg = d["config"]
     engines = (
         cfg["engines"] if isinstance(cfg.get("engines"), list) else list(ENGINE_LABEL)
     )
-    per_target = summary["per_target"]
-    cases = list(per_target)
-
-    out: list[str] = ["<!-- SPDX-License-Identifier: Apache-2.0 -->"]
-    out.append("# Engine-quality trade study (Experiment 1) — distribution report\n")
-    out.append(
+    out = [
         f"Generated: {d.get('generated_utc', '?')} · elapsed {d.get('elapsed_s', '?')}s · "
         f"{len(rows)} raw trial rows · commit `{(d.get('git_commit') or '?')[:12]}`.\n"
-    )
+    ]
     host = d.get("host", {})
     out.append(
         f"**Host:** {host.get('cpu', '?')} ({host.get('nproc', '?')} cores; each "
@@ -135,50 +147,67 @@ def main() -> int:
             f"**Target manifest:** `{manifest['path']}` (sha256 `{(manifest.get('sha256') or '?')[:16]}`)\n"
         )
     else:
-        out.append(
-            "**Target set:** the four checked-in controlled fixtures (no manifest).\n"
-        )
+        out.append("**Target set:** the checked-in controlled fixtures (no manifest).\n")
 
-    out.append("## Methodology (unchanged from the reviewed machinery)\n")
-    out.append(
-        "- One fixed harness per target drives EVERY engine; each engine's final "
-        "corpus is merged through ONE shared libFuzzer-sancov binary so coverage "
-        "edges are directly comparable, and each saved crash + final corpus is "
-        "replayed through ONE independent ASan/UBSan oracle.\n"
-        "- **Crash-find** is a Wilson 95% interval over VALID campaigns only; "
-        "build-failed/timeout/incomplete/unsupported trials are shown separately so "
-        "the effective sample size is never hidden.\n"
-        "- **Distributions**: median with interquartile range `[q1–q3]`, and a "
-        "percentile-bootstrap (or degenerate) CI. Native exec/s is per-engine only "
-        "and is NOT comparable across engines (counter semantics differ).\n"
-    )
-
-    for case in cases:
+    per_target = summary["per_target"]
+    for case in per_target:
         out.append(f"## Target: `{case}`\n")
         out.extend(render_engine_rows(per_target[case], engines))
         out.extend(render_outcomes(per_target[case], engines))
         out.append("")
 
-    out.append("## All targets pooled — per engine\n")
+    out.append("## All targets pooled, per engine\n")
     agg = summary.get("aggregate_by_engine", {})
     out.extend(render_engine_rows(agg, engines))
     out.extend(render_outcomes(agg, engines))
-    out.append("")
+    return out
 
-    out.append("## Caveats\n")
-    out.append(
-        "- Crash-find CIs are only as meaningful as the trial count; a wide Wilson "
-        "interval (small n) is not evidence of parity.\n"
-        "- Controlled micro-fixtures isolate mutator reach/magic-value solving, not "
-        "whole-program throughput on production code. Real-code targets require a "
-        "pinned manifest; targets that need a full project build are shown as "
-        "`unsupported` rows until a build recipe is supplied.\n"
-        "- Native exec/s differs in definition per engine and is reported for "
-        "context only.\n"
-        "- No licensed-tool (e.g. Mayhem) comparison is included; none has been run.\n"
+
+def render_report(d: dict, results: str) -> str:
+    """A new report: the title, the methodology, the results and the scope."""
+    cfg = d["config"]
+    engines = cfg["engines"] if isinstance(cfg.get("engines"), list) else list(ENGINE_LABEL)
+    names = [ENGINE_NAME.get(e, e) for e in engines]
+    title = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+    return (
+        "<!-- SPDX-License-Identifier: Apache-2.0 -->\n"
+        f"# Multi-engine fuzzing trade study: {title}\n\n"
+        f"{METHODOLOGY}\n{BEGIN}\n{results}\n{END}\n\n{SCOPE}"
     )
-    args.output.write_text("\n".join(out) + "\n")
-    print(f"wrote {args.output} ({len(rows)} rows, {len(cases)} targets)")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", type=Path, required=True)
+    ap.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="report to write; an existing one gets only its generated results replaced",
+    )
+    args = ap.parse_args()
+    d = json.loads(args.input.read_text())
+    if "per_target" not in d["summary"]:
+        raise SystemExit(
+            "input is a pre-v2 summary without distribution fields; re-run "
+            "trade_study.py to regenerate it"
+        )
+    results = "\n".join(render_results(d)).rstrip("\n")
+    if args.output.exists():
+        text = args.output.read_text()
+        if text.count(BEGIN) != 1 or text.count(END) != 1 or text.index(BEGIN) > text.index(END):
+            raise SystemExit(
+                f"{args.output} has no generated results section (between {BEGIN} and "
+                f"{END}): it was written by hand, so it is left as it is. Pass a new --output."
+            )
+        before, rest = text.split(BEGIN, 1)
+        after = rest.split(END, 1)[1]
+        args.output.write_text(f"{before}{BEGIN}\n{results}\n{END}{after}")
+    else:
+        args.output.write_text(render_report(d, results))
+    print(
+        f"wrote {args.output} ({len(d['rows'])} rows, {len(d['summary']['per_target'])} targets)"
+    )
     return 0
 
 

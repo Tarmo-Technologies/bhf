@@ -26,6 +26,20 @@ include = [
     "../../python_runtime",
     "../../ruby_runtime",
     "../rust_runtime",
+    # The documentation, laid out as in the repository so the relative links
+    # in README.md, INSTALL.md and docs/ resolve inside the archive. cargo-dist
+    # adds README.md, LICENSE and CHANGELOG.md itself.
+    "../../RELEASE_NOTES.md",
+    "../../NOTICE",
+    "../../THIRD_PARTY.md",
+    "../../SECURITY.md",
+    "../../CONTRIBUTING.md",
+    "../../CODE_OF_CONDUCT.md",
+    "../../ROADMAP.md",
+    "../../docs",
+    "../../examples",
+    "../../schemas",
+    "../../benchmarks",
 ]
 
 [package.metadata.dist.binaries]
@@ -47,7 +61,7 @@ c_parser = { path = "../c_parser" }
 c_stub_gen = { path = "../c_stub_gen" }
 java_parser = { path = "../java_parser" }
 cmplog = { path = "../cmplog" }
-clap.workspace = true
+clap = { workspace = true, features = ["wrap_help"] }
 compiler_adapter = { path = "../compiler_adapter" }
 config = { path = "../config" }
 cpp_parser = { path = "../cpp_parser" }
@@ -93,6 +107,8 @@ stub_gen = { path = "../stub_gen" }
 target_rank = { path = "../target_rank" }
 target_transport = { path = "../target_transport" }
 tempfile.workspace = true
+# The terminal width help wraps to: clap's `wrap_help` already builds it.
+terminal_size = "0.4.4"
 thiserror.workspace = true
 toml.workspace = true
 type_model = { path = "../type_model" }

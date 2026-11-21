@@ -13,6 +13,7 @@ except ImportError:  # pragma: no cover - GNAT Studio provides GPS at runtime.
     GPS = None
 
 from bhf_gnatstudio_core import (
+    DEFAULT_FINDINGS_DIR,
     BhfConfig,
     action_name,
     build_minimize_args,
@@ -78,8 +79,10 @@ def create_preferences() -> None:
         PREF_FINDINGS,
         "Findings directory",
         "string",
-        "Findings directory loaded through the daemon.",
-        "findings",
+        "Findings directory loaded through the daemon, relative to the project's "
+        "directory unless absolute. `bhf auto` writes findings to "
+        "`<work-dir>/results/findings`.",
+        DEFAULT_FINDINGS_DIR,
     )
     create_preference(
         PREF_HARNESS,
@@ -221,7 +224,7 @@ def current_config() -> BhfConfig:
     return BhfConfig(
         daemon_path=string_preference(PREF_DAEMON, "bhf-daemon"),
         cli_path=string_preference(PREF_CLI, "bhf"),
-        findings_dir=string_preference(PREF_FINDINGS, "findings"),
+        findings_dir=string_preference(PREF_FINDINGS, DEFAULT_FINDINGS_DIR),
         harness_path=string_preference(PREF_HARNESS, ""),
         minimize_strategy=strategy_preference(),
         workspace_root=workspace_root(),

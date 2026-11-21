@@ -23,7 +23,7 @@ pub struct CiArgs {
     #[arg(skip)]
     pub(crate) given: std::collections::BTreeSet<String>,
 
-    /// Work directory. Default ./bhf_work.
+    /// Work directory.
     #[arg(long, default_value = "bhf_work")]
     pub work_dir: PathBuf,
 
@@ -35,25 +35,24 @@ pub struct CiArgs {
     #[arg(long = "regressions", value_name = "DIR")]
     pub regressions: Vec<PathBuf>,
 
-    /// Per-target TOTAL fuzz wall-clock budget in seconds (split across the
-    /// passes). Forwarded to `bhf auto`.
+    /// Fuzzing time per target, in seconds, split across its passes. Passed
+    /// to `bhf auto`.
     #[arg(long, default_value_t = 60)]
     pub per_target_time: u64,
 
-    /// Stop a target once it has produced N distinct findings (crash
-    /// signatures), or when its per-target time is spent — whichever first.
-    /// `1` ≈ libFuzzer stop-on-first-crash. Forwarded to `bhf auto`.
+    /// Stop a target once it has N distinct findings (crash signatures), or
+    /// when its per-target time is spent, whichever comes first. `1` stops at
+    /// the first crash, as libFuzzer does. Passed to `bhf auto`.
     #[arg(long = "per-target-finding-count", value_name = "N")]
     pub per_target_finding_count: Option<usize>,
 
-    /// Whole-run wall-clock budget across all targets (seconds); with
-    /// `--min-target-time` it splits the budget across targets instead.
-    /// Forwarded to `bhf auto`.
+    /// Time limit of the whole run, in seconds; with `--min-target-time` it
+    /// is divided across the targets instead. Passed to `bhf auto`.
     #[arg(long = "campaign-time", value_name = "SECS")]
     pub campaign_time: Option<u64>,
 
-    /// SPLIT-mode floor (seconds), used only with `--campaign-time`: each
-    /// attempted target gets at least this much fuzz time. Forwarded to
+    /// With `--campaign-time`: the least fuzzing time, in seconds, each
+    /// attempted target gets when the campaign time is divided. Passed to
     /// `bhf auto`.
     #[arg(
         long = "min-target-time",
@@ -62,27 +61,29 @@ pub struct CiArgs {
     )]
     pub min_target_time: Option<u64>,
 
-    /// Skip auto-stubbing entirely (diagnostics-only).
+    /// Do not generate stubs for missing symbols: a target that does not build
+    /// as it is fails, with its build diagnostics. Passed to `bhf auto`.
     #[arg(long)]
     pub no_stubs: bool,
 
-    /// Path to append a Markdown summary to. Defaults to the
-    /// `GITHUB_STEP_SUMMARY` env var when unset.
+    /// File to append the Markdown summary to. Default: the file the
+    /// `GITHUB_STEP_SUMMARY` environment variable names.
     #[arg(long, value_name = "PATH")]
     pub summary_file: Option<PathBuf>,
 
-    /// Severity threshold that triggers a non-zero exit.
+    /// Exit non-zero when a finding of this severity or higher is present;
+    /// `any` fails on every finding. With `--policy`, applies only when given.
     #[arg(long, value_enum, default_value_t = FailOn::Any)]
     pub fail_on: FailOn,
 
-    /// Run mode forwarded to bhf auto.
+    /// Actionability profile (`reporting` or `attacking`), passed to
+    /// `bhf auto --mode`.
     #[arg(long, default_value_t = actionability::RunMode::Reporting)]
     pub mode: actionability::RunMode,
 
-    /// Restrict the sweep to a comma-separated subset of the sixteen source
-    /// languages listed under "possible values" below (common spellings like
-    /// `c++`/`rs`/`py` are accepted). Forwarded to `bhf auto`. Unset
-    /// (default) = fuzz every language found.
+    /// Fuzz only these languages, comma-separated, from the sixteen listed
+    /// under "possible values" below (`c++`, `rs`, `py` and other common
+    /// spellings work). Passed to `bhf auto`. Default: every language found.
     #[arg(
         long = "languages",
         visible_alias = "lang",
@@ -93,22 +94,23 @@ pub struct CiArgs {
     )]
     pub languages: Vec<crate::auto::candidate::LangSelector>,
 
-    /// PR-native mode: scope the sweep to only the files changed since this git
-    /// ref (uses `git merge-base <ref> HEAD`, so a branch behind the base does
-    /// not re-fuzz the base's own changes). Discovery still walks the tree but
-    /// only changed files' targets are built and fuzzed; the discovery cache is
-    /// reused across runs. Combine with `--campaign-time` for a bounded PR run.
+    /// Pull-request mode: build and fuzz only the targets in files changed
+    /// since this git ref, from `git merge-base <ref> HEAD`, so a branch
+    /// behind its base does not fuzz the base's own changes. Discovery still
+    /// walks the whole tree, and its cache is reused across runs. Add
+    /// `--campaign-time` to bound a pull-request run.
     #[arg(long = "changed-since", value_name = "GIT_REF")]
     pub changed_since: Option<String>,
 
-    /// Instead of asking git, read the newline-separated changed-file list from
-    /// this file (paths relative to the repo root or absolute). Useful when the
-    /// CI system already computed the PR diff. Overrides `--changed-since`.
+    /// Read the changed files from this file, one per line (relative to the
+    /// repository root, or absolute), in place of asking git; for a CI system
+    /// that has already computed the pull request's diff. Overrides
+    /// `--changed-since`.
     #[arg(long = "changed-paths-from", value_name = "PATH")]
     pub changed_paths_from: Option<PathBuf>,
 
-    /// Emit a SARIF 2.1.0 report to this path. The GitHub Action uploads it to
-    /// the code-scanning tab for inline PR annotations.
+    /// Write a SARIF 2.1.0 report to this path. The GitHub Action uploads it
+    /// to code scanning, which annotates the pull request.
     #[arg(long, value_name = "PATH")]
     pub sarif: Option<PathBuf>,
 
@@ -118,36 +120,48 @@ pub struct CiArgs {
     #[arg(long = "gitlab-sast", value_name = "PATH")]
     pub gitlab_sast: Option<PathBuf>,
 
-    /// Write a compact machine-readable CI result JSON to this path (finding
-    /// counts by severity + verdict, confirmed count, scoped file count, exit
-    /// code). Consumed by the GitHub Action to build the PR summary comment.
+    /// Write a short CI result JSON to this path: finding counts by severity
+    /// and verdict, the confirmed count, the scoped file count and the exit
+    /// code. The GitHub Action builds its pull-request comment from it.
     #[arg(long = "ci-json", value_name = "PATH")]
     pub ci_json: Option<PathBuf>,
 
-    /// PR gate policy. `confirmed` exits non-zero only when a fuzz-confirmed
-    /// finding (verdict real/likely) is present; `all` fails on any finding;
-    /// `never` never fails (annotate-only); `off` (default) keeps the existing
-    /// `--fail-on` / `--fail-on-actionability` behavior.
+    /// Pull-request gate. `confirmed` exits non-zero only when a
+    /// fuzz-confirmed finding (verdict real or likely) is present; `all` fails
+    /// on any finding; `never` never fails, and only annotates; `off`
+    /// (default) leaves the decision to `--fail-on` or
+    /// `--fail-on-actionability`.
     #[arg(long = "pr-gate", value_enum, default_value_t = PrGate::Off)]
     pub pr_gate: PrGate,
 
-    /// Actionability threshold that triggers a non-zero exit. When unset, CI keeps the existing severity gate.
+    /// Exit non-zero when a finding has this actionability verdict or a
+    /// stronger one. Without it, `--fail-on` decides.
     #[arg(long, value_enum)]
     pub fail_on_actionability: Option<FailOnActionability>,
 
-    /// Minimum actionability confidence for --fail-on-actionability.
-    #[arg(long, value_enum, default_value_t = MinActionabilityConfidence::Low)]
+    /// Lowest verdict confidence that counts for --fail-on-actionability.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "CONFIDENCE",
+        default_value_t = MinActionabilityConfidence::Low
+    )]
     pub min_actionability_confidence: MinActionabilityConfidence,
 
-    /// Optional policy file used to enrich CI gate and dashboard decisions.
+    /// Policy file whose CI gate also decides the exit status: the run fails
+    /// when the policy or any gate above fails. Its `fail_on_severity` takes
+    /// the place of the default `--fail-on any`. --dashboard-out reports its
+    /// decisions too.
     #[arg(long)]
     pub policy: Option<PathBuf>,
 
-    /// Optional runner assignment plan used to enrich CI budget governance evidence.
+    /// Runner assignment plan (from `bhf runners plan`) that the policy gate
+    /// and --dashboard-out take into account.
     #[arg(long)]
     pub runner_plan: Option<PathBuf>,
 
-    /// Write dashboard-friendly CI JSON to this path.
+    /// Write the CI result, with policy and runner decisions, as dashboard
+    /// JSON to this path.
     #[arg(long)]
     pub dashboard_out: Option<PathBuf>,
 }
@@ -399,9 +413,36 @@ pub fn run(args: CiArgs) -> i32 {
         }
     };
 
+    let sarif_path = maybe_emit_sarif(&args, &work_dir);
+    if let Some(path) = args.gitlab_sast.as_deref() {
+        // From this run's findings: results/ is rebuilt when the command
+        // ends, after this.
+        let written = match results::rebuild(&work_dir, &results::RebuildOptions::default()) {
+            Ok(_) => crate::report::write_gitlab_sast(&work_dir, path),
+            Err(error) => Err(format!("rebuild results: {error}")),
+        };
+        if let Err(error) = written {
+            bhfeprintln!(
+                "warning: could not write --gitlab-sast {}: {error}",
+                path.display()
+            );
+        }
+    }
+
+    // Every gate the run applied counts: the run fails when any one fails, so
+    // a passing `--policy` cannot hide a failing `--fail-on`, `--pr-gate` or
+    // regression replay.
+    let mut gates = finding_gates(&args, &findings, &actionability, &regression_outcome);
+    if let Some(policy) = args.policy.as_deref() {
+        gates.push(policy_gate(&work_dir, policy, args.runner_plan.as_deref()));
+    }
+    let exit_code = exit_code_from_gates(&gates);
+    bhfeprintln!("bhf ci: {}", format_gates(&gates));
+
     let summary_target = summary_path_resolution(args.summary_file.as_deref());
     if let Some(path) = summary_target {
         let mut markdown = render_summary(&work_dir, total, &findings);
+        markdown.push_str(&render_gates(&gates));
         if regression_outcome.replayed() > 0 {
             markdown.push_str(&format!(
                 "\n**Regressions:** {} stored finding(s) replayed: {} still reproduce, {} fixed, \
@@ -420,66 +461,6 @@ pub fn run(args: CiArgs) -> i32 {
         }
     }
 
-    let sarif_path = maybe_emit_sarif(&args, &work_dir);
-    if let Some(path) = args.gitlab_sast.as_deref() {
-        // From this run's findings: results/ is rebuilt when the command
-        // ends, after this.
-        let written = match results::rebuild(&work_dir, &results::RebuildOptions::default()) {
-            Ok(_) => crate::report::write_gitlab_sast(&work_dir, path),
-            Err(error) => Err(format!("rebuild results: {error}")),
-        };
-        if let Err(error) = written {
-            bhfeprintln!(
-                "warning: could not write --gitlab-sast {}: {error}",
-                path.display()
-            );
-        }
-    }
-
-    let mut exit_code = match args.pr_gate {
-        PrGate::Off => {
-            if let Some(fail_on_actionability) = args.fail_on_actionability {
-                exit_code_from_actionability(
-                    &actionability,
-                    fail_on_actionability,
-                    args.min_actionability_confidence,
-                )
-            } else {
-                exit_code_from_buckets(&findings, args.fail_on)
-            }
-        }
-        PrGate::Never => 0,
-        PrGate::All => i32::from(total > 0),
-        PrGate::Confirmed => i32::from(confirmed_count(&actionability) > 0),
-    };
-    // A stored finding that still reproduces is a regression: it fails any
-    // gate that can fail.
-    if !regression_outcome.reproduced.is_empty() && args.pr_gate != PrGate::Never {
-        exit_code = 1;
-    }
-    if let Some(policy) = args.policy.as_ref() {
-        match governance::ci_policy_gate_with_runner_plan(
-            &work_dir,
-            policy,
-            args.runner_plan.as_deref(),
-        ) {
-            Ok(gate) => {
-                exit_code = if gate
-                    .pointer("/gate/failed")
-                    .and_then(|value| value.as_bool())
-                    .unwrap_or(false)
-                {
-                    1
-                } else {
-                    0
-                };
-            }
-            Err(error) => {
-                bhfeprintln!("warning: could not evaluate CI policy gate: {error:#}");
-                exit_code = 1;
-            }
-        }
-    }
     if let Some(path) = args.ci_json.as_ref() {
         let mut ci = build_ci_json(
             total,
@@ -490,6 +471,7 @@ pub fn run(args: CiArgs) -> i32 {
             exit_code,
         );
         ci["regressions"] = regression_outcome.to_json();
+        ci["gates"] = gates_json(&gates);
         if let Err(error) = fs::write(path, serde_json::to_vec_pretty(&ci).unwrap_or_default()) {
             bhfeprintln!(
                 "warning: could not write --ci-json {}: {error}",
@@ -504,7 +486,13 @@ pub fn run(args: CiArgs) -> i32 {
             args.runner_plan.as_deref(),
             &findings,
             exit_code != 0,
-        );
+        )
+        .map(|mut value| {
+            if args.policy.is_some() {
+                merge_gates_into_dashboard(&mut value, &gates);
+            }
+            value
+        });
         if let Err(error) = dashboard.and_then(|value| {
             governance::write_json(&path, &value)?;
             Ok(value)
@@ -605,6 +593,254 @@ fn confirmed_count(actionability: &ActionabilityBuckets) -> usize {
         .filter(|(verdict, _)| matches!(verdict.as_str(), "real_reachable" | "likely_reachable"))
         .map(|(_, count)| *count)
         .sum()
+}
+
+/// A gate a `bhf ci` run applied, and what it came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Gate {
+    kind: GateKind,
+    /// The gate's setting: the `--fail-on`, `--fail-on-actionability` or
+    /// `--pr-gate` value, or the policy file.
+    setting: Option<String>,
+    failed: bool,
+    /// Why the gate failed, when it gives reasons (the policy's).
+    reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateKind {
+    FailOn,
+    FailOnActionability,
+    PrGate,
+    Regressions,
+    Policy,
+}
+
+impl GateKind {
+    /// The gate's id in the CI JSON.
+    fn id(self) -> &'static str {
+        match self {
+            GateKind::FailOn => "fail_on",
+            GateKind::FailOnActionability => "fail_on_actionability",
+            GateKind::PrGate => "pr_gate",
+            GateKind::Regressions => "regressions",
+            GateKind::Policy => "policy",
+        }
+    }
+
+    /// The reason the dashboard lists when the gate fails.
+    fn reason(self) -> &'static str {
+        match self {
+            GateKind::Regressions => "regression_reproduced",
+            other => other.id(),
+        }
+    }
+}
+
+impl Gate {
+    fn new(kind: GateKind, setting: Option<String>, failed: bool) -> Self {
+        Self {
+            kind,
+            setting,
+            failed,
+            reasons: Vec::new(),
+        }
+    }
+
+    /// How the summary names the gate.
+    fn label(&self) -> String {
+        let flag = match self.kind {
+            GateKind::FailOn => "--fail-on",
+            GateKind::FailOnActionability => "--fail-on-actionability",
+            GateKind::PrGate => "--pr-gate",
+            GateKind::Regressions => return "regression replay".to_owned(),
+            GateKind::Policy => return "`--policy`".to_owned(),
+        };
+        match &self.setting {
+            Some(setting) => format!("`{flag} {setting}`"),
+            None => format!("`{flag}`"),
+        }
+    }
+
+    fn result(&self) -> String {
+        if !self.failed {
+            return "passed".to_owned();
+        }
+        if self.reasons.is_empty() {
+            "**failed**".to_owned()
+        } else {
+            format!("**failed** ({})", self.reasons.join(", "))
+        }
+    }
+}
+
+fn value_name(value: impl ValueEnum) -> Option<String> {
+    value
+        .to_possible_value()
+        .map(|value| value.get_name().to_owned())
+}
+
+/// The gates on this run's findings and on the stored findings it replayed:
+/// `--pr-gate`, else `--fail-on-actionability`, else `--fail-on`, and the
+/// regression replay unless `--pr-gate never`. Beside `--policy`, whose
+/// `fail_on_severity` takes the place of the default `--fail-on any`,
+/// `--fail-on` applies only when the command line gives it.
+fn finding_gates(
+    args: &CiArgs,
+    findings: &BTreeMap<String, usize>,
+    actionability: &ActionabilityBuckets,
+    regressions: &crate::ci_regression::Outcome,
+) -> Vec<Gate> {
+    let total: usize = findings.values().sum();
+    let mut gates = Vec::new();
+    match args.pr_gate {
+        PrGate::Off => {
+            if let Some(level) = args.fail_on_actionability {
+                gates.push(Gate::new(
+                    GateKind::FailOnActionability,
+                    value_name(level),
+                    exit_code_from_actionability(
+                        actionability,
+                        level,
+                        args.min_actionability_confidence,
+                    ) != 0,
+                ));
+            } else if args.policy.is_none() || args.given.contains("fail_on") {
+                gates.push(Gate::new(
+                    GateKind::FailOn,
+                    value_name(args.fail_on),
+                    exit_code_from_buckets(findings, args.fail_on) != 0,
+                ));
+            }
+        }
+        gate => {
+            let failed = match gate {
+                PrGate::All => total > 0,
+                PrGate::Confirmed => confirmed_count(actionability) > 0,
+                PrGate::Off | PrGate::Never => false,
+            };
+            gates.push(Gate::new(GateKind::PrGate, value_name(gate), failed));
+        }
+    }
+    // A stored finding that still reproduces is a regression: it fails any
+    // gate that can fail.
+    if regressions.replayed() > 0 && args.pr_gate != PrGate::Never {
+        gates.push(Gate::new(
+            GateKind::Regressions,
+            None,
+            !regressions.reproduced.is_empty(),
+        ));
+    }
+    gates
+}
+
+/// The `--policy` file's CI gate. One that cannot be evaluated fails.
+fn policy_gate(work_dir: &Path, policy: &Path, runner_plan: Option<&Path>) -> Gate {
+    let setting = Some(policy.display().to_string());
+    match governance::ci_policy_gate_with_runner_plan(work_dir, policy, runner_plan) {
+        Ok(result) => {
+            let mut gate = Gate::new(
+                GateKind::Policy,
+                setting,
+                result
+                    .pointer("/gate/failed")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            );
+            gate.reasons = result
+                .pointer("/gate/reasons")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|reason| reason.as_str().map(str::to_owned))
+                .collect();
+            gate
+        }
+        Err(error) => {
+            bhfeprintln!("warning: could not evaluate CI policy gate: {error:#}");
+            let mut gate = Gate::new(GateKind::Policy, setting, true);
+            gate.reasons.push("not evaluated".to_owned());
+            gate
+        }
+    }
+}
+
+/// `1` when any gate failed, else `0`.
+fn exit_code_from_gates(gates: &[Gate]) -> i32 {
+    i32::from(gates.iter().any(|gate| gate.failed))
+}
+
+/// One line naming each gate's result, for the log.
+fn format_gates(gates: &[Gate]) -> String {
+    let parts: Vec<String> = gates
+        .iter()
+        .map(|gate| {
+            let result = if gate.failed { "failed" } else { "passed" };
+            format!("{} {result}", gate.label().replace('`', ""))
+        })
+        .collect();
+    format!("gates: {}", parts.join(", "))
+}
+
+/// The summary's list item for each gate.
+fn render_gates(gates: &[Gate]) -> String {
+    gates
+        .iter()
+        .map(|gate| format!("- Gate {}: {}\n", gate.label(), gate.result()))
+        .collect()
+}
+
+/// The CI JSON's `gates` array: each gate's id, setting, result and reasons.
+fn gates_json(gates: &[Gate]) -> serde_json::Value {
+    gates
+        .iter()
+        .map(|gate| {
+            serde_json::json!({
+                "gate": gate.kind.id(),
+                "setting": gate.setting,
+                "failed": gate.failed,
+                "reasons": gate.reasons,
+            })
+        })
+        .collect()
+}
+
+/// Fold the gates beside the policy into the dashboard's `gate`, which
+/// `governance` fills from the policy alone, so its `failed` is the run's
+/// result.
+fn merge_gates_into_dashboard(dashboard: &mut serde_json::Value, gates: &[Gate]) {
+    let Some(gate) = dashboard
+        .get_mut("gate")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    let mut reasons: Vec<serde_json::Value> = gate
+        .get("reasons")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for failed in gates
+        .iter()
+        .filter(|g| g.failed && g.kind != GateKind::Policy)
+    {
+        let reason = serde_json::Value::from(failed.kind.reason());
+        if !reasons.contains(&reason) {
+            reasons.push(reason);
+        }
+    }
+    let reason = match reasons.as_slice() {
+        [] => serde_json::Value::from("none"),
+        [single] => single.clone(),
+        _ => serde_json::Value::from("multiple"),
+    };
+    gate.insert(
+        "failed".to_owned(),
+        serde_json::Value::from(exit_code_from_gates(gates) != 0),
+    );
+    gate.insert("reason".to_owned(), reason);
+    gate.insert("reasons".to_owned(), serde_json::Value::from(reasons));
+    gate.insert("gates".to_owned(), gates_json(gates));
 }
 
 /// Compact machine-readable CI result the GitHub Action consumes to render the
@@ -1345,6 +1581,247 @@ mod tests {
         .expect("parses");
         let scoped = resolve_changed_scope(&t.ci).unwrap();
         assert_eq!(scoped, vec![root.join("src/a.c")]);
+    }
+
+    /// `CiArgs` as the command line `argv` gives them, with the given flags
+    /// recorded as `run_from` records them.
+    fn ci_args(argv: &[&str]) -> CiArgs {
+        use clap::{CommandFactory, FromArgMatches, Parser};
+        #[derive(Parser)]
+        struct T {
+            #[command(flatten)]
+            ci: CiArgs,
+        }
+        let matches = T::command().try_get_matches_from(argv).unwrap();
+        let mut parsed = T::from_arg_matches(&matches).unwrap();
+        parsed.ci.given = crate::auto::cli::given_arg_ids(&matches);
+        parsed.ci
+    }
+
+    fn one_finding(severity: &str) -> BTreeMap<String, usize> {
+        BTreeMap::from([(severity.to_owned(), 1)])
+    }
+
+    fn reproduced(id: &str) -> crate::ci_regression::Outcome {
+        crate::ci_regression::Outcome {
+            reproduced: vec![id.to_owned()],
+            ..Default::default()
+        }
+    }
+
+    fn fixed(id: &str) -> crate::ci_regression::Outcome {
+        crate::ci_regression::Outcome {
+            fixed: vec![id.to_owned()],
+            ..Default::default()
+        }
+    }
+
+    fn policy_result(failed: bool) -> Gate {
+        let mut gate = Gate::new(GateKind::Policy, Some("p.json".to_owned()), failed);
+        if failed {
+            gate.reasons.push("policy_threshold".to_owned());
+        }
+        gate
+    }
+
+    #[test]
+    fn a_failing_fail_on_fails_the_run_beside_a_passing_policy() {
+        let args = ci_args(&["bhf", "src", "--policy", "p.json", "--fail-on", "low"]);
+        let mut gates = finding_gates(
+            &args,
+            &one_finding("medium"),
+            &ActionabilityBuckets::default(),
+            &Default::default(),
+        );
+        assert_eq!(
+            gates,
+            vec![Gate::new(GateKind::FailOn, Some("low".to_owned()), true)]
+        );
+        gates.push(policy_result(false));
+        assert_eq!(exit_code_from_gates(&gates), 1);
+    }
+
+    #[test]
+    fn every_gate_passing_passes_the_run() {
+        let args = ci_args(&["bhf", "src", "--policy", "p.json", "--fail-on", "high"]);
+        let mut gates = finding_gates(
+            &args,
+            &one_finding("medium"),
+            &ActionabilityBuckets::default(),
+            &fixed("F-1"),
+        );
+        gates.push(policy_result(false));
+        assert_eq!(
+            gates.iter().map(|g| (g.kind, g.failed)).collect::<Vec<_>>(),
+            vec![
+                (GateKind::FailOn, false),
+                (GateKind::Regressions, false),
+                (GateKind::Policy, false)
+            ]
+        );
+        assert_eq!(exit_code_from_gates(&gates), 0);
+    }
+
+    #[test]
+    fn a_failing_policy_fails_the_run_beside_passing_gates() {
+        let args = ci_args(&["bhf", "src", "--policy", "p.json", "--pr-gate", "confirmed"]);
+        let mut gates = finding_gates(
+            &args,
+            &one_finding("medium"),
+            &ActionabilityBuckets::default(),
+            &Default::default(),
+        );
+        assert_eq!(
+            gates,
+            vec![Gate::new(
+                GateKind::PrGate,
+                Some("confirmed".to_owned()),
+                false
+            )]
+        );
+        gates.push(policy_result(true));
+        assert_eq!(exit_code_from_gates(&gates), 1);
+    }
+
+    #[test]
+    fn a_reproduced_regression_and_a_failing_pr_gate_fail_beside_a_policy() {
+        let args = ci_args(&["bhf", "src", "--policy", "p.json"]);
+        let gates = finding_gates(
+            &args,
+            &one_finding("critical"),
+            &ActionabilityBuckets::default(),
+            &reproduced("F-1"),
+        );
+        // The policy's `fail_on_severity` replaces the default `--fail-on any`.
+        assert_eq!(gates, vec![Gate::new(GateKind::Regressions, None, true)]);
+
+        let args = ci_args(&["bhf", "src", "--policy", "p.json", "--pr-gate", "all"]);
+        let gates = finding_gates(
+            &args,
+            &one_finding("low"),
+            &ActionabilityBuckets::default(),
+            &Default::default(),
+        );
+        assert_eq!(
+            gates,
+            vec![Gate::new(GateKind::PrGate, Some("all".to_owned()), true)]
+        );
+    }
+
+    #[test]
+    fn a_fail_on_actionability_given_beside_a_policy_is_applied() {
+        let args = ci_args(&[
+            "bhf",
+            "src",
+            "--policy",
+            "p.json",
+            "--fail-on-actionability",
+            "likely",
+        ]);
+        let mut actionability = ActionabilityBuckets::default();
+        actionability
+            .by_verdict_and_confidence
+            .insert(("likely_reachable".to_owned(), "high".to_owned()), 1);
+        let gates = finding_gates(
+            &args,
+            &one_finding("low"),
+            &actionability,
+            &Default::default(),
+        );
+        assert_eq!(
+            gates,
+            vec![Gate::new(
+                GateKind::FailOnActionability,
+                Some("likely".to_owned()),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn without_a_policy_the_default_fail_on_and_never_gate_still_apply() {
+        let gates = finding_gates(
+            &ci_args(&["bhf", "src"]),
+            &one_finding("info"),
+            &ActionabilityBuckets::default(),
+            &reproduced("F-1"),
+        );
+        assert_eq!(
+            gates.iter().map(|g| (g.kind, g.failed)).collect::<Vec<_>>(),
+            vec![(GateKind::FailOn, true), (GateKind::Regressions, true)]
+        );
+        // `never` only annotates: no finding and no regression fails it.
+        let gates = finding_gates(
+            &ci_args(&["bhf", "src", "--pr-gate", "never"]),
+            &one_finding("critical"),
+            &ActionabilityBuckets::default(),
+            &reproduced("F-1"),
+        );
+        assert_eq!(
+            gates,
+            vec![Gate::new(GateKind::PrGate, Some("never".to_owned()), false)]
+        );
+        assert_eq!(exit_code_from_gates(&gates), 0);
+    }
+
+    #[test]
+    fn the_summary_and_ci_json_name_each_gates_result() {
+        let gates = vec![
+            Gate::new(GateKind::FailOn, Some("any".to_owned()), true),
+            Gate::new(GateKind::Regressions, None, false),
+            policy_result(true),
+        ];
+        assert_eq!(
+            render_gates(&gates),
+            "- Gate `--fail-on any`: **failed**\n\
+             - Gate regression replay: passed\n\
+             - Gate `--policy`: **failed** (policy_threshold)\n"
+        );
+        assert_eq!(
+            format_gates(&gates),
+            "gates: --fail-on any failed, regression replay passed, --policy failed"
+        );
+        let json = gates_json(&gates);
+        assert_eq!(json[0]["gate"], "fail_on");
+        assert_eq!(json[0]["setting"], "any");
+        assert_eq!(json[0]["failed"], true);
+        assert_eq!(json[1]["gate"], "regressions");
+        assert_eq!(json[1]["failed"], false);
+        assert_eq!(json[2]["gate"], "policy");
+        assert_eq!(json[2]["reasons"][0], "policy_threshold");
+    }
+
+    #[test]
+    fn the_dashboard_gate_fails_when_a_gate_beside_the_policy_fails() {
+        let mut dashboard = serde_json::json!({
+            "gate": { "failed": false, "reason": "none", "reasons": [] }
+        });
+        let gates = vec![
+            Gate::new(GateKind::FailOn, Some("any".to_owned()), true),
+            Gate::new(GateKind::Regressions, None, true),
+            policy_result(false),
+        ];
+        merge_gates_into_dashboard(&mut dashboard, &gates);
+        assert_eq!(dashboard["gate"]["failed"], true);
+        assert_eq!(dashboard["gate"]["reason"], "multiple");
+        assert_eq!(
+            dashboard["gate"]["reasons"],
+            serde_json::json!(["fail_on", "regression_reproduced"])
+        );
+        assert_eq!(dashboard["gate"]["gates"][2]["gate"], "policy");
+
+        let mut dashboard = serde_json::json!({
+            "gate": { "failed": true, "reason": "policy_threshold", "reasons": ["policy_threshold"] }
+        });
+        merge_gates_into_dashboard(
+            &mut dashboard,
+            &[
+                Gate::new(GateKind::FailOn, Some("high".to_owned()), false),
+                policy_result(true),
+            ],
+        );
+        assert_eq!(dashboard["gate"]["failed"], true);
+        assert_eq!(dashboard["gate"]["reason"], "policy_threshold");
     }
 
     #[test]

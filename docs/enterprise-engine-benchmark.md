@@ -1,92 +1,96 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
-# Engine comparison: evidence and benchmark plan
+# Engine Comparison Benchmarks
 
-## Supported niche and the two separate experiments
+bhf's effectiveness is measured by two separate experiments, which are reported separately (issue #85). Their schemas, offline run instructions and limits are in [`benchmarks/engine-comparison/METHODOLOGY.md`](../benchmarks/engine-comparison/METHODOLOGY.md). The per-language comparisons behind the white paper are described in [`benchmarks/README.md`](../benchmarks/README.md), and the cold-start time-to-first-crash benchmark in [Engine parity benchmark](site/engine-parity-benchmark.md).
 
-bhf's effectiveness evidence is split into two experiments that must not be
-merged into one headline (issue #85); both are documented, with their schemas,
-offline run instructions, and explicit limitations, in
-`benchmarks/engine-comparison/METHODOLOGY.md`.
+| | Engine quality | Auto-harness productivity |
+|---|---|---|
+| Question | With the harness fixed, how does bhf's engine compare with other engines? | From a raw checkout, how good a harness does bhf generate? |
+| Driver | `benchmarks/engine-comparison/trade_study.py` | [`benchmarks/harness-parity-20/`](../benchmarks/harness-parity-20/README.md) |
+| Method | FuzzBench-style: repeated trials, one shared coverage binary, one independent crash oracle, distributions with confidence intervals | End-to-end: checkout, build recovery, body execution, comparison with a reviewed expert harness |
+| Reports | Median, interquartile range, range and a Wilson or bootstrap interval, per target and pooled; failed, censored and unsupported trials stay in the table | Setup time apart from campaign time; build failures counted |
 
-- **Engine quality** (`benchmarks/engine-comparison/trade_study.py`): a
-  FuzzBench-style study holding the harness fixed across engines. The target set
-  is pluggable via a pinned real-code manifest; results are reported as
-  repeated-trial distributions (median + IQR + range) with a Wilson/bootstrap
-  confidence interval, per-target and pooled, and every failed/censored/
-  unsupported trial stays visible.
-- **Auto-harness productivity** (`benchmarks/harness-parity-20/`): an end-to-end
-  setup study from a raw checkout to a built, body-executing harness vs a
-  reviewed expert harness, with setup time separated from campaign time and
-  build failures counted, not dropped.
+## Results so far
 
-**Measured niche, stated plainly:** on controlled gate-guarded micro-fixtures
-bhf's engine reaches planted bugs competitively, and on a pinned real-code set
-bhf auto-generates harnesses whose project-line coverage reaches expert parity.
-That is the claim the evidence supports. It is **not** a general
-industry-leading-effectiveness claim on arbitrary production targets, and **no
-licensed-tool (e.g. Mayhem) comparison** is made anywhere — none has been run.
+**Engine quality, controlled fixtures.** The four-engine trade study of 2026-09-27 ran bhf's builtin engine, AFL++ 4.09c, libFuzzer (clang 18.1.3) and honggfuzz on the four `engine_parity` fixtures (`magic_byte`, `const_gate`, `len_field`, `redqueen_int`), 10 trials each, 30 s per trial, one pinned core. Report: [`results/trade-study-report-20260927.md`](../benchmarks/engine-comparison/results/trade-study-report-20260927.md).
 
-## Current evidence boundary
+| Fixture | Fastest confirmed crash (AFL++ median) | bhf median time to first crash | Highest median shared coverage |
+|---|---|---|---|
+| `magic_byte` | AFL++ (0.234 s) | 0.502 s | bhf, AFL++, honggfuzz (7 edges) |
+| `const_gate` | AFL++ (0.163 s) | 0.390 s | all four (4 edges) |
+| `len_field` | AFL++ (0.167 s) | 0.193 s | honggfuzz (5 edges) |
+| `redqueen_int` | AFL++ (0.173 s) | no crash in 10 trials | all four (4 edges) |
 
-There is not yet evidence to claim that BHF matches AFL++ or Mayhem on production
-targets. The repository's `engine_parity` and `redqueen_cmplog` integration tests
-are useful correctness gates for BHF's own discovery and comparison guidance,
-but they are not head-to-head benchmarks: both exercise BHF only, use deliberately
-small C gates, and are ignored by default. In a bounded run on 2026-09-24 at
-revision `5528a41df1968e7ec7efb843b9dac12cbe377c8c`,
-`engine_parity` solved three gates with one 3-second campaign each (48, 26, and
-16 reported executions; 1 finding each). `redqueen_cmplog` did not solve the
-integer gate without cmplog (108,075 executions), and did solve it with cmplog
-(51 executions). Those test outcomes show the exercised behavior works; the
-different corpus/control flow and tiny sample do not support comparative speed
-or quality claims. Full raw output is retained at
-`/tmp/bhf-e3-engine-parity.log` and `/tmp/bhf-e3-redqueen-cmplog.log` in the
-validation environment.
+AFL++, libFuzzer and honggfuzz confirmed a crash in 40 of 40 trials, and bhf in 30 of 40. A bhf-only rerun after a fix, on 2026-09-28 with the same fixtures, trials and budget (`benchmarks/engine-comparison/results/trade-study-bhf-refix-20260928.json`), confirmed a crash in 40 of 40 trials, with a median time to first crash of 0.264–0.499 s per fixture, `redqueen_int` 0.426 s.
 
-Initial competitor-runner smoke attempts are preserved under
-`benchmarks/engine-comparison/results/`. The first BHF command used an
-unsupported millisecond spelling for a whole-second timeout; later
-`smoke-valid-*.json` attempts exposed a separate standalone BHF
-protocol-discovery issue. The CLI classified a built generated harness as
-`libfuzzer_single_input`, with no observed coverage or finding, even though the
-generated C driver carries the BHF framed marker in a different directory.
-Candidate AFL++/libFuzzer artifacts independently replayed under the ASan
-oracle, but those first attempts were invalidated by BHF's protocol mismatch.
-The earlier `smoke-*.json` files document bring-up and diagnosis, not
-comparative performance evidence.
+The fixtures are planted, gated micro-bugs. They measure how well a mutator gets past a magic value or a length field (`redqueen_int` needs comparison operand capture), not throughput on whole programs.
 
-The resumed 2026-09-24 checkpoint fixed BHF's split generated/build protocol
-resolution and fresh-process replay. A rebuilt release binary completed the
-unmodified documented workflow and saved a crash that replayed under the common
-ASan oracle (`results/smoke-p1-20260924-01.json`). The pinned AFL++ v5.03c
-LLVM build then succeeded with GCC 13 selected through `CXXFLAGS`. A bounded
-three-engine diagnostic (`results/smoke-p1-three-engine-20260924-01.json`)
-contains one five-second trial on `magic_byte`: BHF and AFL++ saved confirmed
-in-budget crashes, first observed at 0.63s and 0.18s; libFuzzer's confirmed
-artifact was first observed at 8.56s and is classified `out_of_budget_crash`.
-BHF's recorded summary shows `bhf_framed`, forkserver active and 13 edges. The
-single toy trial validates runner and protocol behavior; it cannot establish
-relative effectiveness on real code or Mayhem parity. The earlier `smoke-*.json`
-files retain their diagnostic-only status.
+**Auto-harness productivity, real code.** The audit of 2026-08-14 ([`harness-parity-20/ANALYSIS.md`](../benchmarks/harness-parity-20/ANALYSIS.md)) ran 30 pinned native parser and decompressor projects. On every project, bhf's generated harness built, fuzzed and produced an implementation-line measurement comparable with the expert harness. Generated harnesses covered 50,340 comparable implementation lines against 48,742 for the expert harnesses; 19 of the 30 projects had no line that only the expert harness reached.
 
-## Reproducible smoke runner
+**Integration tests.** `engine_parity` and `redqueen_cmplog` are bhf-only integration tests on small C gates, ignored by default. They check bhf's input discovery and comparison guidance. On 2026-09-24 at revision `5528a41df1968e7ec7efb843b9dac12cbe377c8c`:
 
-`benchmarks/engine-comparison/run.py` is the checked-in start of a reproducible
-comparison harness. It derives each engine's target from the same fixture source
-and `target_one_input` callback, initializes every lane with the same 8-byte
-all-zero seed, pins all work to one selected CPU by default, and records
-source/tool/binary hashes, commands, build logs, run logs, build duration,
-campaign duration, artifact time-to-first-crash, replay confirmation, and
-right-censored no-crash observations. A candidate crash is counted as solved
-only when the saved artifact independently reproduces the fixture's expected
-ASan stack-buffer-overflow using `benchmarks/harnesses/replay_stdin.c`. Build
-failures, runner errors, supervisor timeouts, and unconfirmed artifacts are not
-treated as censored campaigns. Native execution counters are retained but never
-treated as cross-tool comparable. AFL++ and libFuzzer use small checked-in C ABI
-adapters; BHF discovers and generates its harness.
+- `engine_parity` solved three gates, each in one 3-second campaign (48, 26 and 16 executions, one finding each);
+- `redqueen_cmplog` solved the integer gate with cmplog in 51 executions, and did not solve it without cmplog in 108,075 executions.
 
-After building the release CLI and ensuring local `afl++` and `clang` are
-available, a one-case smoke can be run as follows:
+The raw output is in `/tmp/bhf-e3-engine-parity.log` and `/tmp/bhf-e3-redqueen-cmplog.log` on the validation host.
+
+## Trade study runner
+
+`trade_study.py` compares four engines: bhf's builtin engine, AFL++, libFuzzer and honggfuzz (a source build). It reuses the helpers in `run.py` and adds:
+
+1. **honggfuzz and an explicit AFL++ toolchain.** honggfuzz builds the same `LLVMFuzzerTestOneInput` harness through `hfuzz-cc` and `libhfuzz`. AFL++ uses the `afl-cc` from `--afl-path`, with a separate CMPLOG binary.
+2. **Shared coverage.** Every engine's final corpus is merged through one libFuzzer sancov binary (`-merge=1`), so `edges` and `features` come from the same instrumentation for every engine.
+3. **Independent crash oracle.** Each engine's crash artifacts and its final corpus are replayed through one ASan+UBSan binary, and a crash counts when that binary confirms it. honggfuzz's persistent ASan loop keeps a coverage-increasing crasher in its corpus without flagging it, so the corpus replay records that the bug was reached; its time to first crash is `null`, because no crash artifact is written.
+
+Build and setup time are recorded apart from campaign time. Native exec/s is recorded per engine and marked as not comparable across engines.
+
+```sh
+cargo build --release -p bhf
+python3 -B benchmarks/engine-comparison/trade_study.py \
+  --trials 10 --budget 30 \
+  --afl-path <aflpp-checkout>/src --honggfuzz-dir <honggfuzz-build> \
+  --output benchmarks/engine-comparison/results/trade-study-4engine-<date>.json
+python3 -B benchmarks/engine-comparison/analyze_trade_study.py \
+  --input  benchmarks/engine-comparison/results/trade-study-4engine-<date>.json \
+  --output benchmarks/engine-comparison/results/trade-study-report-<date>.md
+```
+
+The JSON holds every trial row, the aggregated summary, tool versions, and the hashes of the sources, the oracle and the coverage binary.
+
+Rendering into an existing report replaces only its generated results, between the `<!-- analyze_trade_study.py: generated results ... -->` markers, and keeps the prose around them; a report without the markers is left as it is.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--engines` | `bhf aflpp libfuzzer honggfuzz` | Engines to run |
+| `--cases` | all targets | Restrict to these target names |
+| `--manifest` | the four fixtures | Real-code target manifest (`.json` or `.toml`) |
+| `--fetch` | off | Clone the manifest's upstreams at their pins, then exit |
+| `--sources` | `<workdir>/sources` | Checkout root for `--fetch` |
+| `--dry-run` | off | Validate and print the plan without building |
+| `--list-targets` | off | Print the resolved target set and exit |
+| `--trials` | `10` | Trials per engine and target |
+| `--budget` | `60` | Fuzzing wall seconds per trial |
+| `--timeout-ms` | `1000` | Per-input timeout |
+| `--max-len` | `64` | Maximum input length |
+| `--cpu` | `0` | CPU or CPU list for `taskset`; `none` disables pinning |
+| `--afl-path`, `--honggfuzz-dir` | host-specific paths | AFL++ `src/` directory and honggfuzz build directory; pass both |
+
+### Real-code targets
+
+With `--manifest`, the same harness, coverage and crash machinery runs pinned real-code targets. The schema and an example (`experiment1-real-code.example.json`) are in `benchmarks/engine-comparison/`, and every field is described in `METHODOLOGY.md`. `aggregate()` reports, per target and pooled, the median, interquartile range and full range, a Wilson interval (crash rate) or a percentile-bootstrap interval (continuous values), and the count of distinct confirmed defects. Each trial is classified (confirmed, censored, build_failed, timeout, incomplete, unsupported), and each engine's breakdown is printed with the rate, so the sample size behind it is visible. A no-crash campaign keeps its censor time. A real-code target that needs a full project build appears as an `unsupported` row with its upstream pin until a build recipe exists for it.
+
+## Smoke runner
+
+`benchmarks/engine-comparison/run.py` runs a single-case smoke comparison of bhf's builtin engine, AFL++ and libFuzzer. For each engine it:
+
+- builds the target from the same fixture source and `target_one_input` callback (AFL++ and libFuzzer through small checked-in C adapters; bhf discovers the target and generates its own harness);
+- starts from the same 8-byte all-zero seed;
+- pins the work to one CPU (`--cpu 0` by default);
+- records the source, tool and binary hashes, commands, build and run logs, build and campaign durations, time to first crash, replay confirmation, and right-censored no-crash results.
+
+A crash counts as solved only when the saved artifact reproduces the fixture's expected ASan stack-buffer-overflow under `benchmarks/harnesses/replay_stdin.c`. Build failures, runner errors, supervisor timeouts and unconfirmed artifacts are recorded as such, not as censored campaigns. Native execution counters are kept and never compared across tools.
+
+With a release build of bhf, `afl++` and `clang` on `PATH`:
 
 ```sh
 cargo build --release -p bhf
@@ -96,131 +100,36 @@ python3 -B benchmarks/engine-comparison/run.py \
   --output benchmarks/engine-comparison/results/smoke-<unique-id>.json
 ```
 
-Each output filename must be new. The runner refuses to overwrite evidence and
-creates a sibling `*-runs/` directory containing per-engine source, corpora,
-artifacts, and logs. `--engines builtin` or another subset is useful for local
-bring-up, but a partial set is not a comparison. Use `--cpu none` only when
-unrestricted scheduling is intentional and recorded. Run multiple trials with
-distinct RNG seeds before computing summaries; this runner stores every trial
-row rather than dropping no-crash observations.
+- Give each run a new output filename: the runner refuses to overwrite evidence. It writes per-engine sources, corpora, artifacts and logs to a sibling `*-runs/` directory.
+- `--engines builtin` (or another subset) is for local bring-up; a comparison needs all three engines.
+- Use `--cpu none` only when you want unpinned scheduling, and record it.
+- Run several trials with distinct RNG seeds before summarizing. Every trial row is stored, including no-crash results.
 
-The runner is smoke-study tooling, not a benchmark suite yet. BHF and
-libFuzzer interfaces express per-input timeouts in whole seconds, so the runner
-rounds up from the millisecond control supplied to AFL++; recorded
-`effective_timeout_ms` makes that difference explicit. BHF builds with `-O1`,
-ASan/UBSan and sanitizer edge/compare coverage; AFL++ builds with `-O1`,
-ASan/UBSan and AFL++ instrumentation (plus a separate CMPLOG binary); libFuzzer
-builds with `-O1`, ASan/UBSan and libFuzzer instrumentation/value profiling.
-These are documented, but not a fully normalized instrumentation matrix.
-Fuzzer startup and shutdown overhead can exceed a short requested campaign
-budget; inspect recorded actual wall durations. Crash-artifact detection is
-polled at 10 ms, so TTFC has that measurement resolution rather than being an
-exact event timestamp. The C fixture suite currently has only toy gates; these
-limitations must remain visible in any reporting.
+Measurement details:
 
-## What a credible enterprise comparison requires
+- bhf and libFuzzer take per-input timeouts in whole seconds, so the runner rounds the millisecond value it passes to AFL++ up for them; each row records `effective_timeout_ms`.
+- Builds: bhf uses `-O1`, ASan/UBSan and sanitizer edge and compare coverage; AFL++ uses `-O1`, ASan/UBSan and AFL++ instrumentation, plus a separate CMPLOG binary; libFuzzer uses `-O1`, ASan/UBSan and libFuzzer instrumentation with value profiling.
+- Fuzzer startup and shutdown can take longer than a short campaign budget; check the recorded wall durations.
+- Crash artifacts are polled every 10 ms, which is the resolution of the time to first crash.
 
-Use FuzzBench as the primary model for a real-code experiment rather than
-extrapolating from the toy fixtures. Its published reports run many fuzzers on
-real-world benchmarks with repeated trials and equal campaign budgets; its
-analysis compares per-benchmark distributions and aggregate results rather than
-presenting a single lucky run. See the [FuzzBench project](https://github.com/google/fuzzbench),
-the [report methodology](https://google.github.io/fuzzbench/reference/report/),
-and [trial terminology](https://google.github.io/fuzzbench/reference/glossary/).
-For AFL++, retain its own `fuzzer_stats` and campaign metadata as raw evidence
-([AFL++ status-screen fields](https://aflplus.plus/docs/status_screen/)).
+### Smoke-run history
 
-Before any broad conclusion, the next study should:
+The files in [`benchmarks/engine-comparison/results/`](../benchmarks/engine-comparison/results/) record the runner's bring-up:
 
-1. Select maintained, representative real-code targets with existing fuzz
-   harnesses or adapter shims that call the same callback and have documented
-   crash/coverage oracles. Include multiple target families and avoid selecting
-   only targets known to favor one engine.
-2. Use identical target revisions, harness semantics, seed corpus bytes,
-   maximum input length, sanitizer policy, environment, CPU quota, campaign
-   budget, and repeated independent seeds for every engine. Record unavoidable
-   differences explicitly rather than silently tuning one lane.
-3. Separate compilation/setup cost from campaign time; report both end-to-end
-   time-to-first-crash and campaign-only time-to-first-crash. Store every
-   no-crash result as right-censored at the observed campaign end, plus crashes,
-   coverage, executions with each engine's native definition, and resource use.
-4. Use enough repetitions for distributions and confidence intervals, publish
-   raw machine-readable rows, exact commands/tool versions/source hashes, and
-   the analysis script. Treat crash counts carefully when duplicates or
-   different sanitizer findings are possible.
-5. Run a separate, licensed Mayhem evaluation only if an authorized account,
-   version, target integration, and equivalent budget are available. No
-   Mayhem comparison has been run here, and this document makes no Mayhem parity
-   claim.
+- `smoke-*.json` and `smoke-valid-*.json` (2026-09-24) are diagnostic runs. The first bhf command passed a millisecond timeout where a whole-second value was required. The `smoke-valid-*` runs exposed a protocol-discovery defect: bhf classified a built generated harness as `libfuzzer_single_input`, with no coverage or finding, because the generated C driver carrying the framed-protocol marker was in a different directory. The AFL++ and libFuzzer artifacts from those runs replayed under the ASan oracle.
+- After the fix to protocol resolution and fresh-process replay, a release build completed the documented workflow and saved a crash that replayed under the shared ASan oracle (`smoke-p1-20260924-01.json`).
+- `smoke-p1-three-engine-20260924-01.json` is one five-second trial on `magic_byte`, with AFL++ v5.03c built with GCC 13 selected through `CXXFLAGS`. bhf and AFL++ saved confirmed crashes, first seen at 0.63 s and 0.18 s. libFuzzer's confirmed artifact was first seen at 8.56 s and is classified `out_of_budget_crash`. bhf's summary shows `bhf_framed`, the fork server active and 13 edges.
 
-An eventual FuzzBench-backed suite should be versioned with this repository,
-but should not be added as a default CI job: full real-code campaigns are
-resource intensive. A small deterministic smoke can remain in CI for protocol
-and adapter regressions, while statistically powered runs are scheduled and
-publish their immutable evidence separately.
+## Requirements for a real-code comparison
 
-## Multi-engine trade study (4 engines) — 2026-09-25
+FuzzBench is the model for a real-code experiment: many fuzzers on real-world benchmarks, repeated trials, equal campaign budgets, and per-benchmark distributions next to aggregate results. See the [FuzzBench project](https://github.com/google/fuzzbench), its [report methodology](https://google.github.io/fuzzbench/reference/report/) and its [trial terminology](https://google.github.io/fuzzbench/reference/glossary/). For AFL++, keep its `fuzzer_stats` and campaign metadata as raw evidence ([AFL++ status-screen fields](https://aflplus.plus/docs/status_screen/)).
 
-`benchmarks/engine-comparison/trade_study.py` extends the smoke runner into a
-statistically powered head-to-head across **four** engines — BHF's builtin
-engine, AFL++ (pinned 5.03c), libFuzzer, and honggfuzz (source build) — over the
-controlled `engine_parity` fixtures (`magic_byte`, `const_gate`, `len_field`,
-`redqueen_int`), with 10 independent trials per (engine, target) at a fixed
-per-trial wall budget. It reuses the reviewed helpers in `run.py` and adds three
-things the smoke runner lacked:
+A real-code study should:
 
-1. **honggfuzz and an explicit pinned-AFL++ toolchain.** honggfuzz builds the
-   same `LLVMFuzzerTestOneInput` harness via `hfuzz-cc`/`libhfuzz`; AFL++ uses the
-   pinned 5.03c `afl-cc` with a separate CMPLOG binary.
-2. **Engine-neutral coverage.** Every engine's FINAL corpus is merged through ONE
-   shared libFuzzer-sancov binary (`-merge=1`, crash-robust), so `edges`/
-   `features` use identical instrumentation and are directly comparable rather
-   than trusting each engine's own counter.
-3. **Engine-neutral crash oracle.** Each engine's native crash artifact AND its
-   final corpus are replayed through one independent ASan+UBSan binary; only
-   oracle-confirmed crashes count. This is required because honggfuzz's
-   persistent+ASan loop keeps a coverage-increasing crasher in its corpus without
-   flagging it as a crash — the corpus backstop still records bug reachability
-   (its precise time-to-first-crash is reported as null, since no native artifact
-   is written).
+1. Select maintained real-code targets from several target families, with existing fuzz harnesses or adapter shims that call the same callback, and documented crash and coverage oracles. Avoid targets known to favour one engine.
+2. Give every engine the same target revisions, harness semantics, seed bytes, maximum input length, sanitizer policy, environment, CPU quota and campaign budget, with independent seeds per trial. Record any difference that cannot be removed instead of tuning one lane.
+3. Record compilation and setup time apart from campaign time, and report both the end-to-end and the campaign-only time to first crash. Store every no-crash result as right-censored at the campaign end, together with crashes, coverage, executions (in each engine's own definition) and resource use.
+4. Run enough trials for distributions and confidence intervals, and publish the raw rows, exact commands, tool versions, source hashes and the analysis script. Deduplicate crashes before counting them.
+5. Run a Mayhem evaluation only with an authorized account, a fixed version, a target integration and an equivalent budget. No Mayhem comparison has been run.
 
-Build/setup time is separated from campaign time; native exec/s is recorded but
-flagged not cross-engine comparable. Raw per-trial rows, the aggregated summary,
-tool versions, and source/oracle/coverage-binary hashes are written to
-`results/trade-study-4engine-<date>.json`; `analyze_trade_study.py` renders the
-Markdown report `results/trade-study-report-<date>.md`.
-
-```sh
-cargo build --release -p bhf
-python3 -B benchmarks/engine-comparison/trade_study.py \
-  --trials 10 --budget 30 \
-  --afl-path <pinned-aflpp-5.03c>/src --honggfuzz-dir <honggfuzz-build> \
-  --output benchmarks/engine-comparison/results/trade-study-4engine-<date>.json
-python3 -B benchmarks/engine-comparison/analyze_trade_study.py \
-  --input  benchmarks/engine-comparison/results/trade-study-4engine-<date>.json \
-  --output benchmarks/engine-comparison/results/trade-study-report-<date>.md
-```
-
-These fixtures are controlled coverage-gated micro-bugs: they isolate mutator
-reach and magic-value solving (the `redqueen_int` gate specifically probes
-cmplog/redqueen/value-profile), not whole-program throughput on production code.
-They complement — they do not replace — the real-code reach study in
-`benchmarks/harness-parity-20/` (bhf-generated vs expert harness). No Mayhem
-comparison is included (no licensed environment).
-
-### Pluggable real-code targets and distribution reporting (issue #85)
-
-The study's target set is no longer limited to the four toy gates. With a
-`--manifest` (schema and example in `benchmarks/engine-comparison/`;
-full field reference in `METHODOLOGY.md`) the identical harness/coverage/crash
-machinery runs pinned real-code targets. `aggregate()` now reports repeated-trial
-distributions — median, interquartile range, full range, and a Wilson (crash
-rate) or percentile-bootstrap (continuous) confidence interval — per-target AND
-pooled, plus the count of distinct confirmed defects. Every trial is classified
-and the per-engine outcome breakdown (confirmed / censored / build_failed /
-timeout / incomplete / unsupported) is reported, so a rate's effective sample
-size is never hidden; right-censored no-crash campaigns keep their censor time.
-Real-code targets that need a full project build are shown as visible
-`unsupported` rows with their upstream pin until a build recipe is wired, rather
-than silently omitted. The four-engine non-parity disclaimer above still holds:
-these remain micro-fixtures unless a real-code manifest is supplied.
+A real-code suite belongs in this repository, versioned with it, and runs on a schedule rather than as a default CI job, because full campaigns are resource intensive. A small deterministic smoke run can stay in CI to catch protocol and adapter regressions.

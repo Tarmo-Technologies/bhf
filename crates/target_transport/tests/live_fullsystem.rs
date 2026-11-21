@@ -1016,14 +1016,57 @@ fn live_fullsystem_fast_snapshot_brings_a_fault_back_without_a_loadvm() {
     );
 }
 
+/// How many times lower `reset=fast`'s mean reset must be than a `loadvm`'s.
+/// Local runs measure 12.4x to 20.8x and a loaded scheduled runner has
+/// measured 9.5x (#452), so 5x stays clear of the runners' timing noise and
+/// still fails a fast snapshot that regresses toward a `loadvm`'s cost.
+const FAST_RESET_MIN_SPEEDUP: f64 = 5.0;
+
+/// The measured speedup of `fast_mean` over `loadvm_mean`, or the benchmark's
+/// failure message when it is under [`FAST_RESET_MIN_SPEEDUP`].
+fn fast_reset_speedup(loadvm_mean: Duration, fast_mean: Duration) -> Result<f64, String> {
+    let ratio = loadvm_mean.as_secs_f64() / fast_mean.as_secs_f64().max(f64::MIN_POSITIVE);
+    if ratio >= FAST_RESET_MIN_SPEEDUP {
+        Ok(ratio)
+    } else {
+        Err(format!(
+            "reset=fast's mean reset took {fast_mean:?}, a loadvm {loadvm_mean:?}: \
+             {ratio:.1}x lower, under the {FAST_RESET_MIN_SPEEDUP}x required"
+        ))
+    }
+}
+
+/// The threshold passes the slowest speedup a scheduled runner has measured
+/// (9.5x) and fails a fast snapshot that is no faster than a `loadvm`.
+#[test]
+fn the_fast_reset_threshold_passes_runner_noise_and_fails_parity() {
+    let loadvm = Duration::from_micros(5_700);
+    for measured in [9.5, 12.4, 20.8] {
+        let ratio = fast_reset_speedup(loadvm, loadvm.div_f64(measured))
+            .unwrap_or_else(|failure| panic!("{measured}x: {failure}"));
+        assert!(
+            (ratio - measured).abs() < 0.01,
+            "{measured}x read as {ratio}x"
+        );
+    }
+    for measured in [0.5, 1.0, 2.0, 4.9] {
+        let failure = fast_reset_speedup(loadvm, loadvm.div_f64(measured))
+            .expect_err("a speedup under the threshold fails");
+        assert!(
+            failure.contains(&format!("{measured:.1}x lower")),
+            "the message reports the measured ratio: {failure}"
+        );
+    }
+}
+
 /// The reset latency the dirty-page fast snapshot buys over a `loadvm`, both
 /// measured here on the same image and inputs, faults included (run nightly
 /// by scripts/hil-emu.sh).
 #[test]
 #[ignore = "benchmark: run with --ignored (nightly, live QEMU)"]
-fn live_fullsystem_fast_snapshot_resets_ten_times_faster_than_loadvm() {
+fn live_fullsystem_fast_snapshot_resets_five_times_faster_than_loadvm() {
     if let Err(reason) = gate(
-        "live_fullsystem_fast_snapshot_resets_ten_times_faster_than_loadvm",
+        "live_fullsystem_fast_snapshot_resets_five_times_faster_than_loadvm",
         &FAST_TOOLS,
     ) {
         eprintln!("{reason}");
@@ -1108,10 +1151,9 @@ fn live_fullsystem_fast_snapshot_resets_ten_times_faster_than_loadvm() {
         loadvm_runs as f64 / secs,
         fast_runs as f64 / secs,
     );
-    assert!(
-        fast_mean * 10 <= loadvm_mean,
-        "reset=fast's mean reset took {fast_mean:?}, a loadvm {loadvm_mean:?}: not 10x lower"
-    );
+    if let Err(failure) = fast_reset_speedup(loadvm_mean, fast_mean) {
+        panic!("{failure}");
+    }
 }
 
 /// The edges a run of `byte` takes in the [`Image::State`] harness when it

@@ -20,35 +20,36 @@ pub struct BinaryFuzzArgs {
     /// Executable binary to fuzz.
     pub binary: PathBuf,
 
-    /// BHF work directory where findings are written.
+    /// Work directory the findings are written to.
     #[arg(long, default_value = "bhf_work")]
     pub work_dir: PathBuf,
 
-    /// How fuzz bytes are delivered to the executable.
+    /// How each input reaches the executable: on stdin, or as a file whose
+    /// path is passed as an argument (see `--target-arg`).
     #[arg(long, value_enum, default_value_t = BinaryInputMode::Stdin)]
     pub input_mode: BinaryInputMode,
 
-    /// Maximum number of seed executions.
+    /// Most executions: the seeds first, then mutations of them. With
+    /// `afl-qemu`, it also sets the default `--time`.
     #[arg(long, default_value_t = 256)]
     pub iterations: usize,
 
-    /// Literal seed input bytes.
+    /// Literal seed input bytes. Repeatable.
     #[arg(long = "seed-input")]
     pub seed_inputs: Vec<String>,
 
-    /// File containing seed input bytes.
+    /// File containing seed input bytes. Repeatable.
     #[arg(long = "seed-file")]
     pub seed_files: Vec<PathBuf>,
 
-    /// Per-execution timeout in milliseconds. Applied to the afl-qemu mutation
-    /// campaign (`afl-fuzz -t`) as well as the crash-replay oracle, so both use
-    /// the same policy.
+    /// Timeout of one execution, in milliseconds. The afl-qemu campaign
+    /// (`afl-fuzz -t`) and the crash replay use the same value.
     #[arg(long, default_value_t = 10_000)]
     pub timeout_ms: u64,
 
-    /// Child-process memory limit in MiB for the afl-qemu engine (`afl-fuzz -m`).
-    /// Accepts an integer or `none`; defaults to `none` because QEMU mode maps a
-    /// large virtual address space and a tight cap aborts the campaign.
+    /// Memory limit of the target process under afl-qemu (`afl-fuzz -m`), in
+    /// MiB, or `none`. The default is `none` because QEMU mode maps a large
+    /// virtual address space, and a tight limit stops the campaign.
     #[arg(long = "mem-mb", default_value = "none")]
     pub mem_mb: String,
 
@@ -66,9 +67,9 @@ pub struct BinaryFuzzArgs {
     #[arg(skip)]
     pub env_redaction: BTreeMap<String, String>,
 
-    /// Runner/emulator to launch the target under, e.g. `wine` or `qemu-x86_64`.
-    /// The target binary and its `--target-arg`s follow. Builtin engine only
-    /// (afl-qemu provides its own `-Q` runner).
+    /// Program to launch the target under, such as `wine` or `qemu-x86_64`;
+    /// the target binary and its `--target-arg`s follow it. Builtin engine
+    /// only (afl-qemu runs the target under its own QEMU).
     #[arg(long = "runner")]
     pub runner: Option<String>,
 
@@ -79,25 +80,27 @@ pub struct BinaryFuzzArgs {
 
     /// Fixed argument passed to the target before the fuzz input. Repeatable. A
     /// literal `@@` token is replaced by the input-file path (file mode); with no
-    /// `@@`, file-mode input is appended last. Lets a manual binary-only harness
-    /// express `wine ./harness.exe --mode fuzz @@`.
+    /// `@@`, the input file is passed last. With `--runner wine --input-mode
+    /// file`, `--target-arg=--mode --target-arg=fuzz --target-arg=@@` runs
+    /// `wine <BINARY> --mode fuzz <input-file>`.
     #[arg(long = "target-arg")]
     pub target_args: Vec<String>,
 
-    /// Sandbox mode recorded in finding provenance.
-    #[arg(long, value_enum, default_value_t = SandboxModeArg::Auto)]
+    /// Target isolation. Only `none` is supported; other modes are refused
+    /// before the target runs.
+    #[arg(long, default_value = "none", value_parser = parse_binary_sandbox)]
     pub sandbox: SandboxModeArg,
 
-    /// Fuzzing engine. `builtin` runs the seeds, then a blind havoc loop:
-    /// stacked byte mutations of the seeds, with no coverage feedback, until
-    /// `--iterations`, `--time` or the first crash. `afl-qemu` drives AFL++ in
-    /// QEMU mode (`afl-fuzz -Q`) so a binary-only / foreign-arch target with NO
-    /// source still gets coverage-guided mutation — qemu's DBT injects edge
-    /// coverage during translation. `afl-frida` drives AFL++ in Frida mode
-    /// (`afl-fuzz -O`), which instruments the binary as it runs on the host
-    /// CPU: for a native binary QEMU mode emulates poorly or slowly. `auto`
-    /// (default) uses afl-qemu when its toolchain is present, else falls back
-    /// to builtin; the run JSON says so (`degraded`).
+    /// Fuzzing engine. `builtin` runs the seeds, then stacked byte mutations
+    /// of them with no coverage feedback, until `--iterations`, `--time` or
+    /// the first crash. `afl-qemu` runs AFL++ in QEMU mode (`afl-fuzz -Q`),
+    /// which adds edge coverage while QEMU translates the binary, so a target
+    /// with no source, or built for another architecture, gets coverage-guided
+    /// mutation. `afl-frida` runs AFL++ in Frida mode (`afl-fuzz -O`), which
+    /// instruments the binary as it runs on the host CPU, for a native binary
+    /// that QEMU mode emulates badly or slowly. `auto` (default) uses afl-qemu
+    /// when its tools are installed, else builtin, and the run JSON records
+    /// the fallback as `degraded`.
     #[arg(long, value_enum, default_value_t = BinaryFuzzEngine::Auto)]
     pub engine: BinaryFuzzEngine,
 
@@ -123,9 +126,9 @@ pub struct BinaryFuzzArgs {
     #[arg(long = "no-cmplog")]
     pub no_cmplog: bool,
 
-    /// Wall-clock budget (e.g. 30s, 5m). For afl-qemu it defaults to ~100ms per
-    /// `--iterations`, clamped to [1s,30s]; the builtin engine stops at it, or
-    /// at `--iterations`, whichever comes first.
+    /// Wall-clock budget, such as 30s or 5m. For afl-qemu the default is about
+    /// 100ms per `--iterations`, between 1s and 30s; the builtin engine stops
+    /// at it or at `--iterations`, whichever comes first.
     #[arg(long = "time")]
     pub time: Option<String>,
 
@@ -133,60 +136,60 @@ pub struct BinaryFuzzArgs {
     #[arg(long = "rng-seed", default_value_t = 0)]
     pub rng_seed: u64,
 
-    /// Load the runtime sink oracles via the LD_PRELOAD runtrace shim (#59) so a
-    /// clean-exit semantic violation — a fuzz-controlled command execution, path
-    /// escape, dlopen, network egress, or SQL query — becomes a `binary_semantic`
-    /// finding even when the target exits zero. `off` (default) is crash-only;
-    /// `auto` enables them when the shim and platform (Linux) support it and skips
-    /// otherwise; `on` requires them (errors if unavailable). Builtin engine only.
+    /// Load the runtime sink oracles through the LD_PRELOAD runtrace shim
+    /// (Linux), so a semantic violation becomes a `binary_semantic` finding
+    /// even when the target exits zero: a command execution, path escape,
+    /// dlopen, network connection or SQL query that the fuzz input controls.
+    /// `off` (default) loads none, so the findings are crashes; `auto` loads
+    /// them when the shim and the platform support it; `on` requires them.
+    /// Builtin engine only.
     #[arg(long = "runtime-oracles", value_enum, default_value_t = crate::runtime_oracles::RuntimeOracleMode::Off)]
     pub runtime_oracles: crate::runtime_oracles::RuntimeOracleMode,
 
-    /// Shell command run BEFORE each testcase to prepare a fresh fixture (#55).
-    /// Receives the testcase path as `$1` and `BHF_TESTCASE`/`BHF_CASE_DIR` in the
-    /// environment. A non-zero exit is an infrastructure error (the case is
-    /// skipped, not a finding).
+    /// Shell command run before each testcase to prepare a fresh fixture. It
+    /// gets the testcase path as `$1`, and `BHF_TESTCASE` and `BHF_CASE_DIR` in
+    /// its environment. A non-zero exit skips the testcase as a setup error.
     #[arg(long = "setup-command")]
     pub setup_command: Option<String>,
 
-    /// Shell command run AFTER each testcase to check a user-defined security
-    /// postcondition (#55) — e.g. "no file escaped the allowed root", "no
-    /// unexpected child process". Receives the testcase path as `$1` plus
-    /// `BHF_TESTCASE`, `BHF_CASE_DIR`, `BHF_TARGET_EXIT`, `BHF_TARGET_SIGNAL`,
-    /// `BHF_TARGET_TIMEOUT`, and `BHF_TARGET_STDERR` (a file). Exit 0 = clean,
-    /// exit 1 = finding (its first stdout line is the classification/signature),
-    /// any other exit = infrastructure error. Fires even when the target exits 0.
+    /// Shell command run after each testcase to check a security condition you
+    /// define, such as "no file left the allowed root" or "no unexpected child
+    /// process". It gets the testcase path as `$1`, plus `BHF_TESTCASE`,
+    /// `BHF_CASE_DIR`, `BHF_TARGET_EXIT`, `BHF_TARGET_SIGNAL`,
+    /// `BHF_TARGET_TIMEOUT` and `BHF_TARGET_STDERR` (a file). Exit 0: clean.
+    /// Exit 1: a finding, whose classification is the first line the command
+    /// prints on stdout. Any other exit: an oracle error. It runs whatever the
+    /// target's exit status.
     #[arg(long = "oracle-command")]
     pub oracle_command: Option<String>,
 
-    /// Shell command run AFTER the oracle to reset state between testcases (#55),
-    /// so filesystem/process/session effects do not leak across mutations.
-    /// Receives the same `BHF_TESTCASE`/`BHF_CASE_DIR` context.
+    /// Shell command run after the oracle to reset state between testcases,
+    /// so files, processes and sessions one testcase leaves do not affect the
+    /// next. It gets the same `BHF_TESTCASE` and `BHF_CASE_DIR`.
     #[arg(long = "reset-command")]
     pub reset_command: Option<String>,
 
     /// Runtime-event collector that observes process, filesystem, and module-load
-    /// effects the target performs even on a clean exit (#60). `auto` selects the
+    /// effects the target performs even on a clean exit. `auto` selects the
     /// built-in provider for the platform: the native Windows ETW provider
     /// `bhf-collector-win`, or on Linux the in-process `LD_PRELOAD` runtrace
     /// adapter, which arms the runtrace shim for the run (with `--runtime-oracles
     /// off` it writes no runtime-oracle findings) and stays inactive only when the
     /// shim is unavailable. A PATH runs an external sidecar that speaks the
     /// bhf.collector-event.v1 JSONL protocol; `none` (default) disables it. A
-    /// collected semantic violation — a controlled process exec, a path escaping
-    /// the allowed root, or a controlled library load — becomes a
-    /// `binary_semantic` finding (no crash needed), with the raw collector session
-    /// stored for deterministic replay.
+    /// collected semantic violation (a process exec or library load the input
+    /// controls, or a path outside the allowed root) becomes a
+    /// `binary_semantic` finding with no crash needed, and the raw collector
+    /// session is stored so the finding replays the same way.
     #[arg(long = "collector", value_parser = crate::collector_run::parse_collector_spec, default_value = "none")]
     pub collector: crate::collector_run::CollectorSpec,
 
-    /// How long, in milliseconds, to keep observing descendant-process effects
-    /// after the testcase process exits — the bounded post-exit observation
-    /// window (#60).
+    /// How long, in milliseconds, the collector keeps observing the effects of
+    /// descendant processes after the testcase process exits.
     #[arg(long = "collector-window-ms", default_value_t = crate::collector_run::DEFAULT_WINDOW_MS)]
     pub collector_window_ms: u64,
 
-    /// A `bhf binary adapter` report of the binary (#267). The strings its
+    /// A `bhf binary adapter` report of the binary. The strings its
     /// code references seed the mutation dictionary (the builtin engine's, and
     /// afl-fuzz's `-x`), and its functions are ranked as fuzz entry points;
     /// the run JSON's `adapter_report` records both, with the top-ranked
@@ -282,6 +285,18 @@ impl TargetInvocation {
         Ok(())
     }
 
+    /// Get the runner ready before the target's first run (#394): a Wine
+    /// runner's prefix is created when it is missing, since Wine creating it
+    /// on the first run outlasts the run's timeout.
+    fn prepare_runner(&self) -> anyhow::Result<()> {
+        match &self.runner {
+            Some(runner) => {
+                crate::runner::prepare_runner_program(Path::new(runner)).map_err(|e| anyhow!(e))
+            }
+            None => Ok(()),
+        }
+    }
+
     /// The `(program, argv)` to spawn for one execution. `input_path` is the fuzz
     /// testcase file for file mode, `None` for stdin. A `@@` target-arg is
     /// replaced by the input path; in file mode with no `@@`, the input path is
@@ -337,6 +352,14 @@ pub(crate) struct BinaryMinimizeSummary {
     pub(crate) reduced: bool,
 }
 
+fn parse_binary_sandbox(value: &str) -> Result<SandboxModeArg, &'static str> {
+    if value == "none" {
+        Ok(SandboxModeArg::None)
+    } else {
+        Err("binary fuzz does not support sandboxing; run untrusted binaries in an isolated VM")
+    }
+}
+
 pub fn run(args: BinaryFuzzArgs) -> i32 {
     match run_inner(args) {
         Ok(summary) => {
@@ -354,6 +377,9 @@ pub fn run(args: BinaryFuzzArgs) -> i32 {
 }
 
 fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
+    if args.sandbox != SandboxModeArg::None {
+        return Err(anyhow!("binary fuzz does not support sandboxing"));
+    }
     if args.iterations == 0 {
         return Err(anyhow!("--iterations must be greater than zero"));
     }
@@ -381,6 +407,7 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
     let engine = resolve_binary_engine(args.engine)?;
     let invocation = TargetInvocation::from_args(&args);
     invocation.validate(args.input_mode, matches!(engine, ResolvedEngine::Afl(_)))?;
+    invocation.prepare_runner()?;
     // #55: user postconditions are a builtin-engine capability; the afl-qemu
     // adapter path is out of scope here.
     if args.oracle_command.is_some() && matches!(engine, ResolvedEngine::Afl(_)) {
@@ -1365,37 +1392,64 @@ fn run_afl_binary(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let mut cmd = Command::new(&afl.afl_fuzz);
-    cmd.args(&argv)
-        // afl-fuzz -Q finds afl-qemu-trace, and -O afl-frida-trace.so, via
-        // AFL_PATH (then alongside afl-fuzz).
-        .env("AFL_PATH", &afl_trace_dir)
-        .env("AFL_NO_UI", "1")
-        .env("AFL_SKIP_CPUFREQ", "1")
-        .env("AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES", "1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (key, value) in env {
-        cmd.env(key, value);
-    }
-    for (key, value) in afl_binary_env(afl.mode, args.persistent_addr, args.entrypoint) {
-        cmd.env(key, value);
-    }
-    // afl-fuzz refuses a custom `<SAN>_OPTIONS` without `symbolize=0`
-    // ("Custom ASAN_OPTIONS set without symbolize=0", afl-fuzz-init.c), as
-    // the container image's defaults are: merge it into whatever is set.
-    for key in ["ASAN_OPTIONS", "UBSAN_OPTIONS", "LSAN_OPTIONS"] {
-        let set = env.get(key).cloned().or_else(|| std::env::var(key).ok());
-        if set.is_some() {
-            cmd.env(
-                key,
-                multicore_fuzz::merge_sanitizer_options(set.as_deref(), "symbolize=0"),
-            );
+    // #444: afl-fuzz binds itself to a free core unless told not to. A run
+    // bhf is pinned for keeps its pin; one that finds every core bound to
+    // another fuzzer runs again, once, unbound.
+    let mut no_affinity = crate::fuzz::afl_no_affinity_at_start(env.keys().map(String::as_str));
+    let run_afl_fuzz = |unbound: bool| -> anyhow::Result<std::process::Output> {
+        let mut cmd = Command::new(&afl.afl_fuzz);
+        cmd.args(&argv)
+            // afl-fuzz -Q finds afl-qemu-trace, and -O afl-frida-trace.so, via
+            // AFL_PATH (then alongside afl-fuzz).
+            .env("AFL_PATH", &afl_trace_dir)
+            .env("AFL_NO_UI", "1")
+            .env("AFL_SKIP_CPUFREQ", "1")
+            .env("AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (key, value) in env {
+            cmd.env(key, value);
         }
+        for (key, value) in afl_binary_env(afl.mode, args.persistent_addr, args.entrypoint) {
+            cmd.env(key, value);
+        }
+        // afl-fuzz refuses a custom `<SAN>_OPTIONS` without `symbolize=0`
+        // ("Custom ASAN_OPTIONS set without symbolize=0", afl-fuzz-init.c), as
+        // the container image's defaults are: merge it into whatever is set.
+        for key in ["ASAN_OPTIONS", "UBSAN_OPTIONS", "LSAN_OPTIONS"] {
+            let set = env.get(key).cloned().or_else(|| std::env::var(key).ok());
+            if set.is_some() {
+                cmd.env(
+                    key,
+                    multicore_fuzz::merge_sanitizer_options(set.as_deref(), "symbolize=0"),
+                );
+            }
+        }
+        if unbound {
+            cmd.env("AFL_NO_AFFINITY", "1");
+        }
+        cmd.output()
+            .with_context(|| format!("spawn afl-fuzz '{}'", afl.afl_fuzz.display()))
+    };
+    let mut output = run_afl_fuzz(no_affinity.is_some())?;
+    if no_affinity.is_none()
+        && output.status.code().is_some_and(|code| code != 0)
+        && (crate::fuzz::afl_output_says_no_free_core(&output.stdout)
+            || crate::fuzz::afl_output_says_no_free_core(&output.stderr))
+    {
+        bhfeprintln!(
+            "bhf binary-fuzz: afl-fuzz {} found every CPU core bound to another CPU-locked \
+             process (another fuzzer) and did not start; running it again without binding a \
+             core (AFL_NO_AFFINITY=1)",
+            afl.mode.flag()
+        );
+        // The output directory afl-fuzz gave up on holds no session.
+        fs::remove_dir_all(&out_dir)
+            .and_then(|()| fs::create_dir_all(&out_dir))
+            .with_context(|| format!("reset {}", out_dir.display()))?;
+        output = run_afl_fuzz(true)?;
+        no_affinity = Some(crate::fuzz::AflNoAffinity::NoFreeCore);
     }
-    let output = cmd
-        .output()
-        .with_context(|| format!("spawn afl-fuzz '{}'", afl.afl_fuzz.display()))?;
     // afl-fuzz self-terminates by signal when -V expires (code None) — that's the
     // intended end of a time-boxed run, not a failure. A positive exit is a real
     // error (bad seed, core_pattern, missing afl-qemu-trace, …).
@@ -1534,6 +1588,11 @@ fn run_afl_binary(
         AflBinaryMode::Frida => "afl_frida_trace",
     };
     summary[trace_key] = json!(afl.trace);
+    // Why afl-fuzz ran without binding a core of its choosing; absent when it
+    // bound one.
+    if let Some(reason) = no_affinity {
+        summary["no_affinity"] = json!(reason);
+    }
     Ok(summary)
 }
 
@@ -1687,6 +1746,7 @@ pub(crate) fn minimize_binary_finding(
     let original = fs::read(finding_dir.join("testcase.bin"))
         .with_context(|| format!("read {}", finding_dir.join("testcase.bin").display()))?;
     let invocation = finding_invocation(&finding, binary);
+    invocation.prepare_runner()?;
     let scratch = crate::minimize::ScratchDir::create(finding_dir.join("binary_minimize_tmp"))?;
     let tmp_dir = scratch.path().to_path_buf();
     // Reduce against the finding's OWN oracle: a crash signature, a runtime-oracle
@@ -1790,6 +1850,7 @@ fn replay_binary_finding_inner(finding_dir: &Path, binary: &Path) -> anyhow::Res
     let scratch = crate::minimize::ScratchDir::create(finding_dir.join("binary_replay_tmp"))?;
     let tmp_dir = scratch.path().to_path_buf();
     let invocation = finding_invocation(&finding, binary);
+    invocation.prepare_runner()?;
     let mode = finding_input_mode(&finding)?;
     let env = finding_env(&finding)?;
     let timeout = finding_timeout(&finding);
@@ -3213,7 +3274,7 @@ mod tests {
             runner: Some("/bin/sh".to_owned()),
             runner_args: Vec::new(),
             target_args,
-            sandbox: SandboxModeArg::Auto,
+            sandbox: SandboxModeArg::None,
             engine: BinaryFuzzEngine::Builtin,
             time: None,
             runtime_oracles: crate::runtime_oracles::RuntimeOracleMode::Off,
@@ -3574,6 +3635,104 @@ mod afl_qemu_tests {
         assert!(parsed(&["--no-cmplog"]).unwrap());
     }
 
+    /// #444: afl-fuzz refuses to start in QEMU or Frida mode when every core
+    /// is bound to another CPU-locked process, and the pass failed with
+    /// "afl-fuzz -Q exited non-zero". It runs again, once, with
+    /// `AFL_NO_AFFINITY=1`, and the run JSON says why.
+    #[cfg(unix)]
+    #[test]
+    fn an_afl_fuzz_that_finds_no_free_core_runs_again_without_binding_one() {
+        use clap::Parser;
+        use std::os::unix::fs::PermissionsExt;
+        #[derive(clap::Parser)]
+        struct Fuzz {
+            #[command(flatten)]
+            args: BinaryFuzzArgs,
+        }
+        let dir = crate::test_support::TestDir::new("binfuzz-no-free-core");
+        let work = dir.join("work");
+        let calls = dir.join("calls.log");
+        let afl_fuzz = dir.join("afl-fuzz");
+        std::fs::write(
+            &afl_fuzz,
+            format!(
+                "#!/bin/sh\necho \"AFL_NO_AFFINITY=${{AFL_NO_AFFINITY:-unset}}\" >> '{}'\n\
+                 if [ -z \"$AFL_NO_AFFINITY\" ]; then\n\
+                 \x20 echo '[-] PROGRAM ABORT : No more free CPU cores'\n\
+                 \x20 echo '         Location : bind_to_free_cpu(), src/afl-fuzz-init.c:448'\n\
+                 \x20 exit 1\n\
+                 fi\nexit 0\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&afl_fuzz, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let args = Fuzz::try_parse_from([
+            "fuzz".as_ref(),
+            "/bin/true".as_ref(),
+            "--work-dir".as_ref(),
+            work.as_os_str(),
+            "--time".as_ref(),
+            "1s".as_ref(),
+        ])
+        .unwrap()
+        .args;
+        let findings = work.join("findings");
+        std::fs::create_dir_all(&findings).unwrap();
+        let afl = AflBinary {
+            mode: AflBinaryMode::Qemu,
+            afl_fuzz,
+            trace: dir.join("afl-qemu-trace"),
+        };
+        let summary = run_afl_binary(
+            &args,
+            &afl,
+            &[b"seed".to_vec()],
+            None,
+            &BTreeMap::new(),
+            &findings,
+        )
+        .expect("the AFL pass runs");
+        let calls = std::fs::read_to_string(&calls).unwrap();
+        let calls: Vec<&str> = calls.lines().collect();
+        match crate::fuzz::afl_no_affinity_at_start(std::iter::empty()) {
+            // This test runs pinned or with AFL_NO_AFFINITY set: unbound
+            // from the start, so no core is looked for.
+            Some(reason) => {
+                assert_eq!(calls, ["AFL_NO_AFFINITY=1"]);
+                assert_eq!(summary["no_affinity"], json!(reason), "{summary:#}");
+            }
+            None => {
+                assert_eq!(
+                    calls,
+                    ["AFL_NO_AFFINITY=unset", "AFL_NO_AFFINITY=1"],
+                    "run again, once, unbound"
+                );
+                assert_eq!(summary["no_affinity"], "no_free_core", "{summary:#}");
+            }
+        }
+        // A run that binds a core records nothing.
+        let bound = dir.join("bound-afl-fuzz");
+        std::fs::write(&bound, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&bound, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let afl = AflBinary {
+            afl_fuzz: bound,
+            ..afl
+        };
+        let summary = run_afl_binary(
+            &args,
+            &afl,
+            &[b"seed".to_vec()],
+            None,
+            &BTreeMap::new(),
+            &findings,
+        )
+        .unwrap();
+        if crate::fuzz::afl_no_affinity_at_start(std::iter::empty()).is_none() {
+            assert!(summary.get("no_affinity").is_none(), "{summary:#}");
+        }
+    }
+
     /// `--persistent-addr` and `--entrypoint` set each mode's variables, and
     /// QEMU mode's loop restores the registers (#375).
     #[test]
@@ -3731,7 +3890,7 @@ mod afl_qemu_tests {
             runner: None,
             runner_args: Vec::new(),
             target_args: Vec::new(),
-            sandbox: SandboxModeArg::Auto,
+            sandbox: SandboxModeArg::None,
             engine: BinaryFuzzEngine::Builtin,
             time: None,
             runtime_oracles: crate::runtime_oracles::RuntimeOracleMode::On,
@@ -3822,7 +3981,7 @@ mod afl_qemu_tests {
             runner: None,
             runner_args: Vec::new(),
             target_args: Vec::new(),
-            sandbox: SandboxModeArg::Auto,
+            sandbox: SandboxModeArg::None,
             engine: BinaryFuzzEngine::Builtin,
             time: None,
             // Runtime oracles OFF: the collector is an independent view.
@@ -4135,7 +4294,7 @@ mod afl_qemu_tests {
             runner: None,
             runner_args: Vec::new(),
             target_args: Vec::new(),
-            sandbox: SandboxModeArg::Auto,
+            sandbox: SandboxModeArg::None,
             engine: BinaryFuzzEngine::Builtin,
             time: None,
             runtime_oracles: crate::runtime_oracles::RuntimeOracleMode::Off,

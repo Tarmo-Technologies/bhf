@@ -2,10 +2,7 @@
 
 # bhf results reference
 
-Every command that produces or changes findings writes into one self-contained
-directory, `<work-dir>/results/` (default `bhf_work/results/`), and rebuilds its
-index when it finishes. This doc describes that layout, the `bhf.findings.v1` /
-`bhf.finding.v1` contracts, the CSV columns, and what changed from bhf ≤ 0.2.x.
+Every command that produces or changes findings writes into one self-contained directory, `<work-dir>/results/` (default `bhf_work/results/`), and rebuilds its index when it finishes. This page describes that layout, the `bhf.findings.v1` and `bhf.finding.v1` formats, the CSV columns, and what changed from bhf 0.2.x. For a first look at a run, read [Quick reading guide](#quick-reading-guide).
 
 ## Layout
 
@@ -22,10 +19,7 @@ index when it finishes. This doc describes that layout, the `bhf.findings.v1` /
 | `results/static/` | Native `static-scan` output (`static-report.{json,md,sarif}`) |
 | `results/sbom/` | Native `sbom` output (`cyclonedx.json`, `sbom.spdx.json`, `openvex.json`, `vulnerabilities.json`, ...) |
 
-`static-scan` (`S-*`) and SCA (`F-SCA-*`) findings carry no evidence
-directory — their evidence (a location, or a component) is inline in
-`findings.json`. The static findings `auto` writes as directories
-(`F-STATIC-*`, `F-RO-*`, `F-EXT-*`) keep them, same as any dynamic finding.
+`static-scan` (`S-*`) and SCA (`F-SCA-*`) findings have no evidence directory; their evidence (a location, or a component) is inline in `findings.json`. The static findings `auto` writes as directories (`F-STATIC-*`, `F-RO-*`, `F-EXT-*`) have one, as dynamic findings do.
 
 ### ID family → `kind`
 
@@ -38,52 +32,23 @@ directory — their evidence (a location, or a component) is inline in
 | `F-STATIC-*`, `F-RO-*`, `F-EXT-*`, `S-*` | `static` |
 | `F-SCA-*` | `sca` |
 
-`bhf report` rebuilds `results/` on demand. A work dir from bhf ≤ 0.2.x (with
-`findings/` at the top) is migrated into the `results/` layout automatically
-the first time any command opens it; see [Migration from 0.2.x](#migration-from-02x).
+`bhf report` rebuilds `results/` on demand. A work dir from bhf ≤ 0.2.x (with `findings/` at the top) is migrated into the `results/` layout automatically the first time any command opens it; see [Migration from 0.2.x](#migration-from-02x).
 
 ## `findings.json` (`bhf.findings.v1`)
 
-`schemas/bhf.findings.v1.schema.json` is the normative definition; this is a
-field summary. `findings.json` always starts with `schema_version`, then
-`generated_at`, `tool`, so an importer can detect the format from the first
-few bytes. Every key is present (`null` where a value does not apply — never
-omitted), and unknown keys are rejected. Keys added to v1 after its first
-release (`fuzz.access`, `fuzz.access.parameter`, `fuzz.input_to_state`,
-`fuzz.input_to_state_input`, `fuzz.input_to_state_status`,
-`fuzz.input_to_state_reason`, `fuzz.input_to_state_search`, `fuzz.arguments`,
-`verdict_reason`, `fuzz.access.allocated_by_harness`, the `runtrace`
-evidence role)
-are optional in the schema, so documents written
-before them still validate; bhf always writes them. A validator holding the
-older schema rejects them. The `binary rehost` value of `producer` came
-later too, and an older schema rejects it, as it rejects the `kernel import`
-producer and the `console_log`, `repro_syz` and `repro_c` evidence roles of
-an imported syzkaller crash, and the `kernel fuzz` producer of a crash bhf
-found in a kernel guest. `reproduce.build.fidelity` is optional the same
-way, but written only for a finding whose harness build used fabricated
-inputs (below).
+`schemas/bhf.findings.v1.schema.json` is the normative definition; this is a field summary. `findings.json` always starts with `schema_version`, then `generated_at` and `tool`, so an importer can detect the format from the first few bytes. Every key is present (`null` where a value does not apply), and unknown keys are rejected.
 
-Document-level fields: `schema_version`, `generated_at`, `tool` (`{name,
-version, build}`), `source` (`{root, vcs}`), `producers[]` (the last 50
-producer-history entries; `manifest.json` keeps the last 1000), `counts`
-(`{total, by_kind, by_severity, by_confirmation}`), `findings[]`, `groups[]`
-(`{key, representative, members, observations}`), and `errors[]` (`{path,
-reason}` for records that failed to load — a bad record never aborts the
-rebuild).
+Some keys and values were added to v1 after its first release. The schema marks the keys optional, so older documents still validate; bhf always writes them, and a validator holding an older copy of the schema rejects them:
 
-A root-cause group is the findings of one defect. A fuzz or runtime finding
-belongs to its **sink**: its first project frame (`location`, file and line)
-and its bug family. The families are out-of-bounds (CWE-119 to 127, 129, 131,
-787, 788, 823 and the like), null dereference, lifetime (use after free,
-double free), integer overflow, divide by zero, uninitialized memory, leak,
-race and format string; any other CWE is a family of its own. So one
-out-of-bounds read reached through two call stacks, or reported by ASan and
-by UBSan, is one group, keyed `sink-<hex>`. Findings that share a crash
-cluster, or the key a grouping pass gave the findings of one bug, stay in one
-group too. A sink group reached through more than one call stack lists them
-in `observations[]` (`{key, members}`, one per stack of functions, files and
-lines). INDEX.md says "Reached through N call stacks".
+- keys: `fuzz.access`, `fuzz.access.parameter`, `fuzz.access.allocated_by_harness`, `fuzz.input_to_state`, `fuzz.input_to_state_input`, `fuzz.input_to_state_status`, `fuzz.input_to_state_reason`, `fuzz.input_to_state_search`, `fuzz.arguments`, `verdict_reason`;
+- `producer` values: `binary rehost`, `kernel import` (an imported syzkaller crash), `kernel fuzz` (a crash bhf found in a kernel guest);
+- evidence roles: `runtrace`, and `console_log`, `repro_syz` and `repro_c` for kernel crashes.
+
+`reproduce.build.fidelity` is optional the same way, and is written only for a finding whose harness build used fabricated inputs (below).
+
+Document-level fields: `schema_version`, `generated_at`, `tool` (`{name, version, build}`), `source` (`{root, vcs}`), `producers[]` (the last 50 producer-history entries; `manifest.json` keeps the last 1000), `counts` (`{total, by_kind, by_severity, by_confirmation}`), `findings[]`, `groups[]` (`{key, representative, members, observations}`), and `errors[]` (`{path, reason}` for records that failed to load; a bad record does not stop the rebuild).
+
+A root-cause group is the findings of one defect. A fuzz or runtime finding belongs to its **sink**: its first project frame (`location`, file and line) and its bug family. The families are out-of-bounds (CWE-119 to 127, 129, 131, 787, 788, 823 and the like), null dereference, lifetime (use after free, double free), integer overflow, divide by zero, uninitialized memory, leak, race and format string; any other CWE is a family of its own. So one out-of-bounds read reached through two call stacks, or reported by ASan and by UBSan, is one group, keyed `sink-<hex>`. Findings that share a crash cluster, or the key a grouping pass gave the findings of one bug, stay in one group too. A sink group reached through more than one call stack lists them in `observations[]` (`{key, members}`, one per stack of functions, files and lines). INDEX.md says "Reached through N call stacks".
 
 ### Finding fields
 
@@ -114,7 +79,7 @@ lines). INDEX.md says "Reached through N call stacks".
 | `reachability` | object \| null | entry path for fuzz (`{kind, source, target}`: `harness`, its `testcase.bin`, the fuzzed function; for a `kernel import` finding `syscall`, the program syzkaller reached it with, `repro.syz`, else `repro.c`, else `console.log`, and the crashing function; for a `kernel fuzz` finding `syscall`, `repro.c`); fuzz reachability for SCA. Its `attacker_reachable` is the entry's signature verdict, so it can be `true` while the finding's `verdict` is `lab_only` for the reason in `verdict_reason` (such as `harness_sized_buffer`) |
 | `fidelity` | `{stubs_used, forced, caveats[]}` | `forced` when the target ran forced-and-stub-heavy under `--force` |
 | `remediation` | string \| null | |
-| `patch_hints` | `[{title, guidance}]` | advisory, not a literal diff |
+| `patch_hints` | `[{title, guidance}]` | advice in prose, not a diff |
 | `reproduce` | `{harness_id, command, build}` \| null | `build`: `{sanitizers[], binary_sha256, build_id}`, plus `fidelity` when the harness compiled only after bhf supplied inputs the build context lacked; `command` is relative to `results/`: it runs the finding's `replay.py`, or is `bhf replay findings/<id>` for a `binary rehost` finding; for a `kernel import` finding it compiles and runs `repro.c`, else runs `repro.syz` under `syz-execprog`, in the test VM; for a `kernel fuzz` finding it is `bhf kernel replay findings/<id>`, which boots the guest the finding records and runs its program |
 | `reproduce.build.fidelity` | `{level, context, fabricated[]}` (optional) | `level` is `reduced`; `context` is where the build context came from (`none`, `exact_tu_compile_database`, ...); each `fabricated` entry is `{kind, name, value}` with `kind` `macro`, `header`, `type`, or `include_dir` (a dir of real headers found by file name outside the scanned tree, which may be another project's). Such a finding's `confidence.level` is `low` and `fidelity.caveats` names what was fabricated: code compiled against a placeholder macro value or header can take paths the real build never does, so the finding may be false or not reproduce against the real build |
 | `evidence` | `{dir, files[]}` \| null | each file: `{role, path, sha256, size}` — roles: `finding`, `testcase`, `testcase_minimized`, `sanitizer_log`, `decoded`, `replay_script`, `repro_ada`, `byte_control`, `runtrace` (the runtrace events of the replay that recorded the comparison evidence); for a `kernel import` finding also `console_log` (syzkaller's `log0`), `repro_syz` and `repro_c` (its reproducers), with the kernel report as `sanitizer_log`; a `kernel fuzz` finding has its program as `testcase` (`testcase.bin`, the executor's format), decoded as `decoded` (`decoded.json`), as C as `repro_c`, the guest's console from the program's start as `console_log` and the report as `sanitizer_log` |
@@ -147,15 +112,11 @@ One `severity` per finding, chosen by the first rule that applies:
 3. The rule catalog's `default_severity`.
 4. `medium`.
 
-A finding with `fidelity.forced: true` is floored to `low`. `ci --fail-on`
-gating, SARIF `level`, CSV and `INDEX.md` ordering all read this resolved
-`severity`, not the raw `impact`.
+A finding with `fidelity.forced: true` is floored to `low`. `ci --fail-on` gating, SARIF `level`, CSV and `INDEX.md` ordering all read this resolved `severity`, not the raw `impact`.
 
 ### Confirmation levels
 
-`confirmation.level` is a normalized evidence strength; bhf owns these
-semantics so importers don't have to re-derive them from raw fields. The
-first row that matches wins:
+`confirmation.level` is a normalized evidence strength, so importers do not have to derive it from raw fields. The first row that matches wins:
 
 | Level | Rule |
 |---|---|
@@ -172,9 +133,7 @@ first row that matches wins:
 
 ## `finding.json` (`bhf.finding.v1`)
 
-Every per-finding evidence record (`results/findings/<ID>/finding.json`)
-carries the envelope below, in addition to its producer-specific fields
-(documented inline above per block — `fuzz`, `static`, `sca`, `binary`):
+Every per-finding evidence record (`results/findings/<ID>/finding.json`) carries the envelope below, in addition to its producer-specific fields (the `fuzz`, `static`, `sca` and `binary` blocks above):
 
 | Field | Meaning |
 |---|---|
@@ -192,17 +151,9 @@ carries the envelope below, in addition to its producer-specific fields
 
 ## Producer history
 
-Every command that writes into `results/` appends one entry to
-`manifest.json` `producers[]`: `{command, argv, started_at, finished_at,
-status, exit_code, findings_total}`. `manifest.json` keeps the last 1000
-entries; `findings.json` `producers[]` shows only the most recent 50 of
-those.
+Every command that writes into `results/` appends one entry to `manifest.json` `producers[]`: `{command, argv, started_at, finished_at, status, exit_code, findings_total}`. `manifest.json` keeps the last 1000 entries; `findings.json` `producers[]` shows only the most recent 50 of those.
 
-Children spawned by multicore fuzz workers and the continuous daemon's job
-workers run with the hidden env var `BHF_RESULTS_DEFER=1`, which skips their
-own per-job rebuild and producer record entirely — the parent process (the
-multicore coordinator, or the daemon's results-refresh thread) merges their
-findings and owns the single record for the batch.
+Children spawned by multicore fuzz workers and the continuous daemon's job workers run with the hidden env var `BHF_RESULTS_DEFER=1`, which skips their own per-job rebuild and producer record. The parent process (the multicore coordinator, or the daemon's results-refresh thread) merges their findings and writes the one record for the batch.
 
 ## `findings.csv`
 
@@ -212,162 +163,42 @@ One row per finding. Columns, from `CSV_HEADER`:
 id,kind,severity,confidence,confirmation,rule_id,cwe,title,file,line,function,group,occurrences,verdict,vuln_id,purl,first_seen,evidence_dir,access,access_size,region_size,region_offset,input_to_state,input_to_state_input,arguments,access_parameter,build_fidelity,input_to_state_status,verdict_reason,alloc_by_harness
 ```
 
-`cwe` is written `CWE-120`; multiple values are `;`-separated. The columns
-after `evidence_dir` were added later, at the end, so readers that address
-columns by position keep working: `access` is the access direction,
-`access_size` its width, `region_size` and `region_offset` the object it hit,
-`input_to_state` lists the comparison evidence as
-`offset:len:cmp_kind:operand_hex`, `;`-separated, `input_to_state_input`
-names the file those offsets index, `arguments` summarises `fuzz.arguments`,
-`access_parameter` names `fuzz.access.parameter`, and `build_fidelity` reads
-`reduced: macro NAME=VALUE, header NAME, ...` for a finding whose harness was
-built with fabricated inputs (empty otherwise), `input_to_state_status` is
-`fuzz.input_to_state_status` (why `input_to_state` is empty is in
-`findings.json` and `INDEX.md`), `verdict_reason` is the finding's
-`verdict_reason` (empty when there is none), and `alloc_by_harness` is
-`fuzz.access.allocated_by_harness` (`true`, `false`, or empty when not
-known). `arguments` is
-`name=value` per argument, `;`-separated: a buffer or string reads
-`len <N>`, followed by `hex <first 8 bytes>` when a preview was traced
-(`data=len 50718 hex 68baa77e0f010203...`), an output whose value changed
-reads `<before>-><after>`, a `;` inside a name or value is written `,`, and
-the cell stops at 200 characters with `...`.
+`cwe` is written `CWE-120`; multiple values are `;`-separated. The columns after `evidence_dir` were added later, at the end, so readers that address columns by position keep working: `access` is the access direction, `access_size` its width, `region_size` and `region_offset` the object it hit, `input_to_state` lists the comparison evidence as `offset:len:cmp_kind:operand_hex`, `;`-separated, `input_to_state_input` names the file those offsets index, `arguments` summarises `fuzz.arguments`, `access_parameter` names `fuzz.access.parameter`, and `build_fidelity` reads `reduced: macro NAME=VALUE, header NAME, ...` for a finding whose harness was built with fabricated inputs (empty otherwise), `input_to_state_status` is `fuzz.input_to_state_status` (why `input_to_state` is empty is in `findings.json` and `INDEX.md`), `verdict_reason` is the finding's `verdict_reason` (empty when there is none), and `alloc_by_harness` is `fuzz.access.allocated_by_harness` (`true`, `false`, or empty when not known). `arguments` is `name=value` per argument, `;`-separated: a buffer or string reads `len <N>`, followed by `hex <first 8 bytes>` when a preview was traced (`data=len 50718 hex 68baa77e0f010203...`), an output whose value changed reads `<before>-><after>`, a `;` inside a name or value is written `,`, and the cell stops at 200 characters with `...`.
 
-SARIF results carry the actionability verdict as `actionabilityVerdict` and
-its reason as `actionabilityVerdictReason` (`null` unless the verdict is
-`lab_only` or `blocked`). They carry the comparison evidence as the `bhfInputToState` property
-(the `finding.json` `gates` entries), the file its offsets index as
-`bhfInputToStateInput`, and each comparison site with a source position as a
-related location. A capture that could not run adds neither property.
+SARIF results carry the actionability verdict as `actionabilityVerdict` and its reason as `actionabilityVerdictReason` (`null` unless the verdict is `lab_only` or `blocked`). They carry the comparison evidence as the `bhfInputToState` property (the `finding.json` `gates` entries), the file its offsets index as `bhfInputToStateInput`, and each comparison site with a source position as a related location. A capture that could not run adds neither property.
 
 ## Migration from 0.2.x
 
-bhf 0.3.0 unified every command's output under `results/`. If you have tooling
-reading the old layout directly:
+bhf 0.3.0 unified every command's output under `results/`. If you have tooling reading the old layout directly:
 
-- `FINDINGS.md`, `findings.csv` / `auto/findings.csv` at the work-dir top,
-  `auto/attestation.json`, and `reports/run-last.*` are gone. Use
-  `results/INDEX.md`, `results/findings.{json,csv,sarif}`, and
-  `results/attestation.json`.
-- The per-finding writeup used to live in `run.md`; it no longer does.
-  `run.md`/`run.json` keep campaign mechanics only (targets built/fuzzed/
-  skipped, missing build deps) — read findings from `results/` instead.
-- `findings.csv` has the single column set above. The per-harness stub
-  accounting (`stub_total`, `stub_blind`, `stub_declared`, `linked_real`) moved
-  to `auto/run.json` `targets[]`; `--static-dynamic` is a no-op.
-- `runtime_mode` is not written anywhere in the new contract.
-- An old-layout work dir (`<work>/findings/` at the top) is migrated
-  automatically the first time any command opens it, including commands that
-  only read (`explain`, `capsule`): `findings/` is renamed to
-  `results/findings/` and the legacy index files and reproducer scripts are
-  kept under `results/legacy/`. The command prints what it moved and kept.
-  A read-only command does not rebuild `results/`; `bhf report` or the next
-  `bhf auto` (or any other command that records findings) does, and `bhf
-  explain`'s migration message ends with the `bhf report --work-dir <W>`
-  command to run. `replay`, `minimize`, `capsule`, and `--resume` keep working
-  against a migrated work dir. See
-  [Upgrading a 0.2.x work dir](#upgrading-a-02x-work-dir).
-- Tools that read `bhf_work/findings.csv` or `bhf_work/findings/` directly
-  must switch to `results/findings.json` (schema in `schemas/`, reference
-  fixture in `tests/fixtures/golden_results/`).
+- `FINDINGS.md`, `findings.csv` / `auto/findings.csv` at the work-dir top, `auto/attestation.json`, and `reports/run-last.*` are gone. Use `results/INDEX.md`, `results/findings.{json,csv,sarif}`, and `results/attestation.json`.
+- The per-finding writeup used to live in `run.md`; it no longer does. `run.md`/`run.json` keep campaign mechanics only (targets built/fuzzed/ skipped, missing build deps) — read findings from `results/` instead.
+- `findings.csv` has the single column set above. The per-harness stub accounting (`stub_total`, `stub_blind`, `stub_declared`, `linked_real`) moved to `auto/run.json` `targets[]`; `--static-dynamic` is a no-op.
+- `runtime_mode` stays in each finding's `finding.json` (see above); `findings.json` does not carry it.
+- An old-layout work dir (`<work>/findings/` at the top) is migrated automatically the first time any command opens it, including commands that only read (`explain`, `capsule`): `findings/` is renamed to `results/findings/` and the legacy index files and reproducer scripts are kept under `results/legacy/`. The command prints what it moved and kept. A read-only command does not rebuild `results/`; `bhf report` or the next `bhf auto` (or any other command that records findings) does, and `bhf explain`'s migration message ends with the `bhf report --work-dir <W>` command to run. `replay`, `minimize`, `capsule`, and `--resume` keep working against a migrated work dir. See [Upgrading a 0.2.x work dir](#upgrading-a-02x-work-dir).
+- Tools that read `bhf_work/findings.csv` or `bhf_work/findings/` directly must switch to `results/findings.json` (schema in `schemas/`, reference fixture in `tests/fixtures/golden_results/`).
 
 
 ### Upgrading a 0.2.x work dir
 
-The migration is one-way: once a current bhf opens a 0.2.x work dir, bhf 0.2.x
-can no longer read it (`cannot read <wd>/findings`). Keep a copy first
-(`cp -a bhf_work bhf_work.0.2`). The copy replays its own harnesses: recorded
-harness paths are resolved in the work dir that holds the finding.
+The migration is one-way: once a current bhf opens a 0.2.x work dir, bhf 0.2.x can no longer read it (`cannot read <wd>/findings`). Keep a copy first (`cp -a bhf_work bhf_work.0.2`). The copy replays its own harnesses: recorded harness paths are resolved in the work dir that holds the finding.
 
 What a migrated work dir has, and what it does not:
 
-- The findings keep their ids and the evidence 0.2.x recorded. They have no
-  `sanitizer.log`, crash frames for UBSan reports, or minimized inputs.
-  Re-running `bhf auto` over the source tree into the same work dir minimizes
-  the representative of each finding group that has no minimized input (within
-  its time budget; `bhf minimize <finding>` does the rest), but it adds no
-  `sanitizer.log` or frames: a crash that matches a migrated finding is a
-  duplicate. Run `bhf report --backfill --work-dir <wd>` to replay each one
-  against its harness and add `sanitizer.log`, frames and the memory access
-  where the harness still exists and still reports the same crash. A replay
-  that comes back unsymbolized is skipped; put `llvm-symbolizer` on `PATH` (or
-  set `ASAN_SYMBOLIZER_PATH`) and run it again.
-- Earlier releases gave a sanitizer crash with no frames, and a crash with no
-  sanitizer report and no frames (a fatal signal, `FATAL_SIGNAL` or, in
-  0.2.x, `ASAN_FATAL_SIGNAL` tagged `asan`; a transport-reported fault,
-  `TARGET_*`; a transport deadline, `TRANSPORT_DEADLINE_EXCEEDED`), one
-  root-cause key per rule and kind, so frame-less UBSan findings at unrelated
-  sites, and fatal signals of unrelated harnesses, shared one group.
-  `results/` (the `group` and `occurrences` columns, `fingerprint.primary`,
-  the `INDEX.md` group count), `findings.sarif`, the report JSON
-  (`cluster_key_full`, `cluster_fallback`) and `bhf explain` key such a
-  finding as this release does: on the site and check its stored report
-  names, or, with no site, its rule, kind, check (a crash's signal) and
-  harness. `finding.json` keeps the key it was written with.
-- Where that key names a site (a UBSan finding's location), the report JSON
-  gives the finding `cluster_fallback: false`, so `bhf report --baseline` and
-  `--triage` match it on its `cluster_key_full` instead of its signature and
-  its `bhf-issue-v1` key changes. A baseline saved before the upgrade then
-  shows such an issue as new and the old one as unobserved, and a triage
-  decision recorded for the old key no longer applies: save the baseline
-  again and re-check those decisions after opening a work dir from 0.3.0 or
-  earlier.
-- `results/legacy/` keeps the old `FINDINGS.md`, `findings.csv`,
-  `auto/findings.csv` and `replay.py` scripts; `results/INDEX.md` and
-  `results/findings.{json,csv,sarif}` replace them, and each finding gets a
-  current `replay.py`.
-- The corpus may hold seeds damaged by the seed encoding of earlier releases
-  (every byte that was not valid UTF-8 became `EF BF BD`). The first `bhf auto`
-  run of this release sets `corpus/` aside as `corpus-legacy/` instead of
-  reseeding it, unless you pass `--reuse-legacy-corpus`. It does the same in a
-  0.2.x work dir an earlier release already migrated, and in any work dir an
-  earlier `bhf auto` wrote: it recognises them by their auto state
-  (`auto/run.json`, `auto/work-state.json`) without the
-  `auto/legacy-corpus.json` record every run of this release writes first.
-  `results/INDEX.md` and `bhf report` warn about testcases and corpus entries
-  that look damaged this way.
+- The findings keep their ids and the evidence 0.2.x recorded. They have no `sanitizer.log`, crash frames for UBSan reports, or minimized inputs. Re-running `bhf auto` over the source tree into the same work dir minimizes the representative of each finding group that has no minimized input (within its time budget; `bhf minimize <finding>` does the rest), but it adds no `sanitizer.log` or frames: a crash that matches a migrated finding is a duplicate. Run `bhf report --backfill --work-dir <wd>` to replay each one against its harness and add `sanitizer.log`, frames and the memory access where the harness still exists and still reports the same crash. A replay that comes back unsymbolized is skipped; put `llvm-symbolizer` on `PATH` (or set `ASAN_SYMBOLIZER_PATH`) and run it again.
+- Earlier releases gave a sanitizer crash with no frames, and a crash with no sanitizer report and no frames (a fatal signal, `FATAL_SIGNAL` or, in 0.2.x, `ASAN_FATAL_SIGNAL` tagged `asan`; a transport-reported fault, `TARGET_*`; a transport deadline, `TRANSPORT_DEADLINE_EXCEEDED`), one root-cause key per rule and kind, so frame-less UBSan findings at unrelated sites, and fatal signals of unrelated harnesses, shared one group. `results/` (the `group` and `occurrences` columns, `fingerprint.primary`, the `INDEX.md` group count), `findings.sarif`, the report JSON (`cluster_key_full`, `cluster_fallback`) and `bhf explain` key such a finding as this release does: on the site and check its stored report names, or, with no site, its rule, kind, check (a crash's signal) and harness. `finding.json` keeps the key it was written with.
+- Where that key names a site (a UBSan finding's location), the report JSON gives the finding `cluster_fallback: false`, so `bhf report --baseline` and `--triage` match it on its `cluster_key_full` instead of its signature and its `bhf-issue-v1` key changes. A baseline saved before the upgrade then shows such an issue as new and the old one as unobserved, and a triage decision recorded for the old key no longer applies: save the baseline again and re-check those decisions after opening a work dir from 0.3.0 or earlier.
+- `results/legacy/` keeps the old `FINDINGS.md`, `findings.csv`, `auto/findings.csv` and `replay.py` scripts; `results/INDEX.md` and `results/findings.{json,csv,sarif}` replace them, and each finding gets a current `replay.py`.
+- The corpus may hold seeds damaged by the seed encoding of earlier releases (every byte that was not valid UTF-8 became `EF BF BD`). The first `bhf auto` run of this release sets `corpus/` aside as `corpus-legacy/` instead of reseeding it, unless you pass `--reuse-legacy-corpus`. It does the same in a 0.2.x work dir an earlier release already migrated, and in any work dir an earlier `bhf auto` wrote: it recognises them by their auto state (`auto/run.json`, `auto/work-state.json`) without the `auto/legacy-corpus.json` record every run of this release writes first. `results/INDEX.md` and `bhf report` warn about testcases and corpus entries that look damaged this way.
 
-For results comparable with a fresh install, run `bhf auto` into a new work
-dir. Read each finding's `sanitizer.log` where it has one, otherwise run its
-`replay.py` (or `bhf replay --finding <id>`), which prints the sanitizer report.
+For results comparable with a fresh install, run `bhf auto` into a new work dir. Read each finding's `sanitizer.log` where it has one, otherwise run its `replay.py` (or `bhf replay --finding <id>`), which prints the sanitizer report.
 
 ## Quick reading guide
 
 - **Distinct bugs?** count unique `fingerprint.primary` (or `group`).
-- **Is it real / worth triaging?** `confirmation.level` of `sanitizer_crash` or
-  stronger, plus `verdict` of `likely_reachable`/`real_reachable`. Treat
-  `impact: info` and `confirmation.level: intended_rejection` as non-defects.
+- **Is it real / worth triaging?** `confirmation.level` of `sanitizer_crash` or stronger, plus `verdict` of `likely_reachable`/`real_reachable`. Treat `impact: info` and `confirmation.level: intended_rejection` as non-defects.
 - **How bad?** `severity` + `cwe`.
-- **Where to fix?** `location` (where it faults) and `fix_location` (where to
-  start) — read `explanation` + `patch_hints` first.
-- **Reproduce?** `evidence.files[role=replay_script]`, or
-  `bhf replay --finding <id>`.
-- **Which input bytes matter?** `fuzz.input_to_state`: the spans that reached a
-  comparison while the finding's input ran. `dictionary.txt` in the harness dir
-  is mined from source when the harness is generated (each token's
-  `# from <file>:<line>` comment says where); a token of it that occurs in an
-  input is not evidence that any comparison read it. `learned_dictionary.txt`
-  beside it holds the comparison constants the engine observed at runtime while
-  fuzzing that harness (from `cmplog.jsonl`, across passes and runs, at most 256
-  tokens: operands that met more distinct values at a comparison site than
-  any of the inputs compared with them did); they were compared during some
-  run, not necessarily this finding's. The runtrace shim's own comparisons (its
-  checks of the paths and names the target used) are never among them.
-- **How sure is `likely_reachable`?** For C/C++ it is usually inferred from the
-  entry's signature (an input-taking shape, such as a byte-buffer parameter or
-  a parser taking a byte, with typedefs such as `const u8_t *` read through the
-  source's and its headers' declarations, and pointer typedefs to bytes such as
-  `LPCBYTE` or `typedef const octet_t *rbuf_t` read as the pointer they are);
-  `finding.json` `input_reachability_basis` records the rule, the parameter and
-  its type as spelled and resolved (`{rule, param, spelled_type,
-  resolved_type, typedefs_resolved}`, plus `via` for a
-  `call_graph_provenance` entry: the registrar it is passed to, the receive
-  call its body makes, or `volatile_pointer`), `findings.json` carries it as
-  `reachability.reachability_basis`, and `bhf explain` says what each verdict
-  rests on. A finding whose input is empty or all zero bytes, or whose method
-  ran on an object bhf's harness constructed, carries a caveat that real
-  callers may never produce that state (`fidelity.caveats`, the INDEX.md
-  `Caveat:` line, and beside the verdict in `bhf explain`). A heap overflow of a buffer the generated harness sized
-  for a pointer parameter it passes without a length is `lab_only`
-  (precondition-dependent); one passed with its length, such as the buffer of a
-  `(buf, len)` pair, keeps the entry's verdict.
+- **Where to fix?** `location` (where it faults) and `fix_location` (where to start) — read `explanation` + `patch_hints` first.
+- **Reproduce?** `evidence.files[role=replay_script]`, or `bhf replay --finding <id>`.
+- **Which input bytes matter?** `fuzz.input_to_state`: the spans that reached a comparison while the finding's input ran. `dictionary.txt` in the harness dir is mined from source when the harness is generated (each token's `# from <file>:<line>` comment says where); a token of it that occurs in an input is not evidence that any comparison read it. `learned_dictionary.txt` beside it holds the comparison constants the engine observed at runtime while fuzzing that harness (from `cmplog.jsonl`, across passes and runs, at most 256 tokens: operands that met more distinct values at a comparison site than any of the inputs compared with them did); they were compared during some run, not necessarily this finding's. The runtrace shim's own comparisons (its checks of the paths and names the target used) are never among them.
+- **How sure is `likely_reachable`?** For C/C++ it is usually inferred from the entry's signature (an input-taking shape, such as a byte-buffer parameter or a parser taking a byte, with typedefs such as `const u8_t *` read through the source's and its headers' declarations, and pointer typedefs to bytes such as `LPCBYTE` or `typedef const octet_t *rbuf_t` read as the pointer they are); `finding.json` `input_reachability_basis` records the rule, the parameter and its type as spelled and resolved (`{rule, param, spelled_type, resolved_type, typedefs_resolved}`, plus `via` for a `call_graph_provenance` entry: the registrar it is passed to, the receive call its body makes, or `volatile_pointer`), `findings.json` carries it as `reachability.reachability_basis`, and `bhf explain` says what each verdict rests on. A finding whose input is empty or all zero bytes, or whose method ran on an object bhf's harness constructed, carries a note that real callers may never produce that state, in `fidelity.caveats`, on the INDEX.md `Caveat:` line, and beside the verdict in `bhf explain`. A heap overflow of a buffer the generated harness sized for a pointer parameter it passes without a length is `lab_only` (it depends on a precondition); one passed with its length, such as the buffer of a `(buf, len)` pair, keeps the entry's verdict.

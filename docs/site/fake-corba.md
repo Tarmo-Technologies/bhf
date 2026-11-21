@@ -2,44 +2,36 @@
 
 # Fake-CORBA
 
-BHF fake-CORBA support lets legacy Ada code with CORBA-style generated
-bindings be fuzzed without a full broker runtime.
+Fake-CORBA lets bhf fuzz legacy Ada code that uses CORBA-style generated bindings, with no broker (ORB) runtime. bhf generates stand-in Ada packages for the CORBA surfaces the code uses, so enough of the project compiles to expose its servant logic to a harness. The packages are test scaffolding for fuzzing, not an ORB.
 
 ## Capabilities
 
-- Parse a CORBA IDL 3.0 subset (modules, interfaces, sequences, unions,
-  exceptions, valuetype, `fixed<>`).
-- Apply the lightweight C++-style preprocessor needed by legacy IDL headers.
-- Generate Ada package stubs for helper, skeleton, object reference, Any, and
-  TypeCode surfaces.
-- Adopt vendor pragmas that appear in imported interface definitions.
-- Discover servant entry points for direct-call harness generation.
-- Translate ROS `.msg` / `.srv` / `.action` interface files through the same
-  Ada mapping pipeline.
+- Parses a CORBA IDL 3.0 subset: modules, interfaces, sequences, unions, exceptions, `valuetype` and `fixed<>`.
+- Applies the C++-style preprocessing that legacy IDL headers need (`#include`, `#define`, conditionals).
+- Generates Ada packages for the Helper, skeleton, object reference, `Any` and `TypeCode` surfaces.
+- Keeps the vendor pragmas found in imported interface definitions.
+- Discovers servant entry points for direct-call harness generation.
+- Translates ROS `.msg`, `.srv` and `.action` interface files through the same Ada mapping.
 
 ## Workflow
 
-`bhf auto` runs fake-CORBA generation automatically from the source tree;
-invoke `fake-corba` manually only to regenerate the scaffolding on its own or
-against an IDL file outside the `auto` pipeline.
+`bhf auto` runs fake-CORBA generation by itself when the source tree holds `.idl` files or Ada code that uses CORBA. It uses bhf's own IDL parser and runs no project code. Run `bhf fake-corba` by hand to regenerate the scaffolding on its own, or for an IDL file outside the tree:
 
 ```sh
 bhf fake-corba bhf_work --idl idl/legacy.idl
-bhf generate-harness src/legacy/servant.adb --target Legacy.Servant.Process --output bhf_work/generated_harnesses
+bhf generate-harness src/legacy/servant.adb --target Legacy.Servant.Process \
+  --output bhf_work/generated_harnesses
 bhf build bhf_work --harness H-1A2B
 ```
 
-Use the actual harness id printed by `generate-harness` (its ids follow
-`H-<4-hex>`, hashed from the source path + target id); the value above is
-illustrative. The `H-A<line>-<hash>` form is what the `bhf auto` pipeline
-prints, not `generate-harness`.
+`generate-harness` prints the harness id; use it in place of `H-1A2B`. Its ids have the form `H-<4 hex digits>`, a hash of the source path and the target. Ids of the form `H-A<line>-<hash>` come from `bhf auto`.
 
-`fake-corba` writes the generated Ada packages under
-`<work-dir>/fake_corba/`. Pass `--idl-include-dir` for `#include` resolution
-and `--idl-define NAME[=VALUE]` for preprocessor symbols when an enclave IDL
-relies on conditionals. `--ros-interface` translates ROS `.msg` / `.srv` /
-`.action` files through the same mapping pipeline.
+`bhf fake-corba` writes the generated Ada packages to `<work-dir>/fake_corba/`.
 
-The generated fake-CORBA packages are test scaffolding, not a production ORB.
-They are designed to compile enough of a target project to expose servant logic
-to fuzzing.
+| Option | Use |
+|---|---|
+| `--idl <file>` | IDL file to map to Helper, skeleton and stub Ada packages |
+| `--idl-include-dir <dir>` | directory to search for IDL `#include` files |
+| `--idl-define NAME[=VALUE]` | predefine a preprocessor symbol, for IDL that relies on conditionals (repeatable) |
+| `--ros-interface <file>` | ROS `.msg`, `.srv` or `.action` file to translate |
+| `--source-dir <dir>` | source directory to scan for CORBA usage (default `<work-dir>/src_instrumented`) |

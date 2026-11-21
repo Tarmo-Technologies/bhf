@@ -11,76 +11,102 @@ pub struct RunnersArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum RunnersCommand {
-    /// List runner profiles and capability counts.
+    /// List the runner profiles of a runner manifest, with their capability
+    /// counts.
     List(ListArgs),
-    /// Select one runner profile and emit capability evidence.
+    /// Select one runner profile and print its capability evidence.
     Select(SelectArgs),
-    /// Create a local offline handoff manifest for a distributed runner.
+    /// Write a handoff manifest for one runner
+    ///
+    /// It holds the runner, its capability evidence, and the findings and
+    /// reports of a work directory, each with its SHA-256.
     Handoff(HandoffArgs),
-    /// Lease jobs from a handoff manifest for a distributed runner.
+    /// Lease the jobs of a handoff manifest to the runner it names.
     Lease(LeaseArgs),
-    /// Complete a distributed runner lease and attach result artifacts.
+    /// Mark a lease complete and attach the runner's result files.
     Complete(CompleteArgs),
-    /// Plan an offline runner assignment queue under policy and capacity limits.
+    /// Assign a queue of jobs to the runners of a manifest, within a policy's
+    /// limits and the runners' capacity.
     Plan(PlanArgs),
-    /// Validate an offline runner capability manifest.
+    /// Check a runner capability manifest.
     Validate(ValidateArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct ListArgs {
+    /// Runner manifest JSON file.
     pub path: PathBuf,
+    /// Write the JSON summary to this path instead of stdout.
     #[arg(long)]
     pub out: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 pub struct SelectArgs {
+    /// Runner manifest JSON file.
     pub path: PathBuf,
+    /// The runner profile's id.
     #[arg(long)]
     pub runner: String,
+    /// Write the JSON summary to this path instead of stdout.
     #[arg(long)]
     pub out: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 pub struct HandoffArgs {
+    /// Runner manifest JSON file.
     pub path: PathBuf,
+    /// The runner profile's id.
     #[arg(long)]
     pub runner: String,
+    /// Work directory whose findings and reports the handoff lists.
     #[arg(long, default_value = "bhf_work")]
     pub work_dir: PathBuf,
+    /// Where to write the handoff manifest JSON.
     #[arg(long)]
     pub out: PathBuf,
 }
 
 #[derive(Debug, Args)]
 pub struct LeaseArgs {
+    /// Handoff manifest written by `bhf runners handoff`.
     pub handoff: PathBuf,
+    /// The runner taking the lease; it must be the one the handoff names.
     #[arg(long)]
     pub runner: String,
+    /// The lease's id.
     #[arg(long)]
     pub lease_id: String,
+    /// Where to write the lease JSON.
     #[arg(long)]
     pub out: PathBuf,
 }
 
 #[derive(Debug, Args)]
 pub struct CompleteArgs {
+    /// Lease written by `bhf runners lease`.
     pub lease: PathBuf,
+    /// A result file to attach, hashed. Repeatable.
     #[arg(long)]
     pub artifact: Vec<PathBuf>,
+    /// Where to write the completion JSON.
     #[arg(long)]
     pub out: PathBuf,
 }
 
 #[derive(Debug, Args)]
 pub struct PlanArgs {
+    /// Runner manifest JSON file.
     pub path: PathBuf,
+    /// Job queue JSON file, with a `jobs` array.
     #[arg(long)]
     pub queue: PathBuf,
+    /// Policy file whose allowed runners and sandbox requirement the plan
+    /// follows.
     #[arg(long)]
     pub policy: Option<PathBuf>,
+    /// Where to write the plan JSON.
     #[arg(long)]
     pub out: PathBuf,
 }
@@ -90,7 +116,7 @@ pub struct ValidateArgs {
     /// Runner manifest JSON file.
     pub path: PathBuf,
 
-    /// Write validation summary JSON to this path.
+    /// Write the JSON validation summary to this path instead of stdout.
     #[arg(long)]
     pub out: Option<PathBuf>,
 }

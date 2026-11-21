@@ -88,10 +88,12 @@ use replay_min::process::kill_process_group;
 
 /// SIGKILL any process still executing `exe`. AFL++'s persistent forkserver
 /// `setsid()`s its worker into a fresh session, so a group kill of afl-fuzz can
-/// leave that worker orphaned (reparented to init, often SIGSTOP-paused). After a
-/// hard-deadline kill we reap by exe path so a hung run leaks no `main_afl`. Each
-/// harness has a unique `harnesses/<id>/main_afl` path, so this only ever targets the
-/// run's own binary. SIGCONT first in case the orphan is stopped.
+/// leave that worker orphaned (reparented to init, often SIGSTOP-paused). After an
+/// AFL pass we reap by exe path so it leaks no `main_afl` or `main_afl_cmplog`.
+/// Each harness has a unique `harnesses/<id>/main_afl` path, so this only ever
+/// targets the run's own binary. SIGCONT first in case the orphan is stopped. It
+/// returns once the processes it killed have exited (bounded), so the files they
+/// held are released.
 #[cfg(target_os = "linux")]
 fn kill_processes_by_exe(exe: &Path) {
     let exe = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
@@ -99,6 +101,7 @@ fn kill_processes_by_exe(exe: &Path) {
         Ok(entries) => entries,
         Err(_) => return,
     };
+    let mut killed = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let pid_str = name.to_string_lossy();
@@ -112,9 +115,21 @@ fn kill_processes_by_exe(exe: &Path) {
                         libc::kill(pid, libc::SIGCONT);
                         libc::kill(pid, libc::SIGKILL);
                     }
+                    killed.push(pid);
                 }
             }
         }
+    }
+    // A killed process is gone, or a zombie, once it has closed its files.
+    let running = |pid: &i32| {
+        fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(") ")
+                .is_some_and(|(_, rest)| !rest.starts_with('Z'))
+        })
+    };
+    let until = std::time::Instant::now() + Duration::from_secs(2);
+    while killed.iter().any(running) && std::time::Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -238,20 +253,23 @@ fn ensure_harness_scratch(work_dir: &Path) -> Result<PathBuf, String> {
 
 #[derive(Debug, clap::Args)]
 pub struct FuzzArgs {
-    /// Path to bhf_work directory containing build/<harness-id>/.
+    /// Work directory that holds the built harness, in `harnesses/<id>/` or
+    /// `build/<id>/`.
     pub work_dir: PathBuf,
 
-    /// Harness id under build/<harness-id>/.
+    /// Harness id: the harness's directory name under `harnesses/` or
+    /// `build/`.
     #[arg(long)]
     pub harness: String,
 
-    /// Fuzz engine: the built-in coverage-guided engine (default), AFL++ via
-    /// subprocess (`afl++`, needs `afl-fuzz`/`afl-clang-fast` on PATH),
+    /// Fuzz engine: bhf's built-in coverage-guided engine (default), AFL++ as
+    /// a subprocess (`afl++`, needs `afl-fuzz` and `afl-clang-fast` on PATH),
     /// libFuzzer (`libfuzzer`, the harness's `main_libfuzzer`, built with
-    /// `make libfuzzer` when absent), honggfuzz (`honggfuzz`, on the harness's
+    /// `make libfuzzer` when absent), honggfuzz (`honggfuzz`, the harness's
     /// `main_honggfuzz`; needs honggfuzz on PATH or in `BHF_HONGGFUZZ_PATH`),
-    /// or WinAFL (`winafl`, native Windows only;
-    /// needs WinAFL and DynamoRIO, see `--winafl-path` and `--dynamorio-path`).
+    /// WinAFL (`winafl`, native Windows only; needs WinAFL and DynamoRIO, see
+    /// `--winafl-path` and `--dynamorio-path`), or LibAFL (`libafl`, in a bhf
+    /// built with the `libafl-engine` feature).
     #[arg(long, value_enum, default_value_t = FuzzEngine::Builtin)]
     pub engine: FuzzEngine,
 
@@ -269,7 +287,7 @@ pub struct FuzzArgs {
 
     /// How WinAFL collects coverage: `dynamorio` (default, `afl-fuzz -D`) or
     /// `intel-pt` (`afl-fuzz -P`; needs an Intel CPU with Processor Trace and
-    /// a WinAFL built with `-DINTELPT=1`, and does not run in most VMs).
+    /// a WinAFL built with `-DINTELPT=1`; most VMs do not pass PT through).
     #[arg(long = "winafl-instrumentation", value_enum, default_value_t = WinaflInstrumentation::Dynamorio)]
     pub winafl_instrumentation: WinaflInstrumentation,
 
@@ -314,20 +332,21 @@ pub struct FuzzArgs {
     #[arg(long = "afl-inst-range", value_name = "RANGE")]
     pub afl_inst_ranges: Vec<String>,
 
-    /// Run multiple fuzz workers. Use a number or `auto`. Each worker fuzzes an
-    /// exact copy of the harness dirs in `<work>/worker-<id>-N/` and logs its
-    /// stderr there; when every worker fails, the command exits non-zero and
-    /// prints each worker's stderr tail.
+    /// Run several fuzz workers: a number, or `auto`. Each worker fuzzes its
+    /// own copy of the harness directories in `<work>/worker-<id>-N/` and logs
+    /// its stderr there. When every worker fails, the command exits non-zero
+    /// and prints the end of each worker's stderr.
     #[arg(long, value_parser = parse_worker_count)]
     pub workers: Option<FuzzWorkerCount>,
 
-    /// Maximum number of harness executions. Defaults to 256 when neither this
-    /// nor `--time` is given; when `--time` is set and this is omitted, the run
-    /// is bounded only by the time budget (not silently capped at 256).
+    /// Most harness executions. Default 256 when `--time` is not given; with
+    /// `--time` and no `--iterations`, only the time budget ends the run.
     #[arg(long)]
     pub iterations: Option<usize>,
 
-    /// Optional wall-clock budget such as 30s, 5m, 1h or 1.5h.
+    /// Wall-clock budget, such as 30s, 5m, 1h or 1.5h. The builtin engine does
+    /// not count the time a harness built with bhf's driver or launchers takes
+    /// to start its fork-server (see --timeout).
     #[arg(long, value_parser = parse_duration)]
     pub time: Option<Duration>,
 
@@ -340,29 +359,29 @@ pub struct FuzzArgs {
 
     /// Adaptive length control (libFuzzer's `-len_control`). The effective
     /// mutation length starts small and doubles toward `--max-len` after this
-    /// many executions without a new corpus signature, so early fuzzing explores
-    /// shallow/fast and deepens as it plateaus. `0` disables it (always use the
-    /// full `--max-len`).
+    /// many executions without a new corpus signature, so short inputs are
+    /// explored first and longer ones once coverage stops growing. `0` turns
+    /// it off and uses the full `--max-len` from the start.
     #[arg(long = "len-control", default_value_t = DEFAULT_LEN_CONTROL)]
     pub len_control: usize,
 
     /// Per-input timeout (libFuzzer's `-timeout`): a single C/C++ harness
     /// execution that runs longer than this is killed, and an input that hangs
     /// again when re-run with twice the timeout is a hang finding (BHF-230).
-    /// Distinct from `--time`, the whole-campaign budget. Defaults to 10s;
-    /// `500ms` and `0.5s` are half a second. (The Ada lane bounds runaway
-    /// inputs via CPU rlimits instead.)
+    /// `--time` is the whole campaign's budget. Default 10s; `500ms` and
+    /// `0.5s` are half a second. An Ada harness is bounded by a CPU-time limit
+    /// instead. It is also how long a harness built with bhf's driver or
+    /// launchers gets to start its fork-server, at least 10s, even when
+    /// `--time` is shorter.
     #[arg(long = "timeout", value_parser = parse_duration)]
     pub timeout: Option<Duration>,
 
-    /// Real-time response deadline (the timing oracle, off by default). Distinct
-    /// from `--timeout`, the coarse hang-kill backstop that reports only an
-    /// input that hangs again at twice it: `--deadline` is a "must respond
-    /// within D" budget, and any input whose host-side wall-clock execution
-    /// exceeds it is recorded as a *finding* (BHF-555, a CWE-400
-    /// timing/availability failure). Use it for watchdog / RTOS / radar
-    /// targets where overrunning a budget is a fault, not just "it hung".
-    /// Accepts the same duration spec as `--time` (`250ms`, `0.5s`, `2s`).
+    /// Response deadline, the timing oracle (off by default): an input whose
+    /// execution takes longer than this, measured on the host, is a finding
+    /// (BHF-555, CWE-400). Use it for watchdog, RTOS or radar targets, where
+    /// missing a deadline is a fault. `--timeout` kills a run and reports only
+    /// an input that hangs again at twice the timeout. Takes the same
+    /// durations as `--time` (`250ms`, `0.5s`, `2s`).
     #[arg(long = "deadline", value_parser = parse_duration)]
     pub deadline: Option<Duration>,
 
@@ -383,24 +402,24 @@ pub struct FuzzArgs {
     /// Resident-memory ceiling in MB for a single C/C++ harness execution
     /// (libFuzzer's `-rss_limit_mb`). An execution whose RSS exceeds this is
     /// killed and reported as an out-of-memory finding. `0` (default) disables
-    /// it. (RSS is polled rather than an `RLIMIT_AS` cap, which would break
-    /// ASan's large virtual-address reservation.)
+    /// it. bhf polls RSS in place of setting `RLIMIT_AS`, which would break
+    /// ASan's large virtual-address reservation.
     #[arg(long = "rss-limit-mb", default_value_t = 0)]
     pub rss_limit_mb: usize,
 
-    /// Force the persistent fork-server execution mode (it is the default for
-    /// the builtin engine; this only matters to override `--no-fork-server` or
-    /// `BHF_FORK_SERVER=0`). One harness process is kept alive and fed inputs
-    /// over a framed protocol, amortizing fork/exec/elaboration (~38x more
-    /// execs/sec) while preserving the coverage-guided feedback. Every finding is
-    /// replay-validated in a fresh process, so a global-state artifact never
-    /// escapes; a hard crash falls back to a per-spawn run and respawns.
+    /// Use the persistent fork server, the builtin engine's default; this
+    /// overrides `--no-fork-server` or `BHF_FORK_SERVER=0`. One harness process
+    /// stays alive and is fed inputs over a framed protocol, which saves a
+    /// process start per input. Every finding is replayed in a fresh process
+    /// before it is kept, so state left over from earlier inputs cannot make
+    /// one. After a hard crash the input runs again in its own process and the
+    /// server is restarted.
     #[arg(long)]
     pub fork_server: bool,
 
-    /// Disable the fork-server and run a fresh process per input. Use for a
-    /// target that intentionally carries fuzz-relevant global state across calls
-    /// (a stateful state machine), where the per-spawn dynamics are preferred.
+    /// Run a fresh process per input, without the fork server. Use it for a
+    /// target that keeps state across calls on purpose, such as a state
+    /// machine, so each input starts from a fresh state.
     #[arg(long)]
     pub no_fork_server: bool,
 
@@ -411,8 +430,8 @@ pub struct FuzzArgs {
     /// rejected, crashed, hung) and on what it observed: the bytes the target
     /// hands `bhf_diff_observe(ptr, len)`, the target's return value in a
     /// generated harness, and `bhf_run_one`'s. Its process runs every input
-    /// the fuzzed build's runs, and both start over when either dies, so a
-    /// target that keeps state holds the same state in both. An input they
+    /// the fuzzed build's process runs, and both start over when either dies,
+    /// so a target that keeps state holds the same state in both. An input they
     /// disagree on, and still disagree on when each re-runs it in a fresh
     /// process (with twice `--timeout`, and once more to check each repeats
     /// itself), is a BHF-301 divergence finding, which `bhf replay` re-runs
@@ -472,45 +491,48 @@ pub struct FuzzArgs {
     #[arg(long = "seeds-layout-prefixed", hide = true)]
     pub seeds_layout_prefixed: bool,
 
-    /// Path to an explicitly-trusted extension manifest (`bhf.extension-manifest.v1`,
-    /// TOML). When set, after the campaign the retained corpus is driven through
-    /// the extension's out-of-process `oracle.evaluate` so a clean-exit semantic
-    /// violation becomes a finding. Explicit load is the trust boundary; an
-    /// extension is never auto-discovered. An extension crash/timeout/malformed
-    /// reply is a bounded infrastructure result that never aborts the campaign nor
-    /// becomes a target finding. (Evaluation runs post-run on retained inputs, not
-    /// in the hot mutation loop; supported by the builtin engine.)
+    /// Extension manifest (`bhf.extension-manifest.v1`, TOML) whose oracle
+    /// judges the kept corpus after the campaign: each input runs through the
+    /// extension's out-of-process `oracle.evaluate`, and a semantic violation
+    /// on a clean exit becomes a finding. bhf runs an extension only from a
+    /// manifest you name. An extension that crashes, times out or sends a malformed reply
+    /// is reported as an extension error; the campaign's results stand and no
+    /// finding is written for it. Builtin engine only.
     #[arg(long = "extension", value_name = "MANIFEST")]
     pub extension: Option<PathBuf>,
 
-    /// Sanitizer campaign matrix to arm, comma-separated (asan, msan, ubsan, tsan,
-    /// lsan, and on an AArch64 host hwasan in place of asan), or the standalone
-    /// value `none` (build coverage-only with no `-fsanitize=` — crash-only
-    /// fuzzing without ASan/UBSan false positives).
+    /// Sanitizers to run the campaign with, comma-separated: asan, msan,
+    /// ubsan, tsan, lsan, and on an AArch64 host hwasan in place of asan. Or
+    /// `none` on its own: a coverage build with no `-fsanitize=`, where the
+    /// findings are crashes and ASan/UBSan raise no false positives.
     #[arg(long = "sanitizers", value_delimiter = ',')]
     pub sanitizers: Vec<String>,
 
-    /// Ada source file to mine guarded literals into prototype symbolic seeds.
+    /// Ada source file whose guarded literals (the constants its conditions
+    /// compare against) become seeds. Repeatable.
     #[arg(long = "symbolic-seed-source")]
     pub symbolic_seed_sources: Vec<PathBuf>,
 
-    /// Deterministic RNG seed for built-in mutation.
+    /// Seed of the builtin engine's mutation RNG, so a run repeats exactly.
     #[arg(long, default_value_t = 0x4756_4655_5a5a)]
     pub rng_seed: u64,
 
-    /// Sandbox wrapper for harness execution.
+    /// Sandbox the harness runs in. `auto` uses bubblewrap, else firejail, and
+    /// runs without one when neither works on this host.
     #[arg(long, value_enum, default_value_t = SandboxModeArg::Auto)]
     pub sandbox: SandboxModeArg,
 
-    /// Actionability profile to optimize for.
+    /// Actionability profile the findings are classified under: `reporting`
+    /// or `attacking`.
     #[arg(long, default_value_t = actionability::RunMode::Reporting)]
     pub mode: actionability::RunMode,
 
-    /// Override sandbox wrapper executable.
+    /// The firejail or bubblewrap executable to use.
     #[arg(long, value_name = "PATH", requires = "sandbox")]
     pub sandbox_tool: Option<PathBuf>,
 
-    /// Fail if the requested sandbox tool is unavailable.
+    /// Fail when the requested sandbox is unavailable, in place of running
+    /// without it.
     #[arg(long)]
     pub sandbox_strict: bool,
 
@@ -528,22 +550,20 @@ pub struct FuzzArgs {
     )]
     pub extra_env: Vec<(String, String)>,
 
-    /// Load the runtime sink oracles via the LD_PRELOAD runtrace shim (#59), so a
-    /// clean-exit semantic violation — a fuzz-controlled command execution, path
-    /// escape, dlopen, network egress, or SQL query — becomes a finding even when
-    /// the target exits zero. `off` (default) is crash-only, preserving existing
-    /// behaviour; `auto` enables them when the shim and platform (Linux) support
-    /// it and skips otherwise; `on` requires them (errors if unavailable). A no-op
-    /// when `bhf auto` already armed the shim through `extra_env`.
+    /// Load the runtime sink oracles through the LD_PRELOAD runtrace shim
+    /// (Linux), so a semantic violation becomes a finding even when the target
+    /// exits zero: a command execution, path escape, dlopen, network
+    /// connection or SQL query that the fuzz input controls. `off` (default)
+    /// loads none, so the findings are crashes; `auto` loads them when the
+    /// shim and the platform support it; `on` requires them. No effect when
+    /// `bhf auto` already loaded the shim for the run.
     #[arg(long = "runtime-oracles", value_enum, default_value_t = crate::runtime_oracles::RuntimeOracleMode::Off)]
     pub runtime_oracles: crate::runtime_oracles::RuntimeOracleMode,
 
-    /// Path to a previously captured runtrace audit log produced
-    /// with `BHF_CMPLOG=1`. When set, recovered cmplog operands
-    /// seed both the mutator dictionary (positional-info-free token
-    /// insert) and an offset-aware RedQueen-style splice that
-    /// replaces operand_a with operand_b at the exact offset
-    /// operand_a appears in the current input.
+    /// A runtrace log captured earlier with `BHF_CMPLOG=1`. Its comparison
+    /// operands are added to the mutator's dictionary, and a RedQueen-style
+    /// mutation replaces one operand with the other where the first appears
+    /// in the current input.
     #[arg(long, value_name = "PATH")]
     pub cmplog_log: Option<PathBuf>,
 
@@ -575,7 +595,8 @@ pub struct FuzzArgs {
     #[arg(long = "dict", value_name = "PATH")]
     pub dict_file: Option<PathBuf>,
 
-    /// Structure-aware input synthesis for the built-in engine.
+    /// Structure-aware input generation for the builtin engine: `auto` tries
+    /// every format, `off` none, and a format name only that one.
     #[arg(long = "structured-inputs", value_enum, default_value_t = StructuredInputMode::Auto)]
     pub structured_inputs: StructuredInputMode,
 
@@ -591,9 +612,8 @@ pub struct FuzzArgs {
     #[arg(skip)]
     pub stop_after_findings: Option<usize>,
 
-    /// Fuzz an off-host / on-target backend through the `target_transport` seam
-    /// (HDF-1b) instead of the host libFuzzer/AFL lane. Additive: when this is
-    /// absent the default host path runs byte-for-byte as before. Spec forms:
+    /// Fuzz a target on another machine, board or emulator in place of a host
+    /// harness. Spec forms:
     /// `agent:tcp:HOST:PORT`, `agent:serial:/dev/ttyX[,baud=N]` (on-target agent),
     /// `gdb:HOST:PORT` (debug-probe/emulator gdbstub; needs
     /// `--transport-coverage-map`), and
@@ -605,8 +625,8 @@ pub struct FuzzArgs {
     /// bhf's QEMU plugin logs, and needs `dirty_log=PATH`), and
     /// `renode:monitor=HOST:PORT,gdb=HOST:PORT[,snapshot=PATH]` (a Renode
     /// board: its telnet monitor saves and loads the baseline; needs
-    /// `--transport-coverage-map`). Live agent/gdb/qemu/renode backends are
-    /// hardware/emulator-gated; a malformed spec is a descriptive error.
+    /// `--transport-coverage-map`). Each needs its board or emulator running;
+    /// a malformed spec is an error that says what is wrong.
     #[arg(long = "target-transport", value_name = "SPEC")]
     pub target_transport: Option<String>,
 
@@ -616,14 +636,14 @@ pub struct FuzzArgs {
     /// plus `input_len=<addr>` when the firmware reads the input's length from
     /// a `u32` there, and `cmplog=<addr>,cmplog_cap=<n>` for the comparison
     /// record the firmware fills for CmpLog (each value decimal or `0x`-hex).
-    /// `input_cap` is the
-    /// staging buffer's size: no input is written past it. The `agent`
-    /// transport carries coverage over its protocol and rejects this option.
+    /// `input_cap` is the staging buffer's size: no input is written past it.
+    /// The `agent` transport carries coverage over its protocol and rejects
+    /// this option.
     #[arg(long = "transport-coverage-map", value_name = "SPEC")]
     pub transport_coverage_map: Option<String>,
 
     /// Take `--target-transport` and `--transport-coverage-map` from a board
-    /// profile (#293): a TOML file of one board's transport contract, with
+    /// profile: a TOML file of one board's transport settings, with
     /// `gdb` and `coverage_map` for its debug probe and `serial` for the
     /// reference agent on its UART. See docs/hil-bringup.md.
     #[arg(long = "board-profile", value_name = "PATH")]
@@ -639,23 +659,24 @@ pub struct FuzzArgs {
     )]
     pub board_lane: crate::board_profile::BoardLane,
 
-    /// Load a versioned protocol profile (TOML, `bhf.protocol.v1`) and fuzz the
-    /// target as a response-dependent, multi-message session (HDF-7) instead of
-    /// single opaque inputs. Additive: when this is absent the default host /
-    /// transport paths run byte-for-byte as before. Presence routes to the
-    /// session lane, which needs `--session-transport`. A testcase is a sequence
-    /// of structured messages; mutation edits field values AND sequence structure
-    /// and a repair pass recomputes derived length/CRC fields and re-resolves
-    /// response back-references before send. Findings (a clean-exit protocol
-    /// violation, no crash) are written through the usual `results/` layout for
-    /// importers / SARIF / vulnerability-management tools.
+    /// Fuzz the target as a multi-message session whose messages depend on
+    /// its responses, described by a protocol profile (TOML, `bhf.protocol.v1`).
+    /// This is the session lane, and it needs `--session-transport`. A
+    /// testcase is a sequence of structured messages: a mutation edits field
+    /// values and the sequence itself, and before each message is sent, a
+    /// repair pass recomputes its length and CRC fields and fills in the
+    /// values it takes from earlier responses. A protocol violation on a clean
+    /// exit is a finding, written to `results/` like any other.
     #[arg(long = "protocol-profile", value_name = "PATH")]
     pub protocol_profile: Option<PathBuf>,
 
-    /// Request/response backend for the session lane. `tcp:HOST:PORT` connects a
-    /// socket per session; `udp:HOST:PORT` sends each message as a datagram from
-    /// a socket of its own per session and waits for one reply datagram.
-    /// Required when `--protocol-profile` is set.
+    /// Request/response backend for the session lane, required with
+    /// `--protocol-profile`. `tcp:HOST:PORT` connects a socket per session;
+    /// `udp:HOST:PORT` sends each message as a datagram from a socket of its
+    /// own per session and waits for one reply datagram;
+    /// `serial:PATH[,baud=N]` talks to a serial device (a UART or a pty);
+    /// `transport:SPEC` sends each message as one execution on a
+    /// `--target-transport` backend, with `--transport-coverage-map`.
     #[arg(long = "session-transport", value_name = "SPEC")]
     pub session_transport: Option<String>,
 
@@ -671,24 +692,22 @@ pub struct FuzzArgs {
     pub session_server_cmd: Option<String>,
 
     /// How long the session lane waits for a reply before the target is taken
-    /// to have ended the session (default 5s over TCP, 1s over UDP).
+    /// to have ended the session (default 1s over UDP, 5s otherwise).
     #[arg(long = "session-reply-timeout", value_parser = parse_duration, value_name = "DURATION")]
     pub session_reply_timeout: Option<Duration>,
 
-    /// How a session is reset between testcases: `reconnect` (default; a fresh
-    /// connection gives fresh per-session target state, so a new handle / id /
-    /// nonce is captured each run) or `none`. Recorded as the run's reset
-    /// fidelity.
+    /// How a session is reset between testcases: `reconnect` or `none`. The
+    /// run records the choice as its reset fidelity.
     #[arg(long = "session-reset", value_enum, default_value_t = crate::session_fuzz::SessionResetMode::Reconnect)]
     pub session_reset: crate::session_fuzz::SessionResetMode,
 
-    /// Bounded cap on messages per session (default 64); a sequence mutation that
-    /// would exceed it fails with a diagnostic rather than growing unbounded.
+    /// Most messages in one session. A sequence mutation that would pass it
+    /// fails with a message saying so.
     #[arg(long = "max-session-messages", default_value_t = 64)]
     pub max_session_messages: usize,
 
     /// Runtime-event collector that observes process, filesystem, and module-load
-    /// effects the harness performs even on a clean exit (#60). `auto` selects the
+    /// effects the harness performs even on a clean exit. `auto` selects the
     /// built-in provider for the platform: the native Windows ETW provider
     /// `bhf-collector-win`, or on Linux the in-process `LD_PRELOAD` runtrace
     /// adapter, which arms the runtrace shim for the run (with `--runtime-oracles
@@ -700,9 +719,8 @@ pub struct FuzzArgs {
     #[arg(long = "collector", value_parser = crate::collector_run::parse_collector_spec, default_value = "none")]
     pub collector: crate::collector_run::CollectorSpec,
 
-    /// How long, in milliseconds, to keep observing descendant-process effects
-    /// after the testcase process exits — the bounded post-exit observation
-    /// window (#60).
+    /// How long, in milliseconds, the collector keeps observing the effects of
+    /// descendant processes after the testcase process exits.
     #[arg(long = "collector-window-ms", default_value_t = crate::collector_run::DEFAULT_WINDOW_MS)]
     pub collector_window_ms: u64,
 }
@@ -901,18 +919,20 @@ fn resolve_iterations(explicit: Option<usize>, has_time_budget: bool) -> usize {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum FuzzEngine {
+    /// bhf's built-in coverage-guided engine. The default.
     Builtin,
+    /// AFL++ as a subprocess, on the harness's AFL++ build.
     #[value(name = "afl++")]
     AflPlusPlus,
     /// WinAFL on native Windows (DynamoRIO or Intel PT instrumentation).
     Winafl,
-    /// libFuzzer, in process (#294): the harness's `main_libfuzzer`, built
-    /// with `make libfuzzer` when there is none.
+    /// libFuzzer, in process: the harness's `main_libfuzzer`, built with
+    /// `make libfuzzer` when there is none.
     Libfuzzer,
-    /// honggfuzz in persistent mode (#295): the harness's `main_honggfuzz`,
-    /// built with `make honggfuzz` (`hfuzz-clang`) when there is none.
+    /// honggfuzz in persistent mode: the harness's `main_honggfuzz`, built
+    /// with `make honggfuzz` (`hfuzz-clang`) when there is none.
     Honggfuzz,
-    /// A LibAFL campaign over the harness (#296), in a bhf built with the
+    /// A LibAFL campaign over the harness, in a bhf built with the
     /// `libafl-engine` feature.
     Libafl,
 }
@@ -1226,6 +1246,124 @@ pub(crate) struct AflRunProvenance {
     /// The `-M`/`-S` instances `--workers` ran (#276); absent for one.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) instances: Vec<String>,
+    /// Why afl-fuzz ran without binding itself to a CPU core of its own
+    /// choosing (#444); absent when it bound one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) no_affinity: Option<AflNoAffinity>,
+}
+
+/// Why an afl-fuzz run did not bind itself to a free CPU core (#444). In
+/// each case afl-fuzz runs with `AFL_NO_AFFINITY=1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AflNoAffinity {
+    /// bhf runs on only some of the host's CPUs (`taskset`, a cpuset):
+    /// afl-fuzz stays on them instead of moving to a core outside them.
+    Pinned,
+    /// `AFL_NO_AFFINITY` was already set for the run.
+    Requested,
+    /// Every core was bound to another CPU-locked process, so afl-fuzz
+    /// refused to start (`No more free CPU cores`); the instance ran again,
+    /// once, without binding a core.
+    NoFreeCore,
+}
+
+/// Why an afl-fuzz run should not bind a core from its start:
+/// `AFL_NO_AFFINITY` is set already (in bhf's environment, or among the
+/// variables the run sets, `run_env`), or bhf runs pinned to some CPUs. `None`
+/// leaves afl-fuzz to bind one.
+pub(crate) fn afl_no_affinity_at_start<'a>(
+    mut run_env: impl Iterator<Item = &'a str>,
+) -> Option<AflNoAffinity> {
+    if std::env::var_os("AFL_NO_AFFINITY").is_some() || run_env.any(|key| key == "AFL_NO_AFFINITY")
+    {
+        return Some(AflNoAffinity::Requested);
+    }
+    process_cpus_pinned().then_some(AflNoAffinity::Pinned)
+}
+
+/// Whether this process may run on only some of the CPUs the host has
+/// online. afl-fuzz binds itself to the first free core, and a core outside
+/// the process's set is one it may move to.
+#[cfg(target_os = "linux")]
+fn process_cpus_pinned() -> bool {
+    let allowed = fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+                .and_then(cpu_list)
+        });
+    let online = fs::read_to_string("/sys/devices/system/cpu/online")
+        .ok()
+        .and_then(|online| cpu_list(&online));
+    match (allowed, online) {
+        (Some(allowed), Some(online)) => cpus_pinned(&allowed, &online),
+        _ => false,
+    }
+}
+
+/// bhf reads a pin from Linux's affinity mask only. On its other hosts
+/// afl-fuzz is left to bind a core: macOS has no hard affinity, and Windows
+/// runs WinAFL, which bhf already starts unbound.
+#[cfg(not(target_os = "linux"))]
+fn process_cpus_pinned() -> bool {
+    false
+}
+
+/// Whether some online CPU is outside the `allowed` set.
+#[cfg(any(target_os = "linux", test))]
+fn cpus_pinned(allowed: &[u32], online: &[u32]) -> bool {
+    online.iter().any(|cpu| !allowed.contains(cpu))
+}
+
+/// The CPUs a kernel CPU list (`0-3,6,8-9`) names, or `None` for a list
+/// that is not one.
+#[cfg(any(target_os = "linux", test))]
+fn cpu_list(list: &str) -> Option<Vec<u32>> {
+    const MAX_CPUS: u32 = 1 << 16;
+    let mut cpus = Vec::new();
+    for part in list.trim().split(',').filter(|part| !part.is_empty()) {
+        let (first, last) = match part.split_once('-') {
+            Some((first, last)) => (first.trim().parse().ok()?, last.trim().parse().ok()?),
+            None => {
+                let cpu: u32 = part.trim().parse().ok()?;
+                (cpu, cpu)
+            }
+        };
+        if first > last || last >= MAX_CPUS {
+            return None;
+        }
+        cpus.extend(first..=last);
+    }
+    (!cpus.is_empty()).then_some(cpus)
+}
+
+/// Whether the afl-fuzz that logged to `log` refused to start because every
+/// core was bound to another CPU-locked process.
+fn afl_found_no_free_core(log: &Path) -> bool {
+    read_bounded_file_head_tail(log, max_captured_stderr_bytes())
+        .is_ok_and(|bytes| afl_output_says_no_free_core(&bytes))
+}
+
+/// Whether afl-fuzz's output says it refused to start because every core was
+/// bound to another CPU-locked process.
+pub(crate) fn afl_output_says_no_free_core(output: &[u8]) -> bool {
+    String::from_utf8_lossy(output).contains("No more free CPU cores")
+}
+
+/// Kill what an AFL++ pass left running of its target (#444): afl-fuzz leaves
+/// the persistent child of its CmpLog fork server stopped when it exits, and a
+/// hung run's worker `setsid()`s out of the group bhf kills. A child left
+/// behind keeps the session's lock, so the next run cannot resume the session
+/// (#275), and keeps the core it was bound to, so a busy host runs out of
+/// free cores. Call it only when none of the pass's afl-fuzz instances runs.
+fn reap_afl_targets(main_afl: &Path, cmplog: Option<&Path>) {
+    kill_processes_by_exe(main_afl);
+    if let Some(cmplog) = cmplog {
+        kill_processes_by_exe(cmplog);
+    }
 }
 
 /// How many afl-fuzz instances a run of `engine` with `--workers` runs
@@ -2458,8 +2596,8 @@ fn run_programmatic_campaign(mut args: FuzzArgs, workers: u32) -> Result<FuzzRun
         time_budget,
         bhf_bin,
         per_worker_env: Vec::new(),
-        extra_worker_args: worker_passthrough_args(&args),
-        kill_grace: None,
+        extra_worker_args: worker_args(&args),
+        kill_grace: Some(campaign_kill_grace(args.timeout)),
         harness_dirs,
         harness_executable,
         lineage_record_cap: corpus::lineage::record_cap(corpus_limits(args.max_len.max(1)).entries),
@@ -3354,8 +3492,8 @@ fn run_multicore_campaign(mut args: FuzzArgs) -> i32 {
         time_budget: args.time.unwrap_or(Duration::ZERO),
         bhf_bin,
         per_worker_env: multicore_fuzz::sanitizer_envs(sanitizers.runtime_set()),
-        extra_worker_args: worker_passthrough_args(&args),
-        kill_grace: None,
+        extra_worker_args: worker_args(&args),
+        kill_grace: Some(campaign_kill_grace(args.timeout)),
         harness_dirs,
         harness_executable,
         // The cap each worker's pass trims its lineage to, so the merge
@@ -3875,6 +4013,17 @@ fn worker_seed_files(args: &mut FuzzArgs, harness: &Path) -> Result<(), String> 
         args.seeds_layout_prefixed = true;
     }
     materialize_seed_bytes(args)
+}
+
+/// A worker `bhf fuzz`'s arguments: the run's `--profile`, so the worker
+/// gates its tools on it as the run does, then the pass's own.
+fn worker_args(args: &FuzzArgs) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(profile) = config::Profile::given() {
+        out.extend(["--profile".to_owned(), profile.as_str().to_owned()]);
+    }
+    out.extend(worker_passthrough_args(args));
+    out
 }
 
 fn worker_passthrough_args(args: &FuzzArgs) -> Vec<String> {
@@ -5403,6 +5552,9 @@ fn run_builtin_with_progress(
     // one call, and the fork-server used to wait its fixed 30s repeatedly even
     // when `--per-target-time` gave the pass only a few seconds.  The outer loop
     // cannot observe its wall-clock budget while blocked in that protocol wait.
+    // The `--timeout` asked for, before the cap: how long a framed harness
+    // gets to start its fork-server (#432).
+    let requested_timeout = prepared.per_input_timeout;
     if let Some(pass_budget) = prepared.time {
         prepared.per_input_timeout = prepared.per_input_timeout.min(pass_budget);
     }
@@ -5719,18 +5871,35 @@ fn run_builtin_with_progress(
     let driver_harness = protocol == HarnessProtocol::BhfFramed;
     let speaks_framed =
         crate::protocol_detect::speaks_framed(prepared.runner.harness_path(), &detection);
-    let handshake_timeout =
-        fork_handshake_timeout(prepared.per_input_timeout, prepared.time, speaks_framed);
+    let handshake_timeout = fork_handshake_timeout(requested_timeout, prepared.time, speaks_framed);
     // #345: with `--differential-harness`, the second build's process runs
     // every input the fuzzed build's persistent process runs.
     let followed = prepared.differential.is_some();
-    let mut fork_server = if prepared.fork_server && !c_libfuzzer_harness {
+    let fork_wanted = prepared.fork_server && !c_libfuzzer_harness;
+    let starting = Instant::now();
+    let mut fork_server = if fork_wanted {
         start_fork_server(&prepared, handshake_timeout, speaks_framed)
             .map(|server| server.followed(followed))
     } else {
         None
     };
     let mut forkserver_started = fork_server.is_some();
+    // #432: the wait for the fork-server is not charged to the pass when it
+    // came up, or when the harness speaks the framed protocol and so was
+    // given the whole handshake. A pass shorter than the start-up (a short
+    // `bhf auto` pass on a loaded host) still fuzzes for its budget once the
+    // harness is ready, or once bhf gave up on it. A campaign's orchestrator
+    // allows each worker this wait ([`campaign_kill_grace`]).
+    let pass_deadline = match pass_deadline {
+        Some(deadline) if fork_wanted && (forkserver_started || speaks_framed) => {
+            Some(deadline + starting.elapsed())
+        }
+        deadline => deadline,
+    };
+    // The inputs run in a fresh process each while a framed harness's
+    // fork-server is down, which the run reports with their rate over the
+    // time it was down.
+    let mut fresh_process_inputs = FreshProcessInputs::default();
     // #345: `--differential-harness`'s second build, which runs every input
     // the loop runs.
     let mut differential = prepared
@@ -6126,10 +6295,7 @@ fn run_builtin_with_progress(
         None => None,
     };
     for iteration in 0..prepared.iterations {
-        if prepared
-            .time
-            .is_some_and(|budget| start.elapsed() >= budget)
-        {
+        if pass_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             break;
         }
         // Near the end, stop issuing inputs once the re-runs still out need
@@ -6323,7 +6489,10 @@ fn run_builtin_with_progress(
             // probes, calibration re-runs), so that both have run the same
             // inputs when they are compared; when the second build's process
             // died, the fuzzed build's starts over too.
-            if peer.follow(fork_server.as_mut(), None, &prepared, handshake_timeout) {
+            // Its fork-server, started on its first input, never waits past
+            // the end of the pass.
+            let peer_handshake = handshake_within(pass_deadline, handshake_timeout);
+            if peer.follow(fork_server.as_mut(), None, &prepared, peer_handshake) {
                 drop(fork_server.take());
                 fork_server = restart_fork_server(
                     &prepared,
@@ -6333,7 +6502,8 @@ fn run_builtin_with_progress(
                     followed,
                 );
                 forkserver_started |= fork_server.is_some();
-                peer.follow(fork_server.as_mut(), None, &prepared, handshake_timeout);
+                let peer_handshake = handshake_within(pass_deadline, handshake_timeout);
+                peer.follow(fork_server.as_mut(), None, &prepared, peer_handshake);
             }
         }
         // The empty input's one run is reused: it ran nothing now.
@@ -6342,6 +6512,9 @@ fn run_builtin_with_progress(
         // per-spawn process). Fork-server findings are replay-validated below so
         // an artifact of accumulated global state never escapes as a finding.
         let mut from_fork_server = false;
+        if fork_wanted && speaks_framed {
+            fresh_process_inputs.observe(fork_server.is_some(), Instant::now());
+        }
         let mut run = if !input.is_empty() && fork_server.is_some() {
             match fork_server
                 .as_mut()
@@ -6392,6 +6565,8 @@ fn run_builtin_with_progress(
             )?;
             if input.is_empty() {
                 empty_input_run = Some(run.clone());
+            } else if fork_wanted && speaks_framed {
+                fresh_process_inputs.record();
             }
             run
         };
@@ -6452,7 +6627,7 @@ fn run_builtin_with_progress(
                     fork_server.as_mut(),
                     from_fork_server,
                     &prepared,
-                    handshake_timeout,
+                    handshake_within(pass_deadline, handshake_timeout),
                 )?;
                 peer_novelty = novelty;
                 diverged = peer.worth_confirming(&primary, &observed);
@@ -6848,6 +7023,7 @@ fn run_builtin_with_progress(
             break;
         }
     }
+    let loop_ended = Instant::now();
 
     // End of pass: wait for the outstanding re-runs while the pass has time
     // left (all of them when it has no `--time`, none once it has its
@@ -7111,6 +7287,9 @@ fn run_builtin_with_progress(
         block
     });
 
+    if let Some(note) = fresh_process_inputs.note(loop_ended) {
+        bhfeprintln!("{note}");
+    }
     let elapsed_secs = start.elapsed().as_secs_f64();
     let coverage = coverage_from_env(&prepared.extra_env, &prepared.harness_path);
     let summary = FuzzRunSummary {
@@ -8214,7 +8393,13 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
     });
 
     let start = Instant::now();
-    let build_afl_command = |instance: &AflInstance| -> Result<Command, String> {
+    // #444: afl-fuzz binds itself to a free core unless told not to. A run
+    // bhf is pinned for keeps its pin; an instance that finds every core
+    // bound to another fuzzer runs again, once, unbound.
+    let mut no_affinity =
+        afl_no_affinity_at_start(prepared.extra_env.iter().map(|(key, _)| key.as_str()));
+    let mut unbound = vec![no_affinity.is_some(); instances.len()];
+    let build_afl_command = |instance: &AflInstance, unbound: bool| -> Result<Command, String> {
         // afl-fuzz's console output goes to a file instead of an undrained
         // pipe (see the stdout/stderr redirect below — a piped, undrained
         // child deadlocks).
@@ -8341,6 +8526,9 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
         for (k, v) in &prepared.extra_env {
             afl_cmd.env(k, v);
         }
+        if unbound {
+            afl_cmd.env("AFL_NO_AFFINITY", "1");
+        }
         // #412: afl-fuzz stops at its first crash when AFL_BENCH_UNTIL_CRASH is
         // set, whatever its value, so it never runs the rest of its budget.
         afl_cmd.env_remove("AFL_BENCH_UNTIL_CRASH");
@@ -8388,8 +8576,8 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
     };
     let (statuses, hard_deadline) = loop {
         let mut children = Vec::with_capacity(instances.len());
-        for instance in &instances {
-            let mut afl_cmd = build_afl_command(instance)?;
+        for (instance, unbound) in instances.iter().zip(&unbound) {
+            let mut afl_cmd = build_afl_command(instance, *unbound)?;
             match afl_cmd.spawn() {
                 Ok(child) => children.push(child),
                 Err(error) => {
@@ -8414,11 +8602,50 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
         let mut timed_out = false;
         let mut statuses: Vec<Option<std::process::ExitStatus>> = vec![None; children.len()];
         while statuses.iter().any(Option::is_none) {
-            for (child, status) in children.iter_mut().zip(statuses.iter_mut()) {
-                if status.is_none() {
-                    *status = child
-                        .try_wait()
-                        .map_err(|error| format!("wait afl-fuzz: {error}"))?;
+            for index in 0..children.len() {
+                if statuses[index].is_some() {
+                    continue;
+                }
+                statuses[index] = children[index]
+                    .try_wait()
+                    .map_err(|error| format!("wait afl-fuzz: {error}"))?;
+                let instance = &instances[index];
+                if !unbound[index]
+                    && statuses[index]
+                        .is_some_and(|status| status.code().is_some_and(|code| code != 0))
+                    && afl_found_no_free_core(&instance.log)
+                {
+                    bhfeprintln!(
+                        "bhf: afl-fuzz instance {} found every CPU core bound to another \
+                         CPU-locked process (another fuzzer) and did not start; running it \
+                         again without binding a core (AFL_NO_AFFINITY=1)",
+                        instance.name
+                    );
+                    // afl-fuzz looks for a core before it starts the target, so
+                    // this instance left none running; what the others left is
+                    // reaped once they are all done.
+                    if statuses
+                        .iter()
+                        .enumerate()
+                        .all(|(other, status)| other == index || status.is_some())
+                    {
+                        reap_afl_targets(&main_afl, cmplog_binary.as_deref());
+                    }
+                    let rerun = build_afl_command(instance, true).and_then(|mut command| {
+                        command.spawn().map_err(|error| {
+                            format!("spawn afl-fuzz '{}': {error}", afl_fuzz.display())
+                        })
+                    });
+                    match rerun {
+                        Ok(rerun) => {
+                            unbound[index] = true;
+                            no_affinity = Some(AflNoAffinity::NoFreeCore);
+                            children[index] = rerun;
+                            statuses[index] = None;
+                        }
+                        // The instance's failure is reported with the others'.
+                        Err(error) => bhfeprintln!("bhf: warning: {error}"),
+                    }
                 }
             }
             if statuses.iter().all(Option::is_some) {
@@ -8441,9 +8668,10 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
             std::thread::sleep(Duration::from_millis(200));
         }
         let statuses: Vec<std::process::ExitStatus> = statuses.into_iter().flatten().collect();
+        // Every instance has exited (at its -V budget, with an error, or killed
+        // at the hard deadline): nothing of the target may outlive the pass.
+        reap_afl_targets(&main_afl, cmplog_binary.as_deref());
         if timed_out {
-            // Reap any persistent-mode worker that setsid()'d out of the killed group.
-            kill_processes_by_exe(&main_afl);
             bhfeprintln!(
                 "bhf: afl-fuzz exceeded its hard deadline ({:?}) and was killed — \
              likely a fork-server/persistent-mode hang; harvesting any crashes found so far",
@@ -8662,6 +8890,7 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
             } else {
                 Vec::new()
             },
+            no_affinity,
         }),
         winafl: None,
         // The extension `oracle.evaluate` pass is a builtin-engine feature
@@ -10903,6 +11132,17 @@ fn runtrace_log_dir(extra_env: &[(String, String)]) -> Option<PathBuf> {
         .and_then(|(_, value)| Path::new(value).parent().map(Path::to_path_buf))
 }
 
+/// Loader environment a setuid Firejail removes before launching the target.
+/// The runner carries it through Firejail's explicit `--env=` channel; direct
+/// and bubblewrap runs continue to inherit the ordinary `Command` environment.
+fn sandbox_loader_env(extra_env: &[(String, String)]) -> Vec<(String, String)> {
+    extra_env
+        .iter()
+        .filter(|(key, _)| key == "LD_PRELOAD" || key == "LD_LIBRARY_PATH")
+        .cloned()
+        .collect()
+}
+
 /// #416: inputs already recorded as crash findings, read from
 /// `<work>/findings/*/testcase.bin`. A crashing input is a finding, not a clean
 /// coverage seed, so it must be kept out of the persisted corpus — even when a
@@ -11141,14 +11381,13 @@ fn run_harness_with_protocol(
     // When a runtrace log is configured (the executable oracles read it), bind
     // its directory read-write into the sandbox so the harness can write events
     // from inside it. No-op when not sandboxed or when it is the events dir.
-    let runner_owned;
-    let runner = match runtrace_log_dir(extra_env) {
-        Some(dir) => {
-            runner_owned = runner.clone().with_rw_binds([dir]);
-            &runner_owned
-        }
-        None => runner,
-    };
+    let mut runner_owned = runner
+        .clone()
+        .with_sandbox_env(sandbox_loader_env(extra_env));
+    if let Some(dir) = runtrace_log_dir(extra_env) {
+        runner_owned = runner_owned.with_rw_binds([dir]);
+    }
+    let runner = &runner_owned;
     let mut command = runner
         .command_for_events(&events_path)
         .map_err(|error| error.to_string())?;
@@ -12386,41 +12625,149 @@ fn announce_deadline_finding(overrun: &str) {
     bhfeprintln!("bhf: input {overrun} - recording BHF-555 finding");
 }
 
-/// How long `ForkServer::spawn` waits for the ready byte: the per-input
-/// timeout, but at least [`FORK_STARTUP_FLOOR`], for a harness known to speak
-/// the framed protocol, and the short [`FORK_HANDSHAKE_PROBE`] for any other.
-/// Never longer than the pass itself.
+/// How long `ForkServer::spawn` waits for the ready byte. A harness known to
+/// speak the framed protocol gets the `--timeout` asked for
+/// (`requested_timeout`, before the loop caps it at the pass), but at least
+/// [`FORK_STARTUP_FLOOR`], however short the pass is (#432): cut to a pass
+/// shorter than its start-up, the handshake failed and every input of the
+/// pass ran in a fresh process, each paying that start-up again. The pass's
+/// deadline does not count that wait (see `run_builtin_with_progress`). Any
+/// other harness gets the short [`FORK_HANDSHAKE_PROBE`], never longer than
+/// the pass (`pass_budget`).
 fn fork_handshake_timeout(
-    run_timeout: Duration,
+    requested_timeout: Duration,
     pass_budget: Option<Duration>,
     speaks_framed: bool,
 ) -> Duration {
-    let wait = if speaks_framed {
-        run_timeout.max(FORK_STARTUP_FLOOR)
+    if speaks_framed {
+        requested_timeout.max(FORK_STARTUP_FLOOR)
     } else {
-        run_timeout.min(FORK_HANDSHAKE_PROBE)
-    };
-    pass_budget.map_or(wait, |budget| wait.min(budget))
+        let probe = requested_timeout.min(FORK_HANDSHAKE_PROBE);
+        pass_budget.map_or(probe, |budget| probe.min(budget))
+    }
 }
 
 #[cfg(test)]
 #[test]
 fn fork_handshake_waits_for_a_slow_start_of_a_framed_harness() {
     let secs = Duration::from_secs;
-    // A known framed harness gets the per-input timeout, at least the floor.
+    // A known framed harness gets the `--timeout` asked for, at least the
+    // floor, whatever the pass's budget.
     assert_eq!(fork_handshake_timeout(secs(10), None, true), secs(10));
     assert_eq!(fork_handshake_timeout(secs(1), None, true), secs(10));
     assert_eq!(fork_handshake_timeout(secs(30), None, true), secs(30));
-    // Never past the pass budget.
     assert_eq!(
-        fork_handshake_timeout(secs(10), Some(secs(4)), true),
-        secs(4)
+        fork_handshake_timeout(secs(20), Some(secs(1)), true),
+        secs(20)
     );
-    // Any other harness keeps the short probe.
+    assert_eq!(
+        fork_handshake_timeout(secs(5), Some(secs(1)), true),
+        secs(10)
+    );
+    // Any other harness keeps the short probe, never past the pass.
     assert_eq!(fork_handshake_timeout(secs(10), None, false), secs(2));
     assert_eq!(
         fork_handshake_timeout(Duration::from_millis(750), None, false),
         Duration::from_millis(750)
+    );
+    assert_eq!(
+        fork_handshake_timeout(secs(10), Some(Duration::from_millis(500)), false),
+        Duration::from_millis(500)
+    );
+}
+
+/// How long past a campaign's `--time` its orchestrator lets a worker run
+/// before it stops it: [`multicore_fuzz::DEFAULT_KILL_GRACE`] for the end of
+/// its pass, plus the wait for its fork-server to start, which a worker's
+/// `--time` does not count (#432). `timeout` is the campaign's `--timeout`.
+fn campaign_kill_grace(timeout: Option<Duration>) -> Duration {
+    let start_up = fork_handshake_timeout(timeout.unwrap_or(PER_INPUT_TIMEOUT), None, true);
+    multicore_fuzz::DEFAULT_KILL_GRACE.saturating_add(start_up)
+}
+
+#[cfg(test)]
+#[test]
+fn a_campaign_lets_its_workers_start_their_fork_servers() {
+    let secs = Duration::from_secs;
+    // The 5 s for the end of a pass, and the 10 s every framed harness may
+    // take to start, or the longer `--timeout` it is given.
+    assert_eq!(campaign_kill_grace(None), secs(15));
+    assert_eq!(campaign_kill_grace(Some(secs(1))), secs(15));
+    assert_eq!(campaign_kill_grace(Some(secs(30))), secs(35));
+}
+
+/// The inputs a run ran in a fresh process each because the fork-server of
+/// its framed harness was not up (#432), and the time of the loop it was down.
+#[derive(Debug, Default)]
+struct FreshProcessInputs {
+    count: usize,
+    /// Since when the fork-server is down, while it is.
+    down_since: Option<Instant>,
+    down: Duration,
+}
+
+impl FreshProcessInputs {
+    /// Note whether the fork-server is `up` `at` this point of the loop: the
+    /// time from a point it was down to the next it is up counts as down.
+    fn observe(&mut self, up: bool, at: Instant) {
+        match (up, self.down_since) {
+            (false, None) => self.down_since = Some(at),
+            (true, Some(since)) => {
+                self.down += at.saturating_duration_since(since);
+                self.down_since = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// One more input ran in a fresh process while the fork-server was down.
+    fn record(&mut self) {
+        self.count += 1;
+    }
+
+    /// What stderr says once the loop ended `at`: how many inputs ran that
+    /// way, and how many per second of the time the fork-server was down.
+    /// `None` when it ran none.
+    fn note(&mut self, at: Instant) -> Option<String> {
+        self.observe(true, at);
+        (self.count > 0).then(|| {
+            let down = self.down.as_secs_f64();
+            let per_sec = self.count as f64 / down.max(1e-3);
+            format!(
+                "bhf: {} input(s) ran in a fresh process each, without the fork-server, \
+                 in the {down:.1}s it was down: {per_sec:.1} per second",
+                self.count
+            )
+        })
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn a_run_without_its_fork_server_reports_its_rate() {
+    let start = Instant::now();
+    let at = |millis| start + Duration::from_millis(millis);
+    assert_eq!(FreshProcessInputs::default().note(at(0)), None);
+    // Down from the start for 2 s, in which it ran 3 inputs, then up for a
+    // second, then down again for 1 s, in which it ran 2 more.
+    let mut inputs = FreshProcessInputs::default();
+    inputs.observe(false, at(0));
+    for millis in [0, 600, 1200] {
+        inputs.observe(false, at(millis));
+        inputs.record();
+    }
+    inputs.observe(true, at(2000));
+    inputs.observe(true, at(2500));
+    inputs.observe(false, at(3000));
+    inputs.record();
+    inputs.observe(false, at(3500));
+    inputs.record();
+    assert_eq!(
+        inputs.note(at(4000)).as_deref(),
+        Some(
+            "bhf: 5 input(s) ran in a fresh process each, without the fork-server, \
+             in the 3.0s it was down: 1.7 per second"
+        )
     );
 }
 /// Convert a run timeout to the bounded millisecond value accepted by `poll(2)`.
@@ -13162,16 +13509,40 @@ fn restart_fork_server(
     speaks_framed: bool,
     followed: bool,
 ) -> Option<ForkServer> {
-    let left = pass_deadline
-        .map_or(handshake_timeout, |deadline| {
-            deadline.saturating_duration_since(Instant::now())
-        })
-        .min(handshake_timeout);
+    let left = handshake_within(pass_deadline, handshake_timeout);
     if left.is_zero() {
         return None;
     }
     start_fork_server(prepared, left, speaks_framed && left == handshake_timeout)
         .map(|server| server.followed(followed))
+}
+
+/// How long a fork-server started now may wait for its ready byte:
+/// `handshake_timeout`, but no longer than the pass has left
+/// (`pass_deadline`), and zero once the pass is over.
+fn handshake_within(pass_deadline: Option<Instant>, handshake_timeout: Duration) -> Duration {
+    pass_deadline
+        .map_or(handshake_timeout, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        })
+        .min(handshake_timeout)
+}
+
+#[cfg(test)]
+#[test]
+fn a_fork_server_started_mid_pass_waits_no_longer_than_the_pass_has_left() {
+    let handshake = Duration::from_secs(10);
+    assert_eq!(handshake_within(None, handshake), handshake);
+    let soon = Instant::now() + Duration::from_secs(3);
+    let left = handshake_within(Some(soon), handshake);
+    assert!(
+        left <= Duration::from_secs(3) && left > Duration::from_secs(2),
+        "{left:?}"
+    );
+    let later = Instant::now() + Duration::from_secs(60);
+    assert_eq!(handshake_within(Some(later), handshake), handshake);
+    let over = Instant::now();
+    assert_eq!(handshake_within(Some(over), handshake), Duration::ZERO);
 }
 
 /// Start the run's fork-server, or `None` to run a fresh process per input. A
@@ -13217,14 +13588,13 @@ impl ForkServer {
         fs::File::create(&events_path)
             .map_err(|error| format!("create fork-server event log: {error}"))?;
         let scratch = ensure_harness_scratch(work_dir)?;
-        let runner_owned;
-        let runner = match runtrace_log_dir(extra_env) {
-            Some(dir) => {
-                runner_owned = runner.clone().with_rw_binds([dir]);
-                &runner_owned
-            }
-            None => runner,
-        };
+        let mut runner_owned = runner
+            .clone()
+            .with_sandbox_env(sandbox_loader_env(extra_env));
+        if let Some(dir) = runtrace_log_dir(extra_env) {
+            runner_owned = runner_owned.with_rw_binds([dir]);
+        }
+        let runner = &runner_owned;
         let mut command = runner
             .command_for_events(&events_path)
             .map_err(|error| error.to_string())?;
@@ -13662,13 +14032,18 @@ impl DifferentialPeer {
     }
 
     /// The second build's fork-server, started when it has none, or `None`
-    /// when it runs a fresh process per input.
+    /// when it runs a fresh process per input. `handshake_timeout` is at most
+    /// what the pass has left ([`handshake_within`]): none left, it starts
+    /// none and this input runs in a fresh process.
     fn fork_server(
         &mut self,
         prepared: &PreparedFuzzRun,
         handshake_timeout: Duration,
     ) -> Option<&mut ForkServer> {
         if self.per_spawn {
+            return None;
+        }
+        if self.fork.is_none() && handshake_timeout.is_zero() {
             return None;
         }
         if self.fork.is_none() {
@@ -20744,6 +21119,209 @@ exit 0
             Note: -G is not an option here\n";
         assert!(!afl_help_lists_max_len(older));
         assert!(!afl_help_lists_max_len(b""));
+    }
+
+    #[test]
+    fn cpu_lists_are_read_as_the_kernel_writes_them() {
+        assert_eq!(cpu_list("0-3,6,8-9\n"), Some(vec![0, 1, 2, 3, 6, 8, 9]));
+        assert_eq!(cpu_list("\t5"), Some(vec![5]));
+        for not_a_list in ["", "3-1", "x", "0-", "1,,a"] {
+            assert_eq!(cpu_list(not_a_list), None, "{not_a_list:?}");
+        }
+    }
+
+    #[test]
+    fn a_process_kept_off_an_online_cpu_is_pinned() {
+        let online: Vec<u32> = (0..6).collect();
+        assert!(cpus_pinned(&[3], &online));
+        assert!(cpus_pinned(&[0, 1, 2, 3, 4], &online));
+        assert!(!cpus_pinned(&online, &online));
+        // CPUs allowed but offline pin nothing.
+        assert!(!cpus_pinned(&(0..8).collect::<Vec<u32>>(), &online));
+    }
+
+    #[test]
+    fn an_afl_no_affinity_the_run_is_given_is_kept() {
+        assert_eq!(
+            afl_no_affinity_at_start(["AFL_PATH", "AFL_NO_AFFINITY"].into_iter()),
+            Some(AflNoAffinity::Requested)
+        );
+        assert!(afl_output_says_no_free_core(
+            b"[-] PROGRAM ABORT : No more free CPU cores\n"
+        ));
+        assert!(!afl_output_says_no_free_core(
+            b"[+] All set and ready to roll!\n"
+        ));
+    }
+
+    /// #444: afl-fuzz refuses to start when every core is bound to another
+    /// CPU-locked process. The instance runs again, once, with
+    /// `AFL_NO_AFFINITY=1`, and the run summary says it ran unbound.
+    #[test]
+    #[cfg(unix)]
+    fn an_afl_fuzz_that_finds_no_free_core_runs_again_without_binding_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        let dir = work_dir.join("build").join("H-AFLCORE");
+        write_c_libfuzzer_harness(&work_dir, "H-AFLCORE", "#!/bin/sh\nexit 0\n");
+        fs::copy(dir.join("main"), dir.join("main_afl")).unwrap();
+        let afl_dir = root.join("afl");
+        fs::create_dir_all(&afl_dir).unwrap();
+        let calls = afl_dir.join("calls.log");
+        let script = afl_dir.join("afl-fuzz");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"AFL_NO_AFFINITY=${{AFL_NO_AFFINITY:-unset}}\" >> '{}'\n\
+                 if [ -z \"$AFL_NO_AFFINITY\" ]; then\n\
+                 \x20 echo '[-] Uh-oh, looks like all 6 CPU cores on your system are allocated to'\n\
+                 \x20 echo '[-] PROGRAM ABORT : No more free CPU cores'\n\
+                 \x20 echo '         Location : bind_to_free_cpu(), src/afl-fuzz-init.c:448'\n\
+                 \x20 exit 1\n\
+                 fi\nexit 0\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut prepared = prepare_afl_programmatic(
+            &work_dir,
+            "H-AFLCORE",
+            vec![non_utf8_seed()],
+            Some(Duration::from_secs(1)),
+            &[],
+            actionability::RunMode::Reporting,
+            0,
+            &[],
+            None,
+        )
+        .unwrap();
+        prepared.afl_path = Some(afl_dir);
+        prepared.afl_max_len = None;
+        let summary = run_afl_plus_plus(prepared).expect("the AFL pass runs");
+        let calls = fs::read_to_string(&calls).unwrap();
+        let no_affinity = summary.afl.as_ref().and_then(|afl| afl.no_affinity);
+        match afl_no_affinity_at_start(std::iter::empty()) {
+            // This test runs pinned or with AFL_NO_AFFINITY set: unbound
+            // from the start, so no core is looked for.
+            Some(reason) => {
+                assert_eq!(calls.lines().collect::<Vec<_>>(), ["AFL_NO_AFFINITY=1"]);
+                assert_eq!(no_affinity, Some(reason));
+            }
+            None => {
+                assert_eq!(
+                    calls.lines().collect::<Vec<_>>(),
+                    ["AFL_NO_AFFINITY=unset", "AFL_NO_AFFINITY=1"],
+                    "run again, once, unbound"
+                );
+                assert_eq!(no_affinity, Some(AflNoAffinity::NoFreeCore));
+                let json = serde_json::to_value(&summary).unwrap();
+                assert_eq!(json["afl"]["no_affinity"], "no_free_core", "{json:#}");
+            }
+        }
+    }
+
+    /// #444, #275: afl-fuzz exits leaving the persistent child of its CmpLog
+    /// fork server stopped. The child kept the session's lock, so the next
+    /// run could not resume the session, and kept its core bound. bhf kills
+    /// what a pass left running of `main_afl` and `main_afl_cmplog`.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn an_afl_pass_leaves_no_target_process_running() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        let dir = work_dir.join("build").join("H-AFLREAP");
+        write_c_libfuzzer_harness(&work_dir, "H-AFLREAP", "#!/bin/sh\nexit 0\n");
+        fs::copy(dir.join("main"), dir.join("main_afl")).unwrap();
+        // The CmpLog build: a program that waits, as a stopped child does. A
+        // multi-call `sleep` (one binary for every utility) runs only by its
+        // own name.
+        let sleep = which::which("sleep")
+            .ok()
+            .and_then(|sleep| sleep.canonicalize().ok())
+            .expect("sleep on PATH");
+        if sleep.file_name() != Some(std::ffi::OsStr::new("sleep")) {
+            eprintln!("skipping: {} is a multi-call binary", sleep.display());
+            return;
+        }
+        let cmplog = dir.join("main_afl_cmplog");
+        fs::copy(&sleep, &cmplog).unwrap();
+        let afl_dir = root.join("afl");
+        fs::create_dir_all(&afl_dir).unwrap();
+        let pids = afl_dir.join("pids");
+        let script = afl_dir.join("afl-fuzz");
+        // An afl-fuzz that starts its `-c` program in a session of its own,
+        // as AFL++'s fork server does, stops it once it runs, and exits.
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n\
+                 \x20 if [ \"$1\" = -c ]; then cmplog=$2; fi\n\
+                 \x20 shift\n\
+                 done\n\
+                 setsid \"$cmplog\" 600 &\n\
+                 pid=$!\n\
+                 want=$(readlink -f \"$cmplog\")\n\
+                 i=0\n\
+                 while [ \"$(readlink /proc/$pid/exe)\" != \"$want\" ] && [ $i -lt 500 ]; do\n\
+                 \x20 sleep 0.01; i=$((i + 1))\n\
+                 done\n\
+                 kill -STOP $pid && echo $pid >> '{}'\n\
+                 exit 0\n",
+                pids.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut prepared = prepare_afl_programmatic(
+            &work_dir,
+            "H-AFLREAP",
+            vec![non_utf8_seed()],
+            Some(Duration::from_secs(1)),
+            &[],
+            actionability::RunMode::Reporting,
+            0,
+            &[],
+            None,
+        )
+        .unwrap();
+        prepared.afl_path = Some(afl_dir);
+        prepared.afl_max_len = None;
+        let summary = run_afl_plus_plus(prepared).expect("the AFL pass runs");
+        assert_eq!(
+            summary
+                .afl
+                .as_ref()
+                .and_then(|afl| afl.cmplog_binary.as_ref()),
+            Some(&cmplog),
+            "afl-fuzz ran with -c"
+        );
+        let pids: Vec<i32> = fs::read_to_string(&pids)
+            .expect("afl-fuzz started its CmpLog program")
+            .lines()
+            .map(|pid| pid.trim().parse().unwrap())
+            .collect();
+        let left: Vec<i32> = pids
+            .iter()
+            .copied()
+            .filter(|pid| {
+                fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                    stat.rsplit_once(") ")
+                        .is_some_and(|(_, rest)| !rest.starts_with('Z'))
+                })
+            })
+            .collect();
+        // Nothing this test started outlives it, whatever it asserts.
+        for pid in &left {
+            // SAFETY: signalling a process this test's stand-in started.
+            unsafe {
+                libc::kill(*pid, libc::SIGCONT);
+                libc::kill(*pid, libc::SIGKILL);
+            }
+        }
+        assert_eq!(left, Vec::<i32>::new(), "main_afl_cmplog left running");
     }
 
     #[test]

@@ -10,15 +10,19 @@ pub struct ExportArgs {
     #[command(subcommand)]
     pub command: Option<ExportCommand>,
 
-    /// BHF work directory to inventory.
+    /// Work directory to inventory: its results/ indexes, reports, SBOM and
+    /// static reports, auto/run.json, and each finding's record, inputs and
+    /// sanitizer log.
     #[arg(long, default_value = "bhf_work")]
     pub work_dir: PathBuf,
 
-    /// Output manifest path.
+    /// Where to write the manifest JSON (each artifact's kind, path, size and
+    /// SHA-256).
     #[arg(long, required = true)]
     pub out: Option<PathBuf>,
 
-    /// Optional directory to materialize copied export artifacts for air-gapped handoff.
+    /// Also copy every listed artifact into this directory, with the manifest
+    /// as `export-manifest.json`, ready to carry to an air-gapped host.
     #[arg(long)]
     pub bundle_dir: Option<PathBuf>,
 
@@ -42,17 +46,19 @@ pub struct ExportArgs {
     #[arg(long)]
     pub runner_plan: Option<PathBuf>,
 
-    /// Required artifact kind. Repeatable.
+    /// An artifact kind the export must contain, such as `sarif` or
+    /// `findings_json`; bhf exits 1 when one is missing. Repeatable.
     #[arg(long = "require-artifact")]
     pub required_artifacts: Vec<String>,
 }
 
 #[derive(Debug, clap::Subcommand)]
 pub enum ExportCommand {
-    /// Write a standalone regression suite: each harness's sources and build
-    /// context, its corpus and its findings' minimized inputs, and a `run.sh`
-    /// that builds the harnesses against the scanned tree and fails when an
-    /// input crashes.
+    /// Write a standalone regression suite of a work directory's harnesses
+    ///
+    /// The suite holds each harness's sources and build context, its corpus
+    /// and its findings' minimized inputs, and a `run.sh` that builds the
+    /// harnesses against the scanned tree and fails when an input crashes.
     Regression(crate::export_regression::RegressionArgs),
 }
 

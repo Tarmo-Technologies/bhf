@@ -31,7 +31,8 @@ pub struct DifferentialArgs {
     #[arg(long = "harness-b", value_name = "PATH")]
     pub harness_b: Option<PathBuf>,
 
-    /// Single harness binary for metamorphic mode. Receives the input path as argv[1].
+    /// The one harness binary of metamorphic mode (`--metamorphic-transform`).
+    /// Receives the input path as argv[1].
     #[arg(long = "harness", value_name = "PATH")]
     pub harness: Option<PathBuf>,
 
@@ -52,7 +53,7 @@ pub struct DifferentialArgs {
     )]
     pub metamorphic_transforms: Vec<MetamorphicTransform>,
 
-    /// Directory of input files to replay through both harnesses.
+    /// Directory of input files to run through the harnesses.
     #[arg(long, value_name = "DIR")]
     pub inputs: PathBuf,
 
@@ -69,7 +70,7 @@ pub struct DifferentialArgs {
     )]
     pub out: Option<PathBuf>,
 
-    /// Per-side timeout in seconds.
+    /// Timeout of each harness run, in seconds.
     #[arg(long, default_value_t = 5)]
     pub timeout_secs: u64,
 }

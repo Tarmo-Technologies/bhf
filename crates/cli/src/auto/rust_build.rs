@@ -223,13 +223,21 @@ fn persist_build_stderr(auto_dir: &Path, stderr: &str) -> Option<PathBuf> {
 /// on the harness + target crates, matching the symbols the C driver provides.
 /// VERIFIED to emit `__sanitizer_cov_trace_pc_guard{,_init}` and the `trace_cmp*`
 /// references the driver defines.
-fn sancov_rustflags() -> String {
+///
+/// `-Clto=off` (#409): at opt-level 1 rustc runs ThinLTO across a crate's
+/// codegen units, and with trace-pc-guard and ASan both on it made a generic
+/// instance (core's stable sort for a dependency's own type) local to one
+/// unit while another still called it, so the staticlib linked with
+/// undefined references. Either flag alone, opt-level 0, one codegen unit or
+/// no ThinLTO links; `-Zshare-generics=n` does not.
+pub(crate) fn sancov_rustflags() -> String {
     [
         "-Cpasses=sancov-module",
         "-Cllvm-args=-sanitizer-coverage-level=4",
         "-Cllvm-args=-sanitizer-coverage-trace-pc-guard",
         "-Cllvm-args=-sanitizer-coverage-trace-compares",
         "-Zsanitizer=address",
+        "-Clto=off",
     ]
     .join(" ")
 }

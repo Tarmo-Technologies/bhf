@@ -2024,6 +2024,14 @@ pub fn write_reports_with_output_limit(
                 strip_target_prefix(reason),
                 context("runtime"),
             )),
+            // #398: the target's own environment stopped it (a package `init`
+            // that panics, a global Node does not define). Nothing for bhf's
+            // maintainer to fix; the run's summary and run.json name the cause.
+            crate::auto::attempt::Outcome::BuiltNotEntered { entry_miss, .. }
+                if entry_miss == "target_environment" =>
+            {
+                None
+            }
             // #95: built + ran but the target was never entered — a coverage gap,
             // surfaced distinctly so a maintainer can tell it apart from a build
             // failure or an unsupported type.

@@ -22,12 +22,11 @@ pub struct MinimizeArgs {
     #[arg(long, value_name = "ID_OR_DIR")]
     pub finding: Option<PathBuf>,
 
-    /// Harness binary path. Optional: when omitted it is resolved from the
-    /// finding's recorded `fixture_path` or `harness_id` the way `bhf replay`
-    /// resolves it (`<work>/{harnesses,auto,generated_harnesses,build}/<harness_id>/main`).
-    /// Not used for a session finding (HDF-7), which minimizes by re-driving
-    /// the recorded multi-message session rather than re-running a harness
-    /// binary.
+    /// Harness binary path. Without it, bhf finds the harness from the
+    /// finding's recorded `fixture_path` or `harness_id`, as `bhf replay` does
+    /// (`<work>/{harnesses,auto,generated_harnesses,build}/<harness_id>/main`).
+    /// A session finding (from `bhf fuzz --protocol-profile`) is minimized by
+    /// re-driving its recorded multi-message session, so it takes no harness.
     #[arg(long)]
     pub harness: Option<PathBuf>,
 
@@ -47,15 +46,17 @@ pub struct MinimizeArgs {
     )]
     pub qemu_args: Vec<String>,
 
-    /// Sandbox wrapper for harness execution.
+    /// Sandbox the harness runs in. `auto` uses bubblewrap, else firejail, and
+    /// runs without one when neither works on this host.
     #[arg(long, value_enum, default_value_t = SandboxModeArg::Auto)]
     pub sandbox: SandboxModeArg,
 
-    /// Override sandbox wrapper executable.
+    /// The firejail or bubblewrap executable to use.
     #[arg(long, value_name = "PATH", requires = "sandbox")]
     pub sandbox_tool: Option<PathBuf>,
 
-    /// Fail if the requested sandbox tool is unavailable.
+    /// Fail when the requested sandbox is unavailable, in place of running
+    /// without it.
     #[arg(long)]
     pub sandbox_strict: bool,
 
@@ -81,9 +82,9 @@ pub struct MinimizeArgs {
     #[arg(long)]
     pub allow_other_crash: bool,
 
-    /// Relocate an on-target transport finding's endpoint to `HOST:PORT`, as
-    /// `bhf replay --transport-endpoint` does. Applies to agent:tcp / gdb
-    /// transport findings.
+    /// Minimize an on-target transport finding against `HOST:PORT` in place of
+    /// the endpoint it records, as `bhf replay --transport-endpoint` does.
+    /// Applies to agent:tcp and gdb transport findings.
     #[arg(long = "transport-endpoint", value_name = "HOST:PORT")]
     pub transport_endpoint: Option<String>,
 }

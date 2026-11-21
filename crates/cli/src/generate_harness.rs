@@ -39,22 +39,25 @@ pub struct GenerateHarnessArgs {
     #[arg(long)]
     pub target: Option<String>,
 
-    /// Disambiguate duplicate definitions: generate for the definition
-    /// at exactly this 1-based line (as printed by list-targets / auto
-    /// discovery). Falls back to name matching when the line no longer
-    /// matches any definition.
+    /// Pick one of several definitions with the same name: the one at this
+    /// 1-based line, as `bhf list targets` prints it. When no definition is at
+    /// that line any more, the name alone selects.
     #[arg(long = "target-line")]
     pub target_line: Option<u32>,
 
-    /// Output directory. Default: generated_harnesses/<harness_id>/.
+    /// Output directory; the harness goes in `<output>/<harness-id>/`.
     #[arg(long, default_value = "generated_harnesses")]
     pub output: PathBuf,
 
-    /// Harness id. Default: stable hash derived from source path and target id.
+    /// Harness id. Default: for Ada, `H-` and a hash of the source path and
+    /// the target; for C and C++, `H-C` or `H-CPP` and the target's line number
+    /// in hex (`H-CPP000A` for line 10).
     #[arg(long)]
     pub id: Option<String>,
 
-    /// Harness type. Default: direct.
+    /// Harness shape: `direct` (call the target once per input), `sequence`
+    /// (a sequence of calls on one package or handle), or, for Ada only,
+    /// `servant_direct` (a target whose first parameter is a CORBA servant).
     #[arg(long, default_value = "direct")]
     pub kind: String,
 
@@ -88,8 +91,8 @@ pub struct GenerateHarnessArgs {
     #[arg(long = "cleanup")]
     pub cleanup: Option<String>,
 
-    /// Concrete type arguments used to instantiate a templated C++ target whose
-    /// call sites offered no observed specialization (#455 / §27.5 phase 3).
+    /// Concrete type arguments for a C++ template target whose call sites show
+    /// no specialization to use.
     /// Comma-separated, positionally aligned with the template's type parameters:
     /// `--template-instantiate int,std::string`. Ignored for a non-template
     /// target, and a call-site-detected instantiation takes precedence.

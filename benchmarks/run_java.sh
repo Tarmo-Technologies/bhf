@@ -21,11 +21,11 @@ s=$(now)
 "$BHF" auto --per-target-time "$BUDGET" --work-dir "$SCRATCH/bhf/gw" "$SCRATCH/bhf" >"$SCRATCH/bhf.log" 2>&1 &
 pid=$!; ttfc="-"; crash=0
 while kill -0 "$pid" 2>/dev/null; do
-  if [ "$crash" = 0 ] && compgen -G "$SCRATCH/bhf/gw/findings/*" >/dev/null 2>&1; then ttfc=$(elapsed "$s"); crash=1; fi
+  if [ "$crash" = 0 ] && compgen -G "$SCRATCH/bhf/gw/results/findings/*" >/dev/null 2>&1; then ttfc=$(elapsed "$s"); crash=1; fi
   sleep 0.2
 done
 wait "$pid" 2>/dev/null
-echo -e "bhf(jazzer)\t0\t$crash\t$ttfc\t-" >> "$RES"
+echo -e "bhf(builtin)\t0\t$crash\t$ttfc\t-" >> "$RES"
 echo "bhf java: crash=$crash ttfc=$ttfc"; grep -iE "built\+fuzzed|finding|failed|jazzer" "$SCRATCH/bhf.log" | head -3
 
 # --- Jazzer: compile the target + the hand-written harness, then fuzz ---

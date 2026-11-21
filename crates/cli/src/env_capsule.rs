@@ -98,7 +98,7 @@ pub struct EnvCapsuleArgs {
     #[arg(long = "finding-id", value_name = "ID")]
     pub finding_id: Option<String>,
 
-    /// Directory to write capsules under. Default `<work-dir>/env-capsules`.
+    /// Directory to write the capsules under. Default: `<work-dir>/env-capsules`.
     #[arg(long, short = 'o', value_name = "DIR")]
     pub out: Option<PathBuf>,
 }

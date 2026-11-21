@@ -113,6 +113,16 @@ class ReleaseWorkflowContracts(unittest.TestCase):
         self.assertIn('dist host --steps=create --tag="$RELEASE_TAG"', block)
         self.assertIn('RELEASE_TAG: ${{ github.ref_name }}', block)
 
+    def test_dist_manifests_are_artifacts_not_job_outputs(self):
+        # Dist manifests can exceed GitHub's 1 MB aggregate job-output limit.
+        # Keep only the small fields needed by downstream jobs in GITHUB_OUTPUT.
+        for name in ('release-plan', 'pull-request-plan', 'plan', 'host'):
+            block = self.jobs[name]
+            self.assertNotIn('outputs.manifest', block)
+            self.assertNotRegex(block, r'echo ["\']manifest=')
+            self.assertNotIn('\n      val:', block)
+        self.assertIn('jq -er \'.announcement_title | strings\' dist-manifest.json', self.jobs['host'])
+
     def test_every_release_checkout_is_pinned_and_does_not_persist_credentials(self):
         lines = self.release.splitlines()
         for index, line in enumerate(lines):

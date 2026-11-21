@@ -1,93 +1,40 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
-# PR-01: daemon and editor production-readiness handoff
+# Daemon and editor hardening (2026-09-24)
 
-Baseline: `5528a41`, reviewed 2026-09-24. Scope: `crates/daemon`,
-`crates/continuous_daemon`, `editors`, and the separately assigned
-`crates/cli/src/capsule.rs`. Findings below are based on source
-inspection; validation results are recorded at the end.
+This page records the defects found in `crates/daemon`, `crates/continuous_daemon`, `editors/` and `crates/cli/src/capsule.rs` at commit `5528a41`, and what bhf does now. [Daemon JSON-RPC](daemon-json-rpc.md), [VS Code Thin Client](vscode-thin-client.md) and [GNAT Studio Plugin](gnatstudio-plugin.md) describe the current behavior.
 
-## Confirmed defects and acceptance checks
+## Defects and fixes
 
-1. **P1, VS Code finding command injection.** `editors/vscode/src/commands.ts`
-   returns `finding.replay.command` verbatim when no harness override is set;
-   `extension.ts` passes it to `Terminal.sendText(..., true)`. Findings are loaded
-   from on-disk JSON through the daemon. A finding containing shell operators
-   therefore executes those operators when the user invokes Replay. Build replay
-   from the configured CLI and a finding path, and pass both through an
-   argument-based process execution. Check that stored command text is ignored
-   and that path metacharacters remain literal arguments.
-2. **P1, scheduler reuses job IDs after restart.** `Scheduler::start` restores
-   `jobs.jsonl` into `seen` but leaves `next_id = 0`; `submit` then issues
-   `J-000000` again. Worker state transitions update the first matching ID,
-   which can strand the new job in Queued or misreport the old job. Derive the
-   next ID from restored records, and test submission after restart.
-3. **P1, scheduler persistence can lose acknowledged jobs.** `submit` drops the
-   state mutex before `persist`, and `persist_locked` also builds a snapshot
-   under that mutex then writes after releasing it. Multiple writers can
-   overwrite a newer snapshot with an older one; all write errors are ignored.
-   Serialize persistence with state updates, use an atomic replacement, and
-   surface submission persistence errors. Test restart visibility and failure.
-4. **P2, authenticated static scan can write outside workspace.** In
-   `crates/daemon/src/lib.rs`, `staticScan` validates an explicit `out` path
-   but `static_scan` defaults absent `out` to relative `bhf_work/static`, resolved
-   from the daemon process cwd. A tenant whose workspace differs from cwd can
-   trigger an out-of-workspace write. Resolve the default within the authorized
-   workspace or validate its actual resolved destination; add a tenant test.
-5. **P2, editor protocol/lifecycle hardening.** The VS Code `FrameDecoder`
-   accumulates stdout without a size bound and throws on malformed frames from
-   a stream event; the GNAT Studio client reads frames without a size bound and
-   pipes stderr without draining it. Confirm practical limits and handle protocol
-   failures as request errors, with regression checks.
-6. **P1, capsule path deletion from finding metadata.** `build_capsule` joins
-   an unvalidated on-disk finding ID to the output directory and calls
-   `remove_dir_all` on that result. Its unvalidated harness ID also feeds
-   `harness_dir`. Reject IDs containing path separators, special components,
-   or platform drive syntax before any filesystem access. A hostile ID test
-   must preserve a sentinel outside the capsule output.
-7. **P1, predictable verifier scratch deletion.** `ScratchDir::new` first
-   removes `/tmp/bhf-verify-poc-<pid>`. Use a unique `tempfile::TempDir` whose
-   ownership is tied to the current invocation; no preexisting directory may
-   be removed.
-8. **P2, capsule packaging failure appears successful.** `run` prints skipped
-   build errors only in verbose mode and always exits zero; `make_tarball`
-   ignores process launch and nonzero statuses. Report failures and return
-   nonzero when requested packaging fails, including tar creation.
-9. **P1, VS Code terminal command quoting depends on the user's shell.** After
-   removing the stored replay command, `commands.ts` still builds a POSIX-quoted
-   command string, and `extension.ts` sends it to the current integrated shell.
-   `cmd.exe` does not treat single quotes as argument delimiters, so a finding
-   ID or configured path with shell operators can be interpreted as commands.
-   Replay/minimize now use a VS Code process task with a separate executable
-   and argument vector. Task terminals show output and process exit status;
-   tests confirm metacharacters remain literal arguments and stored replay
-   text is ignored.
+| # | Priority | Defect at `5528a41` | Current behavior |
+|---|---|---|---|
+| 1 | P1 | VS Code Replay sent a finding's stored `replay.command` to the terminal, so shell operators in on-disk finding JSON ran when the user clicked Replay. | Replay and minimize build the command from the configured CLI and the finding path, and ignore stored command text. |
+| 2 | P1 | The scheduler restored `jobs.jsonl` on start but restarted job IDs at `J-000000`, so a new job could reuse an old ID and be stranded in `Queued` or misreported. | The next ID is derived from the restored records. |
+| 3 | P1 | Job persistence wrote snapshots outside the state lock and ignored write errors, so concurrent writers could replace a newer snapshot with an older one. | `jobs.jsonl` is written to a temporary file, synced, and renamed into place (the directory is synced on Unix); a failed write is reported to the submitter. |
+| 4 | P2 | An authenticated `staticScan` with no `out` wrote to `bhf_work/static` relative to the daemon's working directory, which could be outside the tenant's workspace. | For a tenant, the default `out` is `<workspace root>/bhf_work/static`, and every output path is authorized against the workspace. |
+| 5 | P2 | The VS Code frame decoder and the GNAT Studio client read frames with no size bound; malformed frames threw from a stream event. | Both clients cap a header at 8192 bytes and a frame at 64 MiB, and treat protocol failures as request errors. |
+| 6 | P1 | `build_capsule` joined an unvalidated finding ID to the output directory and called `remove_dir_all` on the result; the harness ID was also unvalidated. | Finding and harness IDs are validated before any filesystem access. |
+| 7 | P1 | `verify-poc` removed a predictable `/tmp/bhf-verify-poc-<pid>` before use. | It uses a fresh `tempfile` directory owned by the current invocation. |
+| 8 | P2 | `bhf capsule` printed build errors only in verbose mode, ignored `tar` failures, and always exited zero. | Each skipped or failed finding is printed with its reason, a failed `tar` run is an error, and the exit code reflects the failures. |
+| 9 | P1 | VS Code sent a POSIX-quoted command string to the user's integrated shell; `cmd.exe` does not treat single quotes as delimiters. | Replay and minimize run as VS Code process tasks with a separate executable and argument vector; task terminals show the output and exit status. |
 
-## Residual review areas
+## Related changes since
 
-- The scheduler's `Drop` joins workers after signaling shutdown; a running
-  `bhf fuzz` process may block shutdown until it exits. Its configured time
-  budget is passed to the CLI only; verify CLI enforcement before promising a
-  bounded shutdown.
-- Tenant path authorization uses canonicalization followed by later file access,
-  leaving a filesystem race if other principals can mutate workspace links.
-  Containing this requires path handling shared with the called scan engines.
-- The daemon returns response bodies without a corresponding output-size limit;
-  a very large findings directory may exhaust memory or break editor clients.
-- Native VS Code task execution on Windows still needs a Windows extension-host
-  smoke check; unit tests verify the argument vector and TypeScript API shape,
-  but this Linux review host cannot exercise the Windows task runner.
-- GNAT Studio's synchronous `read_frame` has no deadline if the daemon stops
-  responding without exiting; the new size limits do not solve that stall.
+- The daemon bounds a `findings` response: the number of findings and the raw and normalized bytes it loads scale with the daemon's memory budget.
+- On Linux, a tenant's paths are pinned for the call with `openat2` (`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`); see [Daemon: Security Modes](site/daemon.md#security-modes).
+- The GNAT Studio plugin's `daemon-timeout-seconds` preference (default 30) bounds a findings refresh and terminates the daemon process when it passes.
+- Scheduler shutdown signals the workers and waits for them until a deadline (the shutdown timeout within which workers kill and reap their jobs, plus a fixed slack). A thread still running after that is joined in the background, and that thread holds the data directory's lock until it ends.
 
-## Validation
+## Open item
 
-- VS Code: `npm test --prefix editors/vscode` — 18/18 passed after the process
-  task change, including literal metacharacter arguments.
-- GNAT Studio: `python3 -m unittest discover -s editors/gnatstudio/tests`
-  — 14/14 passed.
-- `cargo test -p continuous_daemon -p bhf-daemon --lib --offline` —
-  16/16 scheduler tests and 20/20 daemon tests passed.
-- `cargo test -p bhf --lib capsule::tests --offline` — 12/12 matching
-  capsule/environment tests passed.
-- `git diff --check` — passed. Rust formatting was applied only to the three
-  edited Rust source files because other review packages own concurrent changes.
+VS Code process tasks have unit tests for the argument vector and API shape; they have not been run in a Windows extension host.
+
+## Tests
+
+```sh
+npm test --prefix editors/vscode
+python3 -m unittest discover -s editors/gnatstudio/tests
+cargo test -p continuous_daemon -p bhf-daemon --lib --offline
+cargo test -p bhf --lib capsule::tests --offline
+```
+
+The VS Code tests check that metacharacters stay literal arguments and that stored replay text is ignored.

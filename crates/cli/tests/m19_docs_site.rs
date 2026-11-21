@@ -36,21 +36,21 @@ fn docs_site_sources_cover_m19_topics() {
     let root = repo_root();
     let required_pages = [
         ("index", "no public host serves it yet"),
-        ("architecture", "hosting architecture"),
+        ("architecture", "docs site"),
         ("instrumentation", "instrumentation"),
         ("fake-corba", "fake-CORBA"),
         ("licensing", "license audit"),
-        ("cli", "bhf CLI"),
+        ("cli", "# CLI"),
         ("c-cpp", "C and C++ Fuzzing"),
-        ("cross-compilation", "cross-compilation"),
-        ("daemon", "JSON-RPC daemon"),
+        ("cross-compilation", "cross-compil"),
+        ("daemon", "JSON-RPC"),
         ("custom-harness", "Custom C and C++ Harnesses"),
     ];
 
     for (slug, required_text) in required_pages {
-        let source = read(root.join(format!("docs/site/{slug}.md")));
+        let source = read(root.join(format!("docs/site/{slug}.md"))).to_lowercase();
         assert!(
-            source.contains(required_text),
+            source.contains(&required_text.to_lowercase()),
             "docs/site/{slug}.md should mention {required_text:?}"
         );
     }
@@ -162,8 +162,122 @@ fn docs_site_generator_emits_html_pages_and_metadata() {
 /// (#228): it reached the page as literal Markdown.
 #[test]
 fn the_docs_build_fails_on_a_broken_relative_link() {
+    let (scratch, output) = build_with_cli_md_appended(
+        "m19-docs-broken-link",
+        "\nSee [the missing page](no-such-page.md).\n",
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("cli.md -> no-such-page.md"), "{stderr}");
+    let _ = fs::remove_dir_all(&scratch);
+}
+
+/// Every heading, `#` to `######`, gets the anchor GitHub gives it (#453):
+/// the site turned `_` and `.` into `-` and gave `####` headings no anchor,
+/// so links that work on GitHub jumped nowhere on the site.
+#[test]
+fn the_docs_site_gives_every_heading_githubs_anchor() {
     let root = repo_root();
-    let scratch = root.join("target/m19-docs-broken-link");
+    let output_dir = root.join("target/m19-docs-site-anchors");
+    let _ = fs::remove_dir_all(&output_dir);
+    let status = Command::new(PYTHON)
+        .arg("scripts/docs/build-site.py")
+        .arg("--out")
+        .arg(&output_dir)
+        .current_dir(&root)
+        .status()
+        .expect("run the docs site generator");
+    assert!(status.success(), "docs site generator failed: {status}");
+    for (page, heading) in [
+        ("auto", r#"<h3 id="needed_for_build">"#),
+        ("auto", r#"<h3 id="runjson">"#),
+        ("auto", r#"<h3 id="stub_execution-false-clean-guard">"#),
+        (
+            "sanitizers",
+            r#"<h2 id="tuning-sanitizers-with-san_options">"#,
+        ),
+        ("cli", r#"<h4 id="reference-profiles">"#),
+        ("cli", r#"<h4 id="giop-profiles">"#),
+        ("on-target-fuzzing", r#"<h4 id="ring-format">"#),
+        ("on-target-fuzzing", r#"<h4 id="persistent-loop">"#),
+        ("on-target-fuzzing", r#"<h4 id="fast-snapshot">"#),
+        ("on-target-fuzzing", r#"<h4 id="renode-boards">"#),
+    ] {
+        let html = read(output_dir.join(page).join("index.html"));
+        assert!(html.contains(heading), "{page}: no {heading}");
+    }
+    // `####` is a heading, not a paragraph that starts with hashes.
+    let cli = read(output_dir.join("cli/index.html"));
+    assert!(!cli.contains("<p>#### "), "an h4 rendered as a paragraph");
+    let _ = fs::remove_dir_all(&output_dir);
+}
+
+/// A link to a heading that does not exist fails the build (#453), on
+/// another page or on the same one; GitHub's anchors for the others pass:
+/// a repeated heading's `-1`, a code span, an `#####` heading.
+#[test]
+fn the_docs_build_fails_on_a_link_to_a_missing_heading() {
+    let (scratch, output) = build_stub_site(
+        "m19-docs-broken-anchor",
+        &[
+            (
+                "cli.md",
+                "# CLI\n\nSee [the key](auto.md#no-such-key), [above](#no-such-section), \
+                 [usage](auto.md#usage-1), [top](#cli) and [deep](#deep_key-name).\n\n\
+                 ##### `deep_key` name\n",
+            ),
+            ("auto.md", "# Auto\n\n## Usage\n\n## Usage\n"),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("cli/index.html -> ../auto/#no-such-key (no such heading)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("cli/index.html -> #no-such-section (no such heading)"),
+        "{stderr}"
+    );
+    for good in ["#usage-1", "#cli ", "#deep_key-name"] {
+        assert!(!stderr.contains(good), "{good}: {stderr}");
+    }
+    let _ = fs::remove_dir_all(&scratch);
+}
+
+/// Build the site from stub pages, one `# Title` per docs/site page, with
+/// `pages` (name, Markdown) in place of their stubs.
+fn build_stub_site(name: &str, pages: &[(&str, &str)]) -> (PathBuf, std::process::Output) {
+    let root = repo_root();
+    let scratch = root.join("target").join(name);
+    let _ = fs::remove_dir_all(&scratch);
+    let source = scratch.join("site");
+    fs::create_dir_all(&source).unwrap();
+    for entry in fs::read_dir(root.join("docs/site")).unwrap().flatten() {
+        let file = entry.file_name();
+        if file.to_string_lossy().ends_with(".md") {
+            fs::write(source.join(&file), "# Page\n").unwrap();
+        }
+    }
+    for (file, text) in pages {
+        fs::write(source.join(file), text).unwrap();
+    }
+    let output = Command::new(PYTHON)
+        .arg("scripts/docs/build-site.py")
+        .arg("--source")
+        .arg(&source)
+        .arg("--out")
+        .arg(scratch.join("out"))
+        .current_dir(&root)
+        .output()
+        .expect("run the docs site generator");
+    (scratch, output)
+}
+
+/// Build the site from a copy of docs/site whose cli.md ends with `extra`.
+fn build_with_cli_md_appended(name: &str, extra: &str) -> (PathBuf, std::process::Output) {
+    let root = repo_root();
+    let scratch = root.join("target").join(name);
     let _ = fs::remove_dir_all(&scratch);
     let source = scratch.join("site");
     fs::create_dir_all(&source).unwrap();
@@ -180,7 +294,7 @@ fn the_docs_build_fails_on_a_broken_relative_link() {
     }
     let cli = source.join("cli.md");
     let mut text = read(&cli);
-    text.push_str("\nSee [the missing page](no-such-page.md).\n");
+    text.push_str(extra);
     fs::write(&cli, text).unwrap();
     let output = Command::new(PYTHON)
         .arg("scripts/docs/build-site.py")
@@ -191,10 +305,7 @@ fn the_docs_build_fails_on_a_broken_relative_link() {
         .current_dir(&root)
         .output()
         .expect("run the docs site generator");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!output.status.success(), "{stderr}");
-    assert!(stderr.contains("cli.md -> no-such-page.md"), "{stderr}");
-    let _ = fs::remove_dir_all(&scratch);
+    (scratch, output)
 }
 
 /// index.md and the site builder's DEFAULT_BASE_URL name the same public

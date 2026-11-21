@@ -7,15 +7,15 @@ mod comparison;
 
 #[derive(Debug, clap::Args)]
 pub struct ReportArgs {
-    /// Run identifier used for output file names.
+    /// Run name used in the output file names.
     #[arg(long, default_value = "last")]
     pub run: String,
 
-    /// Work directory whose results/ to rebuild (the default mode).
+    /// Work directory whose results/ to rebuild (work-dir mode, the default).
     #[arg(long = "work-dir", default_value = "bhf_work", conflicts_with_all = ["findings", "out"])]
     pub work_dir: PathBuf,
 
-    /// Explicit mode: findings root containing one subdirectory per finding.
+    /// Explicit mode: a findings directory with one subdirectory per finding.
     #[arg(long)]
     pub findings: Option<PathBuf>,
 
@@ -23,7 +23,7 @@ pub struct ReportArgs {
     #[arg(long)]
     pub out: Option<PathBuf>,
 
-    /// Learned confidence model produced by bhf model train.
+    /// Confidence model from `bhf model train`, used to score the findings.
     #[arg(long)]
     pub model: Option<PathBuf>,
 
@@ -48,18 +48,19 @@ pub struct ReportArgs {
     #[arg(long = "gitlab-sast")]
     pub gitlab_sast: bool,
 
-    /// Collapse non-representative findings inside each cluster under
-    /// their representative in the Markdown report.
+    /// In the Markdown report, list each cluster's other findings under its
+    /// representative finding.
     #[arg(long)]
     pub collapse_clusters: bool,
 
-    /// Compare against a saved bhf.report.v2 JSON report; emit JSON, Markdown,
-    /// and standalone offline HTML showing new, persistent, and unobserved issues.
+    /// Compare with a saved bhf.report.v2 JSON report, and write JSON, Markdown
+    /// and a self-contained HTML page of the new, persistent and no longer
+    /// observed findings.
     #[arg(long)]
     pub baseline: Option<PathBuf>,
 
-    /// Carry operator decisions from a bhf.triage.v1 JSON file into the comparison.
-    /// Never suppresses findings or changes their security verdicts.
+    /// Show the triage decisions of a bhf.triage.v1 JSON file in the
+    /// comparison. Every finding and its security verdict stay as they are.
     #[arg(long, requires = "baseline")]
     pub triage: Option<PathBuf>,
 

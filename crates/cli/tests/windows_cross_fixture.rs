@@ -451,3 +451,360 @@ fn bhf_auto_cross_builds_and_fuzzes_a_windows_guarded_cpp_target_under_wine() {
         "the wild-write crash in the C++ target must be found under wine ({execs} execs)"
     );
 }
+
+/// The `name` target's entry in a `bhf auto` work dir's `run.json`.
+fn attempt_named(work: &Path, name: &str) -> serde_json::Value {
+    let run_json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(work.join("auto").join("run.json")).expect("run.json exists"),
+    )
+    .expect("run.json parses");
+    run_json
+        .get("targets")
+        .or_else(|| run_json.get("attempts"))
+        .and_then(|v| v.as_array())
+        .expect("run.json has a targets/attempts array")
+        .iter()
+        .find(|a| a.get("name").and_then(|n| n.as_str()) == Some(name))
+        .unwrap_or_else(|| panic!("{name} was attempted; run.json:\n{run_json:#}"))
+        .clone()
+}
+
+/// Stop the Wine server of a prefix a test created, so nothing writes into
+/// it while the test dir is removed.
+fn stop_wine_server(prefix: &Path) {
+    for flag in ["-k", "-w"] {
+        let _ = Command::new("wineserver")
+            .arg(flag)
+            .env("WINEPREFIX", prefix)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// #394: from a Wine prefix that does not exist yet, `bhf auto` creates it
+/// before the first harness starts, so the first run fuzzes the target
+/// instead of timing every input out while Wine sets the prefix up.
+#[test]
+fn bhf_auto_creates_a_missing_wine_prefix_and_fuzzes_on_the_first_run() {
+    let Some(_tools) = WindowsTools::discover() else {
+        eprintln!("skipping: requires x86_64-w64-mingw32-gcc and wine");
+        return;
+    };
+    if which::which("wineserver").is_err() {
+        eprintln!("skipping: requires wineserver");
+        return;
+    }
+
+    let dir = temp_dir("auto-win-fresh-prefix");
+    std::fs::write(dir.join("win_parser.c"), WIN_PARSER_FIXTURE).expect("fixture written");
+    let work = dir.join("work");
+    let prefix = dir.join("wine-prefix");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .args(["auto"])
+        .arg(&*dir)
+        .args([
+            "--per-target-time",
+            "10",
+            "--max-targets",
+            "4",
+            "--work-dir",
+        ])
+        .arg(&work)
+        .env("WINEPREFIX", &prefix)
+        .env_remove("WINESERVER")
+        .stdin(Stdio::null())
+        .output()
+        .expect("bhf runs");
+    stop_wine_server(&prefix);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("creating the Wine prefix"),
+        "bhf says it creates the prefix; stderr:\n{stderr}"
+    );
+    assert!(
+        prefix.join("system.reg").is_file(),
+        "the prefix is created; stderr:\n{stderr}"
+    );
+    assert!(
+        output.status.success(),
+        "bhf auto exits 0 on the first run in a new prefix; stderr:\n{stderr}"
+    );
+
+    let parse_record = attempt_named(&work, "parse_record");
+    let outcome = &parse_record["outcome"];
+    assert_eq!(
+        outcome["outcome"], "built_and_fuzzed",
+        "the first run enters the target; stderr:\n{stderr}"
+    );
+    let passes = outcome["passes"].as_array().expect("passes");
+    let execs: u64 = passes.iter().filter_map(|p| p["executions"].as_u64()).sum();
+    let findings: usize = passes
+        .iter()
+        .filter_map(|p| p["findings"].as_array())
+        .map(Vec::len)
+        .sum();
+    assert!(execs > 0, "inputs run under wine, got {execs}");
+    assert!(
+        findings > 0,
+        "the wild write is found on the first run ({execs} execs)"
+    );
+}
+
+/// #394: a Wine that cannot create its prefix makes the target a toolchain
+/// problem with Wine's own words, not a target that was never entered.
+#[cfg(unix)]
+#[test]
+fn a_wine_prefix_that_cannot_be_created_is_a_toolchain_error() {
+    use std::os::unix::fs::PermissionsExt as _;
+    if mingw_cc().is_none() {
+        eprintln!("skipping: no x86_64-w64-mingw32-gcc on PATH");
+        return;
+    }
+
+    let dir = temp_dir("auto-win-broken-prefix");
+    std::fs::write(dir.join("win_parser.c"), WIN_PARSER_FIXTURE).expect("fixture written");
+    let work = dir.join("work");
+    let bin = dir.join("bin");
+    std::fs::create_dir(&bin).expect("bin dir is created");
+    let wine = bin.join("wine");
+    std::fs::write(
+        &wine,
+        "#!/bin/sh\necho 'wine: could not set up the configuration directory' >&2\nexit 1\n",
+    )
+    .expect("stand-in wine is written");
+    std::fs::set_permissions(&wine, std::fs::Permissions::from_mode(0o755))
+        .expect("stand-in wine is executable");
+    let path = std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("PATH joins");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .args(["auto"])
+        .arg(&*dir)
+        .args(["--per-target-time", "5", "--max-targets", "4", "--work-dir"])
+        .arg(&work)
+        .env("PATH", path)
+        .env("WINEPREFIX", dir.join("wine-prefix"))
+        .stdin(Stdio::null())
+        .output()
+        .expect("bhf runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let outcome = attempt_named(&work, "parse_record")["outcome"].clone();
+    assert_eq!(
+        outcome["outcome"], "missing_toolchain",
+        "a prefix Wine cannot create is a toolchain problem; outcome:\n{outcome:#}\nstderr:\n{stderr}"
+    );
+    let reason = outcome["reason"].as_str().expect("a reason");
+    assert!(reason.contains("Wine prefix"), "{reason}");
+    assert!(
+        reason.contains("could not set up the configuration directory"),
+        "Wine's own words are kept: {reason}"
+    );
+}
+
+/// The finding directories of a work dir.
+fn finding_dirs(work: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(work.join("results").join("findings"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|dir| dir.join("finding.json").is_file())
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+/// #394: a Windows finding replayed where the Wine prefix does not exist yet
+/// (a new machine, a fresh `WINEPREFIX`) reproduces on the first replay:
+/// bhf creates the prefix before the harness starts. The replay had run out
+/// its timeout while Wine set the prefix up.
+#[test]
+fn a_windows_finding_replays_from_a_fresh_wine_prefix() {
+    let Some(_tools) = WindowsTools::discover() else {
+        eprintln!("skipping: requires x86_64-w64-mingw32-gcc and wine");
+        return;
+    };
+    if which::which("wineserver").is_err() {
+        eprintln!("skipping: requires wineserver");
+        return;
+    }
+
+    let dir = temp_dir("replay-win-fresh-prefix");
+    std::fs::write(dir.join("win_parser.c"), WIN_PARSER_FIXTURE).expect("fixture written");
+    let work = dir.join("work");
+    let fuzzed_in = dir.join("wine-prefix-fuzz");
+    let fuzz = Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .args(["auto"])
+        .arg(&*dir)
+        .args([
+            "--per-target-time",
+            "10",
+            "--max-targets",
+            "4",
+            "--work-dir",
+        ])
+        .arg(&work)
+        .env("WINEPREFIX", &fuzzed_in)
+        .env_remove("WINESERVER")
+        .stdin(Stdio::null())
+        .output()
+        .expect("bhf auto runs");
+    stop_wine_server(&fuzzed_in);
+    let fuzz_stderr = String::from_utf8_lossy(&fuzz.stderr);
+    let finding = finding_dirs(&work)
+        .into_iter()
+        .find(|dir| {
+            std::fs::read_to_string(dir.join("finding.json"))
+                .is_ok_and(|text| text.contains("parse_record"))
+        })
+        .unwrap_or_else(|| panic!("bhf auto finds the wild write; stderr:\n{fuzz_stderr}"));
+
+    let replayed_in = dir.join("wine-prefix-replay");
+    // `--sandbox none`: this test is about the prefix, and runs the harness
+    // as a host without a sandbox tool does.
+    let replay = Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .arg("replay")
+        .arg(&finding)
+        .args(["--sandbox", "none", "--json"])
+        .env("WINEPREFIX", &replayed_in)
+        .env_remove("WINESERVER")
+        .stdin(Stdio::null())
+        .output()
+        .expect("bhf replay runs");
+    stop_wine_server(&replayed_in);
+    let stderr = String::from_utf8_lossy(&replay.stderr);
+    let stdout = String::from_utf8_lossy(&replay.stdout);
+    assert!(
+        stderr.contains("creating the Wine prefix"),
+        "bhf replay creates the prefix first; stderr:\n{stderr}"
+    );
+    assert!(
+        replayed_in.join("system.reg").is_file(),
+        "the prefix is created; stderr:\n{stderr}"
+    );
+    let verdict: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("{error}: stdout:\n{stdout}\nstderr:\n{stderr}"));
+    assert_eq!(
+        verdict["verdict"], "match",
+        "the first replay in a new prefix reproduces the crash: {verdict:#}\nstderr:\n{stderr}"
+    );
+}
+
+/// An executable shell script at `path`.
+#[cfg(unix)]
+fn write_script(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::write(path, format!("#!/bin/sh\n{body}\n")).expect("script is written");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .expect("script is executable");
+}
+
+/// #394: `bhf binary fuzz --runner wine` (what `bhf project` runs for a
+/// Windows binary) creates a missing prefix before the target's first run,
+/// and so does a replay of its finding. A stand-in `wine` records how it is
+/// run, creates the prefix's registry for `wineboot --init` and otherwise
+/// runs the target.
+#[cfg(unix)]
+#[test]
+fn binary_fuzz_under_wine_creates_a_missing_prefix_before_the_first_run() {
+    let dir = temp_dir("binary-wine-prefix");
+    let calls = dir.join("calls.log");
+    let wine = dir.join("wine");
+    write_script(
+        &wine,
+        &format!(
+            "if [ \"$1 $2\" = 'wineboot --init' ]; then\n\
+             \x20 echo \"wineboot WINEDEBUG=$WINEDEBUG\" >> '{log}'\n\
+             \x20 mkdir -p \"$WINEPREFIX\" && echo 'WINE REGISTRY' > \"$WINEPREFIX/system.reg\"\n\
+             \x20 exit 0\n\
+             fi\n\
+             echo \"run $1\" >> '{log}'\n\
+             exec \"$@\"",
+            log = calls.display()
+        ),
+    );
+    write_script(
+        &dir.join("wineserver"),
+        &format!("echo \"wineserver $*\" >> '{}'", calls.display()),
+    );
+    // A target that crashes on every input.
+    let target = dir.join("parse_record.exe");
+    write_script(&target, "kill -SEGV $$");
+    let prefix = dir.join("wine-prefix");
+    let work = dir.join("work");
+    let bhf = |args: &[&std::ffi::OsStr]| {
+        Command::new(env!("CARGO_BIN_EXE_bhf"))
+            .args(args)
+            .env("WINEPREFIX", &prefix)
+            .env_remove("WINESERVER")
+            .env_remove("WINEDLLOVERRIDES")
+            .stdin(Stdio::null())
+            .output()
+            .expect("bhf runs")
+    };
+    let fuzz = bhf(&[
+        "binary".as_ref(),
+        "fuzz".as_ref(),
+        target.as_os_str(),
+        "--runner".as_ref(),
+        wine.as_os_str(),
+        "--engine".as_ref(),
+        "builtin".as_ref(),
+        "--sandbox".as_ref(),
+        "none".as_ref(),
+        "--iterations".as_ref(),
+        "2".as_ref(),
+        "--seed-input".as_ref(),
+        "AAAA".as_ref(),
+        "--work-dir".as_ref(),
+        work.as_os_str(),
+    ]);
+    let stderr = String::from_utf8_lossy(&fuzz.stderr);
+    let log = std::fs::read_to_string(&calls).unwrap_or_default();
+    let first: Vec<&str> = log.lines().take(3).collect();
+    assert_eq!(
+        first,
+        [
+            "wineboot WINEDEBUG=-all",
+            "wineserver --wait",
+            format!("run {}", target.display()).as_str()
+        ],
+        "the prefix is created before the target first runs; stderr:\n{stderr}"
+    );
+    let findings = finding_dirs(&work);
+    assert_eq!(
+        findings.len(),
+        1,
+        "the crash is a finding; stderr:\n{stderr}"
+    );
+
+    // The finding replayed on a machine with no prefix yet.
+    std::fs::remove_dir_all(&prefix).expect("the prefix is removed");
+    std::fs::remove_file(&calls).expect("the call log is reset");
+    let replay = bhf(&[
+        "replay".as_ref(),
+        findings[0].as_os_str(),
+        "--harness".as_ref(),
+        target.as_os_str(),
+        "--json".as_ref(),
+    ]);
+    let stderr = String::from_utf8_lossy(&replay.stderr);
+    let stdout = String::from_utf8_lossy(&replay.stdout);
+    let log = std::fs::read_to_string(&calls).unwrap_or_default();
+    assert_eq!(
+        log.lines().next(),
+        Some("wineboot WINEDEBUG=-all"),
+        "the replay creates the prefix first; calls:\n{log}\nstderr:\n{stderr}"
+    );
+    let verdict: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("{error}: stdout:\n{stdout}\nstderr:\n{stderr}"));
+    assert_eq!(
+        verdict["verdict"], "match",
+        "{verdict:#}\nstderr:\n{stderr}"
+    );
+}

@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import test from "node:test";
 
 import {
+  DEFAULT_FINDINGS_DIR,
   buildMinimizeProcess,
   buildReplayProcess,
   resolveReproducerPath,
@@ -122,4 +125,13 @@ test("resolveReproducerPath preserves absolute repro paths", () => {
     ),
     "/tmp/repro.adb",
   );
+});
+
+test("the findings directory defaults to the one bhf auto writes", () => {
+  const manifest = JSON.parse(
+    readFileSync(path.join(__dirname, "..", "..", "package.json"), "utf8"),
+  );
+  const setting = manifest.contributes.configuration.properties["bhf.findingsDir"];
+  assert.equal(DEFAULT_FINDINGS_DIR, "results/findings");
+  assert.equal(setting.default, DEFAULT_FINDINGS_DIR);
 });

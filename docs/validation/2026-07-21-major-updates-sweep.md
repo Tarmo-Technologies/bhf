@@ -2,18 +2,11 @@
 
 # Post-update 53-project validation sweep (2026-07-21)
 
-This validation was run after the RHEL 7 compatibility and generic C/C++
-driver changes. It combines the pinned broken-project matrix with the complete
-workspace and distribution checks so both legacy recovery and BHF's wider
-functionality are covered.
+This validation was run after the RHEL 7 compatibility and generic C/C++ driver changes. It combines the pinned broken-project matrix with the complete workspace and distribution checks so both legacy recovery and BHF's wider functionality are covered.
 
 ## Project sweep
 
-The canonical manifest contains 53 pinned real repositories: 29 C, 12 C++, and
-12 Ada. Each repository was run first as an unmodified control and then as a
-deliberately damaged local Git clone, for 106 project runs total. Acceptance
-requires the exact selected target to build and fuzz, positive executions and
-coverage, a recorded repair in the damaged tree, and no selected-target stub.
+The canonical manifest (`tests/fixtures/legacy_breakage_validation/expanded-manifest.toml`) contains 53 pinned real repositories: 29 C, 12 C++, and 12 Ada. Each repository was run first as an unmodified control and then as a damaged local Git clone, for 106 project runs in all. The method is the one in the [expanded breakage matrix](2026-07-19-expanded-legacy-breakage-matrix.md). Acceptance requires the exact selected target to build and fuzz, positive executions and coverage, a recorded repair in the damaged tree, and no selected-target stub.
 
 ```sh
 BHF_BIN=target/release/bhf \
@@ -31,46 +24,20 @@ python3 scripts/validation/legacy-breakage-matrix.py \
 | Verified external constraints | 6 | 6 |
 | In-scope repositories | **47/47 (100%)** | **47/47 (100%)** |
 
-The six constraints were proved by pinned repository evidence and exact runtime
-signatures: Ada Drivers Library (ARM cross-toolchain), Drake (version-matched
-GNAT runtime), GNATCOLL Bindings (separate source dependency), RE2 (absent
-Abseil source), TAMP (embedded ARM runtime/toolchain), and YAML-Ada (generated
-binding). TAMP's damaged copy ran using a host substitution, but its clean
-embedded runtime remained correctly classified as external and was not counted
-as an in-scope success.
+The six constraints were proved by pinned repository evidence and exact runtime signatures: Ada Drivers Library (ARM cross-toolchain), Drake (version-matched GNAT runtime), GNATCOLL Bindings (separate source dependency), RE2 (absent Abseil source), TAMP (embedded ARM runtime/toolchain), and YAML-Ada (generated binding). TAMP's damaged copy ran with a host substitution; its clean embedded runtime stays classified as external, so TAMP is not counted as an in-scope success.
 
-Successful repair rounds were p50 2, p95 6, p99 14, and maximum 14 under the
-configured cap of 16. Full per-scenario results are retained in the JSON and
-Markdown paths shown above; the stable manifest is checked into the repository.
+Successful repair rounds were p50 2, p95 6, p99 14, and maximum 14 under the configured cap of 16. Per-scenario results are in the JSON and Markdown files named in the command above.
 
 ## Wider regression coverage
 
-- `cargo test --workspace --no-fail-fast --quiet` passed, exercising all
-  workspace crates and real integrations across C, C++, Ada, COBOL, Fortran,
-  C#, Java, JavaScript/TypeScript, Lua, Perl, PHP, Python, Ruby, Rust, and Go,
-  plus sanitizers, coverage guidance, oracles, capsule replay, static analysis,
-  reporting, SBOM/SCA, binary analysis, and packaging.
-- Strict `cargo clippy --workspace --all-targets -- -D warnings` and
-  `cargo fmt --all -- --check` passed.
-- The 550 harness-generator tests and 1,237 CLI library tests passed after the
-  final lint cleanups.
-- The Python validation suite (14 tests), GNAT Studio helper suite (12 tests),
-  and VS Code extension suite (14 tests) passed.
+- `cargo test --workspace --no-fail-fast --quiet` passed, exercising all workspace crates and real integrations across C, C++, Ada, COBOL, Fortran, C#, Java, JavaScript/TypeScript, Lua, Perl, PHP, Python, Ruby, Rust, and Go, plus sanitizers, coverage guidance, oracles, capsule replay, static analysis, reporting, SBOM/SCA, binary analysis, and packaging.
+- Strict `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all -- --check` passed.
+- The 550 harness-generator tests and 1,237 CLI library tests passed after the final lint cleanups.
+- The Python validation suite (14 tests), GNAT Studio helper suite (12 tests), and VS Code extension suite (14 tests) passed.
 - Shell syntax, ShellCheck, and parsing of every GitHub Actions workflow passed.
 
-Two broader regressions were fixed during this pass. Sanitizer replay could
-hang indefinitely when Ubuntu supplied a remote `DEBUGINFOD_URLS`; replay now
-disables remote debuginfod lookup and the ASan bridge has a hard timeout.
-Strict linting also exposed eight redundant or unnecessarily nested parser and
-repair expressions, which were simplified without changing behavior.
+Two broader regressions were fixed during this pass. Sanitizer replay could hang indefinitely when Ubuntu supplied a remote `DEBUGINFOD_URLS`; replay now disables remote debuginfod lookup and the ASan bridge has a hard timeout. Strict linting also flagged eight redundant or needlessly nested parser and repair expressions, which were simplified with behavior unchanged.
 
 ## EL7 release confirmation
 
-The final source was rebuilt in the pinned manylinux2014 image. The ABI gate
-reported GLIBC 2.16 for `bhf` and `bhf-daemon`, and GLIBC 2.14 for the
-runtime shim, below RHEL 7's GLIBC 2.17 ceiling. The final signed offline bundle
-was then checksum-verified, installed, and fuzz-smoked on the retained CentOS
-7.9 Proxmox VM with SELinux enforcing. A planted C stack overflow was also
-found after 89 executions, packaged as a PoC capsule/tarball, and self-verified
-with the expected AddressSanitizer signature on that guest. See the
-[EL7 VM record](./2026-07-21-rhel7-proxmox.md).
+The final source was rebuilt in the pinned manylinux2014 image. The ABI gate reported GLIBC 2.16 for `bhf` and `bhf-daemon`, and GLIBC 2.14 for the runtrace shim, below RHEL 7's GLIBC 2.17 ceiling. The final signed offline bundle was then checksum-verified, installed, and fuzz-smoked on the retained CentOS 7.9 Proxmox VM with SELinux enforcing. A planted C stack-buffer overflow was also found after 89 executions, packaged as a PoC capsule/tarball, and self-verified with the expected AddressSanitizer signature on that guest. See the [EL7 VM record](./2026-07-21-rhel7-proxmox.md).

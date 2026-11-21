@@ -11,25 +11,34 @@ pub struct PackArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum PackCommand {
-    /// Create a deterministic air-gapped update pack manifest.
+    /// Write an update pack manifest that lists each item with its SHA-256
+    ///
+    /// With --signing-key the manifest is signed with Ed25519. The same inputs
+    /// give the same manifest.
     Create(CreateArgs),
-    /// Inspect an air-gapped update pack manifest without installing it.
+    /// Print an update pack manifest's contents without installing it.
     Inspect(InspectArgs),
-    /// Install a verified update pack into a local offline directory.
+    /// Verify an update pack, then copy its items into a local directory.
     Install(InstallArgs),
-    /// Verify an air-gapped update pack manifest.
+    /// Check an update pack's item hashes and signature, and a policy's limits
+    /// on it.
     Verify(VerifyArgs),
-    /// Generate an Ed25519 signing keypair (private PKCS#8 DER; public raw hex).
+    /// Generate an Ed25519 signing key pair: the private key as PKCS#8 DER,
+    /// the public key as raw hex.
     Keygen(KeygenArgs),
-    /// Sign the exact compressed distribution archive for external OpenSSL verification.
+    /// Sign a distribution archive with an Ed25519 key, for checking with OpenSSL
+    ///
+    /// Prints the archive's SHA-256.
     SignArchive(SignArchiveArgs),
     /// Build an advisory database for `bhf sbom --vuln-db` from OSV records
-    /// (an OSV ecosystem export, unzipped, or single record files).
+    ///
+    /// Takes an OSV ecosystem export (unzipped) or single record files.
     /// Malformed records are reported and skipped.
     ImportOsv(ImportFeedArgs),
-    /// Build an advisory database for `bhf sbom --vuln-db` from NVD CVE
-    /// JSON 2.0 files (yearly feeds or API responses): each vulnerable CPE
-    /// match, with its version range. Malformed records are reported and
+    /// Build an advisory database for `bhf sbom --vuln-db` from NVD CVE JSON 2.0 files
+    ///
+    /// Takes yearly feeds or API responses, and records each vulnerable CPE
+    /// match with its version range. Malformed records are reported and
     /// skipped.
     ImportNvd(ImportFeedArgs),
 }
@@ -46,33 +55,42 @@ pub struct ImportFeedArgs {
 
 #[derive(Debug, Args)]
 pub struct SignArchiveArgs {
+    /// The archive to sign, exactly as it will be distributed.
     #[arg(long)]
     pub archive: PathBuf,
+    /// Ed25519 PKCS#8 v2 DER private key file (from `bhf pack keygen`).
     #[arg(long)]
     pub signing_key: PathBuf,
+    /// Where to write the signature.
     #[arg(long)]
     pub out: PathBuf,
 }
 
 #[derive(Debug, Args)]
 pub struct KeygenArgs {
+    /// Where to write the private key (PKCS#8 DER).
     #[arg(long)]
     pub private_key: PathBuf,
+    /// Where to write the public key (raw hex).
     #[arg(long)]
     pub public_key: PathBuf,
 }
 
 #[derive(Debug, Args)]
 pub struct CreateArgs {
+    /// Directory the item paths are relative to.
     #[arg(long, default_value = ".")]
     pub root: PathBuf,
+    /// The pack's identifier.
     #[arg(long)]
     pub pack_id: String,
+    /// The pack's version.
     #[arg(long)]
     pub version: Option<String>,
     /// Pack item in kind:path form. Repeat for each item.
     #[arg(long = "item")]
     pub items: Vec<String>,
+    /// License of the pack's content, recorded in the manifest.
     #[arg(long)]
     pub license: Option<String>,
     /// External tool required by every item in this pack. Repeatable.
@@ -84,27 +102,34 @@ pub struct CreateArgs {
     /// Ed25519 PKCS#8 v2 DER private key file (owner-only permissions).
     #[arg(long, requires = "key_id")]
     pub signing_key: Option<PathBuf>,
-    /// Policy-controlled publisher key ID for --signing-key.
+    /// Publisher key ID for --signing-key, as the verifying policy names it.
     #[arg(long, requires = "signing_key")]
     pub key_id: Option<String>,
+    /// Where to write the manifest JSON.
     #[arg(long)]
     pub out: PathBuf,
 }
 
 #[derive(Debug, Args)]
 pub struct InspectArgs {
+    /// Update pack manifest JSON file.
     pub manifest: PathBuf,
+    /// Write the JSON summary to this path instead of stdout.
     #[arg(long)]
     pub out: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 pub struct InstallArgs {
+    /// Update pack manifest JSON file.
     pub manifest: PathBuf,
+    /// Directory the manifest's item paths are relative to.
     #[arg(long, default_value = ".")]
     pub root: PathBuf,
+    /// Directory to install the items into (created if missing).
     #[arg(long)]
     pub install_dir: PathBuf,
+    /// Policy file that can deny pack kinds, licenses or required tools.
     #[arg(long)]
     pub policy: Option<PathBuf>,
     /// Reject unless the pack has a verified signature from an explicitly trusted public key.
@@ -113,6 +138,7 @@ pub struct InstallArgs {
     /// Final destination path reported in install.json when installing into a staged prefix.
     #[arg(long)]
     pub reported_install_dir: Option<PathBuf>,
+    /// Write the JSON install summary to this path instead of stdout.
     #[arg(long)]
     pub out: Option<PathBuf>,
 }
@@ -126,11 +152,11 @@ pub struct VerifyArgs {
     #[arg(long, default_value = ".")]
     pub root: PathBuf,
 
-    /// Write verification summary JSON to this path.
+    /// Write the JSON verification summary to this path instead of stdout.
     #[arg(long)]
     pub out: Option<PathBuf>,
 
-    /// Optional policy file used to deny pack kinds, licenses, or required tools.
+    /// Policy file that can deny pack kinds, licenses or required tools.
     #[arg(long)]
     pub policy: Option<PathBuf>,
     /// Reject unless the pack has a verified signature from an explicitly trusted public key.

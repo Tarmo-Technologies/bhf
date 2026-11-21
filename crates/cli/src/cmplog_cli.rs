@@ -21,21 +21,20 @@ pub struct CmplogArgs {
 
 #[derive(Debug, clap::Subcommand)]
 pub enum CmplogCommand {
-    /// Ingest a runtrace audit log and print recovered cmplog
-    /// operands as a JSON token list.
+    /// Read a runtrace log and print the comparison operands it recorded, as
+    /// dictionary tokens.
     Ingest(IngestArgs),
 }
 
 #[derive(Debug, clap::Args)]
 pub struct IngestArgs {
-    /// Path to a `BHF_RUNTRACE_LOG` JSONL file produced by
-    /// the runtrace_shim with BHF_CMPLOG=1 set.
+    /// The JSONL log the runtrace shim wrote (`BHF_RUNTRACE_LOG`) during a run
+    /// with BHF_CMPLOG=1.
     #[arg(long, value_name = "PATH")]
     pub log: PathBuf,
 
-    /// Output format. `json` (default) emits a JSON array of
-    /// base64-encoded token bytes; `tokens` emits one token per
-    /// line, hex-encoded.
+    /// Output format: `json` prints a JSON array of base64-encoded tokens;
+    /// `tokens` prints one hex-encoded token per line.
     #[arg(long, default_value = "json")]
     pub format: String,
 }

@@ -15,14 +15,14 @@ use std::path::{Path, PathBuf};
 /// line map so reported target locations stay on the ORIGINAL source line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum PreprocessMode {
-    /// Preprocess only files with heavy conditional compilation (the default): the
-    /// common no-`#ifdef` file is parsed raw (zero behavior change), while a file
-    /// gated by many `#if`/`#ifdef` branches is resolved first.
+    /// Preprocess only files with heavy conditional compilation (the default):
+    /// a file without `#ifdef` is parsed as it is, and a file with many
+    /// `#if`/`#ifdef` branches is resolved first.
     #[default]
     Auto,
-    /// Force the preprocessor on for every C/C++ file.
+    /// Preprocess every C/C++ file.
     Always,
-    /// Never preprocess; parse raw source (the pre-§27.6 behavior).
+    /// Never preprocess; parse the raw source.
     Never,
 }
 

@@ -923,5 +923,74 @@ class RecipeTests(unittest.TestCase):
                 subprocess.run([str(binary), "-runs=200"], check=True, capture_output=True)
 
 
+class AnalyzeTradeStudyTests(unittest.TestCase):
+    """Re-rendering a report keeps its reviewed prose (#455)."""
+
+    HERE = Path(__file__).resolve().parent
+    REVIEWED = HERE / "results/trade-study-report-20260927.md"
+
+    def evidence(self, generated: str) -> dict:
+        rows = [
+            {"case": "magic_byte", "engine": engine, "outcome": "confirmed_crash",
+             "crash_confirmed": True, "crash_signature": "ASan: oob",
+             "time_to_first_crash_s": ttfc, "common_cov_edges": 7, "common_cov_features": 9,
+             "native_execs_per_s": 1000.0, "build_s": 0.4, "right_censor_s": None}
+            for engine, ttfc in (("bhf", 0.5), ("aflpp", 0.2))
+        ]
+        return {"schema": "bhf-trade-study-v2", "generated_utc": generated, "elapsed_s": 61.0,
+                "git_commit": "0123456789abcdef", "host": {"cpu": "Widget CPU", "nproc": 6},
+                "config": {"engines": ["bhf", "aflpp"], "budget": 30, "trials": 1, "max_len": 64},
+                "manifest": {"path": None}, "rows": rows,
+                "summary": trade_study.aggregate(rows, ["bhf", "aflpp"], ["magic_byte"])}
+
+    def render(self, work: Path, evidence: dict, output: Path) -> subprocess.CompletedProcess:
+        source = work / "evidence.json"
+        source.write_text(json.dumps(evidence))
+        return subprocess.run([sys.executable, str(self.HERE / "analyze_trade_study.py"),
+                               "--input", str(source), "--output", str(output)],
+                              capture_output=True, text=True, timeout=60)
+
+    def test_a_new_report_is_written_in_the_reviewed_wording(self):
+        with TemporaryDirectory() as tmp:
+            output = Path(tmp) / "report.md"
+            result = self.render(Path(tmp), self.evidence("2026-11-20T00:00:00Z"), output)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            text = output.read_text()
+        self.assertIn("# Multi-engine fuzzing trade study: BHF and AFL++\n", text)
+        for heading in ("## Methodology", "## Target: `magic_byte`", "## Scope"):
+            self.assertIn(heading, text)
+        # The reviewed report's own sentences.
+        self.assertIn("- Native exec/s uses each engine's own definition and is reported for context.", text)
+        self.assertIn("so compare it within one engine only.", text)
+        for older in ("## Caveats", "NOT ", "EVERY", "ONE ", "honest", "unchanged from the reviewed"):
+            self.assertNotIn(older, text)
+
+    def test_rerunning_refreshes_the_results_and_keeps_the_prose(self):
+        with TemporaryDirectory() as tmp:
+            output = Path(tmp) / "report.md"
+            self.render(Path(tmp), self.evidence("2026-11-20T00:00:00Z"), output)
+            reviewed = output.read_text().replace(
+                "- Native exec/s uses each engine's own definition and is reported for context.",
+                "- A sentence the review wrote about parse_record.")
+            output.write_text(reviewed)
+            result = self.render(Path(tmp), self.evidence("2026-11-21T00:00:00Z"), output)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            text = output.read_text()
+        self.assertIn("- A sentence the review wrote about parse_record.", text)
+        self.assertIn("Generated: 2026-11-21T00:00:00Z", text)
+        self.assertNotIn("2026-11-20T00:00:00Z", text)
+        self.assertEqual(text.count("## Target: `magic_byte`"), 1)
+        self.assertEqual(text.count("## Scope"), 1)
+
+    def test_a_report_written_by_hand_is_left_as_it_is(self):
+        with TemporaryDirectory() as tmp:
+            output = Path(tmp) / "trade-study-report-20260927.md"
+            shutil.copyfile(self.REVIEWED, output)
+            result = self.render(Path(tmp), self.evidence("2026-11-20T00:00:00Z"), output)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("no generated results section", result.stderr)
+            self.assertEqual(output.read_text(), self.REVIEWED.read_text())
+
+
 if __name__ == "__main__":
     unittest.main()

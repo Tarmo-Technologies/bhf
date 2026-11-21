@@ -37,26 +37,26 @@ pub struct KernelArgs {
 
 #[derive(Debug, clap::Subcommand)]
 enum KernelCommand {
-    /// Generate syzkaller (syzlang) descriptions of a Linux driver's ioctl interface from its source: the commands its handler dispatches on, their argument struct layouts, and the .const file syz-sysgen reads
+    /// Write syzkaller (syzlang) descriptions of a Linux driver's ioctl interface from its source
     ///
     /// Reads the .c and .h files given (directories recursively), finds the
     /// ioctl handlers a `struct file_operations` registers (`.unlocked_ioctl`,
     /// `.compat_ioctl`), the commands their `switch (cmd)` dispatches on
     /// (following calls that pass `cmd` on), the `_IO`/`_IOR`/`_IOW`/`_IOWR`
-    /// macros that define them, and the device node (a `struct miscdevice`,
-    /// `device_create` or `register_chrdev` name). Writes
-    /// `<out>/dev_<name>.txt` and `<out>/dev_<name>.txt.const`: put both in a
-    /// syzkaller checkout's sys/linux and run syz-sysgen (`make descriptions`).
-    /// The .const file gives each command's number for every architecture
-    /// syzkaller builds for Linux. A command whose argument type the source
-    /// does not define, or whose struct syzkaller would lay out unlike C on
-    /// some architecture, is left out with
-    /// the reason. Exit 0 when at least one command was described, 1
-    /// otherwise.
+    /// macros that define them, their argument struct layouts, and the device
+    /// node (a `struct miscdevice`, `device_create` or `register_chrdev` name).
+    /// Writes `<out>/dev_<name>.txt` and `<out>/dev_<name>.txt.const`: put both
+    /// in a syzkaller checkout's sys/linux and run syz-sysgen (`make
+    /// descriptions`). The .const file gives each command's number for every
+    /// architecture syzkaller builds for Linux. A command whose argument type
+    /// the source does not define, or whose struct syzkaller would lay out
+    /// unlike C on some architecture, is left out with the reason. Exit 0 when
+    /// at least one command was described, 1 otherwise.
     Syzlang(SyzlangArgs),
-    /// Import syzkaller crash directories (description, report, log, repro) into <work-dir>/results as findings, with the crash class (KASAN, KMSAN, UBSAN, KCSAN, WARNING, ...), rule, CWE, stack and reproducer
+    /// Import syzkaller crash directories into <work-dir>/results as findings
     ///
-    /// Takes crash directories (`<syz-manager workdir>/crashes/<id>`), a
+    /// Each finding carries the crash class (KASAN, KMSAN, UBSAN, KCSAN,
+    /// WARNING, ...), rule, CWE, stack and reproducer. Takes crash directories (`<syz-manager workdir>/crashes/<id>`), a
     /// workdir's `crashes/`, or a syz-manager workdir. Each crash becomes
     /// `<work-dir>/results/findings/F-KERNEL-NNNN-<hash>/`: `finding.json`, the
     /// report as `sanitizer.log`, the first console log as `console.log`, and
@@ -67,69 +67,73 @@ enum KernelCommand {
     /// test machine (`lost connection to test machine`) is skipped. Exit 0
     /// when at least one crash was imported, 1 otherwise.
     Import(ImportArgs),
-    /// Boot a Linux kernel in a qemu-system guest with bhf's executor as its /init, run system-call programs in it, and print each call's result and the KCOV edges it took
+    /// Boot a kernel in a qemu-system guest and run system-call programs in it, with KCOV
     ///
-    /// The guest boots `--kernel` (built with CONFIG_KCOV and
-    /// CONFIG_DEBUG_FS, and CONFIG_KASAN for memory-safety reports) with an
-    /// initramfs bhf builds: the executor, compiled from
-    /// c_runtime/kernel_executor.c with `--cc` and linked statically, as
-    /// /init, and each `--module`, which it loads at boot. The executor
-    /// talks to bhf over a virtio-serial port; each PROGRAM (the executor's
-    /// program format: a finding's testcase.bin, a `bhf kernel fuzz` corpus
-    /// file) runs in a child process with KCOV on. The kernel boots with
-    /// `nokaslr panic_on_warn=1 oops=panic panic=-1`, so a kernel report
-    /// stops the guest; its title is printed. Exit 0 when every program ran
-    /// with no kernel report, 1 when the kernel reported, the guest stopped
-    /// or did not answer, or could not boot.
+    /// Prints each call's result and the KCOV edges it took.
+    ///
+    /// The guest boots `--kernel` (built with CONFIG_KCOV and CONFIG_DEBUG_FS,
+    /// and CONFIG_KASAN for memory-safety reports) with an initramfs bhf
+    /// builds. Its /init is bhf's executor, compiled from
+    /// c_runtime/kernel_executor.c with `--cc` and linked statically, and it
+    /// loads each `--module` at boot. The executor talks to bhf over a
+    /// virtio-serial port. Each PROGRAM (in the executor's program format,
+    /// such as a finding's testcase.bin or a `bhf kernel fuzz` corpus file)
+    /// runs in a child process with KCOV on. The kernel boots with `nokaslr
+    /// panic_on_warn=1 oops=panic panic=-1`, so a kernel report stops the
+    /// guest, and bhf prints the report's title. Exit 0 when every program ran
+    /// with no kernel report; 1 when the kernel reported, or the guest
+    /// stopped, did not answer or could not boot.
     Run(RunArgs),
-    /// Fuzz a Linux kernel in a qemu-system guest: run seed programs (made from a driver's source, given, or opening --device), then mutate them, keeping each program that reaches new KCOV edges
+    /// Fuzz a Linux kernel in a qemu-system guest with KCOV-guided system-call programs
     ///
-    /// Boots the guest as `bhf kernel run` does. The seeds: each ioctl
-    /// command the `--source` driver's handlers dispatch on (as `bhf kernel
-    /// syzlang` reads them), called on its device node with a zeroed
-    /// argument of its size, and all of them in one program; every program
-    /// in `--seeds`; with `--device` alone, a few calls on that node; and
-    /// the corpus an earlier run left in <work-dir>/kernel/corpus. The
+    /// Boots the guest as `bhf kernel run` does. The seed programs are: one
+    /// per ioctl command the `--source` driver's handlers dispatch on (as `bhf
+    /// kernel syzlang` reads them), calling it on the device node with a
+    /// zeroed argument of its size, and one program with all of them; every
+    /// program in `--seeds`; with `--device` alone, a few calls on that node;
+    /// and the corpus an earlier run left in <work-dir>/kernel/corpus. The
     /// commands' numbers (for the guest's architecture) and the node's path
-    /// are mutation tokens. Each program's KCOV PCs go into the coverage
-    /// map as a harness's breadcrumbs do (each pair of consecutive PCs an
-    /// edge), and a program that reached new coverage joins the corpus.
-    /// With KCOV comparisons in the kernel, each corpus program runs once
-    /// more for the comparisons its calls made: an argument holding one
-    /// operand is tried with the other (hints), and the operands are the
-    /// CmpLog its mutations splice from. A kernel report on the console
-    /// (with `panic_on_warn` the guest panics on it) is written
-    /// as a finding (below) and the guest boots again; a run the guest does
-    /// not survive without one is saved under <work-dir>/kernel/crashes/.
-    /// Writes
-    /// <work-dir>/kernel/fuzz.json. Exit 0 when the campaign ran its budget,
-    /// 1 when the guest could not boot, did not load a --module (the
-    /// executor's setup notes, which bhf prints and fuzz.json keeps, say
-    /// why: no program runs then), or no seed left it running.
+    /// are mutation tokens.
+    ///
+    /// Each program's KCOV PCs go into the coverage map, each pair of
+    /// consecutive PCs as one edge, and a program that reaches new coverage
+    /// joins the corpus. When the kernel records KCOV comparisons
+    /// (CONFIG_KCOV_ENABLE_COMPARISONS), each corpus program runs once more to
+    /// collect the comparisons its calls made: an argument that holds one
+    /// operand is tried with the other, and the operands become CmpLog
+    /// entries that mutations splice in.
+    ///
+    /// A kernel report on the console (with `panic_on_warn` the guest panics
+    /// on it) is written as a finding and the guest boots again. A run the
+    /// guest does not survive, with no report, is saved under
+    /// <work-dir>/kernel/crashes/. The campaign writes
+    /// <work-dir>/kernel/fuzz.json. Exit 0 when the campaign ran its budget;
+    /// 1 when the guest could not boot, no seed left it running, or it did not
+    /// load a --module (then no program runs, and the executor's setup notes,
+    /// which bhf prints and fuzz.json keeps, say why).
     ///
     /// A KASAN, KCSAN, KMSAN, KFENCE or UBSAN report, an oops, a WARNING, a
     /// hang or a panic on the guest's console becomes a finding in
     /// <work-dir>/results/findings/F-KERNEL-*: syzkaller's title for it, its
     /// class, rule and CWE, the stack, the access and the object, and the
     /// program (testcase.bin, decoded.json, program.txt, repro.c). A new
-    /// title's program first runs alone in a freshly booted guest:
-    /// `kernel.reproduced` says whether it made the report again (the
-    /// finding is written first: when that guest does not boot,
-    /// `kernel.unconfirmed` says why). A title found again is counted on its
-    /// finding. `bhf kernel replay` replays one.
+    /// title's program first runs alone in a freshly booted guest, and
+    /// `kernel.reproduced` says whether it made the report again. The finding
+    /// is written first, so when that guest does not boot, `kernel.unconfirmed`
+    /// says why. A title found again is counted on its existing finding. `bhf
+    /// kernel replay` replays a finding.
     Fuzz(KernelFuzzArgs),
-    /// Boot the guest a `bhf kernel fuzz` finding was found in, run its program again, and say whether the kernel makes the same report
+    /// Re-run a `bhf kernel fuzz` finding's program in its guest and compare the kernel report
     ///
-    /// Reads the finding's finding.json (the guest it records: kernel,
-    /// modules, qemu, accel, memory, CPUs, command line, timeout) and its
-    /// program (testcase.bin), builds the executor and the initramfs in a
-    /// temporary directory, boots the guest and runs the program. Prints
-    /// MATCH and the title when the kernel reports the crash the finding
-    /// records, MISMATCH and the other title when it reports another, or
-    /// NOT REPRODUCED. `--kernel`, `--module` and the other options replace
-    /// what the finding records, for a kernel or module that moved. Exit 0
-    /// on a MATCH, 1 otherwise, 2 when the finding cannot be read or the
-    /// guest cannot boot.
+    /// Reads the guest the finding's finding.json records (kernel, modules,
+    /// qemu, accel, memory, CPUs, command line, timeout) and its program
+    /// (testcase.bin), builds the executor and the initramfs in a temporary
+    /// directory, boots the guest and runs the program. Prints MATCH and the
+    /// title when the kernel reports the crash the finding records, MISMATCH
+    /// and the other title when it reports another, or NOT REPRODUCED.
+    /// `--kernel`, `--module` and the other options replace what the finding
+    /// records, for a kernel or module that moved. Exit 0 on a MATCH, 1
+    /// otherwise, 2 when the finding cannot be read or the guest cannot boot.
     Replay(ReplayArgs),
 }
 
@@ -150,19 +154,19 @@ pub struct KernelFuzzArgs {
     /// A directory of seed programs, in the executor's format
     #[arg(long, value_name = "DIR")]
     seeds: Option<PathBuf>,
-    /// Executions at most (default 1000, or no cap with --time)
+    /// Most program executions (default 1000; no limit when --time is given)
     #[arg(long)]
     iterations: Option<usize>,
     /// Wall-clock budget such as 30s, 5m or 1h
     #[arg(long, value_parser = crate::fuzz::parse_duration)]
     time: Option<std::time::Duration>,
-    /// Deterministic RNG seed for mutation
+    /// Seed of the mutation RNG, so a campaign repeats exactly
     #[arg(long, default_value_t = 0x4b43_4f56)]
     rng_seed: u64,
     /// Longest program a mutation makes, in bytes (at most 65536)
     #[arg(long, value_name = "BYTES", default_value_t = 4096)]
     max_len: usize,
-    /// Stop once this many findings were written (or counted again)
+    /// Stop once this many findings were written or counted again
     #[arg(long, value_name = "N")]
     stop_after_findings: Option<usize>,
 }

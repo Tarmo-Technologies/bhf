@@ -1,21 +1,14 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Installing bhf
 
-bhf is a Rust workspace. Building it also produces the runtime
-virtualisation shim (`libbhf_runtrace_shim.so`) and the build-time compiler
-interception shim (`libbhf_cc_intercept.so`) next to the binaries, where
-`bhf auto` locates them automatically. How much CPU, memory and disk a run
-needs, per lane and per tree size, is in the README's
-[Resource Requirements](../../README.md#resource-requirements).
+bhf is a Rust workspace. Building it also produces the runtime virtualisation shim (`libbhf_runtrace_shim.so`) and the build-time compiler interception shim (`libbhf_cc_intercept.so`) next to the binaries, where `bhf auto` locates them automatically. How much CPU, memory and disk a run needs, per lane and per tree size, is in the README's [Resource Requirements](../../README.md#resource-requirements).
 
 ## From source
 
 Prerequisites:
 
-- **Rust** stable toolchain, 1.88 or newer (`rust-toolchain.toml` selects the
-  current stable channel, so `rustup` selects it for you).
-- **`make`** and **`clang`/`clang++`** with SanitizerCoverage plus ASan/UBSan
-  support — required to build and fuzz C/C++ with the built-in engine.
+- **Rust** 1.88 or newer. `rust-toolchain.toml` pins Rust 1.99.0, and `rustup` installs it on the first build.
+- **`make`** and **`clang`/`clang++`** with SanitizerCoverage, ASan and UBSan support, to build and fuzz C and C++ with the built-in engine.
 
 ```sh
 git clone https://github.com/Tarmo-Technologies/bhf.git
@@ -24,20 +17,11 @@ cargo build --release --workspace
 ./target/release/bhf --help
 ```
 
-The binaries land in `target/release/` (`bhf`, `bhf-daemon`) alongside
-`libbhf_runtrace_shim.so` and `libbhf_cc_intercept.so`. Put `bhf` on
-your `PATH`, or `cargo install --path crates/cli` (then also build the shims with
-`cargo build --release -p bhf_runtrace_shim -p bhf_cc_intercept` and set
-`BHF_RUNTRACE_SHIM` / `BHF_CC_INTERCEPT` to their paths — `cargo install`
-does not stage them beside the binary).
+The binaries land in `target/release/` (`bhf`, `bhf-daemon`) next to `libbhf_runtrace_shim.so` and `libbhf_cc_intercept.so`. Put `bhf` on your `PATH`, or run `cargo install --path crates/cli`. `cargo install` installs only the binary, so then also build the shims with `cargo build --release -p bhf_runtrace_shim -p bhf_cc_intercept` and set `BHF_RUNTRACE_SHIM` and `BHF_CC_INTERCEPT` to their paths.
 
 ### Supported OS matrices
 
-The published GNU/Linux release target is x86_64 and supports RHEL 7, 8, 9, and 10.
-“Supported” here means that the release binaries are held to the EL7 glibc 2.17
-ABI, the installer handles the applicable `yum`/`dnf` family, and BHF can
-select a compiler with the required sanitizer-coverage capabilities. It is not
-a Red Hat certification claim.
+The published GNU/Linux release target is x86_64 and supports RHEL 7, 8, 9 and 10. Supported means three things: the release binaries keep to the EL7 glibc 2.17 ABI, the installer handles the `yum` or `dnf` family, and bhf can select a compiler with the sanitizer-coverage features it needs.
 
 | Version | Release status | Package manager | C/C++ compiler | Validation evidence |
 |---|---|---|---|---|
@@ -46,21 +30,11 @@ a Red Hat certification claim.
 | RHEL 9 | Supported by the prebuilt x86_64 release | `dnf` | AppStream Clang/LLVM | AlmaLinux 9.8 RHEL-compatible Proxmox guest, SELinux enforcing |
 | RHEL 10 | Supported by the prebuilt x86_64 release | `dnf` | AppStream Clang/LLVM | AlmaLinux 10.2 RHEL-compatible Proxmox guest, SELinux enforcing |
 
-The guest records use freely available, binary-compatible distributions because
-licensed Red Hat media was unavailable. See the
-[EL7 validation record](https://github.com/Tarmo-Technologies/bhf/blob/main/docs/validation/2026-07-21-rhel7-proxmox.md)
-and
-[EL9 validation record](https://github.com/Tarmo-Technologies/bhf/blob/main/docs/validation/2026-07-20-rhel9-proxmox.md)
-as well as the
-[current-platform validation record](https://github.com/Tarmo-Technologies/bhf/blob/main/docs/validation/2026-07-21-current-platform-matrix.md)
-for the exact VMs and results. The 64-bit ARM (`aarch64-unknown-linux-gnu`)
-component archives and installers are built on the same glibc 2.17 baseline
-and smoke-tested on an Ubuntu 24.04 ARM64 runner; the guest validation above
-covers x86_64 only. Other architectures can be built from source, but they are
-not covered by this release claim.
+The validation guests run the binary-compatible distributions in the last column. The [EL7 validation record](../validation/2026-07-21-rhel7-proxmox.md), the [EL9 validation record](../validation/2026-07-20-rhel9-proxmox.md) and the [current-platform validation record](../validation/2026-07-21-current-platform-matrix.md) list the exact VMs and results.
 
-The tested Ubuntu and Windows matrix is deliberately explicit; “latest” does
-not silently float to an untested future release:
+The 64-bit ARM (`aarch64-unknown-linux-gnu`) component archives and installers build on the same glibc 2.17 baseline and are smoke-tested on an Ubuntu 24.04 ARM64 runner; the guest validation above is x86_64. Release 0.3.0 ships x86_64 Linux and Windows assets, so check a release's asset list for the ARM64 archives. Other architectures build from source.
+
+The tested Ubuntu and Windows versions:
 
 | Family | Supported x86_64 versions | Notes |
 |---|---|---|
@@ -68,15 +42,11 @@ not silently float to an untested future release:
 | Windows client | Windows 11 Enterprise 25H2; Windows 11 Enterprise LTSC 2024 (24H2 codebase) | Native `x86_64-pc-windows-msvc` CLI and daemon; C/C++ fuzzing also needs LLVM, VS Build Tools/Windows SDK, and GNU make. |
 | Windows Server | Windows Server 2019, Windows Server 2022, Windows Server 2025 | Windows Server 2019 is the oldest supported Windows baseline; Windows Server 2022 and Windows Server 2025 are persistent CI environments. |
 
-Windows 10 and Windows Server 2016 are outside this tested support matrix. See
-[Running bhf on Windows](./windows.md) for setup and native-Windows feature
-limits.
+The tested matrix does not include Windows 10 or Windows Server 2016. See [Running bhf on Windows](./windows.md) for setup and for the features native Windows runs.
 
 ### Per-language toolchains
 
-bhf fuzzes sixteen languages; each lane needs its own toolchain, installed
-only if you fuzz that language (a target whose toolchain is absent skips
-cleanly). On Debian/Ubuntu:
+bhf fuzzes sixteen languages. Each lane needs its own toolchain, which you install only if you fuzz that language; a target whose toolchain is missing is skipped with a reason. On Debian or Ubuntu:
 
 ```sh
 sudo apt-get update
@@ -86,7 +56,7 @@ sudo apt-get install -y default-jdk maven gradle        # Java
 sudo apt-get install -y python3                         # Python (3.12+ for sys.monitoring coverage)
 sudo apt-get install -y perl                            # Perl
 sudo apt-get install -y golang-go                       # Go
-rustup toolchain install nightly                        # Rust (sancov + ASan staticlib)
+rustup toolchain install nightly                        # Rust lane (sancov + ASan staticlib needs nightly)
 sudo apt-get install -y gfortran                        # Fortran
 sudo apt-get install -y gnucobol                        # COBOL (GnuCOBOL cobc)
 sudo apt-get install -y nodejs npm                      # JavaScript / TypeScript (TS via esbuild)
@@ -98,8 +68,7 @@ dotnet tool install --global SharpFuzz.CommandLine
 sudo apt-get install -y afl++                           # optional: AFL++ engine (C/C++, COBOL, Fortran, Rust, Ada)
 ```
 
-On RHEL 8, 9, or 10 and compatible distributions (AlmaLinux/Rocky Linux), the base
-and AppStream repositories provide the core build and most language toolchains:
+On RHEL 8, 9 or 10 and compatible distributions (AlmaLinux, Rocky Linux), the base and AppStream repositories provide the core build and most language toolchains:
 
 ```sh
 sudo dnf install -y curl tar xz                         # release installer prerequisites
@@ -111,14 +80,9 @@ sudo dnf install -y nodejs npm ruby lua php-cli        # interpreter lanes
 rustup toolchain install nightly                       # Rust fuzzing lane
 ```
 
-On RHEL 7, the released BHF binaries run against the system glibc 2.17.
-The stock Clang 3.4 cannot instrument BHF harnesses, so enable the Red Hat
-Software Collections repository approved for the host and install LLVM 7.0:
+On RHEL 7, the released bhf binaries run against the system glibc 2.17. The stock Clang 3.4 cannot instrument bhf harnesses, so enable the Red Hat Software Collections repository approved for the host and install LLVM 7.0:
 
-> The lightweight `bhf-installer.sh` release asset installs only the CLI.
-> It does not enable repositories, install the packages below, or install the
-> separate Linux runtime shims. Prepare the host first, then run the component
-> installers shown under [Prebuilt release binaries](#prebuilt-release-binaries).
+> The `bhf-installer.sh` release asset installs the CLI. Enable the repositories, install the packages below and install the Linux runtime shims yourself: prepare the host first, then run the component installers shown under [Prebuilt release binaries](#prebuilt-release-binaries).
 
 ```sh
 sudo subscription-manager repos --enable rhel-server-rhscl-7-rpms
@@ -126,78 +90,36 @@ sudo yum install -y curl tar xz gcc gcc-c++ make \
   llvm-toolset-7.0-clang llvm-toolset-7.0-compiler-rt
 ```
 
-BHF discovers and activates `/opt/rh/llvm-toolset-7.0/root/usr`
-automatically; an interactive `scl enable` shell is not required.
+bhf finds and activates `/opt/rh/llvm-toolset-7.0/root/usr` by itself; you do not need an `scl enable` shell.
 
-RHEL 7 hosts need an active vendor/organization package source, and CentOS 7
-test hosts need an archive mirror because the original mirrorlist is retired.
-The stock EL7 linker is too old to link the current preload shim from source;
-use the prebuilt release, or reproduce the release build in the pinned
-manylinux2014 image from `.github/workflows/release.yml`.
+RHEL 7 hosts need an active vendor or organisation package source, and CentOS 7 test hosts need an archive mirror because the original mirrorlist is retired. The stock EL7 linker is too old to link the current preload shim from source, so use the prebuilt release, or reproduce the release build in the pinned manylinux2014 image from `.github/workflows/release.yml`.
 
-GNAT/GPRbuild, GnuCOBOL, Gradle, AFL++, Wine/mingw, and foreign-architecture
-cross compilers are not consistently present in the standard RHEL repositories.
-Enable an organization-approved supplemental repository or stage those tools
-separately when their lanes are needed. The binary distribution installer uses
-`dnf` automatically on RHEL and installs every available selected dependency
-without allowing an absent optional package to block the core C/C++ setup.
+The standard RHEL repositories do not reliably carry GNAT and GPRbuild, GnuCOBOL, Gradle, AFL++, Wine and mingw, or foreign-architecture cross compilers. Enable an approved supplemental repository, or stage those tools separately, for the lanes that need them. The distribution installer uses `dnf` on RHEL and installs every selected dependency it can find; a missing optional package does not block the core C/C++ setup.
 
-The full per-lane matrix lives in
-[offline-deployment.md](./offline-deployment.md#toolchains-on-the-offline-host).
-For Windows-native cross-fuzzing (mingw + wine) and foreign-arch fuzzing
-(qemu-user), see [cross-compilation.md](./cross-compilation.md).
+The full per-lane matrix lives in [offline-deployment.md](./offline-deployment.md#toolchains-on-the-offline-host). For Windows-native cross-fuzzing (mingw + wine) and foreign-arch fuzzing (qemu-user), see [cross-compilation.md](./cross-compilation.md).
 
 ### Optional LLM and agent integration
 
-No model, API key, or network connection is required for BHF. Default release
-binaries omit the LLM feature. Build with `--features bhf/llm,bhf-daemon/llm`
-for the optional assistance commands and MCP prompt/preflight tools. Optional
-assistance then needs one of the following:
+bhf needs no model, API key or network connection. The release binaries leave out the `llm` feature. Build with `--features bhf/llm,bhf-daemon/llm` to add the `bhf llm` assistance commands and the MCP prompt and preflight tools. Assistance then needs one of these:
 
-- the `bhf-daemon` release component plus an MCP-capable Codex or Claude
-  host for the recommended current-session workflow;
-- an already installed and authenticated `codex` or `claude` executable for a
-  separate ephemeral CLI-provider request;
-- an OpenAI or Anthropic API credential injected through an environment
-  variable and an explicit model id; or
+- the `bhf-daemon` component and an MCP-capable agent host, for the current-session workflow;
+- an installed, authenticated provider CLI, for a separate one-off request;
+- a hosted-provider API credential in an environment variable, with an explicit model id; or
 - a locally served OpenAI-compatible model endpoint.
 
-Run `bhf llm status --json` to inspect non-secret availability and
-`bhf llm test --provider <name>` to make a live connection check. The status
-command does not prove CLI authentication and does not print credential values.
-See [LLM Assistance](./llm.md) before registering MCP or transmitting source and
-findings to any provider.
+`bhf llm status --json` lists the installed provider CLIs and the configured credentials without making a model call, and prints no credential values. `bhf llm test --provider <name>` makes a small live request. Read [LLM Assistance](./llm.md), which names the supported providers, before you register MCP or send source and findings to any provider.
 
 ## Prebuilt release binaries
 
-GNU/Linux release artifacts are built in a pinned manylinux2014 / CentOS 7
-userspace. CI rejects an artifact that requires a symbol newer than glibc 2.17,
-so the published binaries are compatible with RHEL 7, 8, 9, and 10. A binary built
-locally on a newer distribution may not be portable to RHEL; use the published
-artifact or the same pinned build image if the loader reports
-`GLIBC_2.xx not found`.
+GNU/Linux release artifacts are built in a pinned manylinux2014 (CentOS 7) userspace. CI rejects an artifact that needs a symbol newer than glibc 2.17, so the published binaries run on RHEL 7, 8, 9 and 10. A binary you build on a newer distribution can need a newer glibc; if the loader reports `GLIBC_2.xx not found`, use the published artifact or the same pinned build image.
 
-GitHub releases ship an all-in-one Linux bundle with `install.sh` plus the
-per-component archives and installers. Use the all-in-one bundle for a complete
-Linux installation, or use components when you deliberately want a smaller or
-manually controlled layout. You do **not** need every asset for every install.
+GitHub releases ship an all-in-one Linux bundle with `install.sh`, plus per-component archives and installers. Use the all-in-one bundle for a complete Linux installation, or the components for a smaller layout you control. Each install needs only the assets in the table below.
 
-The CLI archive carries every harness-runtime source tree. The CLI executable
-also embeds the same sources and stages a private copy automatically when it was
-installed by the shell or PowerShell installer, so prebuilt installs do not
-need a bhf source checkout. The copy goes to the user's cache,
-`$XDG_CACHE_HOME/bhf/runtime-<sha256>/` (else `~/.cache/bhf/…`, and
-`%LOCALAPPDATA%\bhf\…` on Windows), named by the content's digest. It stays
-there: generated harness Makefiles name it, and every later run of the same
-release reuses it. Set `BHF_FORCE_EMBEDDED_RUNTIMES=1` to use the embedded copy
-even when runtime directories sit beside the executable.
+The CLI archive carries every harness-runtime source tree. The CLI executable also embeds the same sources, and when the shell or PowerShell installer installed it, it stages a private copy by itself, so a prebuilt install needs no bhf source checkout. The copy goes to the user's cache, `$XDG_CACHE_HOME/bhf/runtime-<sha256>/` (else `~/.cache/bhf/…`, and `%LOCALAPPDATA%\bhf\…` on Windows), named by the content's digest. It stays there: generated harness Makefiles name it, and every later run of the same release reuses it. Set `BHF_FORCE_EMBEDDED_RUNTIMES=1` to use the embedded copy even when runtime directories sit beside the executable.
 
 ### Choose release assets by task
 
-The all-in-one archive is self-contained and its bundled `install.sh` installs
-all Linux runtime components. A component installer downloads and installs only
-its matching archive. Do not download both the installer and archive for the
-same individual component.
+The all-in-one archive is self-contained, and its bundled `install.sh` installs every Linux runtime component. A component installer downloads and installs its own archive, so for each component download either the installer or the archive.
 
 | Task | Required assets | Optional additions |
 |---|---|---|
@@ -207,39 +129,24 @@ same individual component.
 | Full Linux `bhf auto` | The Linux CLI plus `bhf_runtrace_shim-installer.sh` (or its archive and sidecar) | Add `bhf_cc_intercept` when testing C/C++ projects with real build systems |
 | Complex C/C++ `--probe-build` / `--build-command` recovery | Linux CLI plus `bhf_cc_intercept-installer.sh` (or its archive and sidecar) | Add the runtrace shim for runtime audit/fake-resource coverage too |
 | Linux IDE/JSON-RPC/MCP service | The required Linux CLI/shims for the intended workload, plus `bhf-daemon-installer.sh` or its archive | None |
-| Source audit or rebuild | `source.tar.gz` and `source.tar.gz.sha256` | Prebuilt runtime assets are not required unless you also want to run them |
+| Source audit or rebuild | `source.tar.gz` and `source.tar.gz.sha256` | The prebuilt runtime assets, only if you also run them |
 | Automated component-release processing | `dist-manifest.json`; use `sha256.sum` to verify all archives or the matching `*.sha256` file for one archive | The GitHub Release asset list also includes the separately assembled all-in-one bundle |
 
 What each optional component changes:
 
-- `bhf_runtrace_shim` is Linux-only. It enables runtime environment auditing,
-  behavioral/taint oracles, and fake files, sockets, and environment resources.
-  Without it, BHF still scans, builds, and fuzzes, but warns and runs without
-  those runtime features.
-- `bhf_cc_intercept` is Linux-only. It lets C/C++ build recovery observe
-  compilers launched by absolute path or through `posix_spawn`. Most direct
-  harness builds do not need it; complex `--probe-build` and `--build-command`
-  workflows often do.
-- `bhf-daemon` provides JSON-RPC and read-only MCP. The CLI does not use or
-  require the daemon for ordinary terminal runs.
-- `source.tar.gz`, `dist-manifest.json`, and checksum files are not executable
-  components. Do not install them into `PATH`.
+- `bhf_runtrace_shim` is Linux-only. It enables runtime environment auditing, the behavioural and taint oracles, and fake files, sockets and environment resources. Without it, bhf scans, builds and fuzzes, and warns that those runtime features are off.
+- `bhf_cc_intercept` is Linux-only. It lets C/C++ build recovery observe compilers launched by absolute path or through `posix_spawn`. Most direct harness builds do not need it; complex `--probe-build` and `--build-command` workflows often do.
+- `bhf-daemon` provides JSON-RPC and read-only MCP. The CLI does not use or require the daemon for ordinary terminal runs.
+- `source.tar.gz`, `dist-manifest.json` and the checksum files are data; keep them out of `PATH`.
 
-The recommended full Linux delivery is the all-in-one bundle. Its
-manual equivalent is the CLI plus both shims, with the daemon added only when
-needed. The normal Windows set is the CLI alone, with the daemon added only for
-IDE/MCP use. Windows users should ignore the two Linux-only shim assets.
+The recommended full Linux install is the all-in-one bundle. Its manual equivalent is the CLI plus both shims, with the daemon when you need it. On Windows, install the CLI, and the daemon for IDE or MCP use; the two shims are Linux-only.
 
 ### Complete Linux installation with the bundled `install.sh`
 
-Obtain the verifier, publisher public key, and operator policy through a trusted
-channel independent of the archive. Verification needs Python 3 and an
-Ed25519-capable OpenSSL; EL7 needs an approved newer OpenSSL or a separate
-verification host. Set `VERSION` to the release you received; the example uses
-0.3.0 release candidate.
+Obtain the verifier (`scripts/verify-offline-dist.py`), the publisher's public key and your operator policy through a trusted channel that is independent of the archive. Verification needs Python 3.8 or newer and an OpenSSL with Ed25519 support; on EL7, use an approved newer OpenSSL or a separate verification host. Set `VERSION` to the release you received. The example uses 0.4.0.
 
 ```sh
-VERSION=0.3.0
+VERSION=0.4.0
 BASE="https://github.com/Tarmo-Technologies/bhf/releases/download/${VERSION}"
 ARCHIVE="bhf-dist-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 
@@ -256,10 +163,7 @@ cd "${ARCHIVE%.tar.gz}"
 ./install.sh --trust-policy /trusted/operator-policy.json
 ```
 
-The interactive installer selects language toolchains, compile targets,
-fuzzers, and optional extras. It installs to `/opt/bhf` by default and
-creates `bhf` and `bhf-daemon` symlinks in `/usr/local/bin`.
-For automation:
+The interactive installer asks which language toolchains, compile targets, fuzzers and optional extras to install. It installs to `/opt/bhf` by default and creates `bhf` and `bhf-daemon` symlinks in `/usr/local/bin`. For automation:
 
 ```sh
 ./install.sh --non-interactive --trust-policy /trusted/operator-policy.json \
@@ -269,9 +173,7 @@ For automation:
   --extras build-recovery,archives
 ```
 
-On an offline host with dependencies already staged, add
-`--no-system-packages --no-rustup`. Run `./install.sh --help` for custom
-prefixes, seeds, content-pack, symlink, and smoke-test controls.
+On an offline host with the dependencies already staged, add `--no-system-packages --no-rustup`. `./install.sh --help` lists the options for the prefix, seed corpus, content packs, symlinks and smoke test.
 
 ### Connected component-installer alternative
 
@@ -285,16 +187,11 @@ curl --proto '=https' --tlsv1.2 -LsSf "$BASE/bhf_runtrace_shim-installer.sh" | s
 curl --proto '=https' --tlsv1.2 -LsSf "$BASE/bhf_cc_intercept-installer.sh" | sh
 ```
 
-Those three installers place `bhf`, `libbhf_runtrace_shim.so`, and
-`libbhf_cc_intercept.so` together in `$CARGO_HOME/bin` or
-`$HOME/.cargo/bin`. The daemon has its own optional installer.
+Those three installers place `bhf`, `libbhf_runtrace_shim.so`, and `libbhf_cc_intercept.so` together in `$CARGO_HOME/bin` or `$HOME/.cargo/bin`. The daemon has its own optional installer.
 
 ### Manual component-archive co-location
 
-Verify each selected archive with its sidecar, extract it, and copy both Linux
-libraries into the CLI directory. On 64-bit ARM, use the
-`aarch64-unknown-linux-gnu` archives in place of `x86_64-unknown-linux-gnu`;
-the shell installers pick the archive for the host's architecture themselves.
+Verify each selected archive with its sidecar, extract it, and copy both Linux libraries into the CLI directory. On 64-bit ARM, use the `aarch64-unknown-linux-gnu` archives in place of `x86_64-unknown-linux-gnu`; the shell installers pick the archive for the host's architecture themselves.
 
 ```sh
 sha256sum -c bhf-x86_64-unknown-linux-gnu.tar.xz.sha256
@@ -316,34 +213,21 @@ install -m 0755 \
 "./$CLI_DIR/bhf" --version
 ```
 
-Run in place or copy that entire co-located directory to a permanent prefix.
-If policy keeps the libraries elsewhere, set `BHF_RUNTRACE_SHIM` and
-`BHF_CC_INTERCEPT` to absolute paths. A prefix with a space or colon in it
-(`/opt/Program Files (x86)/bhf`) works too: `LD_PRELOAD` splits paths on
-those characters, so bhf preloads a copy of the runtrace shim staged under
-the run's work dir (`<work>/.bhf-runtime/`) or `$TMPDIR/bhf-shim-<uid>-<hash>/`.
-It only uses a directory private to the account running bhf (owned by it, mode
-`0700`), so no other local user can plant the library it preloads, and it
-reuses a staged copy only while its bytes are the shim's; any other file there
-is replaced by a fresh copy. When no such directory can be used it warns
-once and runs without the shim. Every component archive includes an
-`INSTALL.md` with these commands and the optional daemon/user-local layout.
+Run it in place, or copy the whole directory to a permanent prefix. If policy keeps the libraries elsewhere, set `BHF_RUNTRACE_SHIM` and `BHF_CC_INTERCEPT` to absolute paths.
+
+A prefix with a space or colon in it (`/opt/Program Files (x86)/bhf`) also works. `LD_PRELOAD` splits paths on those characters, so bhf preloads a copy of the runtrace shim staged in the run's work directory (`<work>/.bhf-runtime/`) or in `$TMPDIR/bhf-shim-<uid>-<hash>/`. It uses only a directory private to the account running bhf (owned by it, mode `0700`), so no other local user can plant the library it preloads. It reuses a staged copy only while its bytes match the shim and replaces any other file there. When no such directory is usable, it warns once and runs without the shim. Every component archive includes an `INSTALL.md` with these commands and the optional daemon and user-local layouts.
 
 ## Native Windows release or build
 
-Releases include `bhf-x86_64-pc-windows-msvc.zip`,
-`bhf-daemon-x86_64-pc-windows-msvc.zip`, their SHA-256 sidecars, and native
-PowerShell installers. For example:
+Releases include `bhf-x86_64-pc-windows-msvc.zip`, `bhf-daemon-x86_64-pc-windows-msvc.zip`, their SHA-256 sidecars, and native PowerShell installers. For example:
 
 ```powershell
-$Version = "0.3.0"
+$Version = "0.4.0"
 irm "https://github.com/Tarmo-Technologies/bhf/releases/download/$Version/bhf-installer.ps1" | iex
 bhf.exe --version
 ```
 
-The release executables do not require Rust. LLVM, Visual Studio Build Tools,
-and GNU make are still required to compile and fuzz native C/C++ targets; see
-[windows.md](./windows.md).
+The release executables need no Rust toolchain. To compile and fuzz native C and C++ targets you need LLVM, Visual Studio Build Tools and GNU make; see [windows.md](./windows.md).
 
 To build from source instead:
 
@@ -353,19 +237,11 @@ cargo build --release --target x86_64-pc-windows-msvc -p bhf
 # -> target/x86_64-pc-windows-msvc/release/bhf.exe
 ```
 
-`bhf.exe` runs the full pipeline on Windows — discovery, clang harness builds
-(edge coverage + cmplog + ASan), coverage-guided fuzzing, crash detection —
-including Visual Studio solutions (`.sln`/`.vcxproj`) via `--probe-build`. See
-[windows.md](./windows.md) for the full guide.
+`bhf.exe` runs the pipeline on Windows: discovery, clang harness builds (edge coverage, cmplog and ASan), coverage-guided fuzzing and crash detection, including Visual Studio solutions (`.sln`, `.vcxproj`) through `--probe-build`. See [windows.md](./windows.md) for the full guide.
 
 ## macOS (Apple Silicon) from source
 
-No macOS release binaries are published yet, but bhf builds and fuzzes
-natively on Apple Silicon (`aarch64-apple-darwin`); CI builds it on a
-`macos-15` runner and checks that `bhf auto` finds a planted C overflow
-there. You need Rust and the Xcode Command Line Tools (`xcode-select
---install`), whose `clang` and `make` build the C/C++ harnesses with
-AddressSanitizer, UBSan and SanitizerCoverage:
+Releases include no macOS binaries. bhf builds and fuzzes natively on Apple Silicon (`aarch64-apple-darwin`): CI builds it on a `macos-15` runner and checks that `bhf auto` finds a planted C overflow there. You need Rust and the Xcode Command Line Tools (`xcode-select --install`), whose `clang` and `make` build the C/C++ harnesses with AddressSanitizer, UBSan and SanitizerCoverage:
 
 ```sh
 git clone https://github.com/Tarmo-Technologies/bhf.git && cd bhf
@@ -373,34 +249,21 @@ cargo build --locked --release -p bhf
 ./target/release/bhf auto path/to/src --work-dir bhf_work --per-target-time 60
 ```
 
-The runtrace shim is an `LD_PRELOAD` library built for Linux only, so on macOS
-native harnesses run without it: there are no behavioral sink oracles and no
-record of the files, environment variables and network the target used.
-`run.json` and every finding say so: the target's `behavioral_oracles` is
-`off`, its `fidelity.runtime_shim` is `not_exercised` with the reason, and the
-finding's `runtime_mode.shim_armed` is `false`. Coverage, CmpLog, the
-fork-server and the sanitizers work as on Linux. `--rss-limit-mb` is not
-enforced on macOS. The Linux toolchain lanes, including the shim, run on a Mac
-through Docker Desktop ([docker.md](./docker.md)).
+The runtrace shim is an `LD_PRELOAD` library for Linux, so on macOS native harnesses run without it: bhf runs no behavioural sink oracles there and records no files, environment variables or network use. `run.json` and every finding say so: the target's `behavioral_oracles` is `off`, its `fidelity.runtime_shim` is `not_exercised` with the reason, and the finding's `runtime_mode.shim_armed` is `false`. Coverage, CmpLog, the fork-server and the sanitizers work as on Linux. macOS does not enforce `--rss-limit-mb`. The Linux toolchain lanes, including the shim, run on a Mac through Docker Desktop ([docker.md](./docker.md)).
 
 ## Offline / air-gapped install
 
-bhf runs with no network access and never auto-updates. To install or update
-on a disconnected machine, build a binary-only offline tarball
-(`scripts/package-offline-dist.sh`), transfer published/source-built binaries, or
-transfer the source and build on the offline host — plus stage the harness
-build/fuzz toolchains and checksum-verified content packs.
-[offline-deployment.md](./offline-deployment.md) is the full operational guide:
-the binary-only package flow, the build-vs-transfer decision, exactly which
-artifacts to move, glibc/arch matching for the runtrace shim, the `cargo vendor`
-offline-build flow, toolchain staging, staging harness dependencies across the
-air gap (`--deps-only` / `--install-deps`), and rules/CVE/corpus pack updates.
+bhf runs with no network access and never updates itself. To install or update it on a disconnected machine, do one of these, then stage the harness build and fuzz toolchains and the checksum-verified content packs:
+
+- build a binary-only offline tarball (`scripts/package-offline-dist.sh`);
+- transfer published or source-built binaries; or
+- transfer the source and build on the offline host.
+
+[offline-deployment.md](./offline-deployment.md) is the full guide: the binary-only package flow, the build-or-transfer decision, which artifacts to move, glibc and architecture matching for the runtrace shim, the `cargo vendor` offline build, toolchain staging, staging harness dependencies across the air gap (`--deps-only`, `--install-deps`), and rules, CVE and corpus pack updates.
 
 ## Verify the install
 
-Run `auto` against a source tree that ships with the repo. The C example needs
-only `clang`; the Ada example also needs the optional GNAT/GPRbuild toolchain.
-`--per-target-time` is the **total** per-target fuzz budget in **seconds**.
+Run `auto` on a source tree that ships with the repository. The C example needs `clang` and `make`; the Ada example also needs GNAT and GPRbuild. `--per-target-time` is the **total** fuzz budget per target, in **seconds**.
 
 ```sh
 # Real C library (miniz)
@@ -410,27 +273,24 @@ bhf auto tests/fixtures/build_recovery/fixtures/miniz --work-dir /tmp/bhf-miniz 
 bhf auto examples/swallowed_constraint_error --work-dir /tmp/bhf-ada --per-target-time 10
 ```
 
-When the sweep finishes it prints a summary — duration, outcome breakdown, file/
-language counts, findings, executions, throughput, coverage edges, and where every
-output landed — and writes it to `<work-dir>/auto/summary.txt`. Detailed reports
-start at `<work-dir>/results/INDEX.md` and `<work-dir>/results/findings.csv`; campaign and
-coverage details are at `<work-dir>/auto/run.md` and `run.json`. If the summary ends in a
-`⚠ WARNING: N target(s) fuzzed STUB-ONLY` line, those targets fuzzed blind stubs
-rather than real library code, so a clean result there is a **false clean** —
-inspect the `stub_execution` block in `run.json` before trusting it.
+When the sweep finishes, it prints a summary (duration, outcome breakdown, file and language counts, findings, executions, throughput, coverage edges and where each output landed) and writes it to `<work-dir>/auto/summary.txt`. The detailed reports start at `<work-dir>/results/INDEX.md` and `<work-dir>/results/findings.csv`; campaign and coverage details are in `<work-dir>/auto/run.md` and `run.json`.
 
-See [auto.md](./auto.md) for the full `bhf auto` reference, including scaling
-to large trees, force-fuzz mode, and static-analysis integration.
+If the summary has a `⚠ WARNING: N target(s) fuzzed STUB-ONLY` line, those targets ran blind stubs instead of real library code, so a clean result for them is a **false clean**. Check the `stub_execution` block in `run.json` before you rely on it.
+
+See [auto.md](./auto.md) for the full `bhf auto` reference, including scaling to large trees, force-fuzz mode, and static-analysis integration.
 
 ### Selected language installations
 
-All sixteen languages remain the default; AI/LLM features remain opt-in at build
-and invocation time. Container `--languages` controls installed toolchains,
-while `bhf auto --languages` controls only the current run. For example:
+All sixteen languages are installed by default; the `llm` feature is opt-in at build time. The container's `--languages` selects the toolchains to install, and `bhf auto --languages` selects the languages for one run. For example:
 
 ```sh
 scripts/build-container-release.sh bhf:java-python --languages java,python
 ```
 
-For an extracted native bundle: `./install.sh --non-interactive --no-content --languages java,python` (one shell command). See [selection and dependency details](docker.md#installation-selection-versus-run-selection) for aliases, conflicts,
-shared dependencies, engine opt-outs, and current executed evidence.
+For an extracted native bundle:
+
+```sh
+./install.sh --non-interactive --no-content --languages java,python
+```
+
+See [selection and dependency details](docker.md#installation-selection-versus-run-selection) for aliases, conflicts, shared dependencies, engine opt-outs and the recorded test runs.

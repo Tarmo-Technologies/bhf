@@ -19,21 +19,25 @@ pub struct CorpusArgs {
 
 #[derive(Debug, clap::Subcommand)]
 pub enum CorpusCommand {
-    /// Import a foreign corpus into a bhf-layout directory.
+    /// Copy another fuzzer's corpus into a bhf-layout directory, dropping
+    /// duplicate inputs.
     Import(ImportArgs),
-    /// Export a bhf corpus to another fuzzer's layout.
+    /// Copy a bhf corpus into another fuzzer's layout.
     Export(ExportArgs),
     /// Merge multiple corpus directories, deduplicating by content.
     Merge(MergeArgs),
-    /// Produce a coverage-minimal corpus: replay each input through a harness
-    /// and keep only those that add new coverage (libFuzzer `-merge=1`).
+    /// Write a coverage-minimal corpus: the inputs that add new coverage
+    ///
+    /// Each input is replayed through the harness, and kept only when it adds
+    /// coverage, as libFuzzer's `-merge=1` does.
     Minimize(MinimizeCorpusArgs),
 }
 
 #[derive(Debug, clap::Args)]
 pub struct ImportArgs {
-    /// Source format. `auto` (default) detects from filename
-    /// patterns; pass an explicit value for mixed-format dirs.
+    /// Source layout, as the summary reports it: `auto` (detected from the
+    /// file names), `bhf`, `libfuzzer`, `afl` or `honggfuzz`. Every regular
+    /// file in the directory is imported whatever the layout.
     #[arg(long, default_value = "auto")]
     pub from: String,
 
@@ -48,9 +52,9 @@ pub struct ImportArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct ExportArgs {
-    /// Target format. `afl` names entries `id:000000,sig:...`, or
-    /// `id_000000,sig_...` on Windows, which allows no `:` in a file name
-    /// (import reads both).
+    /// Target layout: `libfuzzer`, `afl`, `honggfuzz` or `bhf`. `afl` names
+    /// entries `id:000000,sig:...`, or `id_000000,sig_...` on Windows, which
+    /// allows no `:` in a file name (import reads both).
     #[arg(long, default_value = "libfuzzer")]
     pub to: String,
 

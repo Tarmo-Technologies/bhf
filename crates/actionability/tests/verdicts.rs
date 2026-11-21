@@ -163,6 +163,36 @@ fn go_must_function_panic_is_lab_only() {
 }
 
 #[test]
+fn go_runtime_fault_in_a_must_functions_own_body_is_not_demoted() {
+    // #399: only a `Must` function's own `panic` is its contract. A runtime
+    // fault in its body (an index, slice, nil or divide error) is a defect in
+    // it, whatever its name, and keeps its verdict.
+    for message in [
+        "Go panic: runtime error: slice bounds out of range [:3] with length 1",
+        "Go panic: runtime error: invalid memory address or nil pointer dereference",
+    ] {
+        let raw = json!({
+            "id": "F-must-fault", "rule_id": "BHF-201", "harness_id": "H-G2",
+            "input_reachability": "attacker_reachable",
+            "exception": {
+                "name": "ASAN_GO_PANIC",
+                "message": message,
+                "stack": [
+                    { "function": "example.com/widget.MustParseTag", "file": "tag.go", "line": 9 }
+                ]
+            },
+            "replay": { "status": "reproduced" }
+        });
+        let record = backfill_actionability(
+            RunMode::Attacking,
+            &raw,
+            Some("findings/F-must-fault/finding.json"),
+        );
+        assert_ne!(record.verdict, Verdict::LabOnly, "{message}");
+    }
+}
+
+#[test]
 fn go_panic_in_non_must_function_is_not_demoted() {
     // The contrast: a Go panic whose top frame is an ordinary (`Parse`) function
     // is a genuine finding — the Must* demotion must be precise.

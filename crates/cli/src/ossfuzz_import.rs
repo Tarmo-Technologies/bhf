@@ -23,14 +23,19 @@
 //!   runtime every generated C harness links) and a `bhf_run_one` that calls
 //!   the target's `LLVMFuzzerTestOneInput`, so each fuzzer the build links
 //!   is a bhf harness the builtin engine drives with coverage.
-//! - `build.sh` runs in a sandbox: bubblewrap or firejail, with no network
-//!   and with every path outside `$SRC`, `$WORK` and `$OUT` read-only (or,
-//!   under bubblewrap, absent), `/tmp` included: `$TMPDIR` is `$WORK/tmp`.
+//! - `build.sh` runs in a sandbox: bubblewrap or firejail, with no network.
+//!   Of the host's files it sees the system directories and bhf's engine,
+//!   read-only, and `$SRC`, `$WORK` and `$OUT`, writable, and nothing else
+//!   (firejail hides the rest behind empty mounts, /sys and /dev/log
+//!   included). `/tmp` is empty and read-only, and `$TMPDIR` is `$WORK/tmp`.
+//!   The build has its own /dev, IPC namespace and session, so it reaches
+//!   none of the host's devices, shared memory or terminal, and it cannot
+//!   gain privileges (a setuid `sudo` does not raise them).
 //!   The environment is cleared to the build contract's variables, so no
-//!   host secret reaches the build. A host with
-//!   neither tool, or with one that cannot isolate the network, is refused
-//!   with what to install; `--sandbox none` runs the build directly, which
-//!   is the operator's explicit choice.
+//!   secret in bhf's environment reaches the build. A host with neither
+//!   tool, or with one that cannot isolate the network, is refused with
+//!   what to install; `--sandbox none` runs the build directly, which is the
+//!   operator's explicit choice.
 //!
 //! The fuzzers are found in `$OUT` the way OSS-Fuzz's `get_fuzz_targets`
 //! finds them: a regular, executable file named `[A-Za-z0-9_-]+` (with no
@@ -175,7 +180,7 @@ impl Layout {
         }
         // A private temporary directory in `$WORK`: TMPDIR points here, so
         // the compilers' scratch files never need a writable /tmp.
-        fs::create_dir_all(self.work.join("tmp")).context("create $WORK/tmp")?;
+        fs::create_dir_all(self.tmp()).context("create $WORK/tmp")?;
         // The record and manifest of the import this one replaces.
         for stale in [self.root.join("import.json"), self.root.join(MANIFEST_FILE)] {
             if stale.exists() {
@@ -183,6 +188,11 @@ impl Layout {
             }
         }
         Ok(())
+    }
+
+    /// `$WORK/tmp`, the build's `$TMPDIR`.
+    fn tmp(&self) -> PathBuf {
+        self.work.join("tmp")
     }
 
     /// The directories `build.sh` may write: `$SRC`, `$WORK` and `$OUT`.
@@ -1176,23 +1186,167 @@ fn probe(sandbox: &BuildSandbox, layout: &Layout) -> std::result::Result<(), Str
     }
 }
 
-/// System directories mounted read-only into a bubblewrap sandbox.
-const BWRAP_SYSTEM_DIRS: [&str; 9] = [
+/// The system directories the build sees, read-only, in either sandbox.
+const SYSTEM_DIRS: [&str; 9] = [
     "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/etc", "/opt",
 ];
+
+/// The name bhf whitelists in a directory firejail is to show empty: a
+/// whitelist mounts an empty tmpfs on its directory and binds in only the
+/// paths named, and nothing has this name.
+const FIREJAIL_HIDDEN: &str = ".bhf-hidden";
+
+/// What a firejail build is set up against: the host as it is when the
+/// command is made. bubblewrap starts from an empty root and needs none of
+/// it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct HostView {
+    /// The directories of `/` the build does not see: all but the system
+    /// ones, `/proc`, `/sys` and `/dev`.
+    hidden: Vec<PathBuf>,
+    /// This user's runtime directory, `/run/user/<uid>`, which firejail
+    /// binds back in when `/run` is hidden. It holds the session's sockets.
+    runtime_dir: Option<PathBuf>,
+    /// The home directory (`$HOME`), which firejail binds in as well.
+    home: Option<PathBuf>,
+    /// The writable mounts under the system directories: `--read-only=/`
+    /// does not reach a mount below it.
+    mounts: Vec<PathBuf>,
+}
+
+impl HostView {
+    fn current() -> Self {
+        Self {
+            hidden: hidden_dirs(Path::new("/")),
+            runtime_dir: runtime_dir(),
+            home: std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .and_then(|home| fs::canonicalize(home).ok()),
+            mounts: fs::read_to_string("/proc/self/mountinfo")
+                .map(|text| writable_system_mounts(&text))
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// The directories of `root` firejail hides from the build: every one but
+/// the system directories, `proc`, `sys` and `dev` (firejail mounts its own
+/// /proc and, with `--private-dev`, /dev). A symlink or a file is left
+/// alone: it is not a directory firejail can mount over.
+fn hidden_dirs(root: &Path) -> Vec<PathBuf> {
+    let kept = |name: &std::ffi::OsStr| {
+        ["proc", "sys", "dev"].iter().any(|dir| name == *dir)
+            || SYSTEM_DIRS
+                .iter()
+                .any(|dir| Path::new(dir).file_name() == Some(name))
+    };
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut hidden: Vec<PathBuf> = entries
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter(|entry| !kept(&entry.file_name()))
+        .map(|entry| entry.path())
+        .collect();
+    hidden.sort();
+    hidden
+}
+
+/// This user's runtime directory, when there is one.
+#[cfg(unix)]
+fn runtime_dir() -> Option<PathBuf> {
+    // SAFETY: getuid takes no arguments and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    Some(PathBuf::from(format!("/run/user/{uid}"))).filter(|dir| dir.is_dir())
+}
+
+#[cfg(not(unix))]
+fn runtime_dir() -> Option<PathBuf> {
+    None
+}
+
+/// The writable mounts under the system directories, from
+/// `/proc/self/mountinfo` (`/` itself and read-only mounts left out).
+fn writable_system_mounts(mountinfo: &str) -> Vec<PathBuf> {
+    let mut mounts: Vec<PathBuf> = mountinfo
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split(' ');
+            let point = fields.nth(4)?;
+            let options = fields.next()?;
+            (!options.split(',').any(|option| option == "ro")).then(|| unescape_mount(point))
+        })
+        .filter(|point| {
+            point != Path::new("/") && SYSTEM_DIRS.iter().any(|dir| point.starts_with(dir))
+        })
+        .collect();
+    mounts.sort();
+    mounts.dedup();
+    mounts
+}
+
+/// A mountinfo path, whose space, tab, newline and backslash the kernel
+/// writes as `\NNN` octal escapes.
+fn unescape_mount(field: &str) -> PathBuf {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let octal = bytes.get(i + 1..i + 4).and_then(|digits| {
+            let text = std::str::from_utf8(digits).ok()?;
+            u8::from_str_radix(text, 8).ok()
+        });
+        match (bytes[i], octal) {
+            (b'\\', Some(byte)) => {
+                out.push(byte);
+                i += 4;
+            }
+            (byte, _) => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    PathBuf::from(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// `--<option>=<path>`.
+fn path_flag(option: &str, path: &Path) -> OsString {
+    let mut flag = OsString::from(format!("--{option}="));
+    flag.push(path);
+    flag
+}
 
 /// `program args` in `sandbox`, run from `cwd` with an empty environment
 /// (the caller adds the build's).
 ///
-/// - bubblewrap: every namespace unshared, the network included; the system
-///   directories and bhf's engine read-only, `$SRC`, `$WORK` and `$OUT`
-///   read-write, a private `/proc` and `/dev`, an empty read-only `/tmp`,
-///   and nothing else of the host (no home directory).
-/// - firejail: no network, the whole filesystem read-only except `$SRC`,
-///   `$WORK` and `$OUT`.
+/// - bubblewrap: every namespace unshared, the network and IPC included, in
+///   a new session and with no new privileges (which bubblewrap always
+///   sets); the system directories and bhf's engine read-only, `$SRC`,
+///   `$WORK` and `$OUT` read-write, a private `/proc` and `/dev`, an empty
+///   read-only `/tmp`, and nothing else of the host (no home directory).
+/// - firejail: the same view of the host and the same isolation (see
+///   [`firejail_args`]), in a session of its own ([`in_a_new_session`]).
 fn sandboxed(
     sandbox: &BuildSandbox,
     layout: &Layout,
+    cwd: &Path,
+    program: &Path,
+    args: &[OsString],
+) -> Command {
+    let host = match sandbox {
+        BuildSandbox::Firejail(_) => HostView::current(),
+        _ => HostView::default(),
+    };
+    sandboxed_on(sandbox, layout, &host, cwd, program, args)
+}
+
+/// [`sandboxed`], with firejail set up against `host`.
+fn sandboxed_on(
+    sandbox: &BuildSandbox,
+    layout: &Layout,
+    host: &HostView,
     cwd: &Path,
     program: &Path,
     args: &[OsString],
@@ -1202,7 +1356,7 @@ fn sandboxed(
             let mut command = Command::new(bwrap);
             command.args(["--die-with-parent", "--unshare-all", "--new-session"]);
             command.args(["--proc", "/proc", "--dev", "/dev", "--dir", "/tmp"]);
-            for dir in BWRAP_SYSTEM_DIRS {
+            for dir in SYSTEM_DIRS {
                 if Path::new(dir).exists() {
                     command.args(["--ro-bind", dir, dir]);
                 }
@@ -1222,12 +1376,8 @@ fn sandboxed(
         }
         BuildSandbox::Firejail(firejail) => {
             let mut command = Command::new(firejail);
-            command.args(["--quiet", "--noprofile", "--net=none", "--read-only=/"]);
-            for dir in layout.writable() {
-                let mut flag = OsString::from("--read-write=");
-                flag.push(dir);
-                command.arg(flag);
-            }
+            in_a_new_session(&mut command);
+            command.args(firejail_args(layout, host));
             command.arg("--").arg(program);
             command
         }
@@ -1236,6 +1386,121 @@ fn sandboxed(
     command.args(args).current_dir(cwd).env_clear();
     command
 }
+
+/// The firejail options that cut the build off from the host as
+/// bubblewrap's do: no network, its own IPC namespace (no SysV segment or
+/// message queue of the host's), its own /dev without the host's sound,
+/// video, GPU, U2F, DVD, TV and input devices, no X11 (firejail would copy
+/// `~/.Xauthority` into the home it empties), and no new privileges or
+/// capabilities, so a setuid program such as sudo does not raise them.
+const FIREJAIL_ISOLATION: [&str; 15] = [
+    "--quiet",
+    "--noprofile",
+    "--net=none",
+    "--ipc-namespace",
+    "--private-dev",
+    "--nosound",
+    "--novideo",
+    "--no3d",
+    "--nou2f",
+    "--nodvd",
+    "--notv",
+    "--noinput",
+    "--x11=none",
+    "--nonewprivs",
+    "--caps.drop=all",
+];
+
+/// What firejail leaves visible that bubblewrap does not mount: the host's
+/// log socket, which `--private-dev` binds into its /dev, and /sys.
+const FIREJAIL_BLACKLIST: [&str; 2] = ["/dev/log", "/sys"];
+
+/// The firejail options that show the build what bubblewrap shows it.
+///
+/// firejail starts from the host's filesystem, so it is cut down to the
+/// same view: every directory of `/` but the system ones, the home
+/// directory and the runtime directory are empty tmpfs mounts (a whitelist
+/// of [`FIREJAIL_HIDDEN`]), with the import's directories whitelisted back
+/// into them; the system, its writable mounts, the home and runtime
+/// directories, /tmp and the engine are read-only, and `$SRC`, `$WORK` and
+/// `$OUT` writable (in that order: firejail applies them in turn); and
+/// [`FIREJAIL_BLACKLIST`] is out of reach. Hidden, the host's files and its
+/// Unix sockets (the Docker socket, a session bus), which a read-only mount
+/// would still let the build connect to, are out of reach too. The rest of
+/// the isolation is [`FIREJAIL_ISOLATION`]. glibc drops `TMPDIR` from the
+/// environment of a setuid program such as firejail, so it is set again in
+/// the sandbox.
+fn firejail_args(layout: &Layout, host: &HostView) -> Vec<OsString> {
+    let mut args: Vec<OsString> = FIREJAIL_ISOLATION.map(OsString::from).to_vec();
+    let mut tmpdir = OsString::from("--env=TMPDIR=");
+    tmpdir.push(layout.tmp());
+    args.push(tmpdir);
+    for dir in &host.hidden {
+        args.push(path_flag("whitelist", &dir.join(FIREJAIL_HIDDEN)));
+    }
+    args.push(OsString::from(format!("--whitelist=~/{FIREJAIL_HIDDEN}")));
+    if let Some(dir) = &host.runtime_dir {
+        args.push(path_flag("whitelist", &dir.join(FIREJAIL_HIDDEN)));
+    }
+    // An import directory in a hidden directory is whitelisted back in; one
+    // in a system directory is there already, and a whitelist would hide
+    // the rest of that directory.
+    let in_hidden = |dir: &Path| {
+        host.hidden.iter().any(|hidden| dir.starts_with(hidden))
+            || host.home.as_ref().is_some_and(|home| dir.starts_with(home))
+    };
+    for dir in layout
+        .writable()
+        .into_iter()
+        .chain([layout.engine.as_path()])
+    {
+        if in_hidden(dir) {
+            args.push(path_flag("whitelist", dir));
+        }
+    }
+    args.push(OsString::from("--read-only=/"));
+    args.push(OsString::from("--read-only=~"));
+    let tmp = Path::new("/tmp");
+    if host.hidden.iter().any(|dir| dir == tmp) {
+        args.push(path_flag("read-only", tmp));
+    }
+    if let Some(dir) = &host.runtime_dir {
+        args.push(path_flag("read-only", dir));
+    }
+    for mount in &host.mounts {
+        args.push(path_flag("read-only", mount));
+    }
+    args.push(path_flag("read-only", &layout.engine));
+    for dir in layout.writable() {
+        args.push(path_flag("read-write", dir));
+    }
+    for path in FIREJAIL_BLACKLIST {
+        args.push(path_flag("blacklist", Path::new(path)));
+    }
+    args
+}
+
+/// Runs `command` in a session of its own, with no controlling terminal, so
+/// the build cannot open the operator's terminal through /dev/tty to read
+/// what is typed or write to it (bubblewrap's `--new-session`).
+#[cfg(unix)]
+fn in_a_new_session(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: setsid(2) is async-signal-safe, and the closure allocates
+    // nothing.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn in_a_new_session(_command: &mut Command) {}
 
 /// The environment `build.sh` runs with: OSS-Fuzz's build variables, and
 /// PATH, HOME and TMPDIR. `copy` is `(the copy in $SRC, the tree it is of)`:
@@ -1289,7 +1554,7 @@ fn build_env(
             std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_owned()),
         ),
         ("HOME".to_owned(), path(&layout.work)),
-        ("TMPDIR".to_owned(), path(&layout.work.join("tmp"))),
+        ("TMPDIR".to_owned(), path(&layout.tmp())),
     ]
 }
 
@@ -1848,27 +2113,23 @@ mod tests {
     }
 
     /// bubblewrap gets no network, the system read-only, and only `$SRC`,
-    /// `$WORK` and `$OUT` writable; firejail the same with the whole
-    /// filesystem read-only. The environment is cleared either way.
+    /// `$WORK` and `$OUT` writable. The environment is cleared.
     #[cfg(unix)]
     #[test]
     fn the_sandbox_confines_the_build_to_src_work_and_out() {
         let layout = Layout::new(Path::new("/w"));
-        let args = |sandbox: &BuildSandbox| -> Vec<String> {
-            let command = sandboxed(
-                sandbox,
-                &layout,
-                Path::new("/w/ossfuzz/src/p"),
-                Path::new("/bin/bash"),
-                &[OsString::from("build.sh")],
-            );
-            assert!(command.get_envs().all(|(_, value)| value.is_none()));
-            command
-                .get_args()
-                .map(|a| a.to_string_lossy().into_owned())
-                .collect()
-        };
-        let bwrap = args(&BuildSandbox::Bubblewrap(PathBuf::from("/usr/bin/bwrap")));
+        let command = sandboxed(
+            &BuildSandbox::Bubblewrap(PathBuf::from("/usr/bin/bwrap")),
+            &layout,
+            Path::new("/w/ossfuzz/src/p"),
+            Path::new("/bin/bash"),
+            &[OsString::from("build.sh")],
+        );
+        assert!(command.get_envs().all(|(_, value)| value.is_none()));
+        let bwrap: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
         let joined = bwrap.join(" ");
         assert!(joined.starts_with("--die-with-parent --unshare-all"));
         for bind in [
@@ -1883,22 +2144,152 @@ mod tests {
             assert!(joined.contains(bind), "{bind} in {joined}");
         }
         assert_eq!(bwrap.iter().filter(|a| *a == "--bind").count(), 3);
+    }
 
-        let firejail = args(&BuildSandbox::Firejail(PathBuf::from("/usr/bin/firejail")));
+    /// The firejail arguments for `layout` on `host`.
+    #[cfg(unix)]
+    fn firejail_argv(layout: &Layout, host: &HostView) -> Vec<String> {
+        let command = sandboxed_on(
+            &BuildSandbox::Firejail(PathBuf::from("/usr/bin/firejail")),
+            layout,
+            host,
+            &layout.src.join("p"),
+            Path::new("/bin/bash"),
+            &[OsString::from("build.sh")],
+        );
+        assert!(command.get_envs().all(|(_, value)| value.is_none()));
+        command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// firejail shows the build what bubblewrap does: every directory of `/`
+    /// but the system ones is an empty tmpfs (a whitelist of a name that is
+    /// never there), and so are the home and runtime directories, except the
+    /// import's directories, which are whitelisted into them. The system is
+    /// read-only, writable mounts under it included, as are /tmp, the home
+    /// and runtime directories and the engine; `$SRC`, `$WORK` and `$OUT`
+    /// are writable; /dev/log and /sys are blacklisted. The network is none,
+    /// IPC is the sandbox's own, /dev is firejail's own without the seat's
+    /// devices, X11 is off, and no privileges or capabilities can be gained.
+    /// `$TMPDIR` is set in the sandbox, since glibc drops it from the
+    /// environment of the setuid firejail.
+    #[cfg(unix)]
+    #[test]
+    fn firejail_hides_the_host_and_confines_the_build_to_src_work_and_out() {
+        let host = HostView {
+            hidden: ["/home", "/run", "/tmp", "/var"]
+                .map(PathBuf::from)
+                .to_vec(),
+            runtime_dir: Some(PathBuf::from("/run/user/1000")),
+            home: Some(PathBuf::from("/home/me")),
+            mounts: vec![PathBuf::from("/opt/data")],
+        };
+        let layout = Layout::new(Path::new("/tmp/w"));
         assert_eq!(
-            firejail,
+            firejail_argv(&layout, &host),
             [
                 "--quiet",
                 "--noprofile",
                 "--net=none",
+                "--ipc-namespace",
+                "--private-dev",
+                "--nosound",
+                "--novideo",
+                "--no3d",
+                "--nou2f",
+                "--nodvd",
+                "--notv",
+                "--noinput",
+                "--x11=none",
+                "--nonewprivs",
+                "--caps.drop=all",
+                "--env=TMPDIR=/tmp/w/ossfuzz/work/tmp",
+                "--whitelist=/home/.bhf-hidden",
+                "--whitelist=/run/.bhf-hidden",
+                "--whitelist=/tmp/.bhf-hidden",
+                "--whitelist=/var/.bhf-hidden",
+                "--whitelist=~/.bhf-hidden",
+                "--whitelist=/run/user/1000/.bhf-hidden",
+                "--whitelist=/tmp/w/ossfuzz/src",
+                "--whitelist=/tmp/w/ossfuzz/work",
+                "--whitelist=/tmp/w/ossfuzz/out",
+                "--whitelist=/tmp/w/ossfuzz/engine",
                 "--read-only=/",
-                "--read-write=/w/ossfuzz/src",
-                "--read-write=/w/ossfuzz/work",
-                "--read-write=/w/ossfuzz/out",
+                "--read-only=~",
+                "--read-only=/tmp",
+                "--read-only=/run/user/1000",
+                "--read-only=/opt/data",
+                "--read-only=/tmp/w/ossfuzz/engine",
+                "--read-write=/tmp/w/ossfuzz/src",
+                "--read-write=/tmp/w/ossfuzz/work",
+                "--read-write=/tmp/w/ossfuzz/out",
+                "--blacklist=/dev/log",
+                "--blacklist=/sys",
                 "--",
                 "/bin/bash",
                 "build.sh",
             ]
+        );
+
+        // In the home directory, the import's directories are whitelisted
+        // into it; in a system directory, which the build sees anyway, they
+        // are not (a whitelist would hide the rest of it).
+        let home = firejail_argv(&Layout::new(Path::new("/home/me/w")), &host);
+        assert!(home.contains(&"--whitelist=/home/me/w/ossfuzz/src".to_owned()));
+        let opt = firejail_argv(&Layout::new(Path::new("/opt/w")), &host);
+        assert!(
+            !opt.iter().any(|arg| arg.starts_with("--whitelist=/opt")),
+            "{opt:?}"
+        );
+        assert!(opt.contains(&"--read-write=/opt/w/ossfuzz/out".to_owned()));
+        let bare = firejail_argv(&layout, &HostView::default());
+        assert!(
+            !bare.iter().any(|arg| arg.contains("/run/user")),
+            "{bare:?}"
+        );
+    }
+
+    /// The directories of `/` firejail hides: every directory but the
+    /// system ones, /proc, /sys and /dev; a symlink (`/bin` on a merged
+    /// /usr) or a file is not one.
+    #[cfg(unix)]
+    #[test]
+    fn the_hidden_directories_are_all_but_the_system_ones() {
+        let root = TestDir::new("ossfuzz-hidden-dirs");
+        for dir in [
+            "usr", "etc", "opt", "proc", "sys", "dev", "home", "tmp", "srv",
+        ] {
+            fs::create_dir(root.join(dir)).unwrap();
+        }
+        std::os::unix::fs::symlink("usr/bin", root.join("bin")).unwrap();
+        fs::write(root.join("swapfile"), b"").unwrap();
+        assert_eq!(
+            hidden_dirs(&root),
+            ["home", "srv", "tmp"].map(|name| root.join(name))
+        );
+    }
+
+    /// The writable mounts under the system directories, from mountinfo:
+    /// not `/`, not a read-only one, not one elsewhere (those are hidden),
+    /// with the kernel's octal escapes decoded.
+    #[cfg(unix)]
+    #[test]
+    fn the_writable_system_mounts_are_read_from_mountinfo() {
+        let mountinfo = "\
+22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
+23 22 8:2 / /opt/data rw,relatime shared:2 - ext4 /dev/sda2 rw
+24 22 8:3 / /opt/my\\040tools rw shared:3 - ext4 /dev/sda3 rw
+25 22 7:0 / /usr/lib/snapd ro,nodev shared:4 - squashfs /dev/loop0 ro
+26 22 0:5 / /dev/shm rw,nosuid shared:5 - tmpfs tmpfs rw
+27 22 0:6 / /home rw shared:6 - ext4 /dev/sda4 rw
+28 22 0:7 / /optional rw shared:7 - ext4 /dev/sda5 rw
+29 22 0:8 / /etc/pki rw shared:8 - tmpfs tmpfs rw
+";
+        assert_eq!(
+            writable_system_mounts(mountinfo),
+            ["/etc/pki", "/opt/data", "/opt/my tools"].map(PathBuf::from)
         );
     }
 

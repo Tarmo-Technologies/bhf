@@ -2,108 +2,65 @@
 
 # Release Packaging
 
-BHF uses `dist` to publish binary archives for the `bhf` CLI, the
-`bhf-daemon` JSON-RPC/read-only-MCP service, the `bhf_runtrace_shim` cdylib that
-`bhf auto` loads for runtime virtualisation on Linux, and the
-`bhf_cc_intercept` cdylib that C/C++ build recovery uses to observe
-absolute-path and `posix_spawn` compiler invocations.
+bhf uses `dist` (cargo-dist 0.31.0) to publish binary archives for four components:
 
-The CLI archives include the complete Ada, C/C++, C#, Java, JavaScript,
-Lua, Perl, PHP, Python, Ruby, and Rust harness-runtime trees. The executable
-also embeds those sources as a fallback for shell/PowerShell installer installs,
-so neither install style depends on a source checkout or a CI build path.
+- the `bhf` CLI;
+- `bhf-daemon`, the JSON-RPC and read-only MCP service;
+- the `bhf_runtrace_shim` library that `bhf auto` preloads on Linux for runtime virtualisation;
+- the `bhf_cc_intercept` library that C/C++ build recovery preloads to observe compilers started by absolute path or through `posix_spawn`.
+
+The CLI archives hold the complete Ada, C/C++, C#, Java, JavaScript, Lua, Perl, PHP, Python, Ruby and Rust harness-runtime trees. The executable also embeds those sources for installs made with the shell or PowerShell installer, so neither install style needs a source checkout or a CI build path.
 
 ## Artifacts
 
-The CLI and daemon archives are built for `x86_64-unknown-linux-gnu`,
-`aarch64-unknown-linux-gnu` and `x86_64-pc-windows-msvc`. Each GNU/Linux build
-runs natively in a pinned manylinux2014 / CentOS 7 container of its
-architecture; the aarch64 archives are smoke-tested on an ARM64 runner. An
-automated gate rejects GLIBC requirements newer than
-2.17 and missing preload-hook exports, fixing the release ABI for Ubuntu
-22.04/24.04/26.04 LTS and RHEL 7 through RHEL 10 instead of inheriting a newer
-Ubuntu runner's glibc. Release binaries are scan/build/fuzz tested across that
-Linux matrix. The Windows build runs on Windows Server 2022 and the same binary
-is smoke-tested on Server 2025; Windows Server 2019, Windows 11 Enterprise 25H2,
-and Windows 11 Enterprise LTSC 2024 are covered by the platform VM validation.
-The runtime
-preload libraries are Linux-only and use package-local targets, so they remain
-separate Linux cdylib assets rather than empty Windows artifacts. The
-all-in-one `bhf-dist-*` bundle is published for x86_64 only; on aarch64 use the
-component archives or installers. macOS and Windows-on-Arm artifacts are not
-currently published; CI's `macos-build` job builds bhf natively for
-`aarch64-apple-darwin` on a `macos-15` runner, without the Linux-only preload
-libraries, and runs a `bhf auto` smoke there.
+The CLI and daemon archives are built for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` and `x86_64-pc-windows-msvc`.
 
-The GitHub Release contains the all-in-one Linux `install.sh` bundle,
-per-component platform archives, Unix shell installers, and PowerShell
-installers for the portable Windows components:
+- **Linux.** Each GNU/Linux build runs natively in a pinned manylinux2014 (CentOS 7) container for its architecture, and the aarch64 archives are smoke-tested on an ARM64 runner. A release gate rejects a binary that needs a glibc newer than 2.17 or lacks a preload-hook export. That fixes the release ABI for Ubuntu 22.04, 24.04 and 26.04 LTS and RHEL 7 to 10, independent of the build runner's glibc. The release binaries are scan, build and fuzz tested across that Linux matrix.
+- **Windows.** The Windows build runs on Windows Server 2022, and the same binary is smoke-tested on Server 2025. The platform VM validation covers Windows Server 2019, Windows 11 Enterprise 25H2 and Windows 11 Enterprise LTSC 2024.
+- **Preload libraries.** The two shims are Linux-only and are published as Linux libraries only.
+- **All-in-one bundle.** `bhf-dist-*` is published for x86_64. On aarch64, use the component archives or installers.
+- **macOS.** Releases include no macOS or Windows-on-Arm artifacts. CI's `macos-build` job builds bhf natively for `aarch64-apple-darwin` on a `macos-15` runner, without the Linux preload libraries, and runs a `bhf auto` smoke test there.
 
-Choose one delivery form per component: run its installer on a connected host,
-or download its archive and checksum for a manual/offline install. The installer
-already downloads the archive, so keeping both is unnecessary.
+A GitHub Release contains the all-in-one Linux bundle with its `install.sh`, per-component archives for each platform, Unix shell installers, and PowerShell installers for the Windows components. For each component, pick one form: run its installer on a connected host, or download its archive and checksum for a manual or offline install. The installer downloads the archive itself.
 
-| Consumer scenario | Assets to use |
+| Scenario | Assets to use |
 |---|---|
-| Linux, complete one-package install | `bhf-dist-<version>-x86_64-unknown-linux-gnu.tar.gz` and its sidecar; extract and run the bundled `install.sh` |
-| Windows terminal/CI | `bhf-installer.ps1`, or the `bhf-*.zip` and its `.sha256` sidecar—not both |
-| Linux terminal/CI, basic features | `bhf-installer.sh`, or the Linux `bhf-*.tar.xz` and sidecar—not both |
-| Linux, full `bhf auto` on real projects | The Linux CLI plus `bhf_runtrace_shim` and `bhf_cc_intercept`; use either all three installers or all three archives/sidecars |
-| IDE, JSON-RPC, or read-only MCP | Add the OS-appropriate `bhf-daemon` installer/archive to the components needed for the workload |
-| Source audit/rebuild | `source.tar.gz` and `source.tar.gz.sha256`; no binary asset is required merely to inspect source |
-| Release automation | `dist-manifest.json` plus the relevant checksum sidecars, or `sha256.sum` for the full archive set |
+| Linux, complete one-package install | `bhf-dist-<version>-x86_64-unknown-linux-gnu.tar.gz` and its sidecar; extract it and run the bundled `install.sh` |
+| Windows terminal or CI | `bhf-installer.ps1`, or the `bhf-*.zip` and its `.sha256` sidecar |
+| Linux terminal or CI, basic features | `bhf-installer.sh`, or the Linux `bhf-*.tar.xz` and its sidecar |
+| Linux, full `bhf auto` on real projects | the Linux CLI plus `bhf_runtrace_shim` and `bhf_cc_intercept`, as three installers or three archives with sidecars |
+| IDE, JSON-RPC or read-only MCP | add the `bhf-daemon` installer or archive for your OS |
+| Source audit or rebuild | `source.tar.gz` and `source.tar.gz.sha256` |
+| Release automation | `dist-manifest.json` plus the checksum sidecars, or `sha256.sum` for the full archive set |
 
-The daemon is never required by the normal CLI. The two preload shims are
-Linux-only; Windows users should ignore them. Omitting the runtrace shim keeps
-ordinary scan/build/fuzz functionality but removes runtime audit, behavioral/
-taint oracles, and fake-resource support. Omitting the compiler-interception
-shim affects only complex C/C++ build recovery that must observe absolute-path
-or `posix_spawn` compiler launches.
+The CLI works without the daemon. On Windows, skip the two Linux preload shims. Without the runtrace shim, scan, build and fuzz work, and the runtime audit, the behavioural and taint oracles and the fake resources are off. The compiler-interception shim matters only for C/C++ build recovery that has to observe compilers started by absolute path or through `posix_spawn`.
 
-| Component prefix | Purpose | Required for |
+| Component prefix | Purpose | Needed for |
 |---|---|---|
-| `bhf-dist-*` | All-in-one Linux bundle with `install.sh`, CLI, daemon, both shims, runtimes, content pack, and smoke fixture | Complete Linux or air-gapped install after external signature verification |
-| `bhf-*` | Main CLI | All CLI workflows |
-| `bhf_runtrace_shim-*` | Runtime virtualisation `LD_PRELOAD` shim | Full `bhf auto` runtime audit/fake-resource support |
-| `bhf_cc_intercept-*` | Build-time compiler interception `LD_PRELOAD` shim | C/C++ `--probe-build` / `--build-command` recovery when builds invoke compilers by absolute path or via `posix_spawn` |
-| `bhf-daemon-*` | JSON-RPC and read-only MCP daemon | IDE/editor or MCP/agent integrations |
-| `source.tar.gz` | Release source snapshot | Source audit or rebuilds |
-| `dist-manifest.json`, `sha256.sum`, `*.sha256` | dist metadata and checksums | Automation and integrity verification |
+| `bhf-dist-*` | All-in-one Linux bundle: `install.sh`, CLI, daemon, both shims, runtimes, content pack and smoke fixture | a complete Linux or air-gapped install, after you verify its signature |
+| `bhf-*` | Main CLI | every CLI workflow |
+| `bhf_runtrace_shim-*` | Runtime virtualisation `LD_PRELOAD` shim | full `bhf auto` runtime audit and fake resources |
+| `bhf_cc_intercept-*` | Build-time compiler interception `LD_PRELOAD` shim | C/C++ `--probe-build` and `--build-command` recovery when builds start compilers by absolute path or through `posix_spawn` |
+| `bhf-daemon-*` | JSON-RPC and read-only MCP daemon | IDE, editor, MCP and agent integrations |
+| `source.tar.gz` | Release source snapshot | source audit or rebuild |
+| `dist-manifest.json`, `sha256.sum`, `*.sha256` | dist metadata and checksums | automation and integrity checks |
 
-For manual component installs, copy `libbhf_runtrace_shim.so` and
-`libbhf_cc_intercept.so` into the extracted `bhf-*` CLI directory, or
-set `BHF_RUNTRACE_SHIM` / `BHF_CC_INTERCEPT` to absolute extracted
-paths. Only the runtrace shim has sibling-archive-directory discovery; the
-compiler-interception shim must be directly beside the CLI or explicitly
-configured. Every component archive includes `INSTALL.md` with exact commands.
-For component-installer installs, run each installer you need; installing
-`bhf` alone installs only the CLI. Each archive has a SHA-256 checksum
-sidecar, and the all-in-one distribution carries a content pack whose SHA-256
-digests and Ed25519 publisher signature are checked during package creation
-and install when the operator supplies an external trust policy. The checksum
-sidecars alone do not authenticate a publisher.
+For a manual component install, copy `libbhf_runtrace_shim.so` and `libbhf_cc_intercept.so` into the extracted `bhf-*` CLI directory, or set `BHF_RUNTRACE_SHIM` and `BHF_CC_INTERCEPT` to their absolute paths. bhf also finds the runtrace shim in a sibling `bhf_runtrace_shim-*` archive directory; the compiler-interception shim must sit beside the CLI or be set explicitly. Every component archive includes an `INSTALL.md` with the exact commands. Every component archive also carries the documentation beside `README.md` (`docs/`, `examples/`, `schemas/`, `benchmarks/` and the pages `README.md` links), and the release workflow checks that the links of `README.md`, `INSTALL.md` and `docs/site/index.md` resolve inside each Linux archive. With the component installers, run each one you need; the `bhf` installer installs the CLI.
 
-The release workflow post-processes the main Unix `bhf-installer.sh` so
-RHEL and CentOS 7 users see the required repository, compiler-package, and
-separate preload-shim installation commands before the installer runs. This
-keeps the generated cargo-dist installer reproducible while making its scope
-and the complete EL7 setup explicit.
+Each archive has a SHA-256 checksum sidecar. A sidecar detects changes to the file; it does not identify the publisher. The all-in-one bundle carries a content pack whose SHA-256 digests and Ed25519 publisher signature are checked when the pack is built, and again at install when you supply an external trust policy.
 
-All four Unix installers are also post-processed to require `xz` before they
-download a `.tar.xz` archive. This gives minimal RHEL installations an immediate
-missing-command diagnostic instead of failing partway through extraction.
+### Installer adjustments
 
-It also post-processes both Linux preload-library installers to correct
-cargo-dist 0.31's temporary-directory `chmod` path. A release gate checks the
-corrected path so a shim installer cannot be published with the known failure.
-The CLI and daemon PowerShell installers are post-processed as well so
-`Expand-Archive` does not access a console progress buffer in non-interactive
-Windows OpenSSH sessions.
+The release workflow edits the generated installers after `dist` creates them:
+
+- `bhf-installer.sh` prints, before it runs, the repository, compiler-package and preload-shim commands that RHEL and CentOS 7 need. The generated installer stays reproducible.
+- All four Unix installers check for `xz` before they download a `.tar.xz` archive, so a minimal RHEL host gets a clear missing-command message instead of failing during extraction.
+- Both Linux preload-library installers get a corrected temporary-directory `chmod` path for cargo-dist 0.31, and a release gate checks that correction.
+- The CLI and daemon PowerShell installers stop `Expand-Archive` from reading the console progress buffer, which fails in non-interactive Windows OpenSSH sessions.
 
 ## Binary-Only Distribution Package
 
-For customer or enclave installs where the build host has source but the
-destination host should receive only an installable package, use:
+When the build host has the source and the destination host should receive only an installable package, as in an enclave, run:
 
 ```sh
 scripts/package-offline-dist.sh \
@@ -111,7 +68,7 @@ scripts/package-offline-dist.sh \
   --trusted-public-key keys/publisher.pub
 ```
 
-When CVE DBs or seeds are not provided, the script creates and packages:
+When you supply no CVE databases or seeds, the script creates and packages:
 
 ```text
 dist/content-inputs/sbom-cves.json
@@ -119,32 +76,22 @@ dist/content-inputs/binary-cves.json
 dist/content-inputs/seeds/
 ```
 
-Those generated CVE DBs are valid empty defaults. Replace them with real feed
-data and rerun the same command when you need SBOM or binary-CVE matching.
+The generated CVE databases are valid and empty. For SBOM or binary CVE matching, replace them with real feed data (`--sbom-cve-db`, `--binary-cve-db`) and run the same command again.
 
-The script builds `cargo build --release --workspace`, stages the CLI, daemon,
-runtrace shim, compiler-interception shim, harness runtime support files, a tiny
-`bhf auto` smoke fixture, the `bhf-bug-report` privacy-scrubbing support
-collector, an Ed25519-signed content pack, and `install.sh`, then writes
-`dist/bhf-dist-<version>-<triple>.tar.gz` plus a SHA-256 sidecar and detached
-`.tar.gz.sig` Ed25519 signature. The
-package does not include the BHF application source tree; it does include
-runtime support files needed to compile generated harnesses on the destination.
-It also includes `README-DIST.md` for package context, `INSTALL.md` for both the
-installer and manual co-location choices, and `RUN-BHF.md` for post-install
-operation.
+The script runs `cargo build --release --workspace` and stages:
 
-The staged runtime trees cover C/C++, Ada, Rust, Java, Python, Perl, C#,
-JavaScript/TypeScript, Ruby, Lua, and PHP. COBOL, Fortran, and Go use their
-system toolchains plus the shared C runtime and do not have separate runtime
-trees. All sixteen installer dependency profiles are selected by default in
-both interactive and non-interactive installation. Use `--languages c,cpp` or
-another explicit subset to select fewer languages.
+- the CLI, the daemon, the runtrace shim and the compiler-interception shim;
+- the harness runtime support files needed to compile generated harnesses on the destination;
+- a small `bhf auto` smoke fixture;
+- the `bhf-bug-report` support collector, which scrubs private data;
+- an Ed25519-signed content pack and `install.sh`;
+- documentation: `README.md`, `INSTALL.md`, `RELEASE_NOTES.md`, `LICENSE`, `README-DIST.md` (package context), `RUN-BHF.md` (running bhf after install) and the offline runbooks (`scripts/package-offline-dist.sh --help` lists the current set).
 
-The bundled `install.sh` prompts with an arrow-key terminal checklist for
-languages, compile targets, fuzzers, and extras. Up/Down moves through options
-and the OK/Cancel rows, Space toggles options, and Enter accepts the highlighted
-action. Non-interactive all-features install:
+It writes `dist/bhf-dist-<version>-<triple>.tar.gz` with a SHA-256 sidecar and a detached `.tar.gz.sig` Ed25519 signature. The package holds no bhf application source.
+
+The staged runtime trees cover C/C++, Ada, Rust, Java, Python, Perl, C#, JavaScript and TypeScript, Ruby, Lua and PHP. COBOL, Fortran and Go use their system toolchains and the shared C runtime. The installer selects all sixteen language dependency profiles by default, interactively or not; pass `--languages c,cpp` or another subset to install fewer.
+
+The bundled `install.sh` shows a terminal checklist for languages, compile targets, fuzzers and extras. Up and Down move through the options and the OK and Cancel rows, Space toggles an option, and Enter accepts. A non-interactive install of every feature:
 
 ```sh
 ./install.sh --non-interactive --trust-policy /trusted/operator-policy.json \
@@ -154,24 +101,11 @@ action. Non-interactive all-features install:
   --extras build-recovery,sandbox,archives
 ```
 
-The installer requires an independently provisioned policy pinning the
-publisher public key. The archive, verifier, and key must themselves be
-authenticated out of band before extraction or execution; a same-channel
-checksum sidecar alone cannot establish publisher identity. Check the detached
-signature with a separately trusted `scripts/verify-offline-dist.sh` and the
-publisher public key before extraction. An explicitly produced checksum-only
-pack requires `--allow-legacy-integrity-only` instead; it is not authenticated.
+The installer needs a policy, provisioned independently, that pins the publisher's public key. Authenticate the archive, the verifier and the key out of band before you extract or run anything: a checksum sidecar from the same channel cannot establish who published it. Check the detached signature with a separately trusted `scripts/verify-offline-dist.sh` and the publisher's public key before extraction. A pack built as checksum-only (`--legacy-integrity-only`) is unauthenticated and installs only with `--allow-legacy-integrity-only`.
 
-The installer runs the bundled smoke fixture by default after install; pass
-`--no-smoke` only for constrained installs where the C toolchain is intentionally
-absent.
+After installing, the installer runs the bundled smoke fixture. Pass `--no-smoke` to skip it, for example on a host without a C toolchain.
 
-The release workflow invokes the same packager with the EL7-baseline prebuilt
-release directory for every tagged release, verifies the archive checksum and
-required payload, extracts the bundle, requires `install.sh`, `INSTALL.md`,
-`LICENSE`, `README.md`, and `RELEASE_NOTES.md`, runs the installer into a
-temporary prefix, and publishes both the tarball and sidecar. This keeps the
-one-package artifact on the same glibc 2.17 baseline as the component archives.
+For every tagged release, the release workflow runs the same packager on the EL7-baseline prebuilt binaries. It verifies the archive checksum and the required payload, extracts the bundle, checks that `install.sh`, `INSTALL.md`, `LICENSE`, `README.md` and `RELEASE_NOTES.md` are present, runs the installer into a temporary prefix, and publishes the tarball and its sidecar. The all-in-one bundle is therefore on the same glibc 2.17 baseline as the component archives.
 
 ## Verification
 
@@ -179,34 +113,21 @@ one-package artifact on the same glibc 2.17 baseline as the component archives.
 sha256sum -c <asset>.sha256
 ```
 
-GitHub Artifact Attestations are disabled in the generated workflow because
-GitHub currently rejects attestation persistence for this private
-Tarmo-Technologies organization/repository plan. When repository support is
-available, re-enable `github-attestations = true`, regenerate the workflow, and
-restore the connected `gh attestation verify` step.
+GitHub Artifact Attestations are turned off (`github-attestations = false` in `Cargo.toml`). To turn them on, set it to `true`, regenerate the workflow and restore the `gh attestation verify` step.
 
 ## Release Flow
 
-Before cutting a release tag, bump `[workspace.package].version` in `Cargo.toml`
-to the exact tag version, refresh `Cargo.lock`, and validate dist's local
-release plan:
+Before you push a release tag, set `[workspace.package].version` in `Cargo.toml` to the tag's version, refresh `Cargo.lock`, and check dist's local release plan:
 
 ```sh
-dist host --steps=create --tag=vX.Y.Z
+dist host --steps=create --tag=X.Y.Z
 ```
 
-Tag pushes matching semantic versions, such as `v0.2.19`, run the generated
-release workflow. The workflow plans artifacts, builds the EL7-compatible Linux
-and Windows MSVC archives and checksums, verifies that every harness runtime is
-inside both CLI archives, generates Unix shell and PowerShell installers, and
-uploads the verified artifacts to the GitHub Release.
+Pushing a tag that matches a semantic version, such as `0.3.0`, runs the release workflow. It plans the artifacts, builds the EL7-compatible Linux archives and the Windows MSVC archives with their checksums, checks that every harness runtime is inside each CLI archive, generates the Unix shell and PowerShell installers, and uploads the verified artifacts to the GitHub Release.
 
 ## Air-Gapped Packs
 
-Update packs are local JSON manifests for rules, CVE databases, corpora, and
-other offline content. Create one with deterministic hashes and an Ed25519
-publisher signature. The legacy `--sign-key` option labels an unkeyed digest
-and does not authenticate the pack:
+Update packs are local JSON manifests for rules, CVE databases, corpora and other offline content. Create one with deterministic hashes and an Ed25519 publisher signature:
 
 ```sh
 bhf pack keygen --private-key keys/offline-root.der --public-key keys/offline-root.pub
@@ -225,8 +146,4 @@ bhf pack verify packs/current/update-pack.json \
   --policy bhf-policy.json
 ```
 
-The verifying host must independently configure
-`update_packs.trusted_public_keys: {"offline-root": "<64-character public key hex>"}`
-and `require_signature: true`. The private key must not be transferred with
-the pack. The source-tree document `docs/enterprise-pack-authentication.md`
-specifies canonical bytes, rotation, revocation, and legacy behavior.
+The legacy `--sign-key` option only labels an unkeyed digest; it does not authenticate the pack. The verifying host must configure, independently, `update_packs.trusted_public_keys: {"offline-root": "<64-character public key hex>"}` and `require_signature: true`. Keep the private key on the signing host; never transfer it with the pack. [docs/enterprise-pack-authentication.md](../enterprise-pack-authentication.md) specifies the canonical bytes, key rotation, revocation and legacy behaviour.

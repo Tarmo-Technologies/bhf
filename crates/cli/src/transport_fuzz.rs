@@ -1569,11 +1569,13 @@ pub(crate) fn run_transport_campaign_workers(
     config: &TransportFuzzConfig,
 ) -> Result<TransportFuzzSummary, TransportFuzzError> {
     let campaign = Campaign::new(config);
+    let profile = config::Profile::given();
     let results: Vec<Result<(), TransportFuzzError>> = std::thread::scope(|scope| {
         let campaign = &campaign;
         let handles: Vec<_> = (0..workers.max(1))
             .map(|worker| {
                 scope.spawn(move || {
+                    let _profile = config::GivenProfile::enter(profile);
                     let transport = make(worker)?;
                     let result = run_worker(worker, transport.as_ref(), campaign, config);
                     if result.is_err() {

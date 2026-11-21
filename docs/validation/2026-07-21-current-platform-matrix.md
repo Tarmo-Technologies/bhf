@@ -2,19 +2,9 @@
 
 # Current Linux and Windows platform validation (2026-07-21)
 
-This record extends the RHEL 7 compatibility work through the current RHEL,
-Ubuntu LTS, Windows client, and Windows Server generations. The tested support
-matrix is RHEL 7–10, Ubuntu 22.04/24.04/26.04 LTS, Windows 11 Enterprise 25H2,
-Windows 11 Enterprise LTSC 2024 (24H2 codebase), and Windows Server
-2019/2022/2025. Windows 10 and Server 2016 are outside this matrix because their
-normal Microsoft support has ended.
+This record extends the [RHEL 7 compatibility work](2026-07-21-rhel7-proxmox.md) through the current RHEL, Ubuntu LTS, Windows client, and Windows Server generations. The tested support matrix is RHEL 7–10, Ubuntu 22.04/24.04/26.04 LTS, Windows 11 Enterprise 25H2, Windows 11 Enterprise LTSC 2024 (24H2 codebase), and Windows Server 2019/2022/2025. Windows 10 and Server 2016 are outside this matrix because their normal Microsoft support has ended.
 
-The Linux tests used the published v0.2.18 release installers and the same
-EL7-baseline artifacts delivered to users. Windows tests used the published
-native MSVC release executables. Each behavioral smoke covered `--version`, the
-daemon, `scan`, `auto --list-targets`, native C harness compilation, and a real
-fuzz run whose JSON report had one `built_and_fuzzed` target. Linux sanitizer
-runs also required ASan+UBSan success and a nonempty per-harness runtrace.
+The Linux tests used the published v0.2.18 release installers and the same EL7-baseline artifacts delivered to users. Windows tests used the published native MSVC release executables. Each behavioral smoke covered `--version`, the daemon, `scan`, `auto --list-targets`, native C harness compilation, and a real fuzz run whose JSON report had one `built_and_fuzzed` target. Linux sanitizer runs also required ASan+UBSan success and a nonempty per-harness runtrace.
 
 ## Proxmox and official Red Hat validation
 
@@ -30,42 +20,25 @@ runs also required ASan+UBSan success and a nonempty per-harness runtrace.
 | Windows 11 Enterprise LTSC 2024 Evaluation | Proxmox VM 116; build 26100.1742 (24H2 codebase) | UEFI Secure Boot and TPM 2.0 | PASS: official hash-verified Microsoft evaluation media, CLI and daemon PowerShell installers, scan, discovery, LLVM 22 + VS 2022 native build, and 32-iteration fuzz run |
 | Windows Server 2019 Standard Evaluation | Proxmox VM 114; build 17763 | Native x64 guest | PASS: CLI and daemon PowerShell installers over OpenSSH; scan, discovery, LLVM 22 + VS 2022 native build, and 32-iteration fuzz run |
 
-Licensed RHEL installation media was not available. AlmaLinux guests therefore
-provide full-system RHEL-compatible VM evidence, while Red Hat's official UBI
-10.2 image provides an actual current RHEL 10.2 userspace check. This supports a
-compatibility statement, not Red Hat certification.
+Licensed RHEL installation media was not available. The AlmaLinux guests give full-system RHEL-compatible VM evidence, and Red Hat's official UBI 10.2 image checks a current RHEL 10.2 userspace.
 
 ## Continuous matrix
 
 The CI workflow has persistent behavioral jobs for the release artifact on:
 
-- AlmaLinux 8.10, 9.8, and 10.2 containers, in addition to the EL7 ABI build
-  and retained CentOS 7.9 VM result;
+- AlmaLinux 8.10, 9.8, and 10.2 containers, in addition to the EL7 ABI build and retained CentOS 7.9 VM result;
 - Ubuntu 22.04, 24.04, and 26.04 LTS runners; and
 - Windows Server 2022 and 2025 runners using the native MSVC release pair.
 
-The Windows jobs share `scripts/ci/windows-release-smoke.ps1`, so both lanes
-must perform a real native C compile and fuzz rather than a startup-only smoke.
+The Windows jobs share `scripts/ci/windows-release-smoke.ps1`, so both lanes compile a native C harness and fuzz it.
 
 ## Defects found and fixed
 
 Clean-host validation found three distribution defects and one diagnostic bug:
 
-1. Cargo-dist 0.31's generated preload-library installers applied `chmod` to a
-   final path before moving the library from its temporary directory. Both
-   Linux shim installers are now corrected and release-gated.
-2. Cargo-dist's PowerShell `Expand-Archive` progress display attempted to read a
-   console buffer in non-interactive Windows OpenSSH sessions. Both Windows
-   installers now disable archive progress in that scope.
-3. Minimal RHEL images can omit the external `xz` helper required by `.tar.xz`
-   release archives. RHEL prerequisites now install it, and every generated
-   Unix installer checks for it before downloading an archive.
-4. Missing Windows C/C++ prerequisites incorrectly suggested `apt-get`, while
-   Linux hints did not distinguish RHEL from Ubuntu. Windows diagnostics now
-   name LLVM, VS 2022 Build Tools/Windows SDK, and GNU make; Linux diagnostics
-   distinguish RHEL 7 LLVM Toolset 7, RHEL 8+ `dnf`, and Ubuntu `apt-get`.
+1. Cargo-dist 0.31's generated preload-library installers applied `chmod` to a final path before moving the library from its temporary directory. Both Linux shim installers are now corrected and release-gated.
+2. Cargo-dist's PowerShell `Expand-Archive` progress display attempted to read a console buffer in non-interactive Windows OpenSSH sessions. Both Windows installers now disable archive progress in that scope.
+3. Minimal RHEL images can omit the external `xz` helper required by `.tar.xz` release archives. RHEL prerequisites now install it, and every generated Unix installer checks for it before downloading an archive.
+4. Missing Windows C/C++ prerequisites incorrectly suggested `apt-get`, while Linux hints did not distinguish RHEL from Ubuntu. Windows diagnostics now name LLVM, VS 2022 Build Tools/Windows SDK, and GNU make; Linux diagnostics distinguish RHEL 7 LLVM Toolset 7, RHEL 8+ `dnf`, and Ubuntu `apt-get`.
 
-The broader functional result remains the
-[53-project post-update sweep](./2026-07-21-major-updates-sweep.md): 106 clean
-and damaged project runs, 47/47 in-scope successes in both populations, followed
-by the complete workspace regression suite.
+For the functional result, see the [53-project post-update sweep](./2026-07-21-major-updates-sweep.md): 106 clean and damaged project runs, 47/47 in-scope successes in both populations, followed by the complete workspace regression suite.

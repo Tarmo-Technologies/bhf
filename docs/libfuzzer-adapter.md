@@ -2,31 +2,26 @@
 
 # libFuzzer Adapter
 
-The standalone libFuzzer adapter is intentionally deferred for Ada. BHF can
-define the adapter contract without shipping or requiring LLVM, libFuzzer, or an
-Ada frontend in the strict-permissive core profile.
+## C and C++
 
-C and C++ are different: generated C/C++ harnesses already expose
-`LLVMFuzzerTestOneInput`, and their Makefiles build sanitizer-instrumented
-binaries (ASan/UBSan plus `trace-pc-guard` / `trace-cmp` coverage) with
-`clang` / `clang++` — but they deliberately do not link libFuzzer's own `main`
-(`-fsanitize=fuzzer`). `bhf fuzz` still defaults to the built-in
-BHF engine, which drives those binaries through a persistent framed
-fork-server (single-input file mode as a fallback) and normalizes sanitizer
-findings into BHF reports. Running the generated `main` binary directly
-drives that BHF fork-server / single-input loop, not libFuzzer's own loop.
+Generated C and C++ harnesses define `LLVMFuzzerTestOneInput`. Their Makefiles build two kinds of binary with `clang` / `clang++`:
 
-The planned adapter boundary is:
+| Make target | Binary | Links | Run by |
+|---|---|---|---|
+| `make` (default) | `main` | bhf's driver (`c_runtime/bhf_driver.c`), ASan/UBSan, `trace-pc-guard` / `trace-cmp` coverage; no libFuzzer | `bhf fuzz` (builtin engine, the default) |
+| `make libfuzzer` | `main_libfuzzer` | `-fsanitize=fuzzer,address,undefined` (libFuzzer's own `main`) | `bhf fuzz --engine libfuzzer`, or libFuzzer-compatible external drivers |
 
-- user supplies a working LLVM/libFuzzer toolchain with a production-viable Ada
-  frontend;
-- generated harness behavior is exposed through `LLVMFuzzerTestOneInput`;
-- testcase bytes are passed to the existing harness contract as stdin-equivalent
-  bytes;
-- adapter smoke tests skip when the host lacks that Ada/LLVM path, but the Rust
-  crate still tests the contract and skip reason.
+The builtin engine drives `main` through a persistent framed fork server, with single-input file mode as a fallback, and normalizes sanitizer reports into bhf findings. Running `main` by hand runs bhf's driver loop.
 
-Until that Ada toolchain path exists, use the built-in engine as the supported
-default for Ada. C/C++ users can also build an AFL++ target with
-`bhf build --c-engine afl++` and run it with
-`bhf fuzz --engine afl++` when AFL++ is installed.
+`bhf fuzz --engine libfuzzer` runs `main_libfuzzer` in process, building it with `make libfuzzer` when it is missing; it needs clang. To fuzz with AFL++ instead, build with `bhf build --c-engine afl++` and run `bhf fuzz --engine afl++` with AFL++ installed.
+
+The libFuzzer flags that the builtin engine mirrors are mapped in [libFuzzer feature parity](site/libfuzzer-parity.md).
+
+## Ada
+
+The builtin engine is the fuzzer for Ada harnesses. A libFuzzer adapter for Ada needs an LLVM-based Ada front end, which the strict-permissive core profile neither ships nor requires. The adapter contract is:
+
+- the user supplies a working LLVM/libFuzzer toolchain with a production-ready Ada front end;
+- the generated harness is exposed through `LLVMFuzzerTestOneInput`;
+- the testcase bytes reach the existing harness contract as stdin-equivalent bytes;
+- the adapter's smoke tests skip when the host has no such Ada/LLVM path, and the Rust crate still tests the contract and the skip reason.

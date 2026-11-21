@@ -185,6 +185,7 @@ class WorkflowContractTests(unittest.TestCase):
         "explain_cli",
         "provenance_cli",
         "winafl_engine",
+        "fork_server_slow_start",
     )
 
     def test_windows_runs_the_windows_integration_suites(self):
@@ -207,6 +208,25 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertEqual(sorted(named), sorted(self.WINDOWS_INTEGRATION_SUITES))
         for suite in named:
             self.assertTrue((ROOT / "crates/cli/tests" / f"{suite}.rs").is_file(), suite)
+
+    def test_windows_runs_the_cobol_lane_with_gnucobols_mingw_build(self):
+        # #430: the COBOL lane builds on native Windows with the gcc in
+        # GnuCOBOL's bin, which bhf finds through COB_CONFIG_DIR when the cobc
+        # on PATH is Chocolatey's shim.
+        steps = re.findall(r"(?m)^      - name: (.+)$", self.jobs["windows-build"])
+        self.assertLess(steps.index("Install GNU make"), steps.index("Test the COBOL lane"))
+        lines = self.windows_step("Test the COBOL lane").splitlines()
+        install = [index for index, line in enumerate(lines) if line.strip().startswith("choco install gnucobol ")]
+        self.assertEqual(len(install), 1)
+        self.assertRegex(lines[install[0]], r"--version=\d+(\.\d+)+\b")
+        self.assertEqual(lines[install[0] + 1].strip(), "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }")
+        step = "\n".join(lines)
+        self.assertIn("COB_CONFIG_DIR", step)
+        self.assertIn('BHF_REQUIRE_TOOLS: "1"', step)
+        commands = [index for index, line in enumerate(lines) if line.strip().startswith("cargo test ")]
+        self.assertEqual(len(commands), 1)
+        self.assertIn("--test auto_cobol", lines[commands[0]])
+        self.assertEqual(lines[commands[0] + 1].strip(), "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }")
 
     def test_windows_integration_suites_have_make(self):
         # Their end-to-end tests skip when GNU make is not on PATH, and the

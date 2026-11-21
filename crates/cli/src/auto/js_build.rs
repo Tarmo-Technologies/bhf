@@ -74,6 +74,10 @@ pub enum JsBuildResult {
     MissingToolchain(String),
     /// A genuine failure (missing runtime, unwritable work dir).
     Failed(String),
+    /// Built, but every input the build's probe ran stopped at the same
+    /// undefined global, from the same frame: the target's environment, not a
+    /// finding. Carries why, naming the global.
+    NotEntered(String),
 }
 
 fn have_node() -> bool {
@@ -102,8 +106,15 @@ fn resolve_target(candidate: &Candidate) -> Result<JsFunction, String> {
         .ok_or_else(|| format!("JS target `{}` no longer present in source", candidate.name))
 }
 
-/// The single public entry point of the lane.
-pub fn build_js_harness(candidate: &Candidate, work_dir: &Path, harness_id: &str) -> JsBuildResult {
+/// The single public entry point of the lane. `starting_inputs`: the run's
+/// seed inputs (`--seed-file`/`--seed-dir`, or the seeds mined from the
+/// tree), which build gate 4 also runs.
+pub fn build_js_harness(
+    candidate: &Candidate,
+    work_dir: &Path,
+    harness_id: &str,
+    starting_inputs: &[Vec<u8>],
+) -> JsBuildResult {
     if !have_node() {
         return JsBuildResult::MissingToolchain(
             "no `node` runtime found; install Node.js to fuzz JavaScript (the lane \
@@ -139,7 +150,15 @@ pub fn build_js_harness(candidate: &Candidate, work_dir: &Path, harness_id: &str
         return JsBuildResult::Skip(reason);
     }
 
-    emit_js_harness(work_dir, harness_id, &runtime, &module_abs, &func, false)
+    emit_js_harness(
+        work_dir,
+        harness_id,
+        &runtime,
+        &module_abs,
+        &func,
+        false,
+        starting_inputs,
+    )
 }
 
 /// `None` if the module parses and `require`s cleanly, else a skip reason. Catches
@@ -197,7 +216,8 @@ fn js_module_load_error(module_abs: &Path, load_cwd: &Path) -> Option<String> {
 /// `source_maps`: run node with `--enable-source-maps`, so the stacks of a
 /// module transpiled with a source map (the TypeScript lane's `target.js`)
 /// name the original source's file and line. Off for plain JavaScript, whose
-/// frames already name its own files.
+/// frames already name its own files. `starting_inputs`: the run's seed
+/// inputs, for build gate 4.
 fn emit_js_harness(
     work_dir: &Path,
     harness_id: &str,
@@ -205,6 +225,7 @@ fn emit_js_harness(
     module_abs: &Path,
     func: &JsFunction,
     source_maps: bool,
+    starting_inputs: &[Vec<u8>],
 ) -> JsBuildResult {
     let hdir = crate::auto::layout::harness_dir(work_dir, harness_id);
     if let Err(e) = std::fs::create_dir_all(&hdir) {
@@ -289,7 +310,161 @@ fn emit_js_harness(
     if let Some(reason) = js_export_load_error(&main_path, &func.export_path) {
         return JsBuildResult::Skip(reason);
     }
+    // Build gate 4 (#398): a global that neither Node nor the driver's
+    // browser stand-ins define (`FileReader`, a host's `app`) that every
+    // input bhf can try stops at. Fuzzing it would report the environment as
+    // a finding.
+    if let Some(stop) = undefined_global_gate(&main_path, starting_inputs) {
+        return JsBuildResult::NotEntered(stop.reason());
+    }
     JsBuildResult::Built
+}
+
+/// Every input build gate 4's probe ran threw `ReferenceError: {name} is
+/// not defined` from `frame` (V8's `fn (file:line:column)`).
+#[derive(Debug, PartialEq)]
+struct UndefinedGlobalStop {
+    inputs: usize,
+    name: String,
+    frame: String,
+}
+
+impl UndefinedGlobalStop {
+    fn reason(&self) -> String {
+        let UndefinedGlobalStop {
+            inputs,
+            name,
+            frame,
+        } = self;
+        format!(
+            "all {inputs} inputs bhf ran before fuzzing (the fuzz passes' starting inputs, and \
+             inputs built from the target's own literals) stop at `ReferenceError: {name} is \
+             not defined`, thrown at `{frame}`. Node does not define `{name}` here, so this is \
+             the target's environment, not a finding. Fuzz the target where `{name}` exists, \
+             fuzz a function that does not need it, or pass an input that gets past that \
+             point with `--seed-file`"
+        )
+    }
+}
+
+/// How many of the target's dictionary tokens build gate 4 turns into probe
+/// inputs, at most (two inputs each).
+const MAX_LITERAL_PROBES: usize = 2048;
+
+/// Build gate 4 (#398): `Some` when every input the probe runs stops at the
+/// same undefined global from the same frame. The bootstrap seeds
+/// ([`crate::auto::attempt::BOOTSTRAP_SEEDS`]) run first, alone: most targets
+/// get past the first of them, and the gate ends there. Only when all of them
+/// stop does the probe run [`undefined_global_probes`]. `None` as soon as one
+/// input does anything else (runs cleanly, is rejected, raises another error),
+/// and when the probe cannot run or runs out of time: then the gate has
+/// learned nothing and the target is fuzzed.
+fn undefined_global_gate(
+    main_path: &Path,
+    starting_inputs: &[Vec<u8>],
+) -> Option<UndefinedGlobalStop> {
+    let bootstrap: Vec<Vec<u8>> = crate::auto::attempt::BOOTSTRAP_SEEDS
+        .iter()
+        .map(|seed| seed.to_vec())
+        .collect();
+    run_undefined_global_probe(main_path, &bootstrap, Duration::from_secs(10))?;
+    let dir = main_path.parent().unwrap_or_else(|| Path::new("."));
+    let probes = undefined_global_probes(dir, starting_inputs);
+    run_undefined_global_probe(main_path, &probes, Duration::from_secs(60))
+}
+
+/// The inputs build gate 4 runs when every bootstrap seed stopped: the fuzz
+/// passes' starting inputs (the bootstrap seeds, the run's seed inputs and a
+/// provided harness's seeds), each token of the harness's dictionary (the
+/// target's own string and number literals) alone and followed by 64 `A`s,
+/// and three longer shapes. Duplicates are dropped; the order is kept.
+fn undefined_global_probes(harness_dir: &Path, starting_inputs: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let mut probes: Vec<Vec<u8>> = crate::auto::attempt::BOOTSTRAP_SEEDS
+        .iter()
+        .map(|seed| seed.to_vec())
+        .collect();
+    probes.extend(starting_inputs.iter().cloned());
+    probes.extend(crate::auto::provided::load_seeds(harness_dir));
+    let dictionary =
+        std::fs::read_to_string(harness_dir.join("dictionary.txt")).unwrap_or_default();
+    let tokens = dictionary
+        .lines()
+        .filter_map(|line| crate::fuzz::parse_afl_dictionary_line(line).ok().flatten())
+        .filter(|token| !token.is_empty())
+        .take(MAX_LITERAL_PROBES);
+    for token in tokens {
+        let mut padded = token.clone();
+        padded.extend_from_slice(&[b'A'; 64]);
+        probes.push(token);
+        probes.push(padded);
+    }
+    probes.extend([vec![b'A'; 4096], vec![0; 64], vec![0xff; 64]]);
+    let mut seen = std::collections::HashSet::new();
+    probes.retain(|probe| seen.insert(probe.clone()));
+    probes
+}
+
+/// Run `inputs` through the emitted launcher in the driver's probe mode
+/// (`BHF_JS_PROBE`, one process for all of them) and read its verdict.
+fn run_undefined_global_probe(
+    main_path: &Path,
+    inputs: &[Vec<u8>],
+    timeout: Duration,
+) -> Option<UndefinedGlobalStop> {
+    let dir = main_path.parent().unwrap_or_else(|| Path::new("."));
+    let file = dir.join("bhf-probe-inputs.bin");
+    let mut framed = Vec::new();
+    for input in inputs {
+        framed.extend_from_slice(&u32::try_from(input.len()).ok()?.to_le_bytes());
+        framed.extend_from_slice(input);
+    }
+    std::fs::write(&file, framed).ok()?;
+    let mut command = match crate::launch_spec::launch_for(main_path) {
+        Some(launch) => {
+            let mut command = Command::new(&launch.program);
+            command.args(&launch.args).envs(launch.env.iter().cloned());
+            command
+        }
+        None => Command::new(main_path),
+    };
+    command
+        .env("BHF_JS_PROBE", &file)
+        .env_remove("BHF_FRAMED")
+        .env_remove("BHF_JS_LOAD_ONLY")
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null());
+    let run = crate::command_output::output_with_timeout_flagged(&mut command, timeout);
+    let _ = std::fs::remove_file(&file);
+    let (out, timed_out) = run.ok()?;
+    if timed_out {
+        return None;
+    }
+    undefined_global_verdict(&String::from_utf8_lossy(&out.stderr))
+        .filter(|stop| stop.inputs == inputs.len())
+}
+
+/// The probe's verdict when every input stopped at one undefined global
+/// (`== bhf js probe: every input stopped: 3: hostApp: readUpload (/x/a.js:9:17)`).
+fn undefined_global_verdict(stderr: &str) -> Option<UndefinedGlobalStop> {
+    let verdict = stderr
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("== bhf js probe: "))?;
+    let rest = verdict.strip_prefix("every input stopped: ")?;
+    let (inputs, rest) = rest.split_once(": ")?;
+    let (name, frame) = rest.split_once(": ")?;
+    let identifier = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c == '_' || c == '$' || c.is_alphanumeric());
+    if !identifier {
+        return None;
+    }
+    Some(UndefinedGlobalStop {
+        inputs: inputs.parse().ok()?,
+        name: name.to_owned(),
+        frame: frame.trim_end().to_owned(),
+    })
 }
 
 /// Run the emitted launcher in LOAD-ONLY mode: the driver resolves the export,
@@ -472,6 +647,7 @@ pub fn build_ts_harness(
     work_dir: &Path,
     harness_id: &str,
     scan_root: Option<&Path>,
+    starting_inputs: &[Vec<u8>],
 ) -> JsBuildResult {
     if !have_node() {
         return JsBuildResult::MissingToolchain(
@@ -540,7 +716,15 @@ pub fn build_ts_harness(
     if let Some(reason) = js_module_load_error(&out_js, &hdir) {
         return JsBuildResult::Skip(reason);
     }
-    emit_js_harness(work_dir, harness_id, &runtime, &out_js, &func, true)
+    emit_js_harness(
+        work_dir,
+        harness_id,
+        &runtime,
+        &out_js,
+        &func,
+        true,
+        starting_inputs,
+    )
 }
 
 #[cfg(unix)]
@@ -653,6 +837,133 @@ mod tests {
             driver.contains("await runOne(buf);"),
             "promise rejections must pass through finding classification"
         );
+    }
+
+    /// #398: the probe's verdict line, and nothing for any other line.
+    #[test]
+    fn the_probe_verdict_names_the_global_its_frame_and_the_input_count() {
+        let stderr = "ReferenceError: hostApp is not defined\n\
+                      == bhf js probe: every input stopped: 3: hostApp: readUpload (/x/upload.js:9:17)\n";
+        assert_eq!(
+            undefined_global_verdict(stderr),
+            Some(UndefinedGlobalStop {
+                inputs: 3,
+                name: "hostApp".to_owned(),
+                frame: "readUpload (/x/upload.js:9:17)".to_owned(),
+            })
+        );
+        for other in [
+            "== bhf js probe: got past: 0",
+            "== bhf js probe: every input stopped: x: hostApp: f (/x/a.js:1:1)",
+            "== bhf js probe: every input stopped: 2: host app: f (/x/a.js:1:1)",
+            "== bhf js finding: BHF-210: ReferenceError: hostApp is not defined",
+            "",
+        ] {
+            assert_eq!(undefined_global_verdict(other), None, "{other}");
+        }
+    }
+
+    /// #398: the probe runs the fuzz passes' starting inputs, then each
+    /// dictionary token alone and padded, then the longer shapes, once each.
+    #[test]
+    fn the_probe_inputs_are_the_starting_inputs_and_the_targets_literals() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("dictionary.txt"),
+            "# from frame.js:10\n\"BHF1\"\n\"A\"\n",
+        )
+        .unwrap();
+        let seeds = crate::auto::provided::SEEDS_DIR;
+        std::fs::create_dir_all(dir.path().join(seeds)).unwrap();
+        std::fs::write(dir.path().join(seeds).join("one"), b"REC1").unwrap();
+        let probes = undefined_global_probes(dir.path(), &[b"12-34".to_vec(), b"A".to_vec()]);
+        let padded = |token: &[u8]| [token, &[b'A'; 64][..]].concat();
+        assert_eq!(
+            probes,
+            [
+                b"".to_vec(),
+                b"A".to_vec(),
+                b"AAAAAAAA".to_vec(),
+                b"12-34".to_vec(),
+                b"REC1".to_vec(),
+                b"BHF1".to_vec(),
+                padded(b"BHF1"),
+                padded(b"A"),
+                vec![b'A'; 4096],
+                vec![0; 64],
+                vec![0xff; 64],
+            ]
+        );
+    }
+
+    /// #398: build gate 4 against real targets. A global read on every call
+    /// stops every input. One that a literal, a seed or a longer input gets
+    /// past, or that two frames throw, is not the target's environment.
+    #[cfg(unix)]
+    #[test]
+    fn the_gate_reports_only_a_global_no_input_gets_past() {
+        if which::which("node").is_err() {
+            return;
+        }
+        let runtime = locate_js_runtime().expect("js_runtime locatable in-tree");
+        let dir = tempfile::tempdir().unwrap();
+        let module = dir.path().join("widget.js");
+        std::fs::write(
+            &module,
+            "'use strict';\n\
+             const text = (data) => Buffer.from(data).toString('latin1');\n\
+             exports.readUpload = (data) => hostApp.uploads.save(data);\n\
+             exports.parseFrame = (data) =>\n\
+               text(data).startsWith('BHF1') ? 1 : legacyFrames.decode(data);\n\
+             exports.parseRange = (data) =>\n\
+               /^[0-9]+-[0-9]+$/.test(text(data)) ? 1 : rangeTable.lookup(data);\n\
+             exports.parseBlock = (data) => (data.length > 8 ? 0 : shortBlocks.decode(data));\n\
+             function short(data) { return ghost.short(data); }\n\
+             function long(data) { return ghost.long(data); }\n\
+             exports.copyAt = (data) => (data.length === 1 ? short(data) : long(data));\n",
+        )
+        .unwrap();
+        let gate = |export: &str, dictionary: &str, seeds: &[Vec<u8>]| {
+            let harness = dir.path().join(export);
+            std::fs::create_dir_all(&harness).unwrap();
+            std::fs::write(harness.join("dictionary.txt"), dictionary).unwrap();
+            let main = harness.join("main");
+            std::fs::write(
+                &main,
+                format!(
+                    "#!/bin/sh\nBHF_JS_MODULE=\"{}\" BHF_JS_EXPORT=\"{export}\" \
+                     BHF_JS_ARG=buffer exec node \"{}\" \"$@\"\n",
+                    module.display(),
+                    runtime.join("bhf_driver.js").display()
+                ),
+            )
+            .unwrap();
+            make_executable(&main).unwrap();
+            undefined_global_gate(&main, seeds)
+        };
+        let upload = gate("readUpload", "\"BHF1\"\n", &[b"12-34".to_vec()])
+            .expect("hostApp stops every input");
+        assert_eq!(upload.name, "hostApp");
+        assert!(upload.frame.contains("widget.js:3:"), "{upload:?}");
+        assert!(upload.reason().contains("`hostApp`"), "{}", upload.reason());
+        assert!(
+            upload.reason().contains(&upload.frame),
+            "{}",
+            upload.reason()
+        );
+        assert_eq!(
+            gate("parseFrame", "", &[]).map(|stop| stop.name),
+            Some("legacyFrames".to_owned())
+        );
+        assert_eq!(gate("parseFrame", "\"BHF1\"\n", &[]), None);
+        assert_eq!(
+            gate("parseRange", "\"-\"\n", &[]).map(|stop| stop.name),
+            Some("rangeTable".to_owned())
+        );
+        assert_eq!(gate("parseRange", "\"-\"\n", &[b"12-34".to_vec()]), None);
+        assert_eq!(gate("parseBlock", "", &[]), None);
+        assert_eq!(gate("copyAt", "", &[]), None);
+        assert!(!dir.path().join("readUpload/bhf-probe-inputs.bin").exists());
     }
 
     #[test]

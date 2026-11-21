@@ -58,8 +58,8 @@ pub(crate) fn publish(root: &Path, prior_text: &str, current: &[(String, u64)]) 
 }
 
 /// Whether `source_path` is byte-identical to the previous run's record. `true`
-/// when no scope was published (no cache configured), leaving the caller's other
-/// guards in charge.
+/// when no scope was published (discovery publishes one on every run, with or
+/// without the discovery cache), leaving the caller's other guards in charge.
 pub(crate) fn file_unchanged(source_path: &Path) -> bool {
     let Ok(slot) = SCOPE.lock() else {
         return false;

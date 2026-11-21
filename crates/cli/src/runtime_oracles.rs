@@ -24,12 +24,13 @@ use std::process::Command;
 /// Whether the manual fuzz paths load the runtime sink oracles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum RuntimeOracleMode {
-    /// Load them when the shim and platform support it, else skip silently.
+    /// Load them when the shim and the platform support it; otherwise run
+    /// without them.
     Auto,
-    /// Require them; error if the shim or platform is unavailable.
+    /// Require them: an error when the shim or the platform does not support
+    /// them.
     On,
-    /// Never load them (crash-only, the historical behaviour). The default:
-    /// runtime oracles are opt-in so a plain `bhf fuzz` keeps its prior behaviour.
+    /// Do not load them, so the findings are crashes. The default.
     #[default]
     Off,
 }

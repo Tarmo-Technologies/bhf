@@ -173,7 +173,12 @@ fn install_hint(lang: Lang, windows: bool) -> &'static str {
             Lang::Python => "install Python 3.12+ for sys.monitoring coverage",
             Lang::Perl => "install a Windows Perl distribution",
             Lang::Go => "install Go for Windows",
-            Lang::Cobol => "install a Windows GnuCOBOL toolchain or use WSL/Linux",
+            Lang::Cobol => {
+                "install GnuCOBOL's MinGW build (`choco install gnucobol`, or a GnuCOBOL \
+                 for Windows zip whose bin holds its own gcc, with its set_env.cmd run or \
+                 that bin on PATH); bhf builds COBOL without sanitizers there, since MinGW's \
+                 GCC ships none"
+            }
             Lang::Fortran => {
                 "install MinGW-w64's gfortran and gcc (Strawberry Perl's, or MSYS2's \
                  mingw-w64-ucrt-x86_64-gcc-fortran); bhf builds Fortran without sanitizers \
@@ -445,6 +450,18 @@ mod tests {
         assert!(c.contains("LLVM"));
         assert!(c.contains("VS 2022 Build Tools"));
         assert!(c.contains("GNU make"));
+    }
+
+    /// #430: the COBOL lane runs on native Windows with GnuCOBOL's MinGW
+    /// build, so its hint says how to install that and no longer sends the
+    /// operator to WSL.
+    #[test]
+    fn the_windows_cobol_hint_names_gnucobols_mingw_build() {
+        let hint = install_hint(Lang::Cobol, true);
+        assert!(hint.contains("choco install gnucobol"), "{hint}");
+        assert!(hint.contains("set_env.cmd"), "{hint}");
+        assert!(hint.contains("without sanitizers"), "{hint}");
+        assert!(!hint.contains("WSL"), "{hint}");
     }
 
     #[test]

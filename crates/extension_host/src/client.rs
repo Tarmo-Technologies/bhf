@@ -473,8 +473,7 @@ impl ExtensionClient {
         manifest_path: &Path,
         extra_optional: &[&str],
     ) -> Result<Self> {
-        let manifest_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
-        let program = manifest.resolve_executable(manifest_dir)?;
+        let program = manifest.resolve_executable(manifest_dir(manifest_path))?;
         let limits = Limits::from_wire(manifest.wire_limits(), manifest.max_outstanding());
         let resource_limits = ResourceLimits {
             address_space_bytes: manifest.limits.as_ref().and_then(|l| l.address_space_bytes),
@@ -854,6 +853,17 @@ impl ExtensionClient {
     }
 }
 
+/// The directory a manifest's relative executable resolves against. A bare
+/// file name such as `extension.toml` has the empty parent `""`, which would
+/// join to a bare program name that `Command` looks up on `PATH`; it is the
+/// current directory, `.`, instead.
+fn manifest_dir(manifest_path: &Path) -> &Path {
+    match manifest_path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    }
+}
+
 /// The terminal, bounded infrastructure outcome for a session that cannot be
 /// recovered (no status/signal is available for a loss the host synthesizes).
 fn terminal_crash() -> CallOutcome {
@@ -1223,5 +1233,31 @@ fn apply_rlimits(command: &mut Command, limits: ResourceLimits) {
             }
             Ok(())
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_bare_manifest_name_resolves_beside_it_not_on_path() {
+        assert_eq!(manifest_dir(Path::new("extension.toml")), Path::new("."));
+        assert_eq!(
+            manifest_dir(Path::new("pkg/extension.toml")),
+            Path::new("pkg")
+        );
+        assert_eq!(manifest_dir(Path::new("./extension.toml")), Path::new("."));
+        assert_eq!(
+            manifest_dir(Path::new("/opt/ext/extension.toml")),
+            Path::new("/opt/ext")
+        );
+        // The program the bare manifest names keeps a directory component, so
+        // `Command` runs that file instead of searching `PATH`.
+        let program = manifest_dir(Path::new("extension.toml")).join("ext-beside");
+        assert_eq!(program, Path::new("./ext-beside"));
+        assert!(program
+            .parent()
+            .is_some_and(|dir| !dir.as_os_str().is_empty()));
     }
 }

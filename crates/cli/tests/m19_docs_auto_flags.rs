@@ -13,6 +13,7 @@ fn help(args: &[&str]) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_bhf"))
         .args(args)
         .arg("--help")
+        .env("COLUMNS", "100")
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -69,23 +70,24 @@ fn row<'a>(doc: &'a str, flag: &str) -> &'a str {
 #[test]
 fn the_max_targets_row_is_a_fuzz_cap_with_backfill_and_max_attempts_has_one() {
     let help = help(&["auto"]);
-    assert!(help.contains("reach the FUZZ phase"), "{help}");
+    assert!(help.contains("reach the fuzz phase"), "{help}");
     assert!(help.contains("backfilled"), "{help}");
     let doc = auto_md();
-    let max_targets = row(&doc, "--max-targets");
-    for words in [
-        "reach the **fuzz** phase",
-        "backfilled",
-        "not on the candidates inspected",
-    ] {
-        assert!(max_targets.contains(words), "{max_targets}");
-    }
+    let max_targets = row(&doc, "--max-targets").replace("**", "");
+    assert!(max_targets.contains("fuzz phase"), "{max_targets}");
+    // Targets that do not build do not use up the cap: others take their place.
+    assert!(
+        ["backfill", "fill their places", "take their places"]
+            .iter()
+            .any(|words| max_targets.contains(words)),
+        "{max_targets}"
+    );
     assert!(
         !max_targets.contains("Keep only the top-N"),
         "{max_targets}"
     );
     let max_attempts = row(&doc, "--max-attempts");
-    assert!(max_attempts.contains("**inspected**"), "{max_attempts}");
+    assert!(max_attempts.contains("inspect"), "{max_attempts}");
 }
 
 /// The table's cells for `flag`: its default and its purpose, with `\|`
@@ -132,14 +134,15 @@ fn the_table_defaults_match_the_help() {
         }
         let (default, _) = cells(&doc, flag);
         // Computed from the host: the table gives the rule, not a number.
-        let rule = match flag.as_str() {
-            "--jobs" => Some("half the host's cores"),
-            "--rss-limit-mb" => Some("dynamic"),
-            _ => None,
+        let rules: &[&str] = match flag.as_str() {
+            "--jobs" => &["half the host's cores"],
+            "--rss-limit-mb" => &["dynamic", "a quarter of"],
+            _ => &[],
         };
-        let documented = match rule {
-            Some(rule) => default.contains(rule),
-            None => default.contains(value.as_str()),
+        let documented = if rules.is_empty() {
+            default.contains(value.as_str())
+        } else {
+            rules.iter().any(|rule| default.contains(rule))
         };
         if !documented {
             wrong.push(format!("{flag}: help {value:?}, auto.md {default:?}"));

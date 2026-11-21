@@ -288,9 +288,13 @@ fn a_real_adapter_without_an_analysis_is_an_error_or_skipped() {
 fn the_adapter_help_names_the_analyzers_it_runs() {
     let output = Command::new(bhf_bin())
         .args(["binary", "--help"])
+        .env("COLUMNS", "100")
         .output()
         .unwrap();
-    let help = String::from_utf8_lossy(&output.stdout);
+    let help = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(
         help.contains("Rizin, Ghidra headless or angr, run as subprocesses"),
         "{help}"

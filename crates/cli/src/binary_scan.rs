@@ -12,15 +12,15 @@ pub struct BinaryScanArgs {
     #[arg(long, default_value = "bhf_work/binary")]
     pub out: PathBuf,
 
-    /// Skip individual files or archive members larger than this byte count.
+    /// Skip files and archive members larger than this many bytes.
     #[arg(long)]
     pub max_bytes: Option<u64>,
 
-    /// Offline CVE component database for SBOM/SCA matching.
+    /// Offline CVE database to match the inventoried components against.
     #[arg(long)]
     pub cve_db: Option<PathBuf>,
 
-    /// A `bhf binary adapter` report of one of the scanned binaries (#267):
+    /// A `bhf binary adapter` report of one of the scanned binaries:
     /// its inventory entry gets an `adapter` object with the functions ranked
     /// as fuzz entry points, the dictionary tokens and the candidate
     /// persistent address. The report is matched by the binary's SHA-256.

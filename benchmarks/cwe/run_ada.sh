@@ -9,7 +9,7 @@ RES="$ROOT/results/ada_cwe.tsv"; echo -e "metric\tbhf\t(any other fuzzer)" > "$R
 command -v gnatmake >/dev/null 2>&1 || { echo "SKIP: no gnatmake"; exit 0; }
 cp -r "$ROOT/targets/ada" "$SCRATCH/bhf"
 "$BHF" auto --per-target-time "$BUDGET" --work-dir "$SCRATCH/gw" "$SCRATCH/bhf" >"$SCRATCH/bhf.log" 2>&1
-bhf_fns=$(python3 - "$SCRATCH/gw/findings" <<'PY'
+bhf_fns=$(python3 - "$SCRATCH/gw/results/findings" <<'PY'
 import json,os,sys
 root=sys.argv[1]; fns=set()
 if os.path.isdir(root):

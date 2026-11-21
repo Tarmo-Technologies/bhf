@@ -524,13 +524,16 @@ jobs:
           retention-days: 30
 
   # The sandbox tests of `bhf project import-ossfuzz`, which run an OSS-Fuzz
-  # build.sh under bubblewrap and check that it has no network and cannot
-  # write outside $SRC, $WORK and $OUT. The hosted image's AppArmor policy
-  # (kernel.apparmor_restrict_unprivileged_userns=1) denies an unprivileged
-  # bwrap its user namespace, so this job lifts it on its own runner only;
-  # every other job keeps the image's policy, where `--sandbox auto` finds no
-  # working sandbox. The hash shards run ossfuzz_import too, where the
-  # sandbox tests skip (scripts/ci/allowed-skips.txt).
+  # build.sh under bubblewrap and under firejail and check that it builds,
+  # has no network, cannot write outside $SRC, $WORK and $OUT, sees none of
+  # the host's files, cannot reach the host's log socket, shared memory,
+  # devices or terminal, and gains no privileges. The hosted image's
+  # AppArmor policy (kernel.apparmor_restrict_unprivileged_userns=1) denies
+  # an unprivileged bwrap its user namespace, so this job lifts it on its
+  # own runner only; every other job keeps the image's policy and has no
+  # firejail, so `--sandbox auto` finds no working sandbox. The hash shards
+  # run ossfuzz_import too, where the sandbox tests skip
+  # (scripts/ci/allowed-skips.txt).
   ossfuzz-sandbox:
     name: Integration tests (bhf) (OSS-Fuzz import sandbox)
     needs: [gate, build]
@@ -548,14 +551,16 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Install bubblewrap and give it its namespaces
+      - name: Install bubblewrap and firejail, and give bubblewrap its namespaces
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends bubblewrap clang zip unzip
+          sudo apt-get install -y -q --no-install-recommends bubblewrap firejail clang zip unzip
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
           bwrap --die-with-parent --unshare-all --ro-bind / / -- true
+          firejail --version | head -n 1
+          firejail --quiet --noprofile --net=none -- true
 
       - name: Install cargo-nextest
         run: bash scripts/ci/install-nextest.sh
@@ -565,8 +570,8 @@ jobs:
         with:
           name: nightly-tests-${{ github.run_id }}
 
-      # BHF_OSSFUZZ_SANDBOX=1 fails a sandbox test that finds no working
-      # sandbox instead of skipping it.
+      # BHF_OSSFUZZ_SANDBOX=1 fails a sandbox test whose sandbox does not
+      # work instead of skipping it.
       - name: OSS-Fuzz import tests
         env:
           BHF_OSSFUZZ_SANDBOX: "1"

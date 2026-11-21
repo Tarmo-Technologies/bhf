@@ -79,73 +79,100 @@ pub struct ExtensionArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ExtensionCommand {
-    /// Load an explicitly-trusted extension manifest, spawn the extension, negotiate the bhf.extension.v1 protocol + capabilities, and print the negotiated protocol version, required/negotiated capabilities, and executable/config SHA-256 — WITHOUT driving any case
+    /// Start an extension, negotiate the bhf.extension.v1 protocol, and print what it supports
+    ///
+    /// Prints the protocol version, the required and negotiated capabilities,
+    /// and the SHA-256 of the extension's executable and config. Runs no
+    /// input.
     Validate(ValidateArgs),
-    /// Drive oracle.evaluate over one input through a trusted extension: a clean-exit semantic violation becomes a replayable finding; a crash/timeout/oversized/malformed/unsupported reply is a bounded infrastructure result, never a target finding
+    /// Judge one input with the extension's oracle (`oracle.evaluate`)
+    ///
+    /// A semantic violation on a clean exit becomes a replayable finding. An
+    /// extension that crashes, times out, or sends an oversized, malformed
+    /// or unsupported reply is reported as an extension error, and no finding
+    /// is written.
     Evaluate(EvaluateArgs),
-    /// Drive a full multi-message session through a trusted extension: lifecycle.reset a fresh root, pull each scenario.next message, optionally extension-mutate and codec.repair it before it reaches the target, bind each response (scenario.observe-response) into a later message, then oracle.evaluate the clean-exit outcome. Every extension fault stays a bounded infrastructure result
+    /// Drive a multi-message session through the extension, then judge it with its oracle
+    ///
+    /// The extension resets a fresh root (`lifecycle.reset`) and supplies each
+    /// message (`scenario.next`), which it can mutate (`mutator.mutate`) and
+    /// repair (`codec.repair`) before the message reaches the target; each
+    /// response is bound into later messages (`scenario.observe-response`);
+    /// then `oracle.evaluate` judges the outcome of a clean exit. The target is
+    /// bhf's built-in file-service test target, or with `--session-transport` a
+    /// real one. A target that ends the session is the target's result (exit
+    /// 3). An extension fault is reported as an extension error, and no
+    /// finding is written.
     Session(SessionCmdArgs),
-    /// Minimize an emitted extension-oracle finding by delta-debugging its testcase through oracle.evaluate, accepting a candidate only when it reproduces the SAME stable signature (same rule + signature inputs). Writes min_testcase.bin and records the minimization without ever changing the finding's signature
+    /// Shrink an extension-oracle finding's input by delta debugging through `oracle.evaluate`
+    ///
+    /// A smaller candidate is kept only when the oracle gives it the same rule
+    /// and signature. Writes min_testcase.bin into the finding directory and
+    /// records the minimization in finding.json; the finding's signature
+    /// stays the same.
     Minimize(MinimizeCmdArgs),
 }
 
 #[derive(Debug, clap::Args)]
 pub struct ValidateArgs {
-    /// Path to the `bhf.extension-manifest.v1` manifest (TOML). Explicit load is
-    /// the trust boundary; an extension is never auto-discovered.
+    /// Path to the `bhf.extension-manifest.v1` manifest (TOML). bhf runs an
+    /// extension only from a manifest you name here, and never searches for
+    /// one.
     #[arg(long)]
     manifest: PathBuf,
-    /// Emit a machine-readable JSON report instead of human-readable lines.
+    /// Print a JSON report instead of text lines.
     #[arg(long)]
     json: bool,
 }
 
 #[derive(Debug, clap::Args)]
 pub struct EvaluateArgs {
-    /// Path to the `bhf.extension-manifest.v1` manifest (TOML). Explicit load is
-    /// the trust boundary; an extension is never auto-discovered.
+    /// Path to the `bhf.extension-manifest.v1` manifest (TOML). bhf runs an
+    /// extension only from a manifest you name here, and never searches for
+    /// one.
     #[arg(long)]
     manifest: PathBuf,
-    /// File whose raw bytes are the test input handed to `oracle.evaluate`.
+    /// File whose bytes are the input handed to `oracle.evaluate`.
     #[arg(long)]
     input: PathBuf,
     /// Work directory a finding (and the run's `extension.json` provenance) is
     /// written under (`<work>/results/findings/…`).
     #[arg(long = "work")]
     work: PathBuf,
-    /// Emit a machine-readable JSON report instead of human-readable lines.
+    /// Print a JSON report instead of text lines.
     #[arg(long)]
     json: bool,
 }
 
 #[derive(Debug, clap::Args)]
 pub struct SessionCmdArgs {
-    /// Path to the `bhf.extension-manifest.v1` manifest (TOML). Explicit load is
-    /// the trust boundary; an extension is never auto-discovered.
+    /// Path to the `bhf.extension-manifest.v1` manifest (TOML). bhf runs an
+    /// extension only from a manifest you name here, and never searches for
+    /// one.
     #[arg(long)]
     manifest: PathBuf,
-    /// File whose raw bytes seed the session (e.g. the OPEN path the scenario
-    /// drives). The oracle judges this testcase on the clean-exit outcome.
+    /// File whose bytes seed the session, such as the path an OPEN message of
+    /// the scenario carries. The oracle judges this input.
     #[arg(long)]
     input: PathBuf,
-    /// Work directory a finding (and the run's `extension.json` provenance) is
-    /// written under; the fresh per-case root lives at `<work>/session-root`.
+    /// Work directory the finding and the run's `extension.json` provenance
+    /// are written under; each input's fresh root is `<work>/session-root`.
     #[arg(long = "work")]
     work: PathBuf,
-    /// Enable extension mutation of each scenario message with this seed
-    /// (requires the extension to provide `mutator.mutate`).
+    /// Have the extension mutate each scenario message, with this seed. Needs
+    /// an extension that provides `mutator.mutate`.
     #[arg(long)]
     mutate: Option<u64>,
-    /// Repair each (possibly mutated) message's computed fields via
-    /// `codec.repair` before it reaches the target (on by default when the
-    /// extension provides `codec.repair`).
+    /// Recompute each message's computed fields with the extension's
+    /// `codec.repair` before it reaches the target. Applies when the extension
+    /// provides `codec.repair`.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     repair: bool,
-    /// Emit a machine-readable JSON report instead of human-readable lines.
+    /// Print a JSON report instead of text lines.
     #[arg(long)]
     json: bool,
-    /// Drive a real target instead of the built-in toy one, over the session
-    /// lane's transport: `tcp:HOST:PORT`, `udp:HOST:PORT`,
+    /// Drive a real target in place of the built-in test target, over the
+    /// session lane's transport: `tcp:HOST:PORT`, `udp:HOST:PORT`,
     /// `serial:PATH[,baud=N]` or `transport:SPEC`, as `bhf fuzz
     /// --session-transport` takes. Each message goes as the extension framed
     /// it; its reply is what the target sends until it goes quiet.
@@ -174,16 +201,15 @@ pub struct SessionCmdArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct MinimizeCmdArgs {
-    /// Path to the `bhf.extension-manifest.v1` manifest (TOML) whose oracle judged
-    /// the finding. Explicit load is the trust boundary; re-driving the oracle to
-    /// minimize is never implicit.
+    /// Path to the `bhf.extension-manifest.v1` manifest (TOML) whose oracle
+    /// judged the finding.
     #[arg(long)]
     manifest: PathBuf,
-    /// The extension-oracle finding directory to minimize (holds `finding.json` +
-    /// `testcase.bin`); `min_testcase.bin` is written alongside it.
+    /// The extension-oracle finding directory to minimize (with `finding.json`
+    /// and `testcase.bin`); `min_testcase.bin` is written into it.
     #[arg(long)]
     finding: PathBuf,
-    /// Emit a machine-readable JSON report instead of human-readable lines.
+    /// Print a JSON report instead of text lines.
     #[arg(long)]
     json: bool,
 }

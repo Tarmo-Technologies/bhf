@@ -18,13 +18,15 @@ JsonObject = dict[str, Any]
 MAX_FRAME_BYTES = 64 * 1024 * 1024
 MAX_HEADER_BYTES = 8192
 DEFAULT_DAEMON_TIMEOUT_SECS = 30.0
+# Where `bhf auto` writes findings in its work directory.
+DEFAULT_FINDINGS_DIR = "results/findings"
 
 
 @dataclass(frozen=True)
 class BhfConfig:
     daemon_path: str = "bhf-daemon"
     cli_path: str = "bhf"
-    findings_dir: str = "findings"
+    findings_dir: str = DEFAULT_FINDINGS_DIR
     harness_path: str = ""
     minimize_strategy: str = "bytes"
     workspace_root: str = "."

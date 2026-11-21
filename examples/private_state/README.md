@@ -2,4 +2,6 @@
 
 # Private State
 
-This fixture exercises M9 stateful sequence harnessing. `State.Pop` only underflows after earlier calls mutate package-private state, so a direct single-call harness is not enough to demonstrate the swallowed `Constraint_Error`.
+Fixture for stateful sequence harnesses. `State.Pop` underflows, and swallows the resulting `Constraint_Error`, only after earlier calls have changed package-private state, so one direct call cannot reach the handler. bhf's sequence harness calls `Push`, `Pop`, `Pop` and reaches it.
+
+`crates/cli/tests/m9_private_state.rs` generates the sequence harness, and builds and runs it when GNAT is installed.

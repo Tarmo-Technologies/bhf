@@ -22,7 +22,8 @@ const SHAPE_LIMIT: usize = 360;
 
 #[derive(Debug, clap::Args)]
 pub struct SupportReportArgs {
-    /// Existing `bhf auto --work-dir` to summarize. The source tree is never read.
+    /// The `bhf auto --work-dir` to summarize. bhf does not read the source
+    /// tree.
     pub work_dir: PathBuf,
 
     /// Destination text file. Default: <work-dir>/auto/support-report.txt.
@@ -33,26 +34,26 @@ pub struct SupportReportArgs {
     #[arg(long)]
     pub stdout: bool,
 
-    /// Maximum number of representative reason/error shapes in the report.
+    /// Most example failure reasons and errors in the report.
     #[arg(long, default_value_t = DEFAULT_EXAMPLES, value_name = "N")]
     pub examples: usize,
 
-    /// Hard maximum report size in bytes (minimum 1024).
+    /// Largest report size, in bytes (at least 1024).
     #[arg(long, default_value_t = DEFAULT_MAX_BYTES, value_name = "BYTES")]
     pub max_bytes: usize,
 
-    /// #103: bundle the scrubbed diagnostics into a `.tar.gz` archive at this path
-    /// (e.g. `--bundle bhf-bug-report.tar.gz`). The archive contains the
-    /// scrubbed report, bhf's own internal-issue log (bug-report.json, if any),
-    /// and a manifest describing every included field. Works entirely offline. A
-    /// self-test scans the archive contents for host secrets (the real work-dir
-    /// path, username, hostname) and refuses to write an archive that leaks any.
+    /// Also write the scrubbed diagnostics as a `.tar.gz` archive at this path,
+    /// such as `--bundle bhf-bug-report.tar.gz`. The archive holds the scrubbed
+    /// report, bhf's own internal-error log (bug-report.json, when there is
+    /// one) and a manifest of every field it includes. Before writing it, bhf
+    /// checks its contents for the real work-directory path, user name and
+    /// host name, and refuses to write an archive that contains any of them.
     #[arg(long, value_name = "FILE.tar.gz")]
     pub bundle: Option<PathBuf>,
 
-    /// #103: print the bundle inventory + the scrubbed report to stdout WITHOUT
-    /// writing any archive, so the operator can review exactly what would be shared
-    /// before creating it. Implies bundle-style collection.
+    /// Print what a `--bundle` archive would hold, and the scrubbed report, on
+    /// stdout without writing an archive, so you can review what you would
+    /// share.
     #[arg(long)]
     pub preview: bool,
 }
