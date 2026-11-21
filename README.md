@@ -37,7 +37,7 @@ Then install the compiler or interpreter for each language you want to fuzz. C a
 
 | What you want to do | Install or download |
 |---|---|
-| Install complete BHF on Linux with one `install.sh` | `bhf-dist-0.3.0-x86_64-unknown-linux-gnu.tar.gz` plus its `.sha256` and `.sig` files |
+| Install complete BHF on Linux with one `install.sh` | `bhf-dist-0.4.0-x86_64-unknown-linux-gnu.tar.gz` plus its `.sha256` and `.sig` files |
 | Run the CLI on Windows | `bhf-installer.ps1`, or `bhf-x86_64-pc-windows-msvc.zip` plus its `.sha256` file for a manual or offline install |
 | Run basic CLI workflows on Linux | `bhf-installer.sh`, or `bhf-x86_64-unknown-linux-gnu.tar.xz` (`bhf-aarch64-unknown-linux-gnu.tar.xz` on 64-bit ARM) plus its `.sha256` file |
 | Get the Linux runtime audit, sink oracles and fake resources | Add `bhf_runtrace_shim-installer.sh`, or the matching `bhf_runtrace_shim-*.tar.xz` archive |
@@ -61,7 +61,7 @@ Before you download, get three things through a channel other than the download 
 Keep them outside the extracted bundle. The verifier needs Python 3.8 or newer and OpenSSL with Ed25519 support. From your download directory:
 
 ```sh
-VERSION=0.3.0
+VERSION=0.4.0
 BASE="https://github.com/Tarmo-Technologies/bhf/releases/download/${VERSION}"
 ARCHIVE="bhf-dist-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 
@@ -85,7 +85,7 @@ The installer asks which language toolchains, targets, fuzzers and extras to set
 On a connected host, the component installers download and install their archives:
 
 ```sh
-VERSION=0.3.0
+VERSION=0.4.0
 BASE="https://github.com/Tarmo-Technologies/bhf/releases/download/${VERSION}"
 
 curl --proto '=https' --tlsv1.2 -LsSf "$BASE/bhf-installer.sh" | sh
@@ -103,7 +103,7 @@ The PowerShell installers install the native x64 CLI and daemon. For C and C++ f
 choco install llvm make visualstudio2022buildtools `
   visualstudio2022-workload-vctools -y
 
-$Version = "0.3.0"
+$Version = "0.4.0"
 $Base = "https://github.com/Tarmo-Technologies/bhf/releases/download/$Version"
 irm "$Base/bhf-installer.ps1" | iex
 irm "$Base/bhf-daemon-installer.ps1" | iex       # optional: RPC/MCP service

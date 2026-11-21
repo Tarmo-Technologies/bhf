@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+## 0.4.0 - 2026-11-20
+
 ### Added
 - The COBOL lane builds on native Windows (#430) with GnuCOBOL's MinGW build (`choco install gnucobol`, or a GnuCOBOL zip with its own gcc): the driver, glue and translated program build with the gcc in GnuCOBOL's `bin`, without sanitizers, libcob's runtime checks stay the crash oracle, and each finding's `fidelity.sanitizers` says `none (toolchain limit)`. The harness gets the GnuCOBOL DLLs it loads beside `main.exe`.
 - `bhf binary rehost --svd FILE` takes the peripheral windows from the part's CMSIS-SVD file (#354): only its peripherals' address blocks (inherited through `derivedFrom`, arrays expanded, reserved blocks and the system space left out) are registers the MMIO models serve, so a load or store between them is an invalid-access finding, and an `--mmio` model outside them is refused. The rehost crate gains `Svd` (its own XML reader, no new dependency) and `MachineConfig::peripheral_windows`. The setup records the windows and the SVD's path, digest, device and interrupt names (`rehost.setup.peripheral_windows`; older findings replay with the whole region). Every rehosted run and finding carries the fidelity label `rehosted, peripheral-modelled` (`fidelity.label`, and a finding's `fidelity_caveat`, which `results/findings.json` lists in `fidelity.caveats`), and with an SVD inferred loops and interrupts are named by peripheral.
@@ -245,6 +247,7 @@
 - Every unit test in the `bhf` crate now makes its scratch directory with `TestDir`. The GNAT `-gnat2022` probe and the replay directory of `bhf corpus minimize` are `tempfile` directories, so they are also removed when bhf panics.
 
 ### Fixed
+- `bhf sloc` reports TypeScript and JavaScript on separate rows and still uses the same comment-counting rules for both.
 - `bhf binary fuzz` rejects unsupported `--sandbox` modes before launching a target. Runs without a sandbox record `none` in their provenance (#447).
 - An extension manifest named by a bare relative path (`--manifest extension.toml`) starts the executable beside it (#450). Its parent directory is empty, so the executable joined to a bare name that was looked up on `PATH`; it now resolves against the current directory, as `./extension.toml` does.
 - `bhf auto --resume --no-discovery-cache` re-attempts the targets whose source file changed and reloads the others (#449). It reused every earlier result, because `--no-discovery-cache` also skipped the per-file source record that `--resume` compares; that record is now kept without the cache.

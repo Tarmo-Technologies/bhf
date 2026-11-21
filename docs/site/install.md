@@ -143,10 +143,10 @@ The recommended full Linux install is the all-in-one bundle. Its manual equivale
 
 ### Complete Linux installation with the bundled `install.sh`
 
-Obtain the verifier (`scripts/verify-offline-dist.py`), the publisher's public key and your operator policy through a trusted channel that is independent of the archive. Verification needs Python 3.8 or newer and an OpenSSL with Ed25519 support; on EL7, use an approved newer OpenSSL or a separate verification host. Set `VERSION` to the release you received; the example uses 0.3.0.
+Obtain the verifier (`scripts/verify-offline-dist.py`), the publisher's public key and your operator policy through a trusted channel that is independent of the archive. Verification needs Python 3.8 or newer and an OpenSSL with Ed25519 support; on EL7, use an approved newer OpenSSL or a separate verification host. Set `VERSION` to the release you received. The example uses 0.4.0.
 
 ```sh
-VERSION=0.3.0
+VERSION=0.4.0
 BASE="https://github.com/Tarmo-Technologies/bhf/releases/download/${VERSION}"
 ARCHIVE="bhf-dist-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 
@@ -222,7 +222,7 @@ A prefix with a space or colon in it (`/opt/Program Files (x86)/bhf`) also works
 Releases include `bhf-x86_64-pc-windows-msvc.zip`, `bhf-daemon-x86_64-pc-windows-msvc.zip`, their SHA-256 sidecars, and native PowerShell installers. For example:
 
 ```powershell
-$Version = "0.3.0"
+$Version = "0.4.0"
 irm "https://github.com/Tarmo-Technologies/bhf/releases/download/$Version/bhf-installer.ps1" | iex
 bhf.exe --version
 ```

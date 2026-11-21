@@ -1,6 +1,19 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# BHF v0.3.0
+# BHF v0.4.0
+
+2026-11-20
+
+- Native Windows support now includes Rust, Fortran, COBOL, and interpreted language toolchains. BHF also builds natively from source on Apple Silicon Macs.
+- The README links to the installation instructions and user guides. The component archives include the guides, examples, and schemas so the links work offline. Start with [INSTALL.md](INSTALL.md) and the [documentation index](docs/site/index.md).
+- Short and long help wrap to the terminal width. Each command lists global options after its own, and `--profile` applies to each invocation and its workers.
+- The VS Code and GNAT Studio integrations look for findings in `results/findings` by default. `bhf sloc` reports TypeScript and JavaScript separately.
+- `bhf ci` combines an explicitly requested failure gate with the policy result. `bhf auto --resume --no-discovery-cache` still rechecks targets whose source files changed.
+- `bhf binary fuzz` supports only `--sandbox none`. It rejects other sandbox modes before launching the target (#447).
+
+See the [changelog](CHANGELOG.md#040---2026-11-20) for the full list of changes.
+
+## Previous release: v0.3.0
 
 Released 2026-10-05.
 
