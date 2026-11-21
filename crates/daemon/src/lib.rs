@@ -2392,8 +2392,9 @@ mod mcp_docs_tests {
         assert_eq!(advertised, expected);
 
         let index = doc("index.md");
+        let normalized_index = index.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            index.contains("three read-only MCP tools (five\n  with the `llm` feature)"),
+            normalized_index.contains("three read-only MCP tools (five with the `llm` feature)"),
             "index.md states the daemon's tool counts"
         );
     }
