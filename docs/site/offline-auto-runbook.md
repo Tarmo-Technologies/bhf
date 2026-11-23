@@ -138,7 +138,15 @@ bhf-bug-report /results/bhf-real
 
 The script writes and prints `bhf-support-report.txt`, capped at 4,000 bytes. It holds version, host and toolchain lines, outcomes by language, structured build-error and repair counts, checkpoint health, and the most frequent diagnostic shapes. It does not read or include source, generated harness code or corpus inputs. Project paths, file names, targets, variables, types, Ada units, symbols and macros are replaced with typed placeholders before the report is written.
 
-The equivalent CLI command is:
+For transfer outside the enclave, prefer the self-tested archive form:
+
+```sh
+bhf-bug-report /results/bhf-real --bundle bhf-bug-report.tar.gz
+```
+
+The archive contains the scrubbed report, manifest and self-test result. It
+refuses to write when its final secret/path scan detects a leak. The equivalent
+text-only CLI command is:
 
 ```sh
 bhf bug-report /results/bhf-real \
@@ -146,7 +154,27 @@ bhf bug-report /results/bhf-real \
   --stdout --examples 6 --max-bytes 4000
 ```
 
-Send only that scrubbed text file. The raw `result.json`, `run.json`, build trees and source are not needed for ordinary build and harness triage.
+Send only the self-tested bundle or that scrubbed text file. The raw
+`result.json`, `run.json`, build trees and source are not needed for ordinary
+build and harness triage.
+
+## Disk, memory and cleanup
+
+The work directory is evidence and is intentionally persistent. `bhf auto`
+bounds its own work tree with `--max-work-dir-mb` (4 GiB by default) and each
+corpus with `--max-corpus-mb` (64 MiB by default); findings are never deleted
+to satisfy a cap. Run `bhf clean <work-dir> --compact` after exporting evidence
+to remove compiler caches and scratch while preserving findings, corpora,
+reports and replay binaries. Remove the entire work directory only under the
+site's evidence-retention policy.
+
+Temporary build directories created through the CLI are RAII-managed and are
+removed at normal exit. SIGKILL and host power loss can prevent cleanup, so an
+offline workstation should run campaigns in a dedicated results filesystem,
+check it after reboot, and treat an abandoned work directory as evidence until
+an operator explicitly compacts or removes it. For long campaigns, compare
+RSS, PID count, file descriptors and filesystem use at fixed intervals; a
+single completed run is not a memory-leak test.
 
 ## Acceptance Check
 

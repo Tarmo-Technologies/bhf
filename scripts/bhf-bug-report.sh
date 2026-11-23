@@ -6,6 +6,7 @@ set -eu
 usage() {
   printf '%s\n' \
     'Usage: bhf-bug-report WORK_DIR [OUTPUT_FILE]' \
+    '       bhf-bug-report WORK_DIR --bundle OUTPUT.tar.gz' \
     '' \
     'Create one compact scrubbed report from a running or completed bhf auto work directory.' \
     'No source, harness code, corpus data, paths, file names, targets, variables, types, units,' \
@@ -24,8 +25,17 @@ case "${1:-}" in
 esac
 
 work_dir=$1
+if [ "${2:-}" = "--bundle" ]; then
+  if [ -z "${3:-}" ] || [ -n "${4:-}" ]; then
+    usage >&2
+    exit 2
+  fi
+  bundle_file=$3
+else
+  bundle_file=
+fi
 output_file=${2:-bhf-support-report.txt}
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 
 bhf_bin=
 for candidate in "$script_dir/bhf" "$script_dir/../bhf"; do
@@ -40,6 +50,10 @@ fi
 if [ -z "$bhf_bin" ]; then
   printf '%s\n' 'bhf-bug-report: could not find the bhf executable' >&2
   exit 2
+fi
+
+if [ -n "$bundle_file" ]; then
+  exec "$bhf_bin" bug-report "$work_dir" --bundle "$bundle_file"
 fi
 
 exec "$bhf_bin" bug-report "$work_dir" --output "$output_file" --stdout \

@@ -2011,6 +2011,21 @@ end Main;
      weak-randomness (CWE-338) and integer-overflow-via-instrumentation oracle
      classes, deeper C/C++ recursive object graphs, and full C++ template/parity
      harnessing.
+10. Clarify fuzz-confirmation terminology in the operator documentation.
+    - The raw confirmation values remain intentionally different:
+      `fuzz` is report provenance for a finding discovered dynamically during
+      fuzzing, while `fuzz_exercised` applies to a `static_scan` finding whose
+      exact flagged line was executed without a crash or oracle hit. The latter
+      is weak false-positive evidence (and lowers confidence to `low`), not proof
+      that the finding is safe.
+    - Update `docs/site/auto.md` and `docs/finding-report-fields.md` to explain
+      that distinction, including the meaning of
+      `classification: static_scan` + `confirmation: fuzz_exercised`, and add
+      `fuzz_exercised` to the documented raw-provenance values.
+    - Audit the normalized `static_confirmed` level, which currently combines
+      `fuzz_confirmed` (a matching crash/oracle) with `fuzz_exercised` (the line
+      executed and survived). Either split those evidence levels or document
+      the compatibility behavior without implying that both confirm a defect.
 
 ---
 
