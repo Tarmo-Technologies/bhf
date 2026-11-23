@@ -251,6 +251,8 @@ bhf replay bhf_work/results/findings/<id>
 
 `auto` keeps at most 64 MiB of corpus per target and stops starting new targets when the work directory reaches 4 GiB. Change these with `--max-corpus-mb` and `--max-work-dir-mb` (`0` turns off the work-directory limit). Findings are never deleted to stay under either limit. To reclaim compiler caches and scratch files and keep findings, corpora, reports and replay binaries, run `bhf clean bhf_work --compact`.
 
+For offline support, do not send the work directory. Run `bhf-bug-report bhf_work --bundle bhf-bug-report.tar.gz`; the self-tested archive omits source, harness and corpus content and replaces paths, filenames, targets, variables, types, units, symbols and macros with typed placeholders.
+
 ### Watch and steer a live sweep
 
 On a terminal, `auto` keeps a status block below the scrolling results:

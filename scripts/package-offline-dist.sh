@@ -556,7 +556,7 @@ Send `bug-report.md`, or one entry from it, to the maintainer; it has the bhf ve
 For build and harness failures in a running or finished campaign, collect a compact support report:
 
 ```sh
-bhf-bug-report /path/to/bhf_work
+bhf-bug-report /path/to/bhf_work --bundle bhf-bug-report.tar.gz
 ```
 
 The collector reads the per-target result checkpoints, so it works before the sweep finishes. It reports outcome and error counts, representative diagnostic shapes, repair-ledger health, which artifacts exist, and the local toolchain versions. It leaves out source and generated harness text, and replaces paths, file names, targets, variables, types, Ada units, symbols and macros before it writes the size-capped `bhf-support-report.txt`.
@@ -683,10 +683,14 @@ The main outputs:
 To report a bhf build or harness limitation without sharing project names, run this while the campaign runs or after it ends:
 
 ```sh
-bhf-bug-report /path/to/bhf_work
+bhf-bug-report /path/to/bhf_work --bundle bhf-bug-report.tar.gz
 ```
 
-It writes and prints one size-capped `bhf-support-report.txt`, built from the per-target result checkpoints. The report leaves out source, harnesses and corpus inputs, and replaces project paths and identifiers with typed placeholders.
+It writes a self-tested archive containing one size-capped support report and
+its manifest, built from the per-target result checkpoints. The report leaves
+out source, harnesses and corpus inputs, replaces project paths and identifiers
+with typed placeholders, and refuses the archive when its final leak scan
+fails. Use the command without `--bundle` for a text-only local preview.
 
 ## When BHF itself errors: `--debug` and the bug report
 
