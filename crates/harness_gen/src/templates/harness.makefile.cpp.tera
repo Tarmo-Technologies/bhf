@@ -348,14 +348,26 @@ ifneq ($(EXEEXT),)
 $(BHF_BINARIES): %: %$(EXEEXT)
 endif
 
+# GNU make reads and writes the toolchain stamps itself. Recipes run through
+# cmd.exe on a stock Windows installation, where the former POSIX shell test
+# stopped at the `|` separators in an ID. Encode whitespace and make's `%`
+# wildcard so `filter-out` is an exact, one-word comparison; `$(file ...)`
+# leaves an unchanged stamp's mtime alone, and its dependants stay built.
+BHF_STAMP_EMPTY :=
+BHF_STAMP_SPACE := $(BHF_STAMP_EMPTY) $(BHF_STAMP_EMPTY)
+bhf_stamp_word = $(subst %,@BHF_PERCENT@,$(subst @,@BHF_AT@,$(subst $(BHF_STAMP_SPACE),@BHF_SPACE@,$(strip $(1)))))
+BHF_TOOLCHAIN_STAMP_ID = $(call bhf_stamp_word,$(BHF_TOOLCHAIN_ID))
+BHF_LANES_STAMP_ID = $(call bhf_stamp_word,$(BHF_LANE_TOOLCHAIN_ID))
+BHF_DRIVER_STAMP_ID = $(call bhf_stamp_word,$(BHF_DRIVER_ID))
+
 bhf_toolchain.stamp: FORCE_TOOLCHAIN_STAMP
-	@bhf_id='$(subst ','\'',$(BHF_TOOLCHAIN_ID))'; if [ "$$(cat $@ 2>/dev/null)" != "$$bhf_id" ]; then printf '%s\n' "$$bhf_id" > $@; fi
+	@$(if $(filter-out $(call bhf_stamp_word,$(file <$@)),$(BHF_TOOLCHAIN_STAMP_ID)),$(file >$@,$(BHF_TOOLCHAIN_ID)))
 
 bhf_lanes.stamp: FORCE_TOOLCHAIN_STAMP
-	@bhf_id='$(subst ','\'',$(BHF_LANE_TOOLCHAIN_ID))'; if [ "$$(cat $@ 2>/dev/null)" != "$$bhf_id" ]; then printf '%s\n' "$$bhf_id" > $@; fi
+	@$(if $(filter-out $(call bhf_stamp_word,$(file <$@)),$(BHF_LANES_STAMP_ID)),$(file >$@,$(BHF_LANE_TOOLCHAIN_ID)))
 
 bhf_driver.stamp: FORCE_TOOLCHAIN_STAMP
-	@bhf_id='$(subst ','\'',$(BHF_DRIVER_ID))'; if [ "$$(cat $@ 2>/dev/null)" != "$$bhf_id" ]; then printf '%s\n' "$$bhf_id" > $@; fi
+	@$(if $(filter-out $(call bhf_stamp_word,$(file <$@)),$(BHF_DRIVER_STAMP_ID)),$(file >$@,$(BHF_DRIVER_ID)))
 
 # Target sources stay OUT of the prerequisites and live only in the recipe: an
 # absolute Windows source path carries a drive-letter colon (`C:\...`) that GNU
