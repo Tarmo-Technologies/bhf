@@ -6318,16 +6318,19 @@ mod tests {
     fn explicit_sanitizer_policy_controls_post_campaign_replays() {
         use multicore_fuzz::{Sanitizer, SanitizerSelection};
 
-        assert!(sanitizer_replay_enabled(
-            &SanitizerSelection::Default,
-            Sanitizer::Tsan
-        ));
+        assert_eq!(
+            sanitizer_replay_enabled(&SanitizerSelection::Default, Sanitizer::Tsan),
+            !cfg!(windows)
+        );
         assert!(!sanitizer_replay_enabled(
             &SanitizerSelection::None,
             Sanitizer::Tsan
         ));
         let selected = SanitizerSelection::Set(vec![Sanitizer::Msan]);
-        assert!(sanitizer_replay_enabled(&selected, Sanitizer::Msan));
+        assert_eq!(
+            sanitizer_replay_enabled(&selected, Sanitizer::Msan),
+            !cfg!(windows)
+        );
         assert!(!sanitizer_replay_enabled(&selected, Sanitizer::Tsan));
     }
 

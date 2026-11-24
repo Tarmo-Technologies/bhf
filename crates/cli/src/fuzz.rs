@@ -18756,8 +18756,13 @@ exit 0
             let error = set(values).expect_err(&format!("{values:?}"));
             assert!(error.contains(named), "{values:?}: {error}");
         }
-        for ok in [&["asan", "ubsan", "lsan"][..], &["msan"][..], &["tsan"][..]] {
-            assert!(set(ok).is_ok(), "{ok:?}");
+        for selection in [&["asan", "ubsan", "lsan"][..], &["msan"][..], &["tsan"][..]] {
+            if cfg!(windows) {
+                let error = set(selection).expect_err(&format!("{selection:?}"));
+                assert!(error.contains("not available on native Windows"), "{error}");
+            } else {
+                assert!(set(selection).is_ok(), "{selection:?}");
+            }
         }
     }
 
