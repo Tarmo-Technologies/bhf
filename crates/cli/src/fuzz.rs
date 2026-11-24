@@ -504,7 +504,8 @@ pub struct FuzzArgs {
     /// Sanitizers to run the campaign with, comma-separated: asan, msan,
     /// ubsan, tsan, lsan, and on an AArch64 host hwasan in place of asan. Or
     /// `none` on its own: a coverage build with no `-fsanitize=`, where the
-    /// findings are crashes and ASan/UBSan raise no false positives.
+    /// findings are crashes and ASan/UBSan raise no false positives. Native
+    /// Windows supports asan and ubsan; unsupported runtimes are refused.
     #[arg(long = "sanitizers", value_delimiter = ',')]
     pub sanitizers: Vec<String>,
 
@@ -9821,7 +9822,6 @@ pub(crate) fn parse_sanitizer_args(
             out.push(sanitizer);
         }
     }
-    hwasan_host_check(&out, std::env::consts::ARCH)?;
     // HWASan replaces ASan's shadow memory with pointer tags: clang refuses
     // `-fsanitize=address,hwaddress`.
     if out.contains(&multicore_fuzz::Sanitizer::Hwasan)
@@ -9855,14 +9855,39 @@ pub(crate) fn parse_sanitizer_args(
             ));
         }
     }
+    sanitizer_host_check(&out, std::env::consts::OS, std::env::consts::ARCH)?;
     Ok(SanitizerSelection::Set(out))
 }
 
-/// HWAddressSanitizer (#333) needs an AArch64 host: it keeps a tag in each
-/// pointer's top byte, which AArch64 ignores on every load and store (Top
-/// Byte Ignore) and other architectures do not, so its build fails or its
-/// runtime does not start anywhere else. `arch` is the host's.
-fn hwasan_host_check(sanitizers: &[multicore_fuzz::Sanitizer], arch: &str) -> Result<(), String> {
+/// Validate the sanitizers whose runtimes exist on this host. Native Windows
+/// LLVM provides ASan and UBSan; HWAddressSanitizer additionally needs an
+/// AArch64 host because its tagged pointers depend on Top Byte Ignore.
+fn sanitizer_host_check(
+    sanitizers: &[multicore_fuzz::Sanitizer],
+    os: &str,
+    arch: &str,
+) -> Result<(), String> {
+    if os == "windows" {
+        let unsupported: Vec<&str> = sanitizers
+            .iter()
+            .filter(|sanitizer| {
+                !matches!(
+                    sanitizer,
+                    multicore_fuzz::Sanitizer::Asan | multicore_fuzz::Sanitizer::Ubsan
+                )
+            })
+            .map(|sanitizer| sanitizer.as_str())
+            .collect();
+        if !unsupported.is_empty() {
+            return Err(format!(
+                "--sanitizers {} is not available on native Windows: LLVM's Windows runtime \
+                 supports address and undefined-behavior sanitizers, but not {}; use \
+                 --sanitizers asan,ubsan (or run these lanes on Linux)",
+                unsupported.join(","),
+                unsupported.join(",")
+            ));
+        }
+    }
     if !sanitizers.contains(&multicore_fuzz::Sanitizer::Hwasan) || arch == "aarch64" {
         return Ok(());
     }
@@ -16729,15 +16754,24 @@ mod parse_sanitizer_args_tests {
     /// refused with the reason and what to use instead.
     #[test]
     fn hwasan_is_refused_off_aarch64_and_never_beside_asan() {
-        use super::hwasan_host_check;
-        let error =
-            hwasan_host_check(&[Sanitizer::Hwasan, Sanitizer::Ubsan], "x86_64").unwrap_err();
+        use super::sanitizer_host_check;
+        let error = sanitizer_host_check(&[Sanitizer::Hwasan, Sanitizer::Ubsan], "linux", "x86_64")
+            .unwrap_err();
         assert!(error.contains("needs an AArch64 host"), "{error}");
         assert!(error.contains("x86_64 does not"), "{error}");
         assert!(error.contains("--sanitizers asan"), "{error}");
-        assert_eq!(hwasan_host_check(&[Sanitizer::Hwasan], "aarch64"), Ok(()));
-        assert_eq!(hwasan_host_check(&[Sanitizer::Asan], "x86_64"), Ok(()));
-        if std::env::consts::ARCH == "aarch64" {
+        assert_eq!(
+            sanitizer_host_check(&[Sanitizer::Hwasan], "linux", "aarch64"),
+            Ok(())
+        );
+        assert_eq!(
+            sanitizer_host_check(&[Sanitizer::Asan], "linux", "x86_64"),
+            Ok(())
+        );
+        if std::env::consts::OS == "windows" {
+            let error = parse(&["hwaddress"]).unwrap_err();
+            assert!(error.contains("not available on native Windows"), "{error}");
+        } else if std::env::consts::ARCH == "aarch64" {
             assert_eq!(
                 parse(&["hwaddress", "ubsan"]).unwrap(),
                 SanitizerSelection::Set(vec![Sanitizer::Hwasan, Sanitizer::Ubsan])
@@ -16750,6 +16784,25 @@ mod parse_sanitizer_args_tests {
         } else {
             let error = parse(&["hwaddress"]).unwrap_err();
             assert!(error.contains("needs an AArch64 host"), "{error}");
+        }
+    }
+
+    #[test]
+    fn native_windows_accepts_asan_and_ubsan_only() {
+        use super::sanitizer_host_check;
+        assert_eq!(
+            sanitizer_host_check(&[Sanitizer::Asan, Sanitizer::Ubsan], "windows", "x86_64"),
+            Ok(())
+        );
+        for sanitizer in [
+            Sanitizer::Hwasan,
+            Sanitizer::Lsan,
+            Sanitizer::Msan,
+            Sanitizer::Tsan,
+        ] {
+            let error = sanitizer_host_check(&[sanitizer], "windows", "x86_64").unwrap_err();
+            assert!(error.contains("not available on native Windows"), "{error}");
+            assert!(error.contains("asan,ubsan"), "{error}");
         }
     }
 

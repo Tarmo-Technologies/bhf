@@ -26,6 +26,16 @@ A native C or C++ harness is built with `-fsanitize=address,undefined` (AddressS
 
 A cross-compiled harness that runs under qemu-user or wine is built without host sanitizers, because ASan's shadow memory does not work under those emulators. [Instrumentation](instrumentation.md) has the per-lane feedback matrix and its fallbacks.
 
+## Platform availability
+
+| Native host | Fuzzed C/C++ build | Post-fuzz replay lanes |
+|---|---|---|
+| Linux | ASan, UBSan and LSan; HWASan on AArch64; MSan or TSan as a separate selection | MSan and TSan by default; CFI and RealtimeSanitizer when selected |
+| Windows with clang | ASan and UBSan | None: LLVM does not ship Windows runtimes for LSan, MSan, TSan or RealtimeSanitizer, and bhf's full CFI lane is not compatible with the Microsoft ABI |
+| Windows with `cl` or `clang-cl` | ASan only | None |
+
+On native Windows the default clang harness uses ASan and UBSan together, with the same coverage and CmpLog instrumentation and the same finding evidence as on Linux. `--sanitizers asan`, `ubsan` and `asan,ubsan` are accepted. bhf refuses `lsan`, `msan`, `tsan`, `hwasan`, `cfi` and `realtime` before discovery instead of attempting builds whose runtime does not exist or reporting those classes as measured. Use a Linux host when those lanes are required. The `cl` and `clang-cl` lanes remain ASan-only because Microsoft's compiler interface provides no UBSan mode.
+
 ## `--sanitizers <set | none>`
 
 | Value | Effect |
@@ -41,7 +51,7 @@ The values are comma-separated (`--sanitizers asan,ubsan,lsan`). `address`, `und
 
 `--sanitizers none` gives coverage-guided fuzzing that finds crashes (SIGSEGV, SIGABRT and the other fatal signals) and produces no ASan or UBSan report, so none of their false positives either. Use it for code that produces many false positives under ASan: shared memory, custom allocators, partially instrumented RTOS builds.
 
-Without `--sanitizers`, `bhf auto` also replays each corpus through MemorySanitizer and ThreadSanitizer builds after fuzzing (see [The MemorySanitizer replay](#the-memorysanitizer-replay) and [The ThreadSanitizer replay](#the-threadsanitizer-replay)). With `--sanitizers`, it runs those replays only for `msan` or `tsan` in the set; `none` runs neither.
+Without `--sanitizers`, `bhf auto` also replays each corpus through MemorySanitizer and ThreadSanitizer builds after fuzzing on hosts where those runtimes exist (see [The MemorySanitizer replay](#the-memorysanitizer-replay) and [The ThreadSanitizer replay](#the-threadsanitizer-replay)). Native Windows skips both and records their bug classes as unobservable. With `--sanitizers`, supported hosts run those replays only for `msan` or `tsan` in the set; `none` runs neither.
 
 With an operator's compiler (`CC`/`CXX`, `--cc`/`--cxx`, `[toolchain]`), `--sanitizers` first links a trivial program with the requested sanitizers and runs it: with `CC` for every harness, and with `CXX` (as C++) for a C++ harness. A compiler that cannot link it (gcc has no MemorySanitizer), or whose runtime links but aborts before `main` on this host (GCC's ThreadSanitizer under a kernel with high-entropy ASLR prints `FATAL: ThreadSanitizer: unexpected memory mapping`), is replaced, and bhf prints a note naming the variable, the compiler and the runtime's message. A failing `CC` sends the C and C++ harnesses to clang/clang++; a failing `CXX` sends the C++ harnesses to clang++ and leaves `CC` building their C units. A C-only sweep never runs `CXX`. The environment's `CFLAGS` (for `CC`) and `CXXFLAGS` (for `CXX`) are written for the compiler bhf replaced, so they stay out of the clang builds, and the note says so when they are set.
 

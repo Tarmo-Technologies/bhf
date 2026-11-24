@@ -180,9 +180,10 @@ struct UnobservableClass {
 
 /// The bug classes the sanitizer lanes of a run with `selection` and
 /// `replay_lanes` could not detect in C and C++ targets, when it fuzzed them.
-/// The fuzzed build has ASan, UBSan and LeakSanitizer unless `--sanitizers`
-/// says otherwise; the MemorySanitizer and ThreadSanitizer replays run by
-/// default and are C-only; control-flow integrity runs only when asked for.
+/// The fuzzed build has ASan and UBSan, plus LeakSanitizer on supported hosts,
+/// unless `--sanitizers` says otherwise; the MemorySanitizer and
+/// ThreadSanitizer replays run by default where their runtimes exist and are
+/// C-only; control-flow integrity runs only when asked for on a supported host.
 /// UBSan's `function` and `vptr` checks are off in the fuzzed build, so type
 /// confusion needs the CFI replay.
 fn unobservable_classes(
@@ -195,10 +196,8 @@ fn unobservable_classes(
     use crate::auto::sanitizer_replay::ReplayLane;
     let selected = |sanitizer: Sanitizer| match selection {
         SanitizerSelection::Default => {
-            matches!(
-                sanitizer,
-                Sanitizer::Asan | Sanitizer::Ubsan | Sanitizer::Lsan
-            )
+            matches!(sanitizer, Sanitizer::Asan | Sanitizer::Ubsan)
+                || (sanitizer == Sanitizer::Lsan && !cfg!(windows))
         }
         SanitizerSelection::None => false,
         SanitizerSelection::Set(set) => {
@@ -206,17 +205,21 @@ fn unobservable_classes(
                 // ASan and HWASan carry LeakSanitizer on the hosts bhf builds
                 // them for, and HWASan finds ASan's memory errors.
                 || (sanitizer == Sanitizer::Lsan
+                    && !cfg!(windows)
                     && (set.contains(&Sanitizer::Asan) || set.contains(&Sanitizer::Hwasan)))
                 || (sanitizer == Sanitizer::Asan && set.contains(&Sanitizer::Hwasan))
         }
     };
-    let replayed = |sanitizer: Sanitizer| match selection {
-        SanitizerSelection::Default => true,
-        SanitizerSelection::None => false,
-        SanitizerSelection::Set(set) => set.contains(&sanitizer),
+    let replayed = |sanitizer: Sanitizer| {
+        !cfg!(windows)
+            && match selection {
+                SanitizerSelection::Default => true,
+                SanitizerSelection::None => false,
+                SanitizerSelection::Set(set) => set.contains(&sanitizer),
+            }
     };
-    let cfi = replay_lanes.contains(&ReplayLane::Cfi);
-    let realtime = replay_lanes.contains(&ReplayLane::Realtime);
+    let cfi = !cfg!(windows) && replay_lanes.contains(&ReplayLane::Cfi);
+    let realtime = !cfg!(windows) && replay_lanes.contains(&ReplayLane::Realtime);
     // (class, description, observed in C, observed in C++, what would)
     let classes = [
         (
@@ -579,6 +582,9 @@ fn effective_sanitizer_names(sel: &SanitizerSelection) -> Vec<String> {
 /// matrix; `Set` runs it only when TSan is selected). The replay is C-only, so
 /// callers additionally gate on dialect.
 fn tsan_replay_runs(sel: &SanitizerSelection) -> bool {
+    if cfg!(windows) {
+        return false;
+    }
     match sel {
         SanitizerSelection::Default => true,
         SanitizerSelection::None => false,

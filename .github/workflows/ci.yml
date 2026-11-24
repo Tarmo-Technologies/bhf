@@ -868,7 +868,7 @@ jobs:
         run: |
           cargo test --locked --workspace --exclude bhf --test '*' --no-fail-fast
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked -p bhf --no-fail-fast --test auto_msbuild_import --test auto_force_win32 --test auto_makefile_injection --test auto_spaced_paths --test auto_force_params --test auto_peripheral_sequence --test capsule_cli --test capsule_lanes_cli --test cartography_cli --test explain_cli --test provenance_cli --test winafl_engine --test fork_server_slow_start
+          cargo test --locked -p bhf --no-fail-fast --test auto_msbuild_import --test auto_force_win32 --test auto_makefile_injection --test auto_spaced_paths --test auto_force_params --test auto_peripheral_sequence --test capsule_cli --test capsule_lanes_cli --test cartography_cli --test explain_cli --test provenance_cli --test sanitizer_set_validation --test winafl_engine --test fork_server_slow_start
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # BHF_REQUIRE_TOOLS=1 fails a test whose toolchain is missing instead of

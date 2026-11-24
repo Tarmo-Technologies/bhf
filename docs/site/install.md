@@ -237,7 +237,7 @@ cargo build --release --target x86_64-pc-windows-msvc -p bhf
 # -> target/x86_64-pc-windows-msvc/release/bhf.exe
 ```
 
-`bhf.exe` runs the pipeline on Windows: discovery, clang harness builds (edge coverage, cmplog and ASan), coverage-guided fuzzing and crash detection, including Visual Studio solutions (`.sln`, `.vcxproj`) through `--probe-build`. See [windows.md](./windows.md) for the full guide.
+`bhf.exe` runs the pipeline on Windows: discovery, clang harness builds (edge coverage, CmpLog, ASan and UBSan), coverage-guided fuzzing and crash detection, including Visual Studio solutions (`.sln`, `.vcxproj`) through `--probe-build`. See [windows.md](./windows.md) for the full guide and the native sanitizer matrix.
 
 ## macOS (Apple Silicon) from source
 

@@ -50,3 +50,28 @@ fn incompatible_sanitizers_and_unknown_engines_exit_2() {
     );
     assert_ne!(code, Some(2), "a compatible set still plans: {stderr}");
 }
+
+#[cfg(windows)]
+#[test]
+fn native_windows_accepts_asan_and_ubsan_and_refuses_missing_runtimes() {
+    let work = TestDir::new("windows-sanitizer-set");
+    std::fs::create_dir_all(work.join("src")).unwrap();
+    for set in ["asan", "ubsan", "asan,ubsan"] {
+        let (code, stderr) = bhf(
+            work.path(),
+            &["auto", "src", "--dry-run", "--sanitizers", set],
+        );
+        assert_ne!(code, Some(2), "Windows must accept {set}: {stderr}");
+    }
+    for set in ["lsan", "msan", "tsan", "hwasan", "cfi", "realtime"] {
+        let (code, stderr) = bhf(
+            work.path(),
+            &["auto", "src", "--dry-run", "--sanitizers", set],
+        );
+        assert_eq!(code, Some(2), "Windows must refuse {set}: {stderr}");
+        assert!(
+            stderr.contains("not available on native Windows"),
+            "{stderr}"
+        );
+    }
+}
