@@ -123,6 +123,13 @@ class ReleaseWorkflowContracts(unittest.TestCase):
             self.assertNotIn('\n      val:', block)
         self.assertIn('jq -er \'.announcement_title | strings\' dist-manifest.json', self.jobs['host'])
 
+    def test_github_release_notes_are_bounded_before_publication(self):
+        block = self.jobs['host']
+        self.assertIn('scripts/ci/bound-release-notes.py', block)
+        self.assertIn('"$GITHUB_REPOSITORY"', block)
+        self.assertIn('"$RELEASE_TAG"', block)
+        self.assertIn('--notes-file "$RUNNER_TEMP/notes.txt"', block)
+
     def test_every_release_checkout_is_pinned_and_does_not_persist_credentials(self):
         lines = self.release.splitlines()
         for index, line in enumerate(lines):

@@ -841,7 +841,12 @@ jobs:
             prerelease_flag+=(--prerelease)
           fi
           announcement_title="$(jq -er '.announcement_title | strings' dist-manifest.json)"
-          jq -er '.announcement_github_body | strings' dist-manifest.json > "$RUNNER_TEMP/notes.txt"
+          jq -er '.announcement_github_body | strings' dist-manifest.json > "$RUNNER_TEMP/notes-full.txt"
+          python3 scripts/ci/bound-release-notes.py \
+            "$RUNNER_TEMP/notes-full.txt" \
+            "$RUNNER_TEMP/notes.txt" \
+            "$GITHUB_REPOSITORY" \
+            "$RELEASE_TAG"
           gh release create "$RELEASE_TAG" --target "$RELEASE_COMMIT" "${prerelease_flag[@]}" --title "$announcement_title" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
   announce:
