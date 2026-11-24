@@ -180,9 +180,10 @@ struct UnobservableClass {
 
 /// The bug classes the sanitizer lanes of a run with `selection` and
 /// `replay_lanes` could not detect in C and C++ targets, when it fuzzed them.
-/// The fuzzed build has ASan, UBSan and LeakSanitizer unless `--sanitizers`
-/// says otherwise; the MemorySanitizer and ThreadSanitizer replays run by
-/// default and are C-only; control-flow integrity runs only when asked for.
+/// The fuzzed build has ASan and UBSan, plus LeakSanitizer on supported hosts,
+/// unless `--sanitizers` says otherwise; the MemorySanitizer and
+/// ThreadSanitizer replays run by default where their runtimes exist and are
+/// C-only; control-flow integrity runs only when asked for on a supported host.
 /// UBSan's `function` and `vptr` checks are off in the fuzzed build, so type
 /// confusion needs the CFI replay.
 fn unobservable_classes(
@@ -195,10 +196,8 @@ fn unobservable_classes(
     use crate::auto::sanitizer_replay::ReplayLane;
     let selected = |sanitizer: Sanitizer| match selection {
         SanitizerSelection::Default => {
-            matches!(
-                sanitizer,
-                Sanitizer::Asan | Sanitizer::Ubsan | Sanitizer::Lsan
-            )
+            matches!(sanitizer, Sanitizer::Asan | Sanitizer::Ubsan)
+                || (sanitizer == Sanitizer::Lsan && !cfg!(windows))
         }
         SanitizerSelection::None => false,
         SanitizerSelection::Set(set) => {
@@ -206,17 +205,21 @@ fn unobservable_classes(
                 // ASan and HWASan carry LeakSanitizer on the hosts bhf builds
                 // them for, and HWASan finds ASan's memory errors.
                 || (sanitizer == Sanitizer::Lsan
+                    && !cfg!(windows)
                     && (set.contains(&Sanitizer::Asan) || set.contains(&Sanitizer::Hwasan)))
                 || (sanitizer == Sanitizer::Asan && set.contains(&Sanitizer::Hwasan))
         }
     };
-    let replayed = |sanitizer: Sanitizer| match selection {
-        SanitizerSelection::Default => true,
-        SanitizerSelection::None => false,
-        SanitizerSelection::Set(set) => set.contains(&sanitizer),
+    let replayed = |sanitizer: Sanitizer| {
+        !cfg!(windows)
+            && match selection {
+                SanitizerSelection::Default => true,
+                SanitizerSelection::None => false,
+                SanitizerSelection::Set(set) => set.contains(&sanitizer),
+            }
     };
-    let cfi = replay_lanes.contains(&ReplayLane::Cfi);
-    let realtime = replay_lanes.contains(&ReplayLane::Realtime);
+    let cfi = !cfg!(windows) && replay_lanes.contains(&ReplayLane::Cfi);
+    let realtime = !cfg!(windows) && replay_lanes.contains(&ReplayLane::Realtime);
     // (class, description, observed in C, observed in C++, what would)
     let classes = [
         (
@@ -579,6 +582,9 @@ fn effective_sanitizer_names(sel: &SanitizerSelection) -> Vec<String> {
 /// matrix; `Set` runs it only when TSan is selected). The replay is C-only, so
 /// callers additionally gate on dialect.
 fn tsan_replay_runs(sel: &SanitizerSelection) -> bool {
+    if cfg!(windows) {
+        return false;
+    }
     match sel {
         SanitizerSelection::Default => true,
         SanitizerSelection::None => false,
@@ -4359,9 +4365,24 @@ mod tests {
                 .map(|class| (class.class, class.languages))
                 .collect::<Vec<_>>()
         };
-        // The default matrix: ASan, UBSan and LSan in the build, MSan and
-        // TSan replays for C; no CFI, and (without an MSan libc++) no MSan
-        // or TSan for C++.
+        // The default Unix matrix has ASan, UBSan and LSan in the build and
+        // MSan and TSan replays for C. Windows has ASan and UBSan only.
+        let default_without_msan_libcxx = if cfg!(windows) {
+            vec![
+                ("memory-leaks", vec!["c", "c++"]),
+                ("uninitialized-reads", vec!["c", "c++"]),
+                ("data-races", vec!["c", "c++"]),
+                ("type-confusion", vec!["c", "c++"]),
+                ("realtime-safety", vec!["c", "c++"]),
+            ]
+        } else {
+            vec![
+                ("uninitialized-reads", vec!["c++"]),
+                ("data-races", vec!["c++"]),
+                ("type-confusion", vec!["c", "c++"]),
+                ("realtime-safety", vec!["c", "c++"]),
+            ]
+        };
         assert_eq!(
             names(unobservable_classes(
                 &SanitizerSelection::Default,
@@ -4370,15 +4391,25 @@ mod tests {
                 true,
                 false,
             )),
-            [
-                ("uninitialized-reads", vec!["c++"]),
+            default_without_msan_libcxx
+        );
+        // With an MSan-instrumented libc++ the C++ harnesses replay under
+        // MSan too (#323).
+        let default_with_msan_libcxx = if cfg!(windows) {
+            vec![
+                ("memory-leaks", vec!["c", "c++"]),
+                ("uninitialized-reads", vec!["c", "c++"]),
+                ("data-races", vec!["c", "c++"]),
+                ("type-confusion", vec!["c", "c++"]),
+                ("realtime-safety", vec!["c", "c++"]),
+            ]
+        } else {
+            vec![
                 ("data-races", vec!["c++"]),
                 ("type-confusion", vec!["c", "c++"]),
                 ("realtime-safety", vec!["c", "c++"]),
             ]
-        );
-        // With an MSan-instrumented libc++ the C++ harnesses replay under
-        // MSan too (#323).
+        };
         assert_eq!(
             names(unobservable_classes(
                 &SanitizerSelection::Default,
@@ -4387,12 +4418,24 @@ mod tests {
                 true,
                 true,
             )),
-            [
-                ("data-races", vec!["c++"]),
-                ("type-confusion", vec!["c", "c++"]),
-                ("realtime-safety", vec!["c", "c++"]),
-            ]
+            default_with_msan_libcxx
         );
+        let asan_with_replay_requests = if cfg!(windows) {
+            vec![
+                ("undefined-behavior", vec!["c"]),
+                ("memory-leaks", vec!["c"]),
+                ("uninitialized-reads", vec!["c"]),
+                ("data-races", vec!["c"]),
+                ("type-confusion", vec!["c"]),
+                ("realtime-safety", vec!["c"]),
+            ]
+        } else {
+            vec![
+                ("undefined-behavior", vec!["c"]),
+                ("uninitialized-reads", vec!["c"]),
+                ("data-races", vec!["c"]),
+            ]
+        };
         assert_eq!(
             names(unobservable_classes(
                 &SanitizerSelection::Set(vec![Sanitizer::Asan]),
@@ -4401,11 +4444,7 @@ mod tests {
                 false,
                 false,
             )),
-            [
-                ("undefined-behavior", vec!["c"]),
-                ("uninitialized-reads", vec!["c"]),
-                ("data-races", vec!["c"]),
-            ]
+            asan_with_replay_requests
         );
         assert!(
             unobservable_classes(&SanitizerSelection::None, &[], false, false, false).is_empty()

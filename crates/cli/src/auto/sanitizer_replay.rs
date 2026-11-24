@@ -63,6 +63,27 @@ pub fn split_replay_lanes(values: &[String]) -> (Vec<String>, Vec<ReplayLane>) {
     (rest, lanes)
 }
 
+/// Refuse replay lanes whose compiler runtimes do not exist on this host.
+/// Keeping this check ahead of discovery makes an unsupported request a clear
+/// CLI error instead of a long campaign ending with every replay build failed.
+pub fn validate_host(lanes: &[ReplayLane], os: &str) -> Result<(), String> {
+    if os != "windows" || lanes.is_empty() {
+        return Ok(());
+    }
+    let unavailable = lanes
+        .iter()
+        .map(|lane| match lane {
+            ReplayLane::Cfi => "cfi (bhf's full CFI lane is incompatible with the Microsoft ABI)",
+            ReplayLane::Realtime => "realtime (LLVM ships no Windows runtime)",
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "--sanitizers {unavailable} is not available on native Windows; run this replay lane on \
+         Linux"
+    ))
+}
+
 /// The longest one replayed input may run, whatever `--timeout` says.
 pub(crate) const MAX_RUN_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -232,6 +253,16 @@ fn digest(input: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_windows_refuses_replay_only_sanitizers() {
+        for lane in [ReplayLane::Cfi, ReplayLane::Realtime] {
+            let error = validate_host(&[lane], "windows").unwrap_err();
+            assert!(error.contains(lane.as_str()), "{error}");
+            assert!(error.contains("native Windows"), "{error}");
+        }
+        assert_eq!(validate_host(&[ReplayLane::Cfi], "linux"), Ok(()));
+    }
 
     #[test]
     fn a_sanitizer_is_told_which_symbolizer_to_run() {

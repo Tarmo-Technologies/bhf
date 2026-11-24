@@ -4,6 +4,14 @@
 
 ## Unreleased
 
+## 0.5.0 - 2026-11-23
+
+### Added
+- Native Windows clang C/C++ harnesses have explicit sanitizer parity with the runtimes LLVM provides there: ASan and UBSan run together by default and can be selected separately or together (#463). Unsupported LSan, MSan, TSan, HWASan, CFI and RealtimeSanitizer selections are refused before discovery, default Windows runs no longer attempt unavailable MSan or TSan replays, and fidelity reports list their bug classes as unobservable instead of measured. The sanitizer and Windows guides carry the platform matrix, and Windows CI checks the accepted and refused selections.
+
+### Fixed
+- Native Windows C/C++ harnesses build with Chocolatey's standalone GNU make when no POSIX shell is installed (#464). Generated Makefiles now compare and update toolchain stamps through GNU make itself, so `cmd.exe` no longer stops on the stamp recipe's shell syntax and unchanged stamps still leave compiled objects intact.
+
 ## 0.4.0 - 2026-11-20
 
 ### Added

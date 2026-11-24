@@ -751,7 +751,9 @@ pub struct AutoArgs {
     /// custom-allocator or RTOS code that ASan reports too much on. This
     /// setting applies to native C/C++ only: every other language has its own
     /// instrumentation, and harnesses cross-compiled to run under qemu-user or
-    /// wine get no host sanitizers.
+    /// wine get no host sanitizers. Native Windows supports `asan` and `ubsan`;
+    /// selections whose LLVM runtime is unavailable there are refused before
+    /// discovery. The MSan and TSan default replays run on supported Unix hosts.
     ///
     /// With an operator's compiler (CC/CXX, --cc/--cxx, `[toolchain]`), bhf first
     /// links and runs a trivial program with the requested sanitizers: with CC
@@ -1040,6 +1042,9 @@ fn sanitizer_replay_enabled(
     selection: &multicore_fuzz::SanitizerSelection,
     sanitizer: multicore_fuzz::Sanitizer,
 ) -> bool {
+    if cfg!(windows) {
+        return false;
+    }
     match selection {
         // Preserve the historical default matrix when the operator did not
         // select a sanitizer policy explicitly.
@@ -1382,6 +1387,12 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     // build's matrix.
     let (build_sanitizers, replay_lanes) =
         crate::auto::sanitizer_replay::split_replay_lanes(&args.sanitizers);
+    if let Err(error) =
+        crate::auto::sanitizer_replay::validate_host(&replay_lanes, std::env::consts::OS)
+    {
+        bhfeprintln!("error: {error}");
+        return Ok(2);
+    }
     if let Err(error) = crate::fuzz::parse_sanitizer_args(&build_sanitizers) {
         bhfeprintln!("error: {error}");
         return Ok(2);
@@ -6307,16 +6318,19 @@ mod tests {
     fn explicit_sanitizer_policy_controls_post_campaign_replays() {
         use multicore_fuzz::{Sanitizer, SanitizerSelection};
 
-        assert!(sanitizer_replay_enabled(
-            &SanitizerSelection::Default,
-            Sanitizer::Tsan
-        ));
+        assert_eq!(
+            sanitizer_replay_enabled(&SanitizerSelection::Default, Sanitizer::Tsan),
+            !cfg!(windows)
+        );
         assert!(!sanitizer_replay_enabled(
             &SanitizerSelection::None,
             Sanitizer::Tsan
         ));
         let selected = SanitizerSelection::Set(vec![Sanitizer::Msan]);
-        assert!(sanitizer_replay_enabled(&selected, Sanitizer::Msan));
+        assert_eq!(
+            sanitizer_replay_enabled(&selected, Sanitizer::Msan),
+            !cfg!(windows)
+        );
         assert!(!sanitizer_replay_enabled(&selected, Sanitizer::Tsan));
     }
 

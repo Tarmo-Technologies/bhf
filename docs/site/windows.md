@@ -22,7 +22,7 @@ Install these with [Chocolatey](https://chocolatey.org), `winget`, or the direct
 | Tool | Why | Install |
 |------|-----|---------|
 | **VS Build Tools (MSVC + Windows SDK)** | The CRT, linker and SDK every harness links against; `cl.exe` for the MSVC lane; MSBuild for solutions. | [vs_buildtools.exe](https://aka.ms/vs/17/release/vs_buildtools.exe) `--quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended` |
-| **clang** | The default harness compiler (edge coverage + cmplog + ASan). Either Visual Studio's "C++ Clang tools for Windows" component (`Microsoft.VisualStudio.Component.VC.Llvm.Clang`) or a standalone LLVM. | `--add Microsoft.VisualStudio.Component.VC.Llvm.Clang` on the Build Tools installer, or `choco install llvm` / the [LLVM release](https://github.com/llvm/llvm-project/releases) (`LLVM-*-win64.exe`). |
+| **clang** | The default harness compiler (edge coverage + CmpLog + ASan + UBSan). Either Visual Studio's "C++ Clang tools for Windows" component (`Microsoft.VisualStudio.Component.VC.Llvm.Clang`) or a standalone LLVM. | `--add Microsoft.VisualStudio.Component.VC.Llvm.Clang` on the Build Tools installer, or `choco install llvm` / the [LLVM release](https://github.com/llvm/llvm-project/releases) (`LLVM-*-win64.exe`). |
 | **GNU make** | bhf builds each C/C++ harness through a generated Makefile (same as Linux). | [w64devkit](https://github.com/skeeto/w64devkit/releases) unpacked to `C:\w64devkit`, or `choco install make`. |
 | **git** | Cloning target projects (optional). | `choco install git` or [Git for Windows](https://gitforwindows.org). |
 | **Rust** (optional) | Only to build bhf from source; you can also use a prebuilt `bhf.exe`. | [rustup](https://rustup.rs). |
@@ -69,7 +69,7 @@ Download the `bhf-x86_64-pc-windows-msvc.zip` archive from the GitHub release an
 Set `$Version` to the release tag you want:
 
 ```powershell
-$Version = "0.4.0"
+$Version = "0.5.0"
 irm "https://github.com/Tarmo-Technologies/bhf/releases/download/$Version/bhf-installer.ps1" | iex
 bhf.exe --version
 ```
@@ -100,7 +100,11 @@ bhf.exe auto C:\path\to\source --work-dir C:\Temp\bhf-work `
   --jobs 1 --max-targets 1 --per-target-time 10
 ```
 
-`auto` runs the same pipeline as on Linux: it discovers fuzzable functions, generates typed harnesses, builds them with clang (edge coverage, CmpLog and ASan), fuzzes them with the builtin engine, and writes JSON and Markdown findings. Windows has no POSIX signals, so a harness fault is detected through ASan or the driver's unhandled-exception filter.
+`auto` runs the same pipeline as on Linux: it discovers fuzzable functions, generates typed harnesses, builds them with clang (edge coverage, CmpLog, ASan and UBSan), fuzzes them with the builtin engine, and writes JSON and Markdown findings. Windows has no POSIX signals, so a harness fault is detected through ASan, UBSan or the driver's unhandled-exception filter.
+
+### Sanitizer support
+
+The default clang C/C++ lane has Linux parity for AddressSanitizer and UndefinedBehaviorSanitizer: both are linked into each harness, their reports use the same classification and evidence pipeline, and `--sanitizers asan`, `ubsan` or `asan,ubsan` selects them explicitly. LLVM does not provide native Windows runtimes for LeakSanitizer, MemorySanitizer, ThreadSanitizer or RealtimeSanitizer, and bhf's full CFI replay is not compatible with the Microsoft ABI. bhf refuses those selections before discovery and does not count their bug classes as measured. The `--cc cl` and `--cc clang-cl` lanes are ASan-only. See [Sanitizers](sanitizers.md#platform-availability) for the full matrix.
 
 ### Verify the install
 
