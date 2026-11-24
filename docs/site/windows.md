@@ -69,7 +69,7 @@ Download the `bhf-x86_64-pc-windows-msvc.zip` archive from the GitHub release an
 Set `$Version` to the release tag you want:
 
 ```powershell
-$Version = "0.4.0"
+$Version = "0.5.0"
 irm "https://github.com/Tarmo-Technologies/bhf/releases/download/$Version/bhf-installer.ps1" | iex
 bhf.exe --version
 ```
