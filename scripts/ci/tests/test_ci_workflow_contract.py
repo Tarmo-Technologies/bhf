@@ -184,6 +184,7 @@ class WorkflowContractTests(unittest.TestCase):
         "cartography_cli",
         "explain_cli",
         "provenance_cli",
+        "sanitizer_set_validation",
         "winafl_engine",
         "fork_server_slow_start",
     )
